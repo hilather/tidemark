@@ -65,7 +65,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     }
     let catalog = Catalog::open(&context.config.general.state_dir, false)?;
     // Removed targets cannot be canonicalized live. Canonicalize the nearest
-    // existing ancestor, then append the missing byte components lexically.
+    // existing ancestor, then append the missing byte names after rejecting unresolved parents.
     let target = query_path(
         args.path
             .as_deref()
@@ -212,5 +212,24 @@ mod tests {
             .join(&tidemark_core::path::RawName::new(b"gone".to_vec()).unwrap());
         assert_eq!(target, expected);
         assert!(query_path(&dir.path().join("link/missing/../gone")).is_err());
+    }
+    #[test]
+    fn missing_target_keeps_bytes_and_rejects_unresolved_parents() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let missing = std::ffi::OsString::from_vec(b"missing\xff".to_vec());
+        let target = query_path(&dir.path().join(&missing).join("child")).unwrap();
+        let expected = tidemark_fs::canon::canonicalize(dir.path())
+            .unwrap()
+            .join(&tidemark_core::path::RawName::new(b"missing\xff".to_vec()).unwrap())
+            .join(&tidemark_core::path::RawName::new(b"child".to_vec()).unwrap());
+        assert_eq!(target, expected);
+        assert_eq!(
+            query_path(&dir.path().join(&missing).join("./child/")).unwrap(),
+            expected
+        );
+        for suffix in ["missing/..", "missing/../child", "missing/child/../../gone"] {
+            assert!(query_path(&dir.path().join(suffix)).is_err());
+        }
     }
 }

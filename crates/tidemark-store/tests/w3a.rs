@@ -155,18 +155,49 @@ fn million_directory_depth_three() {
     let dir = tempfile::tempdir().unwrap();
     let mut rows = vec![row(0, None, b"/fixture", 0)];
     rows[0].subtree_end = 999_999;
-    for id in 1..1_000_000 {
+    for group in 0..10 {
+        let parent = rows.len() as u32;
         rows.push(row(
-            id,
+            parent,
             Some(0),
-            format!("/fixture/{id:08}").as_bytes(),
-            id as u64,
+            format!("/fixture/{group:02}").as_bytes(),
+            0,
         ));
+        let branch = rows.len() as u32;
+        let mut r = row(
+            branch,
+            Some(parent),
+            format!("/fixture/{group:02}/branch").as_bytes(),
+            0,
+        );
+        r.depth = 2;
+        rows.push(r);
+        let leaves = if group == 9 { 100_006 } else { 99_997 };
+        for leaf in 0..leaves {
+            let id = rows.len() as u32;
+            let mut r = row(
+                id,
+                Some(branch),
+                format!("/fixture/{group:02}/branch/{leaf:08}").as_bytes(),
+                u64::from(id),
+            );
+            r.depth = 3;
+            rows.push(r);
+        }
+        let end = rows.len() as u32 - 1;
+        rows[parent as usize].subtree_end = end;
+        rows[branch as usize].subtree_end = end;
     }
+    assert_eq!(rows.len(), 1_000_000);
     let a = snapshot(dir.path(), &rows, 1);
     for r in &mut rows {
         r.t_disk += 1;
     }
+    // A renamed leaf makes the joined union exceed the former input cap.
+    let last = rows.last_mut().unwrap();
+    last.path = p(b"/fixture/09/branch/renamed");
+    last.path_hash = last.path.hash64();
+    last.name = b"renamed".to_vec();
     let b = snapshot(dir.path(), &rows, 2);
     drop(rows);
     let snap = Snapshot::open(&b).unwrap();
@@ -231,4 +262,109 @@ fn own_only_zero_change_missing_target_and_read_only_snapshots() {
     )
     .unwrap();
     assert_eq!(e.target_delta, -20);
+}
+
+#[test]
+fn attachment_uri_bytes_hash_collision_and_error_cleanup() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"state?#%\xff".to_vec()));
+    std::fs::create_dir(&state).unwrap();
+    let mut old = vec![
+        row(0, None, b"/fixture", 10),
+        row(1, Some(0), b"/fixture/a", 2),
+    ];
+    old[0].subtree_end = 1;
+    let mut new = old.clone();
+    new[1].path = p(b"/fixture/b");
+    new[1].name = b"b".to_vec();
+    // Deliberate collision: the complete BLOB path must still distinguish rows.
+    new[1].path_hash = old[1].path_hash;
+    new[1].t_disk = 5;
+    let a = snapshot(&state, &old, 10);
+    let b = snapshot(&state, &new, 20);
+    let snap = Snapshot::open(&b).unwrap();
+    for _ in 0..2 {
+        let rows = diff(&snap, &a, &p(b"/fixture"), DiffMetric::Disk, 1, 5).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].class, DiffClass::New);
+        assert_eq!(rows[1].class, DiffClass::Removed);
+    }
+    // A malformed stored path triggers row-conversion failure after ATTACH.
+    let corrupt = snapshot(&state, &new, 30);
+    let conn = rusqlite::Connection::open(&corrupt).unwrap();
+    conn.execute(
+        "UPDATE dirs SET path = ?1 WHERE id = ?2",
+        rusqlite::params![b"/bad\0path".as_slice(), 1],
+    )
+    .unwrap();
+    drop(conn);
+    let corrupt = Snapshot::open(&corrupt).unwrap();
+    for _ in 0..2 {
+        let error = diff(&corrupt, &a, &p(b"/fixture"), DiffMetric::Disk, 1, 5)
+            .err()
+            .unwrap();
+        assert!(matches!(error, tidemark_store::StoreError::Core(_)));
+    }
+}
+
+#[test]
+fn path_join_ignores_preorder_ids_and_depth_addition_does_not_wrap() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut old = vec![
+        row(0, None, b"/fixture", 20),
+        row(1, Some(0), b"/fixture/b", 10),
+        row(2, Some(0), b"/fixture/a", 10),
+        row(3, Some(2), b"/fixture/a/deep", 5),
+    ];
+    old[2].subtree_end = 3;
+    old[3].depth = 2;
+    let mut new = vec![
+        row(0, None, b"/fixture", 35),
+        row(1, Some(0), b"/fixture/a", 25),
+        row(2, Some(1), b"/fixture/a/deep", 20),
+        row(3, Some(0), b"/fixture/b", 10),
+    ];
+    new[1].subtree_end = 2;
+    new[2].depth = 2;
+    let a = snapshot(dir.path(), &old, 10);
+    let b = snapshot(dir.path(), &new, 20);
+    let snap = Snapshot::open(&b).unwrap();
+    let rows = diff(&snap, &a, &p(b"/fixture/a"), DiffMetric::Disk, u32::MAX, 10).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|r| r.class == DiffClass::Grown && r.delta == 15));
+    assert_eq!(rows[1].depth_rel, 1);
+    let e = explain(&snap, &a, &p(b"/fixture"), DiffMetric::Disk, 0.5, 1, 0).unwrap();
+    assert_eq!(e.steps.len(), 2);
+    assert_eq!(e.steps[1].path, p(b"/fixture/a/deep"));
+    assert!(e.spread.is_empty());
+}
+
+#[test]
+fn zero_parent_delta_does_not_count_opposing_children_as_spread() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut old = vec![
+        row(0, None, b"/fixture", 100),
+        row(1, Some(0), b"/fixture/a", 50),
+        row(2, Some(0), b"/fixture/b", 50),
+    ];
+    old[0].subtree_end = 2;
+    let mut new = old.clone();
+    new[1].t_disk = 60;
+    new[2].t_disk = 40;
+    let a = snapshot(dir.path(), &old, 10);
+    let b = snapshot(dir.path(), &new, 20);
+    let snap = Snapshot::open(&b).unwrap();
+    let e = explain(&snap, &a, &p(b"/fixture"), DiffMetric::Disk, 0.5, 0, 1).unwrap();
+    assert_eq!(e.target_delta, 0);
+    assert!(e.steps.is_empty());
+    assert_eq!(e.spread_children, 0);
+    assert_eq!(e.spread[0].delta, 10);
+    let e = explain(&snap, &a, &p(b"/fixture"), DiffMetric::Disk, 1.0, 100, 0).unwrap();
+    assert_eq!(e.spread_children, 0);
+    assert!(e.spread.is_empty());
 }
