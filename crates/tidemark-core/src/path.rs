@@ -58,6 +58,8 @@ impl RawName {
 }
 impl RawPath {
     /// Normalize an absolute raw path lexically; no filesystem access occurs.
+    /// This is not filesystem canonicalization: callers must canonicalize live
+    /// query paths first when the CLI promises `realpath`.
     pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, CoreError> {
         let bytes = bytes.into();
         if !bytes.starts_with(b"/") || bytes.contains(&0) {
@@ -149,6 +151,97 @@ impl<'de> Deserialize<'de> for RawPath {
 impl<'de> Deserialize<'de> for RawName {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Self::new(Vec::<u8>::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+// Shared sibling-field encoding for report DTOs. Ordinary RawPath serde remains
+// byte-oriented for internal storage; enclosing reports choose the wire adapter.
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct PathFields {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_string"
+    )]
+    path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_string"
+    )]
+    path_b64: Option<String>,
+}
+impl PathFields {
+    fn encode(bytes: Option<&[u8]>) -> Self {
+        match bytes {
+            None => Self::default(),
+            Some(bytes) => match std::str::from_utf8(bytes) {
+                Ok(path) => Self {
+                    path: Some(path.into()),
+                    path_b64: None,
+                },
+                Err(_) => Self {
+                    path: None,
+                    path_b64: Some(STANDARD.encode(bytes)),
+                },
+            },
+        }
+    }
+    fn decode<E: serde::de::Error>(self) -> Result<Option<Vec<u8>>, E> {
+        decode_fields(self.path, self.path_b64)
+    }
+}
+pub(crate) fn present_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(d).map(Some)
+}
+pub(crate) fn decode_fields<E: serde::de::Error>(
+    text: Option<String>,
+    b64: Option<String>,
+) -> Result<Option<Vec<u8>>, E> {
+    match (text, b64) {
+        (Some(_), Some(_)) => Err(E::custom("conflicting path representations")),
+        (Some(text), None) => Ok(Some(text.into_bytes())),
+        (None, Some(b64)) => STANDARD.decode(b64).map(Some).map_err(E::custom),
+        (None, None) => Ok(None),
+    }
+}
+pub(crate) fn encode_fields(bytes: Option<&[u8]>) -> (Option<String>, Option<String>) {
+    let fields = PathFields::encode(bytes);
+    (fields.path, fields.path_b64)
+}
+pub(crate) mod report_bytes {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        PathFields::encode(Some(bytes)).serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        PathFields::deserialize(d)?
+            .decode()?
+            .ok_or_else(|| serde::de::Error::custom("path or path_b64 is required"))
+    }
+}
+pub(crate) mod report_path {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(path: &RawPath, s: S) -> Result<S::Ok, S::Error> {
+        report_bytes::serialize(path.as_bytes(), s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<RawPath, D::Error> {
+        RawPath::new(report_bytes::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+pub(crate) mod report_optional_path {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        path: &Option<RawPath>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        PathFields::encode(path.as_ref().map(RawPath::as_bytes)).serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<RawPath>, D::Error> {
+        PathFields::deserialize(d)?
+            .decode()?
+            .map(RawPath::new)
+            .transpose()
+            .map_err(serde::de::Error::custom)
     }
 }
 fn path_json(bytes: &[u8]) -> serde_json::Value {

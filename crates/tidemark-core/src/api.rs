@@ -160,8 +160,9 @@ pub struct WritersParams {
     /// mount field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount: Option<String>,
-    /// window field.
-    pub window: HotWindow,
+    /// Positive humantime duration; no additional maximum is imposed by core.
+    #[serde(with = "positive_duration")]
+    pub window: std::time::Duration,
 }
 /// PgParams API contract (08 §2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,7 +192,10 @@ pub struct AlertsHistoryParams {
     pub limit: Option<usize>,
 }
 /// ScanStartParams API contract (08 §2).
+/// Exactly one UTF-8 `root` or padded standard-base64 `root_b64` is required;
+/// deserialization validates and lexically normalizes through `RawPath`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "ScanStartParamsWire", into = "ScanStartParamsWire")]
 #[serde(deny_unknown_fields)]
 pub struct ScanStartParams {
     /// root field.
@@ -204,7 +208,9 @@ pub struct ScanStartParams {
     pub throttle: Option<ThrottlePreset>,
 }
 /// ScanStatusParams API contract (08 §2).
+/// At most one UTF-8 `root` or padded standard-base64 `root_b64`; omit both for all roots.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "ScanStatusParamsWire", into = "ScanStatusParamsWire")]
 #[serde(deny_unknown_fields)]
 pub struct ScanStatusParams {
     /// root field.
@@ -212,7 +218,9 @@ pub struct ScanStatusParams {
     pub root: Option<RawPath>,
 }
 /// ScanCancelParams API contract (08 §2).
+/// Exactly one UTF-8 `root` or padded standard-base64 `root_b64` is required.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "ScanCancelParamsWire", into = "ScanCancelParamsWire")]
 #[serde(deny_unknown_fields)]
 pub struct ScanCancelParams {
     /// root field.
@@ -316,5 +324,144 @@ mod tests {
             serde_json::json!({"window":"2m","by":"dir","limit":10})
         )
         .is_err());
+    }
+}
+
+mod positive_duration {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+    pub fn serialize<S: Serializer>(duration: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        if duration.is_zero() {
+            return Err(serde::ser::Error::custom("window must be positive"));
+        }
+        humantime_serde::serialize(duration, s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let duration = humantime_serde::Serde::<Duration>::deserialize(d)?.into_inner();
+        if duration.is_zero() {
+            return Err(serde::de::Error::custom("window must be positive"));
+        }
+        Ok(duration)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanStartParamsWire {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    root: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    root_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<RootMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    throttle: Option<ThrottlePreset>,
+}
+impl From<ScanStartParams> for ScanStartParamsWire {
+    fn from(value: ScanStartParams) -> Self {
+        let (root, root_b64) = crate::path::encode_fields(Some(value.root.as_bytes()));
+        Self {
+            root,
+            root_b64,
+            mode: value.mode,
+            throttle: value.throttle,
+        }
+    }
+}
+impl TryFrom<ScanStartParamsWire> for ScanStartParams {
+    type Error = String;
+    fn try_from(value: ScanStartParamsWire) -> Result<Self, Self::Error> {
+        let root =
+            crate::path::decode_fields::<serde::de::value::Error>(value.root, value.root_b64)
+                .map_err(|e| e.to_string())?
+                .map(RawPath::new)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+        let root = root.ok_or_else(|| "root or root_b64 is required".to_owned())?;
+        Ok(Self {
+            root,
+            mode: value.mode,
+            throttle: value.throttle,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanStatusParamsWire {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    root: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    root_b64: Option<String>,
+}
+impl From<ScanStatusParams> for ScanStatusParamsWire {
+    fn from(value: ScanStatusParams) -> Self {
+        let (root, root_b64) =
+            crate::path::encode_fields(value.root.as_ref().map(RawPath::as_bytes));
+        Self { root, root_b64 }
+    }
+}
+impl TryFrom<ScanStatusParamsWire> for ScanStatusParams {
+    type Error = String;
+    fn try_from(value: ScanStatusParamsWire) -> Result<Self, Self::Error> {
+        let root =
+            crate::path::decode_fields::<serde::de::value::Error>(value.root, value.root_b64)
+                .map_err(|e| e.to_string())?
+                .map(RawPath::new)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+        Ok(Self { root })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanCancelParamsWire {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    root: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    root_b64: Option<String>,
+}
+impl From<ScanCancelParams> for ScanCancelParamsWire {
+    fn from(value: ScanCancelParams) -> Self {
+        let (root, root_b64) = crate::path::encode_fields(Some(value.root.as_bytes()));
+        Self { root, root_b64 }
+    }
+}
+impl TryFrom<ScanCancelParamsWire> for ScanCancelParams {
+    type Error = String;
+    fn try_from(value: ScanCancelParamsWire) -> Result<Self, Self::Error> {
+        let root =
+            crate::path::decode_fields::<serde::de::value::Error>(value.root, value.root_b64)
+                .map_err(|e| e.to_string())?
+                .map(RawPath::new)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+        let root = root.ok_or_else(|| "root or root_b64 is required".to_owned())?;
+        Ok(Self { root })
     }
 }

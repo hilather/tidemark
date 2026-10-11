@@ -125,7 +125,9 @@ pub struct Attribution {
     pub uid: Option<u32>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// HotEntry contract.
+#[serde(try_from = "HotEntryWire", into = "HotEntryWire")]
+/// HotEntry contract. Absolute directory keys serialize as `path`/`path_b64`;
+/// unit/comm labels retain byte-oriented `key` because this type has no scope field.
 pub struct HotEntry {
     #[doc = "key field; see the normative plan for units."]
     pub key: Vec<u8>, /* dir path, unit or comm */
@@ -141,7 +143,9 @@ pub struct HotEntry {
     pub lossy: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// HotMinute contract.
+#[serde(try_from = "HotMinuteWire", into = "HotMinuteWire")]
+/// HotMinute contract. Scope `dir` serializes its key as `path`/`path_b64`;
+/// unit/comm scopes retain byte-oriented `key`.
 pub struct HotMinute {
     #[doc = "mount field; see the normative plan for units."]
     pub mount: String,
@@ -169,7 +173,8 @@ pub struct PhantomHolder {
     pub comm: String,
     #[doc = "unit field; see the normative plan for units."]
     pub unit: Option<String>,
-    #[doc = "path field; see the normative plan for units."]
+    /// Raw path bytes, encoded as mutually exclusive `path`/`path_b64` report fields.
+    #[serde(flatten, with = "crate::path::report_bytes")]
     pub path: Vec<u8>,
     #[doc = "dev field; see the normative plan for units."]
     pub dev: u64,
@@ -203,7 +208,8 @@ pub struct PhantomSample {
     pub comm: String,
     #[doc = "unit field; see the normative plan for units."]
     pub unit: Option<String>,
-    #[doc = "path field; see the normative plan for units."]
+    /// Raw path bytes, encoded as mutually exclusive `path`/`path_b64` report fields.
+    #[serde(flatten, with = "crate::path::report_bytes")]
     pub path: Vec<u8>,
     #[doc = "dev field; see the normative plan for units."]
     pub dev: u64,
@@ -223,7 +229,8 @@ pub struct OpenWriter {
     pub comm: String,
     #[doc = "unit field; see the normative plan for units."]
     pub unit: Option<String>,
-    #[doc = "path field; see the normative plan for units."]
+    /// Raw path bytes, encoded as mutually exclusive `path`/`path_b64` report fields.
+    #[serde(flatten, with = "crate::path::report_bytes")]
     pub path: Vec<u8>,
     #[doc = "dev field; see the normative plan for units."]
     pub dev: u64,
@@ -251,7 +258,8 @@ pub struct WriterSample {
     pub comm: String,
     #[doc = "unit field; see the normative plan for units."]
     pub unit: Option<String>,
-    #[doc = "path field; see the normative plan for units."]
+    /// Raw path bytes, encoded as mutually exclusive `path`/`path_b64` report fields.
+    #[serde(flatten, with = "crate::path::report_bytes")]
     pub path: Vec<u8>,
     #[doc = "dev field; see the normative plan for units."]
     pub dev: u64,
@@ -392,4 +400,140 @@ pub struct LastScan {
     pub mode: String,
     #[doc = "duration_ms field; see the normative plan for units."]
     pub duration_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HotEntryWire {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    path_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<Vec<u8>>,
+    events: u64,
+    files: u64,
+    bytes_delta: i64,
+    top_unit: Option<String>,
+    lossy: bool,
+}
+impl From<HotEntry> for HotEntryWire {
+    fn from(value: HotEntry) -> Self {
+        let (path, path_b64, key) = if value.key.starts_with(b"/") {
+            let (path, path_b64) = crate::path::encode_fields(Some(&value.key));
+            (path, path_b64, None)
+        } else {
+            (None, None, Some(value.key))
+        };
+        Self {
+            path,
+            path_b64,
+            key,
+            events: value.events,
+            files: value.files,
+            bytes_delta: value.bytes_delta,
+            top_unit: value.top_unit,
+            lossy: value.lossy,
+        }
+    }
+}
+impl TryFrom<HotEntryWire> for HotEntry {
+    type Error = String;
+    fn try_from(value: HotEntryWire) -> Result<Self, Self::Error> {
+        let path =
+            crate::path::decode_fields::<serde::de::value::Error>(value.path, value.path_b64)
+                .map_err(|e| e.to_string())?;
+        let key = match (path, value.key) {
+            (Some(_), Some(_)) => return Err("key conflicts with path representation".into()),
+            (Some(path), None) => path,
+            (None, Some(key)) => key,
+            (None, None) => return Err("key or path representation is required".into()),
+        };
+        Ok(Self {
+            key,
+            events: value.events,
+            files: value.files,
+            bytes_delta: value.bytes_delta,
+            top_unit: value.top_unit,
+            lossy: value.lossy,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct HotMinuteWire {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    path_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<Vec<u8>>,
+    mount: String,
+    scope: String,
+    ts: i64,
+    events: u64,
+    files: u64,
+    bytes_delta: i64,
+    lossy: bool,
+}
+impl From<HotMinute> for HotMinuteWire {
+    fn from(value: HotMinute) -> Self {
+        let (path, path_b64, key) = if value.scope == "dir" {
+            let (path, path_b64) = crate::path::encode_fields(Some(&value.key));
+            (path, path_b64, None)
+        } else {
+            (None, None, Some(value.key))
+        };
+        Self {
+            path,
+            path_b64,
+            key,
+            mount: value.mount,
+            scope: value.scope,
+            ts: value.ts,
+            events: value.events,
+            files: value.files,
+            bytes_delta: value.bytes_delta,
+            lossy: value.lossy,
+        }
+    }
+}
+impl TryFrom<HotMinuteWire> for HotMinute {
+    type Error = String;
+    fn try_from(value: HotMinuteWire) -> Result<Self, Self::Error> {
+        let path =
+            crate::path::decode_fields::<serde::de::value::Error>(value.path, value.path_b64)
+                .map_err(|e| e.to_string())?;
+        let key = match (path, value.key) {
+            (Some(_), Some(_)) => return Err("key conflicts with path representation".into()),
+            (Some(path), None) => path,
+            (None, Some(key)) => key,
+            (None, None) => return Err("key or path representation is required".into()),
+        };
+        Ok(Self {
+            key,
+            mount: value.mount,
+            scope: value.scope,
+            ts: value.ts,
+            events: value.events,
+            files: value.files,
+            bytes_delta: value.bytes_delta,
+            lossy: value.lossy,
+        })
+    }
 }
