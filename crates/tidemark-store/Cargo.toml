@@ -10,3 +10,10 @@ privileged = []
 
 [lints]
 workspace = true
+
+[dependencies]
+tidemark-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,6 +1,7 @@
 //! Owned by: W0-A
 //! tidemark-fs crate skeleton.
 
+#![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
 /// attribution module skeleton.
@@ -23,9 +24,12 @@ pub mod symlinks;
 pub mod throttle;
 /// walk module skeleton.
 pub mod walk;
-/// walk/getdents module skeleton.
-#[path = "walk/getdents.rs"]
-mod walk_getdents;
-/// walk/worker module skeleton.
-#[path = "walk/worker.rs"]
-mod walk_worker;
+
+/// Error from the mount stub.
+pub use mount::ParseError;
+
+/// Error from the walk stub.
+pub use walk::WalkError;
+
+/// Error from the lvm stub.
+pub use lvm::LvmError;
