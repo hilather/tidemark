@@ -29,8 +29,9 @@ tidemark-scan = { path = "crates/tidemark-scan" }
 tidemark-live = { path = "crates/tidemark-live" }
 tidemark-pg = { path = "crates/tidemark-pg" }
 test-support = { path = "crates/test-support" }
-rustix = { version = "1", features = ["fs", "process", "system"] }
+rustix = { version = "1", features = ["fs", "process", "system", "event"] }
 libc = "0.2"
+signal-hook = "0.3"
 rusqlite = { version = "0.38", features = ["bundled"] }
 crossbeam-deque = "0.8"
 crossbeam-channel = "0.5"

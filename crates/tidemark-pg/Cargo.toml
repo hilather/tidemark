@@ -6,11 +6,18 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-privileged = []
+privileged = ["test-support/privileged"]
 
 [lints]
 workspace = true
 
 [dependencies]
+serde.workspace = true
+tracing.workspace = true
+postgres.workspace = true
 tidemark-core.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+test-support.workspace = true

@@ -11,13 +11,5 @@ pub mod labels;
 /// queries module skeleton.
 pub mod queries;
 
-/// Stub error reserved for the owning task.
-#[derive(Debug, thiserror::Error)]
-pub enum PgError {
-    /// Cross-task implementation is not available yet.
-    #[error("NotYetImplemented")]
-    NotYetImplemented,
-}
-
 /// Postgres probe signatures.
-pub use collector::{probe_from_config, PgProbe};
+pub use collector::{probe_from_config, PgCollector, PgConn, PgConnector, PgError, PgProbe, PgRow};
