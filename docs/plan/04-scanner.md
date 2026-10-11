@@ -4,7 +4,7 @@ The scanner turns a directory tree into per-directory records with the aggregato
 
 | Mode | How | Needs | Best when |
 |------|-----|-------|-----------|
-| **walk** | Parallel `getdents64` + `statx(AT_SYMLINK_NOFOLLOW)` per entry | Root | Any filesystem; scan root is a small part of the filesystem; reference implementation |
+| **walk** | Parallel `getdents64` + `statx(AT_SYMLINK_NOFOLLOW)` per entry | Read access (root for full coverage) | Any filesystem; scan root is a small part of the filesystem; reference implementation |
 | **bulk** | Phase 1: parallel `getdents64` only (names → inode numbers). Phase 2: XFS bulkstat per allocation group, merge-joined by inode number. Phase 3: name lookup for notable files only. | XFS, `CAP_SYS_ADMIN`, memory for the join | The scan root covers most of an XFS filesystem; cold caches on HDD RAID |
 | **auto** (default) | Chooses using §7 | — | — |
 
@@ -131,7 +131,7 @@ pub struct NoopGate;
 ```
 gate.acquire(COST_OPEN_GETDENTS)
 fd = openat(AT_FDCWD, path, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_NOATIME)
-     EPERM with O_NOATIME → retry without it and count `noatime_fallbacks` (root with missing `CAP_FOWNER`)
+     EPERM with O_NOATIME → retry without it and count `noatime_fallbacks` (non-root runs)
      ENOENT/ENOTDIR/ELOOP → race: emit WalkOutput::Gone{reason: Vanished|Replaced}; return
      EACCES/EIO          → error: statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW) for ino/mtime/blocks (stat needs only
                            search permission on the parent); emit a DirRecord with entries = 0 and the error, so

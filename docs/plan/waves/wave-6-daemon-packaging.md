@@ -73,7 +73,7 @@ tidemarkd/src/
 - **API:**
   - One thread per connection; max 32 concurrent connections.
   - 1 MiB request line limit; 10 s handler timeout.
-  - `SO_PEERCRED` logged; mutating methods require uid 0.
+  - `SO_PEERCRED` logged; every method accepts root or the daemon's own effective uid; other peers receive `forbidden`.
   - Methods and errors exactly as `08` §2.
 - **Self-protection:** `state_dir` is always added to watch and procscan excludes and to scan excludes. The space guard emits the `state_space` alert.
 - **Reload (SIGHUP / `config.reload`):** re-read config and validate. Apply changes to schedules, alert rules, thresholds, exclude lists and metrics settings live. Changes to mounts, the watch set or the Postgres DSN restart only the affected service. Invalid config keeps the old one and reports the issues.
@@ -93,8 +93,8 @@ tidemarkd/src/
 
 ### Tests
 
-- Unit: schedule/window parser and next-run computation (DST transitions, windows wrapping midnight); API framing (partial lines, oversize line, malformed JSON → `bad_request`); root peer permission check for every method.
-- Integration (privileged VM): start the daemon with a temp config (watcher/LVM/pg disabled, walk-mode root on a fixture, socket in a temp dir) → `tidemark status`, `scan.start` via the CLI, `scan.status` until complete, then `now` renders.
+- Unit: schedule/window parser and next-run computation (DST transitions, windows wrapping midnight); API framing (partial lines, oversize line, malformed JSON → `bad_request`); peer-uid check (root or the daemon's own uid accepted; others `forbidden`) for every method.
+- Integration (unprivileged): start the daemon with a temp config (watcher/LVM/pg disabled, walk-mode root on a fixture, socket in a temp dir) → `tidemark status`, `scan.start` via the CLI, `scan.status` until complete, then `now` renders.
 - Privileged `daemon_end_to_end` (`09` §5): start via `systemd-run` with the real unit's properties → write 50 MiB under a transient unit → within 60 s, `tidemark now` shows the hot directory and the unit; `tidemark now` shows both tracked mounts and, on a loop-LVM thin volume, the pool's data %.
 - Privileged `daemon_reload_and_shutdown`: SIGHUP with a changed alert rule is applied; an invalid config is rejected; SIGTERM mid-scan exits within 10 s with no `.db.tmp` left.
 
