@@ -743,10 +743,11 @@ fn prune_rebuilds_catalog_for_remaining_files() {
     let root = RawPath::from_path(fixture.path()).unwrap();
     let now = tidemark_core::time::unix_now();
     let old = publish(state.path(), &root, now - 86400, [4096; 4]);
+    let retained = publish(state.path(), &root, now - 100, [6000; 4]);
     let current = publish(state.path(), &root, now, [8192; 4]);
     std::fs::write(
         state.path().join("config.toml"),
-        "[retention.snapshots]\nrecent=1\ndaily=0\nweekly=0\n",
+        "[retention.snapshots]\nrecent=2\ndaily=0\nweekly=0\n",
     )
     .unwrap();
     fixture_command(state.path(), true)
@@ -756,5 +757,105 @@ fn prune_rebuilds_catalog_for_remaining_files() {
     let catalog = tidemark_store::catalog::Catalog::open(state.path(), false).unwrap();
     assert!(catalog.get(&old).unwrap().is_none());
     assert!(catalog.get(&current).unwrap().is_some());
-    assert_eq!(catalog.list(None).unwrap().len(), 1);
+    assert_eq!(catalog.list(None).unwrap().len(), 2);
+    for command in ["top", "files"] {
+        fixture_command(state.path(), true)
+            .arg(command)
+            .arg(fixture.path())
+            .assert()
+            .success();
+    }
+    fixture_command(state.path(), true)
+        .arg("diff")
+        .arg(fixture.path())
+        .args(["--from", &retained, "--to", &current])
+        .assert()
+        .success();
+}
+
+#[test]
+fn invalid_scan_overrides_exit_two_without_catalog_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    for options in [["--threads", "0"], ["--threads", "65"], ["--exclude", "["]] {
+        fixture_command(state.path(), true)
+            .arg("scan")
+            .arg(root.path())
+            .args(options)
+            .assert()
+            .code(2);
+    }
+    assert!(!state.path().join("timeseries.db").exists());
+}
+
+#[test]
+fn scoped_rebuild_refuses_without_changing_other_root_rows() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = RawPath::from_path(second.path()).unwrap();
+    let now = tidemark_core::time::unix_now();
+    publish(state.path(), &root, now, [4096; 4]);
+    let catalog = tidemark_store::catalog::Catalog::open(state.path(), true).unwrap();
+    for status in ["failed", "running"] {
+        let mut e = catalog.list(Some(&root)).unwrap().remove(0);
+        e.scan_id = format!("historical-{status}");
+        e.status = status.into();
+        e.file = None;
+        catalog.record_start(&e).unwrap();
+    }
+    let before = format!("{:?}", catalog.list(Some(&root)).unwrap());
+    let rejected = fixture_command(state.path(), true)
+        .args(["snapshots", "rebuild-catalog", "--root"])
+        .arg(first.path())
+        .assert()
+        .code(2);
+    assert_eq!(before, format!("{:?}", catalog.list(Some(&root)).unwrap()));
+}
+
+#[test]
+#[ignore = "scale"]
+fn growth_reader_cap_refuses_instead_of_ranking_disk_prefix() {
+    let fixture = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = RawPath::from_path(fixture.path()).unwrap();
+    let now = tidemark_core::time::unix_now();
+    publish(state.path(), &root, now - 86400, [4096; 4]);
+    let mut m = meta(root.clone(), now);
+    m.dirs = 1_000_001;
+    let dir = state
+        .path()
+        .join("snapshots")
+        .join(tidemark_store::catalog::root_slug(&root));
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(&dir, &m).unwrap();
+    let mut root_row = row(0, None, root.as_bytes(), 4096);
+    root_row.subtree_end = 1_000_000;
+    writer.put_dirs(&[root_row]).unwrap();
+    let mut batch = Vec::with_capacity(1000);
+    for id in 1..=1_000_000 {
+        let path = root.join(&RawName::new(format!("d{id:07}").into_bytes()).unwrap());
+        batch.push(row(
+            id,
+            Some(0),
+            path.as_bytes(),
+            if id == 1_000_000 { 1 } else { 4096 },
+        ));
+        if batch.len() == 1000 {
+            writer.put_dirs(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    assert!(batch.is_empty());
+    writer.finish(&m).unwrap();
+    let catalog = tidemark_store::catalog::Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let rejected = fixture_command(state.path(), true)
+        .arg("top")
+        .arg(fixture.path())
+        .args(["--sort", "growth", "--snapshot", &m.scan_id.to_string()])
+        .assert()
+        .code(1);
+    assert!(
+        String::from_utf8_lossy(&rejected.get_output().stderr).contains("1,000,000-row result cap")
+    );
 }

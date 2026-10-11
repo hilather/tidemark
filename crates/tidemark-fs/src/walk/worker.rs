@@ -72,11 +72,11 @@ pub(super) fn run(
         || cfg.top_files > 200_000
     {
         return Err(WalkError::Limit(
-            "threads 1..64, buffer 4 KiB..4 MiB, top_files <= 200000 required",
+            "threads 1..64, buffer 4 KiB..4 MiB, top_files <= 200000 required".into(),
         ));
     }
     if out.capacity().is_none_or(|n| n == 0 || n > 1024) {
-        return Err(WalkError::Limit("output capacity must be 1..1024"));
+        return Err(WalkError::Limit("output capacity must be 1..1024".into()));
     }
     if cancel.load(Ordering::Acquire) {
         return Err(WalkError::Cancelled);
@@ -154,7 +154,7 @@ pub(super) fn run(
                     total.falls += c.falls;
                 }
                 Err(_) => {
-                    shared.state.lock().failure = Some(WalkError::Limit("worker panicked"));
+                    shared.state.lock().failure = Some(WalkError::Limit("worker panicked".into()));
                 }
             }
         }
@@ -245,7 +245,7 @@ impl Drop for ActiveTask<'_, '_> {
         if std::thread::panicking() {
             let mut q = self.shared.state.lock();
             if q.failure.is_none() {
-                q.failure = Some(WalkError::Limit("worker panicked"));
+                q.failure = Some(WalkError::Limit("worker panicked".into()));
             }
         }
         self.shared
@@ -308,8 +308,8 @@ fn error(
     }
 }
 fn set_error_total(record: &mut DirRecord, before: u64, after: u64) -> Result<(), WalkError> {
-    record.errors_total =
-        u32::try_from(after - before).map_err(|_| WalkError::Limit("directory error count"))?;
+    record.errors_total = u32::try_from(after - before)
+        .map_err(|_| WalkError::Limit("directory error count".into()))?;
     Ok(())
 }
 fn directory(
@@ -406,11 +406,23 @@ fn directory(
         errors_total: 0,
         races: 0,
     };
+    let mut record_bytes =
+        std::mem::size_of::<DirRecord>() as u64 + 1024 + t.path.as_bytes().len() as u64;
+    charge_record(s.cfg, &t.path, 0, &mut record_bytes, 0)?;
     let mut children = Vec::new();
     let mut top = Vec::<NotableFile>::new();
     let mut directory_heap = BinaryHeap::<(Reverse<u64>, u64, usize)>::new();
     match opened {
-        Err(e) => error(s, &mut r, c, t.path.clone(), ErrOp::Open, &e),
+        Err(e) => {
+            charge_record(
+                s.cfg,
+                &t.path,
+                r.entries,
+                &mut record_bytes,
+                (2 * std::mem::size_of::<ScanErrorRec>() + t.path.as_bytes().len() + 32) as u64,
+            )?;
+            error(s, &mut r, c, t.path.clone(), ErrOp::Open, &e);
+        }
         Ok(fd) => {
             let mut iter = RawDir::new(&fd, buffer);
             let mut path_bytes = t.path.as_bytes().to_vec();
@@ -426,6 +438,14 @@ fn directory(
                 let entry = match entry {
                     Ok(e) => e,
                     Err(e) => {
+                        charge_record(
+                            s.cfg,
+                            &t.path,
+                            r.entries,
+                            &mut record_bytes,
+                            (2 * std::mem::size_of::<ScanErrorRec>() + t.path.as_bytes().len() + 32)
+                                as u64,
+                        )?;
                         error(s, &mut r, c, t.path.clone(), ErrOp::Getdents, &e.into());
                         break;
                     }
@@ -437,9 +457,9 @@ fn directory(
                 r.entries = r
                     .entries
                     .checked_add(1)
-                    .ok_or(WalkError::Limit("entry count overflow"))?;
+                    .ok_or(WalkError::Limit("entry count overflow".into()))?;
                 if r.entries as usize > MAX_RECORD_ITEMS {
-                    return Err(WalkError::Limit("million-entry directory cap"));
+                    return Err(WalkError::Limit("million-entry directory cap".into()));
                 }
                 path_bytes.truncate(prefix_len);
                 path_bytes.extend_from_slice(bytes);
@@ -449,6 +469,13 @@ fn directory(
                     .binary_search_by(|p| p.as_bytes().cmp(&path_bytes))
                     .is_ok()
                 {
+                    charge_record(
+                        s.cfg,
+                        &t.path,
+                        r.entries,
+                        &mut record_bytes,
+                        (2 * std::mem::size_of::<Skip>() + bytes.len() + 32) as u64,
+                    )?;
                     r.skipped.push(Skip {
                         name: make_name()?,
                         reason: SkipReason::Mount,
@@ -461,6 +488,13 @@ fn directory(
                         &path_bytes,
                     )))
                 {
+                    charge_record(
+                        s.cfg,
+                        &t.path,
+                        r.entries,
+                        &mut record_bytes,
+                        (2 * std::mem::size_of::<Skip>() + bytes.len() + 32) as u64,
+                    )?;
                     r.skipped.push(Skip {
                         name: make_name()?,
                         reason: SkipReason::Excluded,
@@ -479,6 +513,15 @@ fn directory(
                             if race(&e) {
                                 r.races += 1;
                             } else {
+                                charge_record(
+                                    s.cfg,
+                                    &t.path,
+                                    r.entries,
+                                    &mut record_bytes,
+                                    (2 * std::mem::size_of::<ScanErrorRec>()
+                                        + path_bytes.len()
+                                        + 32) as u64,
+                                )?;
                                 error(s, &mut r, c, make_path()?, ErrOp::Statx, &e);
                             }
                             continue;
@@ -493,12 +536,12 @@ fn directory(
                     let id = s
                         .ids
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-                        .map_err(|_| WalkError::Limit("directory id overflow"))?;
+                        .map_err(|_| WalkError::Limit("directory id overflow".into()))?;
                     s.inflight
                         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                             (n < MAX_TASKS).then_some(n + 1)
                         })
-                        .map_err(|_| WalkError::Limit("65536 in-flight directories"))?;
+                        .map_err(|_| WalkError::Limit("65536 in-flight directories".into()))?;
                     let bytes = path.as_bytes().len();
                     if s.task_bytes
                         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -507,7 +550,7 @@ fn directory(
                         .is_err()
                     {
                         s.inflight.fetch_sub(1, Ordering::AcqRel);
-                        return Err(WalkError::Limit("64 MiB pending path bytes"));
+                        return Err(WalkError::Limit("64 MiB pending path bytes".into()));
                     }
                     local.push(Task {
                         id: DirId(id),
@@ -520,6 +563,13 @@ fn directory(
                     continue;
                 }
                 if !s.cfg.stat_entries {
+                    charge_record(
+                        s.cfg,
+                        &t.path,
+                        r.entries,
+                        &mut record_bytes,
+                        (2 * std::mem::size_of::<Ino>()) as u64,
+                    )?;
                     children.push(entry.ino());
                     continue;
                 }
@@ -532,6 +582,14 @@ fn directory(
                         if race(&e) {
                             r.races += 1;
                         } else {
+                            charge_record(
+                                s.cfg,
+                                &t.path,
+                                r.entries,
+                                &mut record_bytes,
+                                (2 * std::mem::size_of::<ScanErrorRec>() + path_bytes.len() + 32)
+                                    as u64,
+                            )?;
                             error(s, &mut r, c, make_path()?, ErrOp::Statx, &e);
                         }
                         continue;
@@ -539,6 +597,13 @@ fn directory(
                 };
                 let entry_dev = libc::makedev(st.stx_dev_major, st.stx_dev_minor);
                 if entry_dev != s.dev || (s.mount_id != 0 && st.stx_mnt_id != s.mount_id) {
+                    charge_record(
+                        s.cfg,
+                        &t.path,
+                        r.entries,
+                        &mut record_bytes,
+                        (2 * std::mem::size_of::<Skip>() + bytes.len() + 32) as u64,
+                    )?;
                     r.skipped.push(Skip {
                         name: make_name()?,
                         reason: SkipReason::OtherFs,
@@ -553,6 +618,13 @@ fn directory(
                 let disk = st.stx_blocks.saturating_mul(512);
                 let mtime = st.stx_mtime.tv_sec;
                 if st.stx_nlink > 1 {
+                    charge_record(
+                        s.cfg,
+                        &t.path,
+                        r.entries,
+                        &mut record_bytes,
+                        (2 * std::mem::size_of::<LinkRef>() + bytes.len() + 32) as u64,
+                    )?;
                     r.links.push(LinkRef {
                         ino: st.stx_ino,
                         nlink: st.stx_nlink,
@@ -598,6 +670,47 @@ fn directory(
                                     (Reverse(disk), st.stx_ino) < (Reverse(*size), *ino)
                                 }));
                     if qualifies || disk >= s.cfg.big_file_threshold {
+                        let candidate_bytes =
+                            (2 * std::mem::size_of::<NotableFile>() + bytes.len() + 32) as u64;
+                        // Both threshold and top collections may own a copy.
+                        if disk >= s.cfg.big_file_threshold {
+                            charge_record(
+                                s.cfg,
+                                &t.path,
+                                r.entries,
+                                &mut record_bytes,
+                                candidate_bytes,
+                            )?;
+                        }
+                        if qualifies {
+                            if top.len() == s.cfg.top_files {
+                                if let Some((_, _, index)) = directory_heap.peek() {
+                                    let old_name = top[*index]
+                                        .name
+                                        .as_ref()
+                                        .map(|n| n.as_bytes().len())
+                                        .unwrap_or(0);
+                                    record_bytes = record_bytes.saturating_sub(old_name as u64);
+                                    charge_record(
+                                        s.cfg,
+                                        &t.path,
+                                        r.entries,
+                                        &mut record_bytes,
+                                        bytes.len() as u64,
+                                    )?;
+                                }
+                            } else {
+                                charge_record(
+                                    s.cfg,
+                                    &t.path,
+                                    r.entries,
+                                    &mut record_bytes,
+                                    candidate_bytes
+                                        + (2 * std::mem::size_of::<(Reverse<u64>, u64, usize)>())
+                                            as u64,
+                                )?;
+                            }
+                        }
                         let candidate = NotableFile {
                             ino: st.stx_ino,
                             name: Some(make_name()?),
@@ -608,7 +721,7 @@ fn directory(
                         if disk >= s.cfg.big_file_threshold {
                             if r.notable.len() == MAX_THRESHOLD_CANDIDATES {
                                 return Err(WalkError::Limit(
-                                    "4096 threshold candidates per directory",
+                                    "4096 threshold candidates per directory".into(),
                                 ));
                             }
                             r.notable.push(candidate.clone());
@@ -617,7 +730,9 @@ fn directory(
                             let index = if top.len() == s.cfg.top_files {
                                 // The heap is nonempty because top_files > 0 here.
                                 let Some((_, _, index)) = directory_heap.pop() else {
-                                    return Err(WalkError::Limit("missing directory candidate"));
+                                    return Err(WalkError::Limit(
+                                        "missing directory candidate".into(),
+                                    ));
                                 };
                                 top[index] = candidate;
                                 index
@@ -667,9 +782,72 @@ fn directory(
     }
 }
 
+// Charges conservatively include Vec growth, allocator padding and candidate clones.
+fn charge_record(
+    cfg: &WalkConfig,
+    path: &RawPath,
+    entries: u32,
+    used: &mut u64,
+    extra: u64,
+) -> Result<(), WalkError> {
+    *used = used
+        .checked_add(extra)
+        .ok_or_else(|| WalkError::Limit("record byte overflow".into()))?;
+    if cfg.max_record_bytes != 0 && *used > cfg.max_record_bytes {
+        return Err(WalkError::Limit(format!(
+            "directory {} with {} entries exceeds record bound {} bytes; raise scan.memory_budget",
+            path.display_lossy(),
+            entries,
+            cfg.max_record_bytes,
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn record_byte_bound_names_directory_and_preserves_smaller_records() {
+        let fixture = test_support::materialize("[[entry]]\npath='file'\nkind='file'\nsize=8\n[[entry]]\npath='link'\nkind='hardlink'\ntarget='file'\n");
+        let root = RawPath::from_path(&fixture.root).unwrap();
+        let mut cfg = WalkConfig {
+            root: root.clone(),
+            threads: 1,
+            stat_entries: true,
+            exclude: globset::GlobSet::empty(),
+            skip_mounts: vec![],
+            big_file_threshold: u64::MAX,
+            top_files: 0,
+            scan_start: 100,
+            getdents_buf: 4096,
+            io_idle: false,
+            max_record_bytes: 0,
+        };
+        let collect = |cfg: &WalkConfig| {
+            let (tx, rx) = crossbeam_channel::bounded(2);
+            let result = run(cfg, &NoopGate, &AtomicBool::new(false), tx);
+            (result, rx.try_iter().collect::<Vec<_>>())
+        };
+        let (baseline, rows) = collect(&cfg);
+        assert!(baseline.is_ok());
+        cfg.max_record_bytes = 1 << 20;
+        let (bounded, bounded_rows) = collect(&cfg);
+        assert!(bounded.is_ok());
+        assert_eq!(format!("{rows:?}"), format!("{bounded_rows:?}"));
+        cfg.max_record_bytes =
+            std::mem::size_of::<DirRecord>() as u64 + 1024 + root.as_bytes().len() as u64;
+        let (limited, rows) = collect(&cfg);
+        let error = limited.err().unwrap();
+        assert!(matches!(error, WalkError::Limit(_)));
+        let message = error.to_string();
+        assert!(message.contains(&root.display_lossy()));
+        assert!(message.contains("1 entries"));
+        assert!(message.contains(&cfg.max_record_bytes.to_string()));
+        assert!(message.contains("raise scan.memory_budget"));
+        assert!(rows.is_empty());
+    }
+
     #[test]
     fn stored_errors_are_capped_but_totals_are_not() {
         let model = test_support::golden::link_semantics_basic();
@@ -684,6 +862,7 @@ mod tests {
             scan_start: model.now,
             getdents_buf: 4096,
             io_idle: false,
+            max_record_bytes: 0,
         };
         let cancel = AtomicBool::new(false);
         let (out, _rx) = crossbeam_channel::bounded(1);

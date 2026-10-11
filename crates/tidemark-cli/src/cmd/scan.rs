@@ -34,6 +34,12 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         mode::ModeRequest,
         orchestrator::{run_scan, ScanRequest},
     };
+    if args.threads.is_some_and(|n| !(1..=64).contains(&n)) {
+        return Err(crate::CliError::Configuration("threads must be 1..=64".into()).into());
+    }
+    for pattern in &args.exclude {
+        globset::Glob::new(pattern).map_err(|e| crate::CliError::Configuration(e.to_string()))?;
+    }
     if args.cancel {
         return Err(crate::CliError::Unavailable(
             "scan --cancel requires the daemon API (W6-A)".into(),
@@ -131,6 +137,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
 pub(crate) fn scan_error(e: tidemark_scan::orchestrator::ScanError) -> crate::CliError {
     use tidemark_scan::orchestrator::ScanError;
     match e {
+        ScanError::Configuration(message) => crate::CliError::Configuration(message),
         ScanError::Busy
         | ScanError::NoSpace
         | ScanError::Precondition(_)

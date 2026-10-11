@@ -301,3 +301,82 @@ fn random_disk_snapshot_matches_independent_reference() {
     }
     assert!(result.summary.incomplete_link_sets > 0);
 }
+
+#[test]
+fn failed_walk_keeps_valid_collected_records_only_when_requested() {
+    let fixture = tempfile::tempdir().unwrap();
+    let child = fixture.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    // The documented threshold-candidate cap deterministically fails the child
+    // after its parent record has been sent; no allocation-size oracle is needed.
+    for id in 0..4097 {
+        std::fs::File::create(child.join(format!("f{id}"))).unwrap();
+    }
+    for keep in [false, true] {
+        let state = tempfile::tempdir().unwrap();
+        let mut cfg = config(state.path());
+        cfg.roots = vec![tidemark_core::config::RootConfig {
+            path: fixture.path().to_owned(),
+            big_file_threshold: tidemark_core::units::ByteSize(0),
+            top_files: 0,
+            ..Default::default()
+        }];
+        let mut req = request(fixture.path(), ModeRequest::Walk);
+        req.threads = Some(1);
+        req.keep_partial = keep;
+        let result = run_scan(
+            &cfg,
+            &req,
+            &Recorder(state.path().to_owned()),
+            &AtomicBool::new(false),
+            &|_| {},
+        );
+        let catalog = Catalog::open(state.path(), false).unwrap();
+        if keep {
+            let outcome = result.unwrap();
+            assert_eq!(outcome.status, tidemark_core::scan::SnapshotStatus::Partial);
+            let snapshot = Snapshot::open(outcome.file.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                snapshot.meta().status,
+                tidemark_core::scan::SnapshotStatus::Partial
+            );
+            assert!(snapshot.dir_by_path(&req.root).unwrap().is_some());
+            assert!(catalog.latest(&req.root).unwrap().is_none());
+        } else {
+            assert!(matches!(
+                result,
+                Err(ScanError::Walk(tidemark_fs::walk::WalkError::Limit(_)))
+            ));
+            assert!(catalog
+                .list(Some(&req.root))
+                .unwrap()
+                .iter()
+                .all(|e| e.status == "failed" && e.file.is_none()));
+        }
+    }
+}
+
+#[test]
+fn automatic_retention_rebuilds_catalog_after_deleting_old_files() {
+    let fixture = test_support::materialize("[[entry]]\npath='file'\nkind='file'\nsize=8\n");
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = config(state.path());
+    cfg.retention.snapshots.recent = 1;
+    cfg.retention.snapshots.daily = 0;
+    cfg.retention.snapshots.weekly = 0;
+    let req = request(&fixture.root, ModeRequest::Walk);
+    let recorder = Recorder(state.path().to_owned());
+    let first = run_scan(&cfg, &req, &recorder, &AtomicBool::new(false), &|_| {}).unwrap();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    let mut entry = catalog.get(&first.scan_id).unwrap().unwrap();
+    entry.started_at -= 172800;
+    catalog.record_finish(&entry).unwrap();
+    drop(catalog);
+    let second = run_scan(&cfg, &req, &recorder, &AtomicBool::new(false), &|_| {}).unwrap();
+    assert!(!first.file.as_ref().unwrap().exists());
+    let catalog = Catalog::open(state.path(), false).unwrap();
+    assert!(catalog.get(&first.scan_id).unwrap().is_none());
+    assert!(catalog.get(&second.scan_id).unwrap().is_some());
+    let remaining = Snapshot::open(second.file.as_ref().unwrap()).unwrap();
+    assert!(remaining.dir_by_path(&req.root).unwrap().is_some());
+}

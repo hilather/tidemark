@@ -80,6 +80,20 @@ pub fn run_scan(
         .find(|r| r.path == req.root.as_path())
         .cloned()
         .unwrap_or_else(RootConfig::default);
+    let threads = req.threads.unwrap_or(cfg.scan.threads as usize);
+    if !(1..=64).contains(&threads) {
+        return Err(ScanError::Configuration("threads must be 1..=64".into()));
+    }
+    let mut exclude = root_cfg.exclude.clone();
+    exclude.extend(req.exclude_extra.clone());
+    let mut globs = globset::GlobSetBuilder::new();
+    for pattern in &exclude {
+        globs
+            .add(globset::Glob::new(pattern).map_err(|e| ScanError::Configuration(e.to_string()))?);
+    }
+    let excludes = globs
+        .build()
+        .map_err(|e| ScanError::Configuration(e.to_string()))?;
     let _lock = ScanLock::acquire(&cfg.general.state_dir)?;
     // The daemon can have a live sample writer: recovery belongs to startup,
     // or to the daemon-absent CLI preflight with all connections closed.
@@ -123,6 +137,7 @@ pub fn run_scan(
         &cfg.general.state_dir,
         &catalog,
         cfg.retention.snapshots.recent,
+        tidemark_core::time::unix_now(),
         || {
             Ok(tidemark_store::space_guard::space_check(
                 &cfg.general.state_dir,
@@ -162,11 +177,7 @@ pub fn run_scan(
             "bulk mode unavailable: {reason}"
         )));
     }
-    let threads = req.threads.unwrap_or(cfg.scan.threads as usize);
-    if !(1..=64).contains(&threads) {
-        return Err(ScanError::Precondition("threads must be 1..=64".into()));
-    }
-    let memory_estimate = if mode == ScanMode::Bulk {
+    let mut memory_estimate = if mode == ScanMode::Bulk {
         crate::bulk::estimate_memory(used, dirs_estimate)
     } else {
         dirs_estimate
@@ -177,13 +188,26 @@ pub fn run_scan(
     tracing::info!(
         memory_estimate,
         memory_budget = cfg.scan.memory_budget.0,
-        "scan memory admission estimate; service cgroup supplies the hard limit"
+        "scan memory admission estimate"
     );
     let capacity = channel_capacity(
         cfg.scan.memory_budget.0,
         threads,
         root_cfg.top_files,
         cfg.scan.getdents_buf.0,
+    )?;
+    if mode == ScanMode::Bulk && capacity < 2 {
+        return Err(ScanError::Resource(
+            "memory budget cannot fit the bulk namespace queue; raise scan.memory_budget".into(),
+        ));
+    }
+    let (_, max_record_bytes) = record_limits(cfg.scan.memory_budget.0, threads)?;
+    admit_memory(
+        cfg.scan.memory_budget.0,
+        memory_estimate,
+        threads,
+        cfg.scan.getdents_buf.0,
+        root_cfg.top_files,
     )?;
     let now = tidemark_core::time::unix_now();
     let dir = cfg
@@ -218,16 +242,7 @@ pub fn run_scan(
                 milliseconds(start.elapsed()),
             )
         },
-        |entry| {
-            let mut exclude = root_cfg.exclude.clone();
-            exclude.extend(req.exclude_extra.clone());
-            let mut globs = globset::GlobSetBuilder::new();
-            for pattern in &exclude {
-                globs.add(
-                    globset::Glob::new(pattern)
-                        .map_err(|e| ScanError::Precondition(e.to_string()))?,
-                );
-            }
+        |entry, recorder| {
             // Escape the state path as literal glob bytes; Glob only accepts UTF-8.
             // Non-UTF-8 state directories are handled by an explicit walker mount-style boundary.
             let mut skips = mount::submounts_under(&mounts, &req.root);
@@ -247,9 +262,7 @@ pub fn run_scan(
                 root: req.root.clone(),
                 threads,
                 stat_entries: mode == ScanMode::Walk,
-                exclude: globs
-                    .build()
-                    .map_err(|e| ScanError::Precondition(e.to_string()))?,
+                exclude: excludes,
                 skip_mounts: skips,
                 big_file_threshold: root_cfg.big_file_threshold.0,
                 top_files: root_cfg.top_files,
@@ -257,6 +270,7 @@ pub fn run_scan(
                 getdents_buf: usize::try_from(cfg.scan.getdents_buf.0)
                     .map_err(|_| ScanError::Resource("getdents buffer overflow".into()))?,
                 io_idle: true,
+                max_record_bytes,
             };
             let new_agg = || {
                 crate::agg::Aggregator::new(crate::agg::AggConfig {
@@ -291,7 +305,8 @@ pub fn run_scan(
                             walk_totals = Some((s.errors, s.races));
                             (s.noatime_fallbacks, false)
                         }
-                        Err(tidemark_fs::walk::WalkError::Cancelled) if req.keep_partial => {
+                        Err(e) if req.keep_partial && recoverable_walk_error(&e) => {
+                            tracing::warn!(error = %e, "retaining collected walk records as partial");
                             (0, true)
                         }
                         Err(e) => return Err(e.into()),
@@ -369,6 +384,17 @@ pub fn run_scan(
                         ) if matches!(req.mode, ModeRequest::Auto) => {
                             reason = format!("walk fallback: {e}");
                             tracing::warn!(%reason, "bulk scan fell back to walk");
+                            memory_estimate = dirs_estimate
+                                .saturating_mul(320)
+                                .saturating_add(used.saturating_mul(72))
+                                .saturating_add(64 << 20);
+                            admit_memory(
+                                cfg.scan.memory_budget.0,
+                                memory_estimate,
+                                threads,
+                                cfg.scan.getdents_buf.0,
+                                root_cfg.top_files,
+                            )?;
                             mode = ScanMode::Walk;
                             entry.mode = mode;
                             walk_cfg.stat_entries = true;
@@ -409,7 +435,7 @@ pub fn run_scan(
             if let Some((_, races)) = walk_totals {
                 summary.races = races;
             }
-            let status = if partial || cancel.load(Ordering::Relaxed) {
+            let mut status = if partial || cancel.load(Ordering::Relaxed) {
                 SnapshotStatus::Partial
             } else {
                 SnapshotStatus::Complete
@@ -475,9 +501,15 @@ pub fn run_scan(
                 writer: &mut writer,
                 series: std::collections::BinaryHeap::new(),
                 depth: root_cfg.series_depth,
+                cancel,
+                keep_partial: req.keep_partial && mode == ScanMode::Walk,
             };
             let writing = Instant::now();
-            let mut summary = prepared.write(&mut sink)?;
+            let written = prepared.write(&mut sink);
+            if cancel.load(Ordering::Acquire) && !sink.keep_partial {
+                return Err(ScanError::Cancelled);
+            }
+            let mut summary = written?;
             if let Some(errors) = expected_errors {
                 if summary.errors != errors {
                     tracing::warn!(
@@ -499,6 +531,8 @@ pub fn run_scan(
                 .into_iter()
                 .map(|r| r.0 .0)
                 .collect();
+            status = publication_status(status, mode, req.keep_partial, cancel)?;
+            meta.status = status;
             let file = finish_snapshot(writer, &meta)?;
             entry.status = if status == SnapshotStatus::Partial {
                 "partial"
@@ -516,7 +550,7 @@ pub fn run_scan(
             entry.duration_ms = Some(milliseconds(start.elapsed()));
             recorder.scan_finished(entry)?;
             recorder.dir_series(&req.root, &entry.scan_id, now, &series)?;
-            let catalog = tidemark_store::catalog::Catalog::open(&cfg.general.state_dir, false)?;
+            let catalog = tidemark_store::catalog::Catalog::open(&cfg.general.state_dir, true)?;
             let entries = catalog.list(Some(&req.root))?;
             for old in tidemark_store::retention::retention_plan(
                 &entries,
@@ -531,6 +565,7 @@ pub fn run_scan(
                     delete_snapshot(&cfg.general.state_dir, path)?;
                 }
             }
+            catalog.rebuild_from_files()?;
             tracing::info!(
                 memory_estimate,
                 peak_rss_bytes = observed_peak_rss(),
@@ -577,6 +612,9 @@ pub enum ScanError {
     /// Bulk pipeline failed.
     #[error(transparent)]
     Bulk(#[from] crate::bulk::BulkError),
+    /// Invalid usage or configuration.
+    #[error("{0}")]
+    Configuration(String),
     /// Unsupported scan precondition.
     #[error("{0}")]
     Precondition(String),
@@ -689,26 +727,38 @@ fn fresh_id(
         "scan id collision retry limit reached".into(),
     ))
 }
-/// Compute queue capacity with explicit producer and threshold-candidate reserves.
-/// Names reserve 255 bytes plus allocation/capacity overhead. Threshold cap is
-/// W1-B's documented 4096; queue capacity is always at most 64.
+/// Derive bounded queued and in-flight record storage from one quarter of the budget.
+/// Capacity is reduced from 64 to 1 before the record bound falls below 16 MiB.
+/// Refuse when the quarter cannot fit 16 MiB per worker even without the queue.
+/// `(threads + capacity) * max_record_bytes <= budget / 4`; the remaining
+/// three quarters must also fit the aggregator estimate and worker buffers.
+pub fn record_limits(budget: u64, threads: usize) -> Result<(usize, u64), ScanError> {
+    const MIN_RECORD: u64 = 16 << 20;
+    if !(1..=64).contains(&threads) {
+        return Err(ScanError::Resource("threads must be 1..=64".into()));
+    }
+    let quarter = budget / 4;
+    let slots = quarter / MIN_RECORD;
+    if slots < threads as u64 {
+        return Err(ScanError::Resource(
+            "memory budget cannot fit 16 MiB per worker; raise scan.memory_budget".into(),
+        ));
+    }
+    let capacity = (slots - threads as u64).clamp(1, 64) as usize;
+    Ok((capacity, quarter / (threads + capacity) as u64))
+}
+/// Compute queue capacity, reserving buffers and worker candidate heaps separately.
 pub fn channel_capacity(
     budget: u64,
     threads: usize,
     top: usize,
     buffer: u64,
 ) -> Result<usize, ScanError> {
-    let candidate = std::mem::size_of::<tidemark_core::scan::NotableFile>() as u128 + 255 + 64;
-    let record = (top as u128 + 4096) * candidate + (1 << 20);
-    let producer = (threads as u128).saturating_mul(record + buffer as u128 + top as u128 * 8);
-    let reserved = producer.saturating_add(64 << 20);
-    let available = u128::from(budget).checked_sub(reserved).ok_or_else(|| {
-        ScanError::Resource("memory budget cannot fit producer candidates and scan state".into())
-    })?;
-    let capacity = (available / 4 / record).min(64) as usize;
-    if capacity == 0 {
+    let (capacity, _) = record_limits(budget, threads)?;
+    let workers = threads as u128 * (u128::from(buffer) + top as u128 * 16);
+    if workers + (64u128 << 20) > u128::from(budget - budget / 4) {
         return Err(ScanError::Resource(
-            "memory budget cannot fit one queued record".into(),
+            "memory budget cannot fit worker buffers and scan state".into(),
         ));
     }
     Ok(capacity)
@@ -816,9 +866,20 @@ struct WriterSink<'a> {
     writer: &'a mut tidemark_store::writer::SnapshotWriter,
     series: std::collections::BinaryHeap<std::cmp::Reverse<SeriesRow>>,
     depth: u32,
+    cancel: &'a AtomicBool,
+    keep_partial: bool,
+}
+impl WriterSink<'_> {
+    fn check_cancel(&self) -> Result<(), crate::agg::SinkError> {
+        if self.cancel.load(std::sync::atomic::Ordering::Acquire) && !self.keep_partial {
+            return Err(crate::agg::SinkError::Other("scan cancelled".into()));
+        }
+        Ok(())
+    }
 }
 impl crate::agg::RowSink for WriterSink<'_> {
     fn dirs(&mut self, rows: &[DirRow]) -> Result<(), crate::agg::SinkError> {
+        self.check_cancel()?;
         self.writer.put_dirs(rows)?;
         for row in rows.iter().filter(|r| r.depth <= self.depth) {
             if self.series.len() < 20_000 {
@@ -837,36 +898,42 @@ impl crate::agg::RowSink for WriterSink<'_> {
         &mut self,
         r: &[tidemark_core::snapshot::FileRow],
     ) -> Result<(), crate::agg::SinkError> {
+        self.check_cancel()?;
         Ok(self.writer.put_files(r)?)
     }
     fn link_sets(
         &mut self,
         r: &[tidemark_core::snapshot::LinkSetRow],
     ) -> Result<(), crate::agg::SinkError> {
+        self.check_cancel()?;
         Ok(self.writer.put_link_sets(r)?)
     }
     fn link_instances(
         &mut self,
         r: &[tidemark_core::snapshot::LinkInstanceRow],
     ) -> Result<(), crate::agg::SinkError> {
+        self.check_cancel()?;
         Ok(self.writer.put_link_instances(r)?)
     }
     fn skipped(
         &mut self,
         r: &[tidemark_core::snapshot::SkipRow],
     ) -> Result<(), crate::agg::SinkError> {
+        self.check_cancel()?;
         Ok(self.writer.put_skipped(r)?)
     }
     fn errors(
         &mut self,
         r: &[tidemark_core::snapshot::ErrorRow],
     ) -> Result<(), crate::agg::SinkError> {
+        self.check_cancel()?;
         Ok(self.writer.put_errors(r)?)
     }
     fn annotations(
         &mut self,
         r: &[tidemark_core::snapshot::AnnotationRow],
     ) -> Result<(), crate::agg::SinkError> {
+        self.check_cancel()?;
         Ok(self.writer.put_annotations(r)?)
     }
 }
@@ -895,6 +962,7 @@ fn guard_and_prune(
     state: &std::path::Path,
     catalog: &tidemark_store::catalog::Catalog,
     recent: usize,
+    now: i64,
     mut check: impl FnMut() -> Result<tidemark_store::space_guard::SpaceVerdict, ScanError>,
 ) -> Result<(), ScanError> {
     use tidemark_store::space_guard::SpaceVerdict;
@@ -902,6 +970,19 @@ fn guard_and_prune(
         return Ok(());
     }
     let entries = catalog.list(None)?;
+    for e in &entries {
+        if matches!(e.status.as_str(), "partial" | "failed")
+            && now.saturating_sub(e.finished_at.unwrap_or(e.started_at)) > 86400
+        {
+            if let Some(file) = &e.file {
+                delete_snapshot(state, file)?;
+                catalog.rebuild_from_files()?;
+                if matches!(check()?, SpaceVerdict::Ok) {
+                    return Ok(());
+                }
+            }
+        }
+    }
     let mut roots = std::collections::BTreeMap::<RawPath, Vec<&ScanEntry>>::new();
     for e in &entries {
         if e.status == "complete" {
@@ -925,6 +1006,7 @@ fn guard_and_prune(
         for e in group.into_iter().skip(recent.max(1)).rev() {
             if let Some(file) = &e.file {
                 delete_snapshot(state, file)?;
+                catalog.rebuild_from_files()?;
                 if matches!(check()?, SpaceVerdict::Ok) {
                     return Ok(());
                 }
@@ -938,18 +1020,64 @@ fn recorded<T>(
     entry: &mut ScanEntry,
     recorder: &dyn ScanRecorder,
     finish: impl Fn() -> (i64, u64),
-    work: impl FnOnce(&mut ScanEntry) -> Result<T, ScanError>,
+    work: impl FnOnce(&mut ScanEntry, &dyn ScanRecorder) -> Result<T, ScanError>,
 ) -> Result<T, ScanError> {
+    let recorder = CompletionRecorder {
+        inner: recorder,
+        acknowledged: AtomicBool::new(false),
+    };
     recorder.scan_started(entry)?;
-    let result = work(entry);
-    if result.is_err() && entry.status == "running" {
+    let result = work(entry, &recorder);
+    if result.is_err()
+        && !recorder
+            .acknowledged
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
         let (now, duration) = finish();
         entry.status = "failed".into();
         entry.finished_at = Some(now);
         entry.duration_ms = Some(duration);
-        recorder.scan_finished(entry)?;
+        if let Err(cleanup) = recorder.scan_finished(entry) {
+            tracing::error!(error = %cleanup, "failed to finalize failed scan; original error preserved");
+        }
     }
     result
+}
+
+// Only acknowledged writes finish a lifecycle, including writer-creation ID retries.
+struct CompletionRecorder<'a> {
+    inner: &'a dyn ScanRecorder,
+    acknowledged: AtomicBool,
+}
+impl ScanRecorder for CompletionRecorder<'_> {
+    fn scan_started(&self, e: &ScanEntry) -> Result<(), ScanError> {
+        self.acknowledged
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.inner.scan_started(e)
+    }
+    fn scan_finished(&self, e: &ScanEntry) -> Result<(), ScanError> {
+        self.inner.scan_finished(e)?;
+        self.acknowledged
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    fn dir_series(
+        &self,
+        root: &RawPath,
+        id: &str,
+        ts: i64,
+        rows: &[DirRow],
+    ) -> Result<(), ScanError> {
+        self.inner.dir_series(root, id, ts, rows)
+    }
+}
+
+fn recoverable_walk_error(error: &tidemark_fs::walk::WalkError) -> bool {
+    // Collector/worker corruption and lost output cannot establish a valid partial tree.
+    matches!(
+        error,
+        tidemark_fs::walk::WalkError::Cancelled | tidemark_fs::walk::WalkError::Io(_)
+    ) || matches!(error, tidemark_fs::walk::WalkError::Limit(reason) if reason != "worker panicked")
 }
 
 fn create_writer(
@@ -980,6 +1108,41 @@ fn create_writer(
     Err(ScanError::Resource(
         "snapshot creation collision retry limit reached".into(),
     ))
+}
+
+fn publication_status(
+    status: SnapshotStatus,
+    mode: ScanMode,
+    keep: bool,
+    cancel: &AtomicBool,
+) -> Result<SnapshotStatus, ScanError> {
+    // The store currently exposes no cancellation seam inside finish's index/sync/rename work.
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        if mode == ScanMode::Bulk || !keep {
+            return Err(ScanError::Cancelled);
+        }
+        return Ok(SnapshotStatus::Partial);
+    }
+    Ok(status)
+}
+
+fn admit_memory(
+    budget: u64,
+    estimate: u64,
+    threads: usize,
+    buffer: u64,
+    top: usize,
+) -> Result<(), ScanError> {
+    let total = u128::from(estimate)
+        + u128::from(budget / 4)
+        + threads as u128 * (u128::from(buffer) + top as u128 * 16);
+    if total > u128::from(budget) {
+        return Err(ScanError::Resource(
+            "memory budget cannot fit aggregator estimate and records; raise scan.memory_budget"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn finish_snapshot(
@@ -1113,6 +1276,165 @@ mod tests {
         assert!(ScanLock::acquire(state.path()).is_err());
     }
     #[test]
+    fn cancellation_after_last_batch_changes_publication_policy() {
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            publication_status(SnapshotStatus::Complete, ScanMode::Walk, false, &cancel).unwrap(),
+            SnapshotStatus::Complete
+        );
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        assert!(matches!(
+            publication_status(SnapshotStatus::Complete, ScanMode::Walk, false, &cancel),
+            Err(ScanError::Cancelled)
+        ));
+        assert_eq!(
+            publication_status(SnapshotStatus::Complete, ScanMode::Walk, true, &cancel).unwrap(),
+            SnapshotStatus::Partial
+        );
+        assert!(matches!(
+            publication_status(SnapshotStatus::Complete, ScanMode::Bulk, true, &cancel),
+            Err(ScanError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn record_limit_derivation_table() {
+        for (mib, threads, expected) in [
+            (128, 1, Some((1, 16))),
+            (256, 1, Some((3, 16))),
+            (1280, 8, Some((12, 16))),
+            (8192, 8, Some((64, 28))),
+            (64, 1, Some((1, 8))),
+            (512, 8, Some((1, 14))),
+            (511, 8, None),
+            (1280, 0, None),
+        ] {
+            match expected {
+                Some((capacity, min_mib)) => {
+                    let (actual, bound) = record_limits(mib << 20, threads).unwrap();
+                    assert_eq!(actual, capacity);
+                    assert_eq!(bound, (mib << 20) / 4 / (threads + actual) as u64);
+                    assert!(bound >= min_mib << 20);
+                    assert!((threads + actual) as u64 * bound <= (mib << 20) / 4);
+                }
+                None => assert!(record_limits(mib << 20, threads).is_err()),
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_completion_is_finalized_as_failed_preserving_original_error() {
+        struct Reject {
+            events: Mutex<Vec<String>>,
+            fail_cleanup: bool,
+        }
+        impl ScanRecorder for Reject {
+            fn scan_started(&self, e: &ScanEntry) -> Result<(), ScanError> {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("start:{}", e.status));
+                Ok(())
+            }
+            fn scan_finished(&self, e: &ScanEntry) -> Result<(), ScanError> {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("finish:{}", e.status));
+                if e.status == "complete" {
+                    return Err(ScanError::Resource("original".into()));
+                }
+                if self.fail_cleanup {
+                    return Err(ScanError::Resource("cleanup".into()));
+                }
+                Ok(())
+            }
+            fn dir_series(
+                &self,
+                _: &RawPath,
+                _: &str,
+                _: i64,
+                _: &[DirRow],
+            ) -> Result<(), ScanError> {
+                Ok(())
+            }
+        }
+        for fail_cleanup in [false, true] {
+            let rec = Reject {
+                events: Mutex::new(vec![]),
+                fail_cleanup,
+            };
+            let state = tempfile::tempdir().unwrap();
+            let published = state.path().join("published.db");
+            std::fs::write(&published, b"published data").unwrap();
+            let mut e = entry();
+            let result: Result<(), ScanError> = recorded(
+                &mut e,
+                &rec,
+                || (102, 2000),
+                |e, recorder| {
+                    e.status = "complete".into();
+                    e.file = Some(published.clone());
+                    recorder.scan_finished(e)
+                },
+            );
+            assert_eq!(result.unwrap_err().to_string(), "original");
+            assert_eq!(
+                *rec.events.lock().unwrap(),
+                ["start:running", "finish:complete", "finish:failed"]
+            );
+            assert_eq!(e.status, "failed");
+            assert_eq!(e.file.as_ref(), Some(&published));
+            assert!(published.exists());
+        }
+    }
+
+    #[test]
+    fn emergency_prune_includes_expired_partial_and_failed_artifacts() {
+        for status in ["partial", "failed"] {
+            let state = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(state.path(), true).unwrap();
+            let dir = state.path().join("snapshots/root");
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("expired.db");
+            std::fs::write(&file, b"expired artifact").unwrap();
+            let mut e = entry();
+            e.status = status.into();
+            e.file = Some(file.clone());
+            e.finished_at = Some(100);
+            catalog.record_start(&e).unwrap();
+            guard_and_prune(state.path(), &catalog, 4, 86501, || {
+                Ok(if file.exists() {
+                    SpaceVerdict::Refuse {
+                        reason: "injected".into(),
+                    }
+                } else {
+                    SpaceVerdict::Ok
+                })
+            })
+            .unwrap();
+            assert!(!file.exists());
+            assert!(catalog.get(&e.scan_id).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn partial_walk_failure_classification() {
+        use tidemark_fs::walk::WalkError;
+        assert!(recoverable_walk_error(&WalkError::Limit(
+            "record bytes".into()
+        )));
+        assert!(recoverable_walk_error(&WalkError::Io(
+            std::io::Error::other("failed directory")
+        )));
+        assert!(recoverable_walk_error(&WalkError::Cancelled));
+        assert!(!recoverable_walk_error(&WalkError::Disconnected));
+        assert!(!recoverable_walk_error(&WalkError::Limit(
+            "worker panicked".into()
+        )));
+    }
+
+    #[test]
     fn queue_budget_and_zero_top() {
         assert!((1..=64).contains(&channel_capacity(1280 << 20, 8, 10000, 256 << 10).unwrap()));
         assert!((1..=64).contains(&channel_capacity(1280 << 20, 8, 0, 256 << 10).unwrap()));
@@ -1154,13 +1476,13 @@ mod tests {
                 &mut e,
                 &rec,
                 || (102, 2000),
-                |e| {
+                |e, recorder| {
                     if fail {
                         return Err(ScanError::Cancelled);
                     }
                     e.status = "complete".into();
-                    rec.scan_finished(e)?;
-                    rec.dir_series(&e.root, &e.scan_id, 102, &[])?;
+                    recorder.scan_finished(e)?;
+                    recorder.dir_series(&e.root, &e.scan_id, 102, &[])?;
                     Ok(())
                 },
             );
@@ -1183,7 +1505,7 @@ mod tests {
     fn injected_space_refusal_creates_no_snapshot() {
         let state = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(state.path(), true).unwrap();
-        let result = guard_and_prune(state.path(), &catalog, 4, || {
+        let result = guard_and_prune(state.path(), &catalog, 4, 100000, || {
             Ok(SpaceVerdict::Refuse {
                 reason: "injected".into(),
             })
@@ -1207,7 +1529,7 @@ mod tests {
             e.file = Some(file);
             catalog.record_start(&e).unwrap();
         }
-        guard_and_prune(state.path(), &catalog, 2, || {
+        guard_and_prune(state.path(), &catalog, 2, 100000, || {
             Ok(if dir.join("id0.db").exists() {
                 SpaceVerdict::Refuse {
                     reason: "injected".into(),
@@ -1255,6 +1577,7 @@ mod tests {
             scan_start: 100,
             getdents_buf: 4096,
             io_idle: false,
+            max_record_bytes: 0,
         };
         let agg = crate::agg::Aggregator::new(crate::agg::AggConfig {
             root,
@@ -1307,6 +1630,7 @@ mod tests {
             scan_start: 100,
             getdents_buf: 4096,
             io_idle: false,
+            max_record_bytes: 0,
         };
         let agg = crate::agg::Aggregator::new(crate::agg::AggConfig {
             root,
@@ -1387,5 +1711,26 @@ mod tests {
             b"existing snapshot must survive"
         );
         assert!(!temporary.exists());
+        for keep_partial in [false, true] {
+            use crate::agg::RowSink;
+            meta.scan_id = tidemark_core::time::ScanId::new(meta.started_at + 2).unwrap();
+            let tmp = dir.join(format!("{}.db.tmp", meta.scan_id));
+            let mut writer = tidemark_store::writer::SnapshotWriter::create(dir, &meta).unwrap();
+            let cancel = AtomicBool::new(false);
+            {
+                let mut sink = WriterSink {
+                    writer: &mut writer,
+                    series: Default::default(),
+                    depth: 0,
+                    cancel: &cancel,
+                    keep_partial,
+                };
+                sink.dirs(&[]).unwrap();
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                assert_eq!(sink.files(&[]).is_ok(), keep_partial);
+            }
+            drop(writer);
+            assert!(!tmp.exists());
+        }
     }
 }
