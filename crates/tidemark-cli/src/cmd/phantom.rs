@@ -77,8 +77,8 @@ pub(super) fn scanner(
     );
     let mut mounts = Vec::new();
     for p in paths {
-        let raw = RawPath::from_path(&p)?;
-        if let Some(m) = table.iter().find(|m| m.mount_point == raw) {
+        let raw = canonical_mount(&p)?;
+        if let Some(m) = visible_mount(&table, &raw) {
             if !mounts.iter().any(|(_, d)| *d == m.dev) {
                 mounts.push((raw, m.dev));
             }
@@ -113,3 +113,15 @@ pub(super) fn scanner(
 #[cfg(test)]
 #[path = "../../tests/w5b/commands.rs"]
 mod tests;
+
+fn canonical_mount(path: &std::path::Path) -> anyhow::Result<tidemark_core::path::RawPath> {
+    Ok(tidemark_core::path::RawPath::from_path(
+        &std::fs::canonicalize(path)?,
+    )?)
+}
+fn visible_mount<'a>(
+    table: &'a [tidemark_fs::mount::MountInfo],
+    raw: &tidemark_core::path::RawPath,
+) -> Option<&'a tidemark_fs::mount::MountInfo> {
+    tidemark_fs::mount::mount_for_path(table, raw).filter(|m| m.mount_point == *raw)
+}

@@ -157,6 +157,8 @@ fn parse_uid(status: &[u8]) -> Option<u32> {
 pub struct OpenFile {
     /// Process ID.
     pub pid: u32,
+    /// Validated process start time during descriptor enumeration.
+    pub starttime: u64,
     /// Descriptor number.
     pub fd: u32,
     /// Raw readlink text, including a possible deleted suffix.
@@ -175,6 +177,7 @@ pub struct OpenFile {
     pub flags: Option<u32>,
 }
 /// Collect regular-file metadata on selected devices, including unlinked open files.
+/// Procfs does no disk I/O, so Gate charging and O_NOATIME do not apply.
 /// Procfs fd magic links are stat-ed intentionally; readlink text is never followed
 /// or opened. Exiting/inaccessible processes are skipped. Exceeding a cap errors.
 pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenFile>> {
@@ -232,6 +235,7 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
             }
             files.push(OpenFile {
                 pid,
+                starttime: start,
                 fd,
                 target,
                 dev: metadata.dev(),

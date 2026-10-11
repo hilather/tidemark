@@ -36,6 +36,10 @@ pub struct ProcScanResult {
     pub at: i64,
     /// Regular-file descriptors returned by the source, before deduplication.
     pub fds_seen: u64,
+    /// Whether writer candidates exceeded the history cap.
+    pub writers_full: bool,
+    /// Histories evicted for admission this pass.
+    pub writer_evictions: u64,
     /// Elapsed scan and aggregation time.
     pub duration: Duration,
 }
@@ -64,6 +68,7 @@ fn growth(t: &Tracked) -> i64 {
     t.samples.front().map_or(0, |s| delta(t.row.disk, s.1))
 }
 /// One-pass phantom detector with at most 10,000 writer histories of 60 samples.
+/// Procfs does no disk I/O, so Gate charging and O_NOATIME do not apply.
 /// Pending samples hold only the latest pass; callers should drain after each pass.
 pub struct ProcScanner {
     cfg: ProcScannerOptions,
@@ -72,6 +77,8 @@ pub struct ProcScanner {
     tracked: BTreeMap<(u64, u64), Tracked>,
     pending: (Vec<PhantomSample>, Vec<WriterSample>),
     now: Option<i64>,
+    admission_cursor: Option<(u64, u64)>,
+    rotate: bool,
 }
 impl ProcScanner {
     /// Construct a real procfs scanner using the shared attribution cache.
@@ -83,6 +90,8 @@ impl ProcScanner {
             tracked: BTreeMap::new(),
             pending: (Vec::new(), Vec::new()),
             now: None,
+            admission_cursor: None,
+            rotate: false,
         }
     }
     /// Scan once. Failed passes preserve the last successful state.
@@ -149,6 +158,14 @@ impl ProcScanner {
             let attr = attrs
                 .entry(file.pid)
                 .or_insert_with(|| self.source.attribution(file.pid));
+            let unknown = (attr.starttime != file.starttime).then(|| Attribution {
+                pid: file.pid,
+                starttime: file.starttime,
+                comm: "?".into(),
+                unit: None,
+                uid: None,
+            });
+            let attr = unknown.as_ref().unwrap_or(attr);
             if file.nlink == 0 {
                 if previous_phantom != Some(key) {
                     summaries[index].total_bytes =
@@ -205,15 +222,39 @@ impl ProcScanner {
                 )
             })
             .collect();
-        candidates.extend(
-            seen_writers
-                .keys()
-                .filter(|k| !self.tracked.contains_key(k))
-                .map(|k| (*k, 0)),
-        );
+        let mut newcomers: Vec<_> = seen_writers
+            .keys()
+            .filter(|k| !self.tracked.contains_key(k))
+            .copied()
+            .collect();
+        // Rotate admission in key order, wrapping after the last admitted key.
+        if let Some(cursor) = self.admission_cursor {
+            let split = newcomers.partition_point(|k| *k <= cursor);
+            newcomers.rotate_left(split);
+        }
+        let writers_full = candidates.len() + newcomers.len() > MAX_WRITERS;
         candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        candidates.truncate(MAX_WRITERS);
-        let keep: std::collections::BTreeSet<_> = candidates.into_iter().map(|c| c.0).collect();
+        // Every other successful pass replaces at most half the table's smallest
+        // growers. The intervening pass guarantees newcomers a second observation.
+        let admissions = if writers_full && self.rotate {
+            newcomers.len().min(MAX_WRITERS / 2)
+        } else {
+            newcomers
+                .len()
+                .min(MAX_WRITERS.saturating_sub(candidates.len()))
+        };
+        candidates.truncate(MAX_WRITERS - admissions);
+        let mut keep: std::collections::BTreeSet<_> = candidates.into_iter().map(|c| c.0).collect();
+        for key in newcomers.into_iter().take(admissions) {
+            self.admission_cursor = Some(key);
+            keep.insert(key);
+        }
+        self.rotate = !self.rotate;
+        let writer_evictions = self
+            .tracked
+            .iter()
+            .filter(|(k, t)| !keep.contains(k) && (t.missed < 2 || seen_writers.contains_key(k)))
+            .count() as u64;
         self.tracked.retain(|k, _| keep.contains(k));
         seen_writers.retain(|k, _| keep.contains(k));
         for (key, row) in seen_writers {
@@ -264,6 +305,8 @@ impl ProcScanner {
         Ok(ProcScanResult {
             at: now,
             fds_seen,
+            writers_full,
+            writer_evictions,
             duration: started.elapsed(),
         })
     }
@@ -278,6 +321,8 @@ impl ProcScanner {
     }
     /// Positive allocated growth from the most recent sample at or before the window
     /// boundary, falling back to the oldest retained sample for shorter histories.
+    /// The reported duration is the actual timestamp span, even for incomplete
+    /// history; observations within the same second yield no measured growth.
     pub fn writers(
         &self,
         mount: Option<&RawPath>,
@@ -314,7 +359,8 @@ impl ProcScanner {
                 continue;
             };
             let growth = delta(r.disk, base.1);
-            if growth <= 0 {
+            let elapsed = r.ts.saturating_sub(base.0);
+            if growth <= 0 || elapsed <= 0 {
                 continue;
             }
             rows.push(OpenWriter {
@@ -328,7 +374,7 @@ impl ProcScanner {
                 size: r.size,
                 disk: r.disk,
                 growth,
-                window_secs: window.as_secs(),
+                window_secs: elapsed as u64,
             });
         }
         rows.sort_unstable_by(|a, b| {

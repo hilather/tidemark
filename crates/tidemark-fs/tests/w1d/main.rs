@@ -240,6 +240,7 @@ fn finds_deleted_open_file_without_reading_contents() {
         .iter()
         .find(|f| f.pid == std::process::id() && f.fd == file.as_raw_fd() as u32)
         .unwrap();
+    assert_eq!(found.starttime, read_starttime(std::process::id()).unwrap());
     assert_eq!(found.nlink, 0);
     assert_eq!(found.size, 12345);
     assert_eq!(found.ino, meta.ino());
