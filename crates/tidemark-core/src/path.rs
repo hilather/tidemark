@@ -45,7 +45,7 @@ impl RawName {
     }
     /// Escape controls, backslashes and invalid UTF-8 for terminal display.
     pub fn display_lossy(&self) -> String {
-        display(&self.0)
+        display_lossy_bytes(&self.0)
     }
     /// xxh3 bits reinterpreted as a signed SQLite integer.
     pub fn hash64(&self) -> i64 {
@@ -132,7 +132,7 @@ impl RawPath {
     }
     /// Escape controls, backslashes and invalid UTF-8 for terminal display.
     pub fn display_lossy(&self) -> String {
-        display(&self.0)
+        display_lossy_bytes(&self.0)
     }
     /// xxh3 bits reinterpreted as a signed SQLite integer.
     pub fn hash64(&self) -> i64 {
@@ -250,7 +250,9 @@ fn path_json(bytes: &[u8]) -> serde_json::Value {
         Err(_) => serde_json::json!({"path_b64": STANDARD.encode(bytes)}),
     }
 }
-fn display(bytes: &[u8]) -> String {
+/// Escape bytes for terminal display: printable Unicode is kept; control characters, invalid
+/// UTF-8 bytes and backslashes are written as uppercase `\xNN`.
+pub fn display_lossy_bytes(bytes: &[u8]) -> String {
     let mut result = String::new();
     let mut remaining = bytes;
     while !remaining.is_empty() {
@@ -327,5 +329,27 @@ mod tests {
             p
         );
         assert!(serde_json::from_str::<RawPath>("[97]").is_err());
+    }
+}
+
+#[cfg(test)]
+mod shared_display_tests {
+    use super::*;
+    #[test]
+    fn three_display_entry_points_agree() {
+        for bytes in [
+            b"plain".as_slice(),
+            "é\u{0085}".as_bytes(),
+            b"a\xff\n\\",
+            b"\xe2\x82",
+        ] {
+            let name = RawName::new(bytes.to_vec()).unwrap();
+            let path = RawPath::new([b"/".as_slice(), bytes].concat()).unwrap();
+            assert_eq!(name.display_lossy(), display_lossy_bytes(bytes));
+            assert_eq!(
+                path.display_lossy(),
+                format!("/{}", display_lossy_bytes(bytes))
+            );
+        }
     }
 }

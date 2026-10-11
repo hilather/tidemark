@@ -20,18 +20,23 @@ fn mountinfo_samples_and_bind_mounts() {
 }
 #[test]
 fn malformed_records_preserve_neighbors() {
-    for s in [
-        "1 2 8:0 / / rw xfs /dev/sda rw",
-        "1 2 8 / / rw - xfs x rw",
-        "1 2 8:0 / /bad\\04 rw - xfs x rw",
-        "1 2 8:0 / /bad\\777 rw - xfs x rw",
-        "1 2 8:0 / /bad\\000 rw - xfs x rw",
+    let mounts = parse_mountinfo(
+        b"1 0 8:0 / /root rw - xfs /dev/sda rw\n2 1 8:0 /sub /root/bind rw - xfs /dev/sda\n",
+    )
+    .unwrap();
+    assert_eq!(
+        submounts_under(&mounts, &raw(b"/root")),
+        vec![raw(b"/root/bind")]
+    );
+    assert!(mounts[1].fs_type.is_empty());
+    assert!(mounts[1].super_opts.is_empty());
+    for line in [
+        b"1 2 8:0 / /bad\\04 rw - xfs x rw".as_slice(),
+        b"1 2 8:0 / /bad\\777 rw - xfs x rw",
+        b"1 2 8:0 / /bad\\000 rw - xfs x rw",
+        b"1 2 8 / / rw - xfs x rw",
     ] {
-        let table = format!(
-            "1 0 8:0 / / rw - xfs /dev/sda rw\n{s}\n3 1 8:0 /bind /bind rw - xfs /dev/sda rw\n"
-        );
-        let mounts = parse_mountinfo(table.as_bytes()).unwrap();
-        assert_eq!(mounts.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert!(parse_mountinfo(line).is_err());
     }
     assert!(parse_mountinfo(b"").unwrap().is_empty());
 }

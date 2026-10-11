@@ -23,6 +23,7 @@ use tidemark_core::{
 const MAX_TASKS: usize = 65_536;
 const MAX_RECORD_ITEMS: usize = 1_000_000;
 const MAX_TASK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_THRESHOLD_CANDIDATES: usize = 4096;
 const MAX_ERRORS: usize = 10_000;
 struct Task {
     id: DirId,
@@ -399,6 +400,8 @@ fn directory(
         races: 0,
     };
     let mut children = Vec::new();
+    let mut top = Vec::<NotableFile>::new();
+    let mut directory_heap = BinaryHeap::<(Reverse<u64>, u64, usize)>::new();
     match opened {
         Err(e) => error(s, &mut r, c, t.path.clone(), ErrOp::Open, &e),
         Ok(fd) => {
@@ -563,8 +566,7 @@ fn directory(
                     }
                     // The heap tracks sizes only: discovery IDs and names cannot
                     // reproduce final directory preorder / inode tie ordering.
-                    // Emit all cutoff ties; each record is bounded by
-                    // MAX_RECORD_ITEMS and completed records use a bounded channel.
+                    // Cross-directory cutoff ties survive the per-directory top-N bound.
                     let admitted = s.cfg.top_files > 0
                         && (heap.len() < s.cfg.top_files
                             || heap
@@ -581,19 +583,54 @@ fn directory(
                         }
                         heap.push(Reverse(disk));
                     }
-                    if disk >= s.cfg.big_file_threshold || admitted {
-                        r.notable.push(NotableFile {
+                    let qualifies = s.cfg.top_files > 0
+                        && (directory_heap.len() < s.cfg.top_files
+                            || directory_heap
+                                .peek()
+                                .is_some_and(|(Reverse(size), ino, _)| {
+                                    (Reverse(disk), st.stx_ino) < (Reverse(*size), *ino)
+                                }));
+                    if qualifies || disk >= s.cfg.big_file_threshold {
+                        let candidate = NotableFile {
                             ino: st.stx_ino,
                             name: Some(make_name()?),
                             disk,
                             apparent: st.stx_size,
                             mtime,
-                        });
+                        };
+                        if disk >= s.cfg.big_file_threshold {
+                            if r.notable.len() == MAX_THRESHOLD_CANDIDATES {
+                                return Err(WalkError::Limit(
+                                    "4096 threshold candidates per directory",
+                                ));
+                            }
+                            r.notable.push(candidate.clone());
+                        }
+                        if qualifies {
+                            let index = if top.len() == s.cfg.top_files {
+                                // The heap is nonempty because top_files > 0 here.
+                                let Some((_, _, index)) = directory_heap.pop() else {
+                                    return Err(WalkError::Limit("missing directory candidate"));
+                                };
+                                top[index] = candidate;
+                                index
+                            } else {
+                                top.push(candidate);
+                                top.len() - 1
+                            };
+                            directory_heap.push((Reverse(disk), st.stx_ino, index));
+                        }
                     }
                 }
             }
         }
     }
+    // Preserve worker cutoff ties across directories, but retain only the exact
+    // first top_files within each directory (final directory ID is constant).
+    r.notable.extend(top.into_iter().filter(|f| {
+        f.disk < s.cfg.big_file_threshold
+            && heap.peek().is_some_and(|Reverse(cutoff)| f.disk >= *cutoff)
+    }));
     c.dirs += 1;
     c.entries += u64::from(r.entries);
     c.races += u64::from(r.races);

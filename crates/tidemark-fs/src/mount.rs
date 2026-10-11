@@ -12,6 +12,7 @@ pub enum ParseError {
     Invalid(&'static str),
 }
 use std::io;
+pub(crate) use tidemark_core::path::display_lossy_bytes as display_field;
 use tidemark_core::{path::RawPath, scan::DevId};
 /// Filesystem path or kernel object used as a mount root.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +48,7 @@ pub struct MountInfo {
     pub super_opts: Vec<String>,
 }
 /// Parse Linux mountinfo, preserving bytes and warning for each malformed line.
-/// Oversized tables are rejected; valid records survive malformed neighbors.
+/// Undecodable boundaries and oversized tables are rejected; malformed later fields are empty.
 pub fn parse_mountinfo(bytes: &[u8]) -> Result<Vec<MountInfo>, ParseError> {
     if bytes.len() > MAX_MOUNTINFO_BYTES {
         return Err(ParseError::Invalid("mountinfo exceeds 16 MiB"));
@@ -57,14 +58,49 @@ pub fn parse_mountinfo(bytes: &[u8]) -> Result<Vec<MountInfo>, ParseError> {
         if line.is_empty() {
             continue;
         }
+        let fields: Vec<_> = line.split(|b| *b == b' ').collect();
+        // Boundary fields must be trustworthy even when the rest is malformed.
+        if fields.len() < 5 {
+            return Err(ParseError::Invalid("missing boundary fields"));
+        }
+        let mount_point = RawPath::new(decode(fields[4])?)
+            .map_err(|_| ParseError::Invalid("invalid mount target"))?;
         match parse_record(line) {
             Ok(mount) => mounts.push(mount),
             Err(error) => {
-                tracing::warn!(line = index + 1, %error, "skipping malformed mountinfo record")
+                let id = parse_number(fields[0])?;
+                let parent = parse_number(fields[1])?;
+                let (major, minor) = fields[2]
+                    .split_once_byte(b':')
+                    .ok_or(ParseError::Invalid("invalid device"))?;
+                let (major, minor) = (parse_number(major)?, parse_number(minor)?);
+                tracing::warn!(line = index + 1, %error, "retaining malformed mountinfo boundary");
+                mounts.push(MountInfo {
+                    id,
+                    parent,
+                    major,
+                    minor,
+                    dev: libc::makedev(major, minor),
+                    root: MountRoot::Object(Vec::new()),
+                    mount_point,
+                    mount_opts: Vec::new(),
+                    fs_type: String::new(),
+                    source: String::new(),
+                    super_opts: Vec::new(),
+                });
             }
         }
     }
     Ok(mounts)
+}
+fn parse_number(b: &[u8]) -> Result<u32, ParseError> {
+    if b.is_empty() || !b.iter().all(u8::is_ascii_digit) {
+        return Err(ParseError::Invalid("invalid number"));
+    }
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or(ParseError::Invalid("invalid number"))
 }
 fn parse_record(line: &[u8]) -> Result<MountInfo, ParseError> {
     let fields: Vec<_> = line.split(|b| *b == b' ').collect();
@@ -75,15 +111,7 @@ fn parse_record(line: &[u8]) -> Result<MountInfo, ParseError> {
     if sep < 6 || fields.len() != sep + 4 || fields.iter().any(|f| f.is_empty()) {
         return Err(ParseError::Invalid("invalid field count"));
     }
-    let number = |b: &[u8]| {
-        if b.is_empty() || !b.iter().all(u8::is_ascii_digit) {
-            return Err(ParseError::Invalid("invalid number"));
-        }
-        std::str::from_utf8(b)
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .ok_or(ParseError::Invalid("invalid number"))
-    };
+    let number = parse_number;
     let (major, minor) = fields[2]
         .split_once_byte(b':')
         .ok_or(ParseError::Invalid("invalid device"))?;
@@ -123,35 +151,6 @@ fn parse_record(line: &[u8]) -> Result<MountInfo, ParseError> {
             .map(str::to_owned)
             .collect(),
     })
-}
-pub(crate) fn display_field(bytes: &[u8]) -> String {
-    let mut result = String::new();
-    let mut remaining = bytes;
-    while !remaining.is_empty() {
-        let (valid, invalid) = match std::str::from_utf8(remaining) {
-            Ok(s) => (s, 0),
-            Err(e) => (
-                std::str::from_utf8(&remaining[..e.valid_up_to()]).unwrap_or(""),
-                e.error_len().unwrap_or(remaining.len() - e.valid_up_to()),
-            ),
-        };
-        for c in valid.chars() {
-            if c.is_control() || c == '\\' {
-                let mut buf = [0; 4];
-                for b in c.encode_utf8(&mut buf).as_bytes() {
-                    result.push_str(&format!("\\x{b:02X}"));
-                }
-            } else {
-                result.push(c);
-            }
-        }
-        let offset = valid.len();
-        for b in &remaining[offset..offset + invalid] {
-            result.push_str(&format!("\\x{b:02X}"));
-        }
-        remaining = &remaining[offset + invalid..];
-    }
-    result
 }
 // Linux's generated table is bounded to avoid allocating from arbitrary input.
 const MAX_MOUNTINFO_BYTES: usize = 16 * 1024 * 1024;
