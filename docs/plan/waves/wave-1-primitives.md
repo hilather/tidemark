@@ -345,7 +345,7 @@ pub fn space_check_with(statvfs: impl Fn() -> io::Result<FsTotals>, used_by_stat
 
 ### Details
 
-- Writer PRAGMAs and the finish sequence exactly as `05` §2. The file is created `0640` (umask-independent: `fchmod` after create).
+- Writer PRAGMAs and the finish sequence exactly as `05` §2. The file is created `0600 root:root` (umask-independent: `fchmod` after create).
 - Reader opens `file:<path>?immutable=1&mode=ro` (rusqlite `OpenFlags::SQLITE_OPEN_URI | SQLITE_OPEN_READ_ONLY`).
 - Query methods use the subtree range technique (`05` §1). `children` sorts in SQL by the requested key, with `name` as tie-break for determinism.
 - Time-series schema and compaction exactly `05` §6. Migrations are numbered Rust functions; v1 is the initial schema.

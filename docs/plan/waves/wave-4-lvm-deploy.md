@@ -113,7 +113,7 @@ pub fn write(state_dir: &Path, r: &FirstbootReport) -> io::Result<()>; // atomic
 - **`deploy stage`**: run every check in `08` §5.
   - **If any check is `Fail`:** print the table, exit 5, and change **nothing**. Test this explicitly.
   - **Otherwise:**
-    1. Install the config atomically (temp file, then rename) as `0640 root:tidemark`. Back up any differing existing config.
+    1. Install the config atomically (temp file, then rename) as `0600 root:root`. Back up any differing existing config.
     2. `systemctl enable tidemarkd`.
     3. With `--start-now`, also restart (or start) the service.
     4. Write `deploy/staged.json`.

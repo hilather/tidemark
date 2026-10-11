@@ -8,7 +8,7 @@
 |------|-------|-------------|------------|
 | W6-A | Daemon core, services, scheduler, API; CLI live commands | `tidemarkd/src/{main,api,state,scheduler}.rs`, `tidemarkd/src/services/**`, `tidemark-cli/src/cmd/{now,hot,alerts,status}.rs`, and the daemon-mode branches in `cmd/{scan,lvm,phantom,writers,pg}.rs` (see note) | W2–W5 |
 | W6-B | Metrics exporter, dashboards, alert rules | `tidemarkd/src/metrics.rs`, `packaging/grafana/**`, `packaging/prometheus/**` | W6-A `state` API (skeleton first) |
-| W6-C | Packaging, systemd, RPM, install tests | `packaging/{systemd,tmpfiles.d,sysusers.d,config}/**`, `packaging/rpm/**`, `xtask/src/rpm.rs`, `tests/install/**` | W6-A binary |
+| W6-C | Packaging, systemd, RPM, install tests | `packaging/{systemd,tmpfiles.d,config}/**`, `packaging/rpm/**`, `xtask/src/rpm.rs`, `tests/install/**` | W6-A binary |
 
 **Note on shared CLI files:** `scan.rs` (W2-C), `lvm.rs` (W4-A), `phantom.rs`/`writers.rs` (W5-B) and `pg.rs` (W5-C) already exist. W6-A adds a "daemon first, direct fallback" branch at the top of each `run()` and **must not change their direct-mode code**. The reviewer checks the diff stays within that branch.
 
@@ -50,7 +50,7 @@ tidemarkd/src/
   4. Catalog.
   5. Namespace check (the watcher is disabled with a loud error if it fails; the daemon still runs).
   6. Services.
-  7. API socket: remove a stale socket, bind, set mode 0660 (group from `Group=`).
+  7. API socket: remove a stale socket, bind, set mode `0600`, owner `root:root`.
   8. `READY=1`.
 - **`LiveState`:**
   - Per-mount rings of the last 2 h of raw fs samples (and the latest LVM report), so rates are computed from memory without DB reads.
@@ -93,8 +93,8 @@ tidemarkd/src/
 
 ### Tests
 
-- Unit: schedule/window parser and next-run computation (DST transitions, windows wrapping midnight); API framing (partial lines, oversize line, malformed JSON → `bad_request`); permission check for mutating methods.
-- Integration (unprivileged): start the daemon with a temp config (watcher/LVM/pg disabled, walk-mode root on a fixture, socket in a temp dir) → `tidemark status`, `scan.start` via the CLI, `scan.status` until complete, then `now` renders.
+- Unit: schedule/window parser and next-run computation (DST transitions, windows wrapping midnight); API framing (partial lines, oversize line, malformed JSON → `bad_request`); root peer permission check for every method.
+- Integration (privileged VM): start the daemon with a temp config (watcher/LVM/pg disabled, walk-mode root on a fixture, socket in a temp dir) → `tidemark status`, `scan.start` via the CLI, `scan.status` until complete, then `now` renders.
 - Privileged `daemon_end_to_end` (`09` §5): start via `systemd-run` with the real unit's properties → write 50 MiB under a transient unit → within 60 s, `tidemark now` shows the hot directory and the unit; `tidemark now` shows both tracked mounts and, on a loop-LVM thin volume, the pool's data %.
 - Privileged `daemon_reload_and_shutdown`: SIGHUP with a changed alert rule is applied; an invalid config is rejected; SIGTERM mid-scan exits within 10 s with no `.db.tmp` left.
 
@@ -149,8 +149,7 @@ tidemarkd/src/
 ### Deliverables
 
 - `packaging/systemd/tidemarkd.service`: **exactly** `08` §6. Do not add mount-namespace options.
-- `packaging/tmpfiles.d/tidemark.conf`: `d /run/tidemark 0750 root tidemark -`.
-- `packaging/sysusers.d/tidemark.conf`: `g tidemark -`.
+- `packaging/tmpfiles.d/tidemark.conf`: `d /run/tidemark 0700 root root -`.
 - `packaging/config/tidemark.toml`: the `08` §3 example with explanatory comments. Postgres, webhook and HTTP metrics are disabled by default. Roots, sampler and watch mounts default to `/` and `/data` (matching the fleet layout); hosts without `/data` are caught by `deploy stage` pre-flight.
 - `xtask rpm [--container]`:
   - Build release binaries in a `rockylinux:8` container (podman, or docker if present). The toolchain is installed via rustup in the container image; cache it.
@@ -158,12 +157,11 @@ tidemarkd/src/
   - RPM layout:
     - `/usr/bin/{tidemark,tidemarkd}`
     - `/usr/lib/systemd/system/tidemarkd.service`
-    - `/usr/lib/tmpfiles.d/tidemark.conf`, `/usr/lib/sysusers.d/tidemark.conf`
-    - `/etc/tidemark/tidemark.toml` (`config(noreplace)`)
+    - `/usr/lib/tmpfiles.d/tidemark.conf`
+    - `/etc/tidemark/tidemark.toml` (`config(noreplace)`, `0600 root:root`)
     - `/usr/share/doc/tidemark/` (README plus the plan's `07`/`08`/`11`)
     - Bash completion
   - Scriptlets:
-    - **%pre:** `getent group tidemark >/dev/null || groupadd -r tidemark`. This must run **before** files owned `root:tidemark` are installed; EL8's rpm 4.14 has no native sysusers support, so `%post` would be too late.
     - **%post:** `systemd-tmpfiles --create /usr/lib/tmpfiles.d/tidemark.conf`, `systemctl daemon-reload`. **Do not enable or start** the service; `tidemark deploy stage` does that.
     - **%preun on erase:** stop and disable.
     - **%postun:** `daemon-reload`.

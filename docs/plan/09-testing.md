@@ -140,7 +140,7 @@ Mandatory privileged tests:
 | Fault | Method | Expected |
 |-------|--------|----------|
 | Directory removed mid-scan | Background thread deletes subtrees during the scan | Counted as races; snapshot complete; no panic |
-| Permission denied | `chmod 000` as non-root test user | Errors recorded; `degraded = true`; exit code 3 |
+| Permission denied (library) | Scanner-library test with `chmod 000` as non-root test user (bypasses the root-only CLI) | Errors recorded; `degraded = true`; exit code 3 |
 | Disk full on state dir | Small loop filesystem as `state_dir` | Space guard refuses; mid-write abort deletes `.tmp`; alert raised |
 | Crash during snapshot write | `kill -9` at random points | No `.db` without a complete `meta`; `.tmp` cleaned on next start |
 | Crash during time-series compaction | `kill -9` | DB opens cleanly; compaction idempotent |

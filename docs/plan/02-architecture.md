@@ -71,7 +71,7 @@ tidemark/
 │   ├── tidemarkd/             # binary `tidemarkd` (services, scheduler, API, metrics, first-boot report)
 │   └── test-support/          # fixture DSL, oracles (du/find), loop-XFS and loop-LVM helpers
 ├── xtask/                     # ci, vm-test, gen-fixture, bench, rpm
-├── packaging/                 # systemd, tmpfiles.d, sysusers.d, default config, RPM metadata, Grafana/Prometheus
+├── packaging/                 # systemd, tmpfiles.d, default config, RPM metadata, Grafana/Prometheus
 └── docs/
     ├── plan/                  # this plan
     └── handoff/               # one note per completed task
@@ -95,7 +95,7 @@ test-support   ◀── dev-dependencies only
 ## 5. Process model
 
 - **`tidemarkd`** runs as root under systemd. It owns all samplers, the watcher, the scan scheduler, the time-series DB writer, metrics output, the API socket and the first-boot report. It is **read-only** with respect to everything outside its own state directory.
-- **`tidemark`** (CLI) runs as root or as a member of group `tidemark`.
+- **`tidemark`** (CLI) runs as root only; administrators use `sudo`. Help and shell completions work without root.
   - Snapshot queries open snapshot files directly, read-only and immutable.
   - Live queries (`now`, `hot`, `lvm`, …) go to the daemon socket. Where possible they fall back to doing the work directly (for example `phantom` scans `/proc` itself, `lvm` runs `lvs` itself).
   - `deploy stage|verify|unstage` manage the service for the hotfix pipeline (`§10`).
@@ -134,16 +134,17 @@ Shared state is `Arc<RwLock<LiveState>>` with small critical sections. Cross-thr
 ## 7. On-disk layout
 
 ```
-/etc/tidemark/tidemark.toml          config (0640 root:tidemark)
-/etc/tidemark/pg.pass                optional Postgres password file (0600 root)
-/var/lib/tidemark/                   state_dir (0750 root:tidemark). On the root filesystem by default,
+/etc/tidemark/tidemark.toml          config (0600 root:root)
+/etc/tidemark/pg.pass                optional Postgres password file (0600 root:root)
+/var/lib/tidemark/                   state_dir (0700 root:root). On the root filesystem by default,
 │                                    which keeps Tidemark's own writes off /data. Excluded from scans and watches.
 ├── timeseries.db (+ -wal, -shm)     samples, scan catalog, dir series, alerts
-├── snapshots/<root-slug>/<scan_id>.db        immutable snapshots (0640)
-├── snapshots/<root-slug>/<scan_id>.db.tmp    in-progress scan (deleted on failure)
+├── snapshots/<root-slug>/<scan_id>.db        immutable snapshots (0600 root:root)
+├── snapshots/<root-slug>/<scan_id>.db.tmp    in-progress scan (0600 root:root; deleted on failure)
 ├── deploy/staged.json, deploy/firstboot.json deployment state (FR-25)
 └── tmp/                             scratch
-/run/tidemark/api.sock               API socket (0660 root:tidemark)
+/run/tidemark/                      runtime directory (0700 root:root)
+/run/tidemark/api.sock               API socket (0600 root:root)
 /var/lib/node_exporter/textfile_collector/tidemark.prom   metrics (configurable)
 ```
 
@@ -163,7 +164,7 @@ Shared state is `Arc<RwLock<LiveState>>` with small critical sections. Cross-thr
   - `tidemarkd` checks that `/proc/self/ns/mnt` equals `/proc/1/ns/mnt` and refuses to start the watcher otherwise. (ADR-013.)
 - **LVM access.** It is read-only: the `lvs`/`vgs` reporting commands, which take a brief shared lock and never write metadata.
 - **Network.** No TCP listener by default. The optional metrics listener binds to `127.0.0.1` only.
-- **Path names are sensitive.** Snapshot files and the API expose them (customer names in report paths), so access is limited to root and group `tidemark`.
+- **Path names are sensitive.** Snapshot files and the API expose them (customer names in report paths), so access is limited to root; administrators use `sudo` (ADR-018).
 - **No content reads.** Tidemark never opens regular files to read data. fanotify hands the daemon an fd per event, and that fd is only `fstat`-ed and closed.
 
 ## 9. Degradation matrix
@@ -171,7 +172,8 @@ Shared state is `Arc<RwLock<LiveState>>` with small critical sections. Cross-thr
 | Condition | Behaviour |
 |-----------|-----------|
 | fanotify FID/name reporting unavailable (likely on 4.18) | Watcher runs in fd mode: close-write events with path and PID. Creates/deletes/renames are not seen; net change comes from L0 and scans. |
-| Not root / missing capability | Walk mode only over the readable subset; snapshot marked `degraded`. No watcher, no procscan of other users. |
+| Not root | CLI fails early with exit code 5 and a message to use `sudo`; help and completions remain available. Daemon refuses to start. |
+| Root with missing capability | Walk mode only over the readable subset; snapshot marked `degraded`. No watcher, no procscan of other users. |
 | Not XFS, or bulkstat unavailable | Walk mode. |
 | Scan memory estimate exceeds budget | Walk mode. |
 | Not on LVM, or `lvs` missing | LVM section shows "n/a"; everything else unaffected. |

@@ -22,30 +22,32 @@ Paths given on the command line are canonicalised (`realpath`) before lookup, so
 
 | Command | Purpose | Key options | Needs |
 |---------|---------|-------------|-------|
-| `probe` | Capability and environment report (FR-1) | `--root PATH…` | root for full detail |
+| `probe` | Capability and environment report (FR-1) | `--root PATH…` | root |
 | `scan [ROOT]` | Run a scan and write a snapshot (FR-2/3) | `--mode auto\|walk\|bulk`, `--throttle gentle\|normal\|max`, `--threads N`, `--exclude GLOB…`, `--keep-partial`, `--cancel` (ask the daemon to cancel the running scan of ROOT) | root |
-| `snapshots list\|show ID\|prune\|rebuild-catalog` | Snapshot catalog (FR-6) | `--root`, `--dry-run` | read access |
-| `top [PATH]` | Directory drill-down (FR-7) | `--depth N` (1), `--sort disk\|apparent\|reclaimable\|charged\|files\|inodes\|newest\|name\|growth`, `--limit N` (25), `--min-size SIZE`, `--snapshot ID`, `--wide` (adds NEWEST, INODES, APPARENT), `--live` (rescan PATH now, throttled, and show deltas vs snapshot) | read access |
-| `files [PATH]` | Largest files (FR-7) | `--limit`, `--min-size`, `--older-than DUR`, `--newer-than DUR`, `--snapshot` | read access |
-| `wide [PATH]` | Widest directories (FR-7) | `--min-entries N` (10000), `--limit` | read access |
-| `diff [PATH]` | Snapshot diff (FR-8) | `--since DUR` or `--from ID [--to ID]`, `--depth N` (3), `--metric disk\|reclaimable\|files`, `--explain`, `--explain-ratio F` (0.5), `--explain-min SIZE` (1GiB), `--limit` | read access |
-| `links [PATH]` | Hard-link topology (FR-9) | `--boundary GLOB…` or `--boundary-depth N`, `--incomplete`, `--top N`, `--show-paths` (live name resolution) | read access |
-| `symlinks [PATH]` | Live symlink analysis (FR-5) | `--check-targets` (stat targets: needed for dangling/loop/other-fs), `--dangling` (list only dangling), `--escaping` (list only links resolving outside PATH), `--limit` | read access |
-| `export ncdu [PATH]` | ncdu JSON export (FR-22) | `-o FILE`, `--snapshot`, `--utf8-lossy`, `--max-depth N` | read access |
-| `now` | Live situation (FR-18) | `--mount M` | daemon |
-| `hot` | Hot directories/writers (FR-14) | `--window 1m\|5m\|15m\|60m`, `--by dir\|unit\|comm`, `--mount`, `--limit` | daemon |
-| `lvm` | LV/VG/thin-pool status and trend (FR-24) | `--mount M` | daemon, or root for a direct `lvs` |
-| `phantom` | Deleted-but-open files (FR-15) | `--mount`, `--direct` (scan `/proc` now) | daemon, or root |
-| `writers` | Growing open files (FR-15) | `--mount`, `--window`, `--direct` (no daemon: two `/proc` passes), `--interval DUR` (10s, with `--direct`) | daemon, or root with `--direct` |
-| `pg` | Postgres breakdown (FR-16) | `--relations`, `--db NAME` | daemon |
-| `alerts` | Active alerts; `--all` for history | | daemon or read access |
+| `snapshots list\|show ID\|prune\|rebuild-catalog` | Snapshot catalog (FR-6) | `--root`, `--dry-run` | root |
+| `top [PATH]` | Directory drill-down (FR-7) | `--depth N` (1), `--sort disk\|apparent\|reclaimable\|charged\|files\|inodes\|newest\|name\|growth`, `--limit N` (25), `--min-size SIZE`, `--snapshot ID`, `--wide` (adds NEWEST, INODES, APPARENT), `--live` (rescan PATH now, throttled, and show deltas vs snapshot) | root |
+| `files [PATH]` | Largest files (FR-7) | `--limit`, `--min-size`, `--older-than DUR`, `--newer-than DUR`, `--snapshot` | root |
+| `wide [PATH]` | Widest directories (FR-7) | `--min-entries N` (10000), `--limit` | root |
+| `diff [PATH]` | Snapshot diff (FR-8) | `--since DUR` or `--from ID [--to ID]`, `--depth N` (3), `--metric disk\|reclaimable\|files`, `--explain`, `--explain-ratio F` (0.5), `--explain-min SIZE` (1GiB), `--limit` | root |
+| `links [PATH]` | Hard-link topology (FR-9) | `--boundary GLOB…` or `--boundary-depth N`, `--incomplete`, `--top N`, `--show-paths` (live name resolution) | root |
+| `symlinks [PATH]` | Live symlink analysis (FR-5) | `--check-targets` (stat targets: needed for dangling/loop/other-fs), `--dangling` (list only dangling), `--escaping` (list only links resolving outside PATH), `--limit` | root |
+| `export ncdu [PATH]` | ncdu JSON export (FR-22) | `-o FILE`, `--snapshot`, `--utf8-lossy`, `--max-depth N` | root |
+| `now` | Live situation (FR-18) | `--mount M` | root |
+| `hot` | Hot directories/writers (FR-14) | `--window 1m\|5m\|15m\|60m`, `--by dir\|unit\|comm`, `--mount`, `--limit` | root |
+| `lvm` | LV/VG/thin-pool status and trend (FR-24) | `--mount M` | root |
+| `phantom` | Deleted-but-open files (FR-15) | `--mount`, `--direct` (scan `/proc` now) | root |
+| `writers` | Growing open files (FR-15) | `--mount`, `--window`, `--direct` (no daemon: two `/proc` passes), `--interval DUR` (10s, with `--direct`) | root |
+| `pg` | Postgres breakdown (FR-16) | `--relations`, `--db NAME` | root |
+| `alerts` | Active alerts; `--all` for history | | root |
 | `deploy stage` | Pre-flight checks, install config, enable the service for next boot (FR-25) | `--from FILE` (config to install; the global `-c` still names the installed path), `--start-now`, `--skip-check NAME…` (warning-level checks only) | root |
-| `deploy verify` | Post-reboot pass/fail for the pipeline (FR-25) | `--wait DUR` (poll until healthy or timeout); machine output via the global `--json` | root or group |
+| `deploy verify` | Post-reboot pass/fail for the pipeline (FR-25) | `--wait DUR` (poll until healthy or timeout); machine output via the global `--json` | root |
 | `deploy unstage` | Stop and disable the service; keep state (FR-25) | `--purge-state` (also delete `state_dir`), `--yes` | root |
 | `watch` | Foreground event stream for debugging | `--mount`, `--events close_write,modify` | root |
-| `status` | Daemon health, versions, component states | `--show-config` (print the effective config including default alert rules) | daemon (config part works without) |
-| `tui [PATH]` | Interactive browser (FR-21) | `--snapshot` | read access |
+| `status` | Daemon health, versions, component states | `--show-config` (print the effective config including default alert rules) | root |
+| `tui [PATH]` | Interactive browser (FR-21) | `--snapshot` | root |
 | `completions <SHELL>` | Shell completions | | — |
+
+All commands require effective uid 0, except `completions` and `--help` (including command help). A non-root invocation fails early, before reading config or state or connecting to the daemon, with exit code **5** and a clear message: `Tidemark requires root; run this command with sudo.`
 
 ### 1.3 Exit codes
 
@@ -74,9 +76,9 @@ The `Δ24h` column appears when a snapshot about 24 h older exists.
 
 ## 2. Daemon API
 
-- **Transport:** Unix stream socket `/run/tidemark/api.sock`, mode `0660 root:tidemark`.
+- **Transport:** Unix stream socket `/run/tidemark/api.sock`, mode `0600 root:root`.
 - **Framing:** newline-delimited JSON. One request per line, one response per line; the connection may carry several requests.
-- **Authentication:** socket permissions. Every request is logged with the peer's `SO_PEERCRED` uid/pid. Mutating methods (`scan.start`, `scan.cancel`, `config.reload`) require peer uid 0.
+- **Authentication:** socket permissions. Every request is logged with the peer's `SO_PEERCRED` uid/pid. Every method requires peer uid 0; other peers receive `forbidden`.
 
 ```json
 {"v":1,"id":"c1","method":"now","params":{"mount":"/data"}}
@@ -109,7 +111,6 @@ Durations use humantime (`30s`, `6h`); sizes use binary units (`1GiB`). Unknown 
 [general]
 state_dir    = "/var/lib/tidemark"     # root filesystem by default; keeps Tidemark writes off /data
 socket       = "/run/tidemark/api.sock"
-socket_group = "tidemark"
 log_level    = "info"                  # error|warn|info|debug|trace
 
 [[roots]]                              # one entry per tracked filesystem
@@ -299,7 +300,7 @@ tidemark deploy verify --wait 5m                    # exit 0 = healthy; 6 = not 
 
 On success, `deploy stage`:
 
-1. installs the config to `/etc/tidemark/tidemark.toml` (`0640 root:tidemark`), backing up any existing file as `tidemark.toml.<ts>.bak`;
+1. installs the config to `/etc/tidemark/tidemark.toml` (`0600 root:root`), backing up any existing file as `tidemark.toml.<ts>.bak`;
 2. runs `systemctl enable tidemarkd`, and also starts it with `--start-now`;
 3. writes `/var/lib/tidemark/deploy/staged.json`, recording the version, time, check results and config hash.
 
@@ -337,8 +338,7 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 User=root
-Group=tidemark                   # files/sockets get gid tidemark without needing CAP_CHOWN
-UMask=0027
+UMask=0077
 Nice=10
 # No IOSchedulingClass here: scan worker threads set idle priority for themselves
 # (04 §2.2); the samplers and DB writer must not be starved.
@@ -348,9 +348,9 @@ MemoryMax=2G                     # cgroup v2
 CPUQuota=200%
 LimitNOFILE=65536
 StateDirectory=tidemark
-StateDirectoryMode=0750
+StateDirectoryMode=0700
 RuntimeDirectory=tidemark
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0700
 NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SYS_PTRACE
 RestrictNamespaces=yes
@@ -368,6 +368,5 @@ WantedBy=multi-user.target
 
 Also shipped:
 
-- `tmpfiles.d/tidemark.conf` creates `/run/tidemark` (it does not create the node_exporter textfile directory).
-- Group `tidemark` is created in the RPM `%pre` scriptlet (`groupadd -r`); a `sysusers.d` file is shipped for documentation and EL9.
-- Default config goes to `/etc/tidemark/tidemark.toml` as `%config(noreplace)`.
+- `tmpfiles.d/tidemark.conf` creates `/run/tidemark` as `0700 root:root` (it does not create the node_exporter textfile directory).
+- Default config goes to `/etc/tidemark/tidemark.toml` as `%config(noreplace)`, mode `0600 root:root`.

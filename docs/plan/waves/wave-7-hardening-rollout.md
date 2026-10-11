@@ -119,7 +119,7 @@ On staging: daemon at defaults, generator in mutate mode, pgbench running, hourl
   - It asserts that `read*` calls on fds opened for regular files are absent. Fanotify event fds are closed unread.
 - **`docs/security.md`, a threat model covering:**
   - The root daemon and its capability set.
-  - The API socket and group model.
+  - Root-only CLI/API access, sudo guidance, and root-owned file and directory modes (ADR-018).
   - Sensitivity of path names in snapshots and metrics.
   - Data sent in webhooks (paths in alert messages; config `alerts.redact_paths` was considered, and a decision is recorded).
   - The read-only guarantee (no metadata, mount or LVM writes) and the `xtask ci` forbidden-call check.
