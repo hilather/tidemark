@@ -661,10 +661,68 @@ fn notable_cutoff_ties_preserve_same_directory_inode_winners() {
             assert_eq!((s.errors, s.races), (0, 0));
             let records = paths(rows, &cfg.root);
             let notable = &records[&cfg.root].notable;
-            assert_eq!(notable.len(), expected.len());
+            assert_eq!(notable.len(), top_files);
             for &(ino, disk) in expected.iter().take(top_files) {
                 assert!(notable.iter().any(|f| (f.ino, f.disk) == (ino, disk)));
             }
         }
     }
+}
+
+#[test]
+fn wide_equal_directories_with_slow_consumer() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut expected = Vec::new();
+    for d in (0..6).rev() {
+        let dir = temp.path().join(format!("d{d}"));
+        fs::create_dir(&dir).unwrap();
+        for i in (0..512).rev() {
+            let file = dir.join(format!("f{i}"));
+            fs::write(&file, []).unwrap();
+            let m = fs::metadata(file).unwrap();
+            expected.push((std::cmp::Reverse(m.blocks() * 512), d, m.ino()));
+        }
+    }
+    expected.sort_unstable();
+    for threads in [1, 4] {
+        let mut cfg = config(temp.path());
+        cfg.threads = threads;
+        cfg.top_files = 7;
+        cfg.big_file_threshold = u64::MAX;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let rows = std::thread::scope(|scope| {
+            let producer = scope.spawn(|| walk(&cfg, &NoopGate, &AtomicBool::new(false), tx));
+            let mut rows = Vec::new();
+            for row in rx {
+                if let WalkOutput::Dir(r) = &row {
+                    assert!(r.notable.len() <= cfg.top_files);
+                }
+                rows.push(row);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            producer.join().unwrap().unwrap();
+            rows
+        });
+        let records = paths(rows, &cfg.root);
+        for &(std::cmp::Reverse(disk), d, ino) in expected.iter().take(cfg.top_files) {
+            let path = RawPath::from_path(&temp.path().join(format!("d{d}"))).unwrap();
+            assert!(records[&path]
+                .notable
+                .iter()
+                .any(|f| f.ino == ino && f.disk == disk));
+        }
+    }
+}
+#[test]
+fn threshold_overflow_refuses_without_truncation() {
+    let temp = tempfile::tempdir().unwrap();
+    for i in 0..4097 {
+        fs::write(temp.path().join(i.to_string()), []).unwrap();
+    }
+    let cfg = config(temp.path());
+    let (tx, _rx) = crossbeam_channel::bounded(1);
+    assert!(matches!(
+        walk(&cfg, &NoopGate, &AtomicBool::new(false), tx),
+        Err(WalkError::Limit("4096 threshold candidates per directory"))
+    ));
 }
