@@ -183,7 +183,7 @@ fn worker(s: &Shared<'_>, local: Worker<Task>) -> Counts {
         }
     }
     let mut c = Counts::default();
-    let mut heap = BinaryHeap::<Reverse<(u64, RawName)>>::new();
+    let mut heap = BinaryHeap::<Reverse<u64>>::new();
     let mut buffer = vec![MaybeUninit::uninit(); s.cfg.getdents_buf];
     loop {
         if s.cancel.load(Ordering::Acquire) || s.state.lock().failure.is_some() {
@@ -311,7 +311,7 @@ fn directory(
     t: Task,
     local: &Worker<Task>,
     c: &mut Counts,
-    heap: &mut BinaryHeap<Reverse<(u64, RawName)>>,
+    heap: &mut BinaryHeap<Reverse<u64>>,
     buffer: &mut [MaybeUninit<u8>],
 ) -> Result<WalkOutput, WalkError> {
     let opened = getdents::open(&t.path, s.gate, &mut c.falls);
@@ -561,19 +561,25 @@ fn directory(
                     if r.own.files == 1 || mtime > r.own.newest_mtime {
                         r.own.newest_mtime = mtime;
                     }
+                    // The heap tracks sizes only: discovery IDs and names cannot
+                    // reproduce final directory preorder / inode tie ordering.
+                    // Emit all cutoff ties; each record is bounded by
+                    // MAX_RECORD_ITEMS and completed records use a bounded channel.
                     let admitted = s.cfg.top_files > 0
                         && (heap.len() < s.cfg.top_files
                             || heap
                                 .peek()
-                                .is_some_and(|Reverse((least_disk, least_name))| {
-                                    disk > *least_disk
-                                        || (disk == *least_disk && bytes > least_name.as_bytes())
-                                }));
-                    if admitted {
+                                .is_some_and(|Reverse(least_disk)| disk >= *least_disk));
+                    if admitted
+                        && (heap.len() < s.cfg.top_files
+                            || heap
+                                .peek()
+                                .is_some_and(|Reverse(least_disk)| disk > *least_disk))
+                    {
                         if heap.len() == s.cfg.top_files {
                             heap.pop();
                         }
-                        heap.push(Reverse((disk, make_name()?)));
+                        heap.push(Reverse(disk));
                     }
                     if disk >= s.cfg.big_file_threshold || admitted {
                         r.notable.push(NotableFile {

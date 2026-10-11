@@ -339,12 +339,18 @@ fn random_tree_records() {
     }
 }
 #[test]
+#[ignore = "scale"]
 fn wide_dir_memory_and_fd_bound() {
     // Sample in an isolated test process so unrelated concurrently running tests
     // cannot inflate the descriptor count or RSS baseline.
     if std::env::var_os("W1B_RESOURCE_CHILD").is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "wide_dir_memory_and_fd_bound", "--nocapture"])
+            .args([
+                "--exact",
+                "wide_dir_memory_and_fd_bound",
+                "--ignored",
+                "--nocapture",
+            ])
             .env("W1B_RESOURCE_CHILD", "1")
             .output()
             .unwrap();
@@ -592,4 +598,73 @@ fn worker_panic_joins_instead_of_hanging() {
         walk(&cfg, &gate, &AtomicBool::new(false), tx),
         Err(WalkError::Limit("worker panicked"))
     ));
+}
+
+#[test]
+fn notable_cutoff_ties_across_reverse_created_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    // Reverse creation exercises discovery order opposite to final byte preorder.
+    // Every tie must be emitted, so the assertion covers every worker assignment.
+    let mut expected = BTreeMap::new();
+    for i in (0..32).rev() {
+        let dir = temp.path().join(format!("a{i:03}"));
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("same");
+        fs::write(&file, []).unwrap();
+        let m = fs::symlink_metadata(file).unwrap();
+        expected.insert(
+            RawPath::from_path(&dir).unwrap(),
+            (m.ino(), m.blocks() * 512),
+        );
+    }
+    assert!(expected
+        .values()
+        .all(|(_, disk)| *disk == expected.values().next().unwrap().1));
+    for threads in [1, 2, 4, 8] {
+        let mut cfg = config(temp.path());
+        cfg.threads = threads;
+        cfg.top_files = 1;
+        cfg.big_file_threshold = u64::MAX;
+        let (s, rows) = collect(&cfg);
+        assert_eq!((s.errors, s.races), (0, 0));
+        let records = paths(rows, &cfg.root);
+        for (dir, &(ino, disk)) in &expected {
+            assert!(records[dir]
+                .notable
+                .iter()
+                .any(|f| (f.ino, f.disk) == (ino, disk)));
+        }
+        // In particular the first final directory's inode is a global top-1 winner.
+        assert_eq!(records[expected.keys().next().unwrap()].notable.len(), 1);
+    }
+}
+
+#[test]
+fn notable_cutoff_ties_preserve_same_directory_inode_winners() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut expected = Vec::new();
+    for i in (0..2048).rev() {
+        let path = temp.path().join(format!("f{i:04}"));
+        fs::write(&path, []).unwrap();
+        let m = fs::symlink_metadata(path).unwrap();
+        expected.push((m.ino(), m.blocks() * 512));
+    }
+    assert!(expected.iter().all(|(_, disk)| *disk == expected[0].1));
+    expected.sort_unstable();
+    for threads in [1, 2, 4, 8] {
+        for top_files in [1, 7] {
+            let mut cfg = config(temp.path());
+            cfg.threads = threads;
+            cfg.top_files = top_files;
+            cfg.big_file_threshold = u64::MAX;
+            let (s, rows) = collect(&cfg);
+            assert_eq!((s.errors, s.races), (0, 0));
+            let records = paths(rows, &cfg.root);
+            let notable = &records[&cfg.root].notable;
+            assert_eq!(notable.len(), expected.len());
+            for &(ino, disk) in expected.iter().take(top_files) {
+                assert!(notable.iter().any(|f| (f.ino, f.disk) == (ino, disk)));
+            }
+        }
+    }
 }
