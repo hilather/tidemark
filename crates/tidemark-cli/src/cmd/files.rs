@@ -44,5 +44,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         },
         limit,
     )?;
-    crate::render::tree::files(&rows, context.json, &mut std::io::stdout().lock())
+    let mut out = std::io::stdout().lock();
+    if !context.json {
+        crate::render::tree::snapshot_header(
+            snapshot.meta(),
+            tidemark_core::time::unix_now(),
+            &mut out,
+        )?;
+    }
+    crate::render::tree::files(&rows, context.json, &mut out)
 }

@@ -3,7 +3,11 @@
 
 use crate::agg::{AggError, Aggregator, Prepared};
 use rayon::prelude::*;
-use std::{io, sync::atomic::Ordering, time::Instant};
+use std::{
+    io,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 use std::{os::fd::BorrowedFd, sync::atomic::AtomicBool};
 use tidemark_core::scan::Gate;
 use tidemark_core::scan::WalkOutput;
@@ -19,11 +23,29 @@ pub struct BulkParams {
     /// AG workers and sorting threads, 1..=64; AG workers are capped at agcount.
     pub threads: usize,
 }
+/// Bounded-cadence observation of the current bulk phase.
+#[derive(Default)]
+pub struct BulkProgress {
+    /// Current phase.
+    pub phase: &'static str,
+    /// Directories visited.
+    pub dirs: u64,
+    /// Namespace entries visited.
+    pub entries: u64,
+    /// Inodes streamed.
+    pub inodes: u64,
+    /// Direct errors, including omitted details.
+    pub errors: u64,
+    /// Observed races.
+    pub races: u64,
+}
 /// Counters for the three bulk phases.
 #[derive(Default)]
 pub struct BulkStats {
     /// Elapsed monotonic milliseconds for namespace, join/prepare, and names.
     pub phase_ms: [u64; 3],
+    /// Directory opens that fell back without O_NOATIME.
+    pub noatime_fallbacks: u64,
     /// Namespace child references plus one self-reference per directory.
     pub dents: u64,
     /// All v5 inodes streamed, including those outside the root.
@@ -58,6 +80,7 @@ pub fn run_bulk(
     geo: &XfsGeometry,
     gate: &dyn Gate,
     cancel: &AtomicBool,
+    progress: &(dyn Fn(&BulkProgress) + Sync),
     mut agg: Aggregator,
 ) -> Result<(Prepared, BulkStats), BulkError> {
     if cancel.load(Ordering::Relaxed) {
@@ -67,7 +90,9 @@ pub fn run_bulk(
         return Err(BulkError::Unsupported("XFS ftype=1 required"));
     }
     if p.batch == 0 || p.batch > 65_536 || p.threads == 0 || p.threads > 64 || geo.agcount == 0 {
-        return Err(BulkError::Limit("invalid batch, thread count or geometry"));
+        return Err(BulkError::BeforePhase2(
+            "invalid batch, thread count or geometry".into(),
+        ));
     }
     // A local configuration forces namespace mode without altering caller settings.
     let cfg = WalkConfig {
@@ -83,6 +108,12 @@ pub fn run_bulk(
         io_idle: p.walk.io_idle,
     };
     let mut stats = BulkStats::default();
+    let mut namespace_errors = 0;
+    let mut observation = BulkProgress {
+        phase: "namespace",
+        ..BulkProgress::default()
+    };
+    let mut last_progress = Instant::now();
     let mut dents = Vec::new();
     let start = Instant::now();
     std::thread::scope(|scope| -> Result<(), BulkError> {
@@ -90,13 +121,24 @@ pub fn run_bulk(
         let worker = scope.spawn(|| walk(&cfg, gate, cancel, tx));
         let mut failure = None;
         // Keep draining even after a collector error so the producer cannot deadlock.
-        for output in rx {
+        loop {
+            let output = match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(output) => output,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    report_due(&observation, progress, &mut last_progress);
+                    continue;
+                }
+            };
             if failure.is_some() {
                 continue;
             }
             match output {
                 WalkOutput::Ns(ns) => match join::append_namespace(&mut dents, &ns) {
                     Ok(()) => {
+                        observation.dirs += 1;
+                        observation.entries += u64::from(ns.entries);
+                        observation.errors += u64::from(ns.errors_total);
                         stats.races += u64::from(ns.races);
                         agg.add_skeleton(&ns);
                     }
@@ -108,27 +150,45 @@ pub fn run_bulk(
                 }
                 WalkOutput::Dir(_) => failure = Some(BulkError::Limit("unexpected stat record")),
             }
+            observation.races = stats.races;
+            report_due(&observation, progress, &mut last_progress);
         }
         let result = worker.join().map_err(|_| BulkError::Worker)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(BulkError::Cancelled);
+        }
         if let Some(e) = failure {
             return Err(e);
         }
-        result?;
+        let summary = result?;
+        stats.noatime_fallbacks = summary.noatime_fallbacks;
+        namespace_errors = summary.errors;
         Ok(())
-    })?;
+    })
+    .map_err(before_phase2)?;
     stats.dents = dents.len() as u64;
     stats.phase_ms[0] = millis(start);
     let start = Instant::now();
     let sort_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(p.threads)
         .build()
-        .map_err(|_| BulkError::Worker)?;
-    sort_pool.install(|| dents.par_sort_unstable_by_key(|d| d.ino()));
+        .map_err(|_| BulkError::BeforePhase2("sort worker creation failed".into()))?;
+    observe_operation(
+        || {
+            sort_pool.install(|| dents.par_sort_unstable_by_key(|d| d.ino()));
+            Ok(())
+        },
+        &observation,
+        progress,
+        &mut last_progress,
+    )
+    .map_err(before_phase2)?;
     drop(sort_pool);
     let (last_start, last_end) = tidemark_sys::xfs::ag_ino_range(geo, geo.agcount - 1);
     if last_start >= last_end || dents.last().is_some_and(|d| d.ino() >= last_end) {
-        return Err(BulkError::Limit("inode outside geometry"));
+        return Err(BulkError::BeforePhase2("inode outside geometry".into()));
     }
+    observation.phase = "bulkstat";
     let next_ag = std::sync::atomic::AtomicU32::new(0);
     std::thread::scope(|scope| -> Result<(), BulkError> {
         let (tx, rx) = crossbeam_channel::bounded(2);
@@ -165,13 +225,24 @@ pub fn run_bulk(
             }));
         }
         drop(tx);
-        for batch in rx {
+        loop {
+            let batch = match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(batch) => batch,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    report_due(&observation, progress, &mut last_progress);
+                    continue;
+                }
+            };
             stats.inodes_streamed += batch.streamed;
+            observation.inodes = stats.inodes_streamed;
             for joined in batch.items {
                 stats.joined += u64::from(joined.attrs.is_some());
                 stats.races += joined.races.len() as u64;
                 joined.dispatch(&mut agg);
             }
+            observation.races = stats.races;
+            report_due(&observation, progress, &mut last_progress);
         }
         let mut failure = None;
         for handle in handles {
@@ -185,6 +256,9 @@ pub fn run_bulk(
                 Err(_) => failure = Some(BulkError::Worker),
             }
         }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(BulkError::Cancelled);
+        }
         if let Some(e) = failure {
             return Err(e);
         }
@@ -196,14 +270,63 @@ pub fn run_bulk(
     stats.ags = geo.agcount;
     drop(dents);
     let mut prepared = agg.prepare()?;
+    prepared.namespace_errors = Some(namespace_errors);
     stats.phase_ms[1] = millis(start);
     let start = Instant::now();
-    let (resolved, missing) = names::resolve(prepared.needs_names(), gate, cancel)?;
+    observation.phase = "names";
+    report_due(&observation, progress, &mut last_progress);
+    let needed = prepared.needs_names();
+    let (resolved, missing) = observe_operation(
+        || names::resolve(needed, gate, cancel),
+        &observation,
+        progress,
+        &mut last_progress,
+    )?;
     stats.names_resolved = resolved.len() as u64;
     stats.names_missing = missing;
     prepared.set_names(resolved);
     stats.phase_ms[2] = millis(start);
     Ok((prepared, stats))
+}
+
+fn report_due(
+    observation: &BulkProgress,
+    progress: &(dyn Fn(&BulkProgress) + Sync),
+    last: &mut Instant,
+) {
+    if last.elapsed() >= Duration::from_secs(2) {
+        progress(observation);
+        *last = Instant::now();
+    }
+}
+
+// Sort and name resolution do not stream counter updates. Keep observing their phase
+// from the owner thread while a bounded, joined worker completes the operation.
+fn observe_operation<T: Send>(
+    operation: impl FnOnce() -> Result<T, BulkError> + Send,
+    observation: &BulkProgress,
+    progress: &(dyn Fn(&BulkProgress) + Sync),
+    last: &mut Instant,
+) -> Result<T, BulkError> {
+    std::thread::scope(|scope| {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let worker = scope.spawn(move || {
+            let _ = tx.send(operation());
+        });
+        let result = loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(result) => break result,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    break Err(BulkError::Worker)
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    report_due(observation, progress, last)
+                }
+            }
+        };
+        worker.join().map_err(|_| BulkError::Worker)?;
+        result
+    })
 }
 
 fn millis(start: Instant) -> u64 {
@@ -216,9 +339,9 @@ mod names;
 /// Fatal bulk failures; per-entry races remain in the aggregator.
 #[derive(Debug, thiserror::Error)]
 pub enum BulkError {
-    /// Compatibility variant retained for downstream callers; never returned here.
-    #[error("NotYetImplemented")]
-    NotYetImplemented,
+    /// Failure before any phase-two bulkstat call, safe to redo in walk mode.
+    #[error("before bulk phase 2: {0}")]
+    BeforePhase2(String),
     /// Scan was cancelled.
     #[error("Cancelled")]
     Cancelled,
@@ -240,4 +363,12 @@ pub enum BulkError {
     /// A worker panicked or its consumer disconnected.
     #[error("bulk worker failed")]
     Worker,
+}
+
+fn before_phase2(error: BulkError) -> BulkError {
+    match error {
+        BulkError::Cancelled | BulkError::Walk(WalkError::Cancelled) => BulkError::Cancelled,
+        BulkError::Unsupported(_) => error,
+        _ => BulkError::BeforePhase2(error.to_string()),
+    }
 }

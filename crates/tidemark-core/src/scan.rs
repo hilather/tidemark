@@ -176,6 +176,9 @@ pub struct DirRecord {
     pub skipped: Vec<Skip>,
     #[doc = "errors field; see the normative plan for units."]
     pub errors: Vec<ScanErrorRec>,
+    /// All errors attributed directly to this directory, whether or not a detail row was kept in
+    /// `errors` (which is a bounded sample).
+    pub errors_total: u32,
     #[doc = "races field; see the normative plan for units."]
     pub races: u32, // entries that vanished or changed type mid-scan
 }
@@ -202,6 +205,9 @@ pub struct NsRecord {
     pub skipped: Vec<Skip>,
     #[doc = "errors field; see the normative plan for units."]
     pub errors: Vec<ScanErrorRec>,
+    /// All errors attributed directly to this directory, whether or not a detail row was kept in
+    /// `errors` (which is a bounded sample).
+    pub errors_total: u32,
     #[doc = "races field; see the normative plan for units."]
     pub races: u32,
 }

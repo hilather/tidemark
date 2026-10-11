@@ -161,6 +161,7 @@ pub(super) fn prepare(mut agg: Aggregator) -> Result<Prepared, AggError> {
         errors: agg.errors,
         annotations: Vec::new(),
         summary,
+        namespace_errors: None,
         ignored_annotations: 0,
         invalid_annotations: false,
     })

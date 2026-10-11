@@ -81,6 +81,52 @@ pub fn du_disk(path: impl AsRef<Path>) -> u64 {
 pub fn du_apparent(path: impl AsRef<Path>) -> u64 {
     du(path.as_ref(), true).unwrap_or_else(|e| panic!("du apparent oracle: {e}"))
 }
+/// GNU apparent-size output normalized to directory-inclusive link semantics (03 §3).
+/// Only metadata is inspected; symlinks and other filesystems are never traversed.
+/// At most one million visited inode identities and pending paths are retained.
+pub fn du_apparent_normalized(path: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut total = du(path, true)?;
+    if du_apparent_counts_directories()? {
+        return Ok(total);
+    }
+    let device = std::fs::symlink_metadata(path)?.dev();
+    let mut stack = vec![path.to_owned()];
+    let mut seen = BTreeSet::new();
+    while let Some(path) = stack.pop() {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.dev() != device || !seen.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
+        if seen.len() > 1_000_000 {
+            return Err(io::Error::other(
+                "apparent oracle exceeds one million inodes",
+            ));
+        }
+        if metadata.is_dir() {
+            total = total
+                .checked_add(metadata.len())
+                .ok_or_else(|| parse_error("apparent oracle overflow"))?;
+            for entry in std::fs::read_dir(&path)? {
+                if stack.len() >= 1_000_000 {
+                    return Err(io::Error::other(
+                        "apparent oracle exceeds one million pending paths",
+                    ));
+                }
+                stack.push(entry?.path());
+            }
+        } else if metadata.file_type().is_fifo()
+            || metadata.file_type().is_socket()
+            || metadata.file_type().is_char_device()
+            || metadata.file_type().is_block_device()
+        {
+            total = total
+                .checked_add(metadata.len())
+                .ok_or_else(|| parse_error("apparent oracle overflow"))?;
+        }
+    }
+    Ok(total)
+}
 /// Entry and inode counts; symlinks are not followed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindCounts {

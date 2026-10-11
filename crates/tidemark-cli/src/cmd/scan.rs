@@ -19,7 +19,7 @@ pub struct Args {
     /// Full-path globs to exclude from the scan.
     #[arg(long, value_name = "GLOB", num_args = 1.., action = clap::ArgAction::Append)]
     pub exclude: Vec<String>,
-    /// Keep the partial snapshot if the scan is interrupted.
+    /// Keep the partial snapshot if a walk-mode scan is interrupted (walk mode only).
     #[arg(long)]
     pub keep_partial: bool,
     /// Ask the daemon to cancel the running scan of ROOT.
@@ -168,9 +168,6 @@ impl tidemark_scan::orchestrator::ScanRecorder for DirectRecorder {
         ts: i64,
         rows: &[tidemark_core::snapshot::DirRow],
     ) -> Result<(), tidemark_scan::orchestrator::ScanError> {
-        Ok(
-            tidemark_store::timeseries::TimeSeries::open(&self.state.join("timeseries.db"), true)?
-                .insert_dir_series(root, id, ts, rows)?,
-        )
+        tidemark_scan::orchestrator::record_dir_series(&self.state, root, id, ts, rows)
     }
 }

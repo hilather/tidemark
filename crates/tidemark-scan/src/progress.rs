@@ -2,7 +2,7 @@
 //! Progress counters and deterministic reporting cadence.
 
 use std::time::Duration;
-/// Reserved for W2-C.
+/// Live scan counters and timing.
 pub struct Progress {
     /// Contract field.
     pub phase: &'static str,
