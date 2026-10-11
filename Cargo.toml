@@ -22,7 +22,14 @@ rust-version = "1.98.0"
 
 [workspace.dependencies]
 tidemark-core = { path = "crates/tidemark-core" }
-rustix = { version = "1", features = ["fs", "process"] }
+tidemark-sys = { path = "crates/tidemark-sys" }
+tidemark-fs = { path = "crates/tidemark-fs" }
+tidemark-store = { path = "crates/tidemark-store" }
+tidemark-scan = { path = "crates/tidemark-scan" }
+tidemark-live = { path = "crates/tidemark-live" }
+tidemark-pg = { path = "crates/tidemark-pg" }
+test-support = { path = "crates/test-support" }
+rustix = { version = "1", features = ["fs", "process", "system"] }
 libc = "0.2"
 rusqlite = { version = "0.38", features = ["bundled"] }
 crossbeam-deque = "0.8"
@@ -48,7 +55,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rustc-hash = "2"
 tempfile = "3"
 assert_cmd = "2"
-insta = "1"
+insta = { version = "1", features = ["json"] }
 proptest = "1"
 cargo-fuzz = "0.13"
 cargo-generate-rpm = "0.20"

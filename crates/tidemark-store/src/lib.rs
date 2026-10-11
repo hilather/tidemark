@@ -23,13 +23,9 @@ pub mod timeseries;
 /// writer module skeleton.
 pub mod writer;
 
-/// Stub error reserved for the owning task.
-#[derive(Debug, thiserror::Error)]
-pub enum StoreError {
-    /// Cross-task implementation is not available yet.
-    #[error("NotYetImplemented")]
-    NotYetImplemented,
-}
+mod error;
+
+pub use error::StoreError;
 
 #[cfg(test)]
 fn test_meta() -> tidemark_core::snapshot::SnapshotMeta {

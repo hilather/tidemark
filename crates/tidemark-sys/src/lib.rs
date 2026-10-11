@@ -3,6 +3,8 @@
 
 #![warn(missing_docs)]
 
+mod gen;
+
 /// fanotify module skeleton.
 pub mod fanotify;
 /// ioprio module skeleton.
