@@ -1,5 +1,6 @@
 //! Owned by: W0-C
 //! VM-only loop PV/VG/LV fixtures restricted to uniquely owned tmtest_ names.
+use crate::fixture::OwnedStorage;
 use crate::xfs::{require_root, run, words};
 use std::{ffi::OsString, fs::File, io, path::PathBuf};
 use tempfile::TempDir;
@@ -28,6 +29,7 @@ pub struct LoopVg {
     pub mounts: Vec<TestLv>,
     name: String,
     dir: Option<TempDir>,
+    storage: Option<OwnedStorage>,
     loopdev: Option<OsString>,
     pv_created: bool,
     vg_created: bool,
@@ -57,7 +59,8 @@ impl LoopVg {
                 "VG suffix must contain only letters, digits or underscores",
             ));
         }
-        let dir = tempfile::tempdir()?;
+        let mut dir = tempfile::tempdir()?;
+        let storage = OwnedStorage::new(&mut dir)?;
         let unique = dir
             .path()
             .file_name()
@@ -72,6 +75,7 @@ impl LoopVg {
             mounts: vec![],
             name,
             dir: Some(dir),
+            storage: Some(storage),
             loopdev: None,
             pv_created: false,
             vg_created: false,
@@ -173,6 +177,12 @@ impl LoopVg {
     }
     /// Remove owned resources in dependency order. Stops on cleanup failure.
     pub fn cleanup(&mut self) -> io::Result<()> {
+        if let Some(storage) = &self.storage {
+            storage.verify_owner()?;
+            if let Some(dir) = &self.dir {
+                storage.verify_path(dir.path())?;
+            }
+        }
         self.guard()?;
         while let Some(lv) = self.mounts.last() {
             let owner = self
@@ -207,9 +217,11 @@ impl LoopVg {
             run("losetup", &["--detach".into(), dev.clone()])?;
             self.loopdev = None;
         }
-        if let Some(dir) = self.dir.take() {
-            dir.close()?;
+        if let Some(storage) = &self.storage {
+            storage.cleanup(&[])?;
         }
+        self.storage = None;
+        self.dir = None;
         Ok(())
     }
 }
@@ -233,6 +245,7 @@ mod tests {
             mounts: vec![],
             name: "production".into(),
             dir: None,
+            storage: None,
             loopdev: None,
             pv_created: false,
             vg_created: false,

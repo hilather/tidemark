@@ -1,5 +1,6 @@
 //! Owned by: W0-C
 //! VM-only loop XFS lifecycle with rollback and conservative cleanup.
+use crate::fixture::OwnedStorage;
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
@@ -40,6 +41,7 @@ pub struct LoopXfs {
     /// XFS mount path, inside the owned temporary directory.
     pub mountpoint: PathBuf,
     dir: Option<TempDir>,
+    storage: Option<OwnedStorage>,
     loopdev: Option<OsString>,
     mounted: bool,
 }
@@ -53,7 +55,8 @@ impl LoopXfs {
     /// Fallible constructor; partially constructed resources are rolled back.
     pub fn try_new(size: u64, mkfs_opts: &[&str], mount_opts: &str) -> io::Result<Self> {
         require_root();
-        let dir = tempfile::tempdir()?;
+        let mut dir = tempfile::tempdir()?;
+        let storage = OwnedStorage::new(&mut dir)?;
         let image = dir.path().join("xfs.img");
         let mountpoint = dir.path().join("mount");
         File::create(&image)?.set_len(size)?;
@@ -62,6 +65,7 @@ impl LoopXfs {
             image,
             mountpoint,
             dir: Some(dir),
+            storage: Some(storage),
             loopdev: None,
             mounted: false,
         };
@@ -91,6 +95,12 @@ impl LoopXfs {
     }
     /// Explicit cleanup, allowing a test to assert successful resource removal.
     pub fn cleanup(&mut self) -> io::Result<()> {
+        if let Some(storage) = &self.storage {
+            storage.verify_owner()?;
+            if let Some(dir) = &self.dir {
+                storage.verify_path(dir.path())?;
+            }
+        }
         if self.mounted {
             let expected = self.dir.as_ref().map(|d| d.path().join("mount"));
             if expected.as_ref() != Some(&self.mountpoint) {
@@ -106,9 +116,11 @@ impl LoopXfs {
             run("losetup", &[OsStr::new("--detach").into(), device.clone()])?;
             self.loopdev = None;
         }
-        if let Some(dir) = self.dir.take() {
-            dir.close()?;
+        if let Some(storage) = &self.storage {
+            storage.cleanup(&[])?;
         }
+        self.storage = None;
+        self.dir = None;
         Ok(())
     }
 }

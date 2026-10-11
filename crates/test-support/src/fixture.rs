@@ -11,7 +11,7 @@ use std::{
         fs::{MetadataExt, PermissionsExt},
         net::UnixListener,
     },
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 use tempfile::TempDir;
 use tidemark_core::units::ByteSize;
@@ -26,42 +26,224 @@ pub struct Fixture {
     pub root: PathBuf,
     /// Entries deliberately outside the scan root.
     pub outside: PathBuf,
-    owner: File,
-    modes: Vec<(PathBuf, File)>,
+    storage: OwnedStorage,
+    modes: Vec<File>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // Paths are relative to the retained owner handle, never the mutable
-        // public root/outside paths. Parents are restored before descendants.
-        for (path, saved) in &self.modes {
-            let verified = (|| -> io::Result<File> {
-                let mut current = self.owner.try_clone()?;
-                for component in path.components() {
-                    let Component::Normal(name) = component else {
-                        return Err(invalid("non-relative cleanup path"));
-                    };
-                    current = File::from(rustix::fs::openat(
-                        &current,
-                        name,
-                        rustix::fs::OFlags::PATH
-                            | rustix::fs::OFlags::DIRECTORY
-                            | rustix::fs::OFlags::NOFOLLOW
-                            | rustix::fs::OFlags::CLOEXEC,
-                        rustix::fs::Mode::empty(),
-                    )?);
+        if let Err(error) = self.storage.cleanup(&self.modes) {
+            eprintln!("fixture cleanup preserved storage: {error}");
+        }
+    }
+}
+
+// A bounded, fd-relative cleanup shared with the privileged storage helpers.
+// TempDir remains available for its public path API, but its destructor is disabled.
+#[derive(Debug)]
+pub(crate) struct OwnedStorage {
+    parent: File,
+    owner: File,
+    name: OsString,
+}
+
+fn open_directory(parent: &File, name: &std::ffi::OsStr, path_only: bool) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    let access = if path_only {
+        OFlags::PATH
+    } else {
+        OFlags::RDONLY
+    };
+    let flags = access | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match rustix::fs::openat(parent, name, flags | OFlags::NOATIME, Mode::empty()) {
+        Ok(fd) => Ok(File::from(fd)),
+        Err(rustix::io::Errno::PERM) => Ok(File::from(rustix::fs::openat(
+            parent,
+            name,
+            flags,
+            Mode::empty(),
+        )?)),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn identity(file: &File) -> io::Result<(u64, u64)> {
+    let meta = file.metadata()?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+fn verify(parent: &File, name: &std::ffi::OsStr, file: &File) -> io::Result<()> {
+    let found = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+    if (found.st_dev, found.st_ino) != identity(file)? {
+        return Err(io::Error::other(
+            "directory identity changed; refusing cleanup",
+        ));
+    }
+    Ok(())
+}
+
+fn mount_id(file: &File) -> io::Result<u64> {
+    use rustix::fs::{statx, AtFlags, StatxFlags};
+    match statx(
+        file,
+        "",
+        AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::MNT_ID,
+    ) {
+        Ok(stat) if stat.stx_mask & StatxFlags::MNT_ID.bits() != 0 => return Ok(stat.stx_mnt_id),
+        Ok(_) | Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL) => {}
+        Err(error) => return Err(error.into()),
+    }
+    proc_mount_id(file)
+}
+
+fn proc_mount_id(file: &File) -> io::Result<u64> {
+    use std::{io::Read, os::fd::AsRawFd};
+    // Rocky 8's older kernels expose mount IDs through proc fd metadata even
+    // when statx lacks STATX_MNT_ID. Read only bounded kernel metadata, never
+    // fixture file contents. If proc is unavailable, preserve the fixture.
+    let info = File::from(rustix::fs::open(
+        format!("/proc/self/fdinfo/{}", file.as_raw_fd()),
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?);
+    let mut text = String::new();
+    info.take(4096).read_to_string(&mut text)?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
+        .ok_or_else(|| io::Error::other("mount identity unavailable; preserving fixture"))
+}
+
+impl OwnedStorage {
+    pub(crate) fn new(dir: &mut TempDir) -> io::Result<Self> {
+        // Disable path-based rollback even if acquiring the anchor fails.
+        dir.disable_cleanup(true);
+        let parent_path = dir
+            .path()
+            .parent()
+            .ok_or_else(|| invalid("missing fixture parent"))?;
+        let parent = File::open(parent_path)?;
+        let name = dir
+            .path()
+            .file_name()
+            .ok_or_else(|| invalid("missing fixture name"))?
+            .to_owned();
+        let owner = open_directory(&parent, &name, false)?;
+        verify(&parent, &name, &owner)?;
+        Ok(Self {
+            parent,
+            owner,
+            name,
+        })
+    }
+
+    pub(crate) fn verify_owner(&self) -> io::Result<()> {
+        verify(&self.parent, &self.name, &self.owner)
+    }
+
+    #[cfg(feature = "privileged")]
+    pub(crate) fn verify_path(&self, path: &Path) -> io::Result<()> {
+        let mut current = File::open("/")?;
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir => {}
+                std::path::Component::Normal(name) => {
+                    current = open_directory(&current, name, true)?
                 }
-                Ok(current)
-            })();
-            if let Ok(current) = verified {
-                if let (Ok(found), Ok(original)) = (current.metadata(), saved.metadata()) {
-                    if (found.dev(), found.ino()) == (original.dev(), original.ino()) {
-                        // The original writable handle also works for mode-000
-                        // directories; O_PATH traversal handles cannot be chmod-ed.
-                        let _ = saved.set_permissions(Permissions::from_mode(0o700));
-                    }
-                }
+                _ => return Err(invalid("non-absolute privileged fixture path")),
             }
         }
+        if identity(&current)? != identity(&self.owner)? {
+            return Err(io::Error::other("privileged fixture pathname changed"));
+        }
+        self.verify_owner()
+    }
+
+    pub(crate) fn cleanup(&self, modes: &[File]) -> io::Result<()> {
+        struct Frame {
+            name: OsString,
+            file: File,
+            entries: rustix::fs::Dir,
+        }
+        // Both traversal work and retained descriptors have explicit limits.
+        const MAX_DEPTH: usize = 1024;
+        const MAX_VISITS: usize = MAX_FIXTURE_ENTRIES * 4;
+        let mut tracked = std::collections::BTreeMap::new();
+        for file in modes {
+            tracked.insert(identity(file)?, file);
+        }
+        self.verify_owner()?;
+        let file = self.owner.try_clone()?;
+        let entries = rustix::fs::Dir::read_from(&file)?;
+        let mut stack = vec![Frame {
+            name: self.name.clone(),
+            file,
+            entries,
+        }];
+        let device = identity(&self.owner)?.0;
+        let mount = mount_id(&self.owner)?;
+        let mut visits = 0;
+        while !stack.is_empty() {
+            // Revalidate the entire ancestry before each mutation: a retained
+            // child handle alone would also reach a directory moved outside.
+            self.verify_owner()?;
+            for i in 1..stack.len() {
+                verify(&stack[i - 1].file, &stack[i].name, &stack[i].file)?;
+            }
+            let i = stack.len() - 1;
+            let entry = stack[i].entries.next().transpose()?;
+            let Some(entry) = entry else {
+                let parent = if i == 0 {
+                    &self.parent
+                } else {
+                    &stack[i - 1].file
+                };
+                verify(parent, &stack[i].name, &stack[i].file)?;
+                rustix::fs::unlinkat(parent, &stack[i].name, rustix::fs::AtFlags::REMOVEDIR)?;
+                stack.pop();
+                continue;
+            };
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            visits += 1;
+            if visits > MAX_VISITS {
+                return Err(io::Error::other("fixture cleanup visit limit"));
+            }
+            let name = OsString::from_vec(bytes.to_vec());
+            let stat =
+                rustix::fs::statat(&stack[i].file, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory
+            {
+                if stack.len() >= MAX_DEPTH || stat.st_dev != device {
+                    return Err(io::Error::other("fixture cleanup depth/device limit"));
+                }
+                let probe = open_directory(&stack[i].file, &name, true)?;
+                verify(&stack[i].file, &name, &probe)?;
+                if identity(&probe)? != (stat.st_dev, stat.st_ino) {
+                    return Err(io::Error::other("directory changed during cleanup"));
+                }
+                if mount_id(&probe)? != mount {
+                    return Err(io::Error::other("refusing fixture mount point"));
+                }
+                if let Some(saved) = tracked.get(&identity(&probe)?) {
+                    saved.set_permissions(Permissions::from_mode(0o700))?;
+                }
+                let file = open_directory(&stack[i].file, &name, false)?;
+                if identity(&file)? != identity(&probe)? {
+                    return Err(io::Error::other("directory changed before descent"));
+                }
+                let entries = rustix::fs::Dir::read_from(&file)?;
+                stack.push(Frame {
+                    name,
+                    file,
+                    entries,
+                });
+            } else {
+                rustix::fs::unlinkat(&stack[i].file, &name, rustix::fs::AtFlags::empty())?;
+            }
+        }
+        Ok(())
     }
 }
 #[derive(Deserialize)]
@@ -187,21 +369,14 @@ pub fn try_materialize(spec: &str) -> io::Result<Fixture> {
     if spec.entry.len() + spec.outside.len() > MAX_FIXTURE_ENTRIES {
         return Err(invalid("fixture entry cap exceeded"));
     }
-    let dir = tempfile::tempdir()?;
+    let mut dir = tempfile::tempdir()?;
+    let storage = OwnedStorage::new(&mut dir)?;
     let root = dir.path().join("r");
     let outside = dir.path().join("outside");
     fs::create_dir(&root)?;
     fs::create_dir(&outside)?;
-    let owner = File::from(rustix::fs::open(
-        dir.path(),
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )?);
     let mut fixture = Fixture {
-        owner,
+        storage,
         dir,
         root,
         outside,
@@ -354,7 +529,7 @@ pub fn try_materialize(spec: &str) -> io::Result<Fixture> {
         }
         pending = next;
     }
-    // Apply directory modes last so descendants can be populated. Save paths for cleanup.
+    // Apply directory modes last so descendants can be populated. Retain handles for identity-based cleanup.
     let mut modes: Vec<_> = entries
         .iter()
         .filter(|(e, _)| e.kind == "dir" && e.mode.is_some())
@@ -362,14 +537,7 @@ pub fn try_materialize(spec: &str) -> io::Result<Fixture> {
     modes.sort_by_key(|(_, p)| p.components().count());
     fixture.modes = modes
         .iter()
-        .map(|(_, p)| {
-            Ok((
-                p.strip_prefix(fixture.dir.path())
-                    .map_err(|e| invalid(e.to_string()))?
-                    .to_path_buf(),
-                File::open(p)?,
-            ))
-        })
+        .map(|(_, p)| File::open(p))
         .collect::<io::Result<_>>()?;
     for (e, path) in modes.into_iter().rev() {
         fs::set_permissions(path, Permissions::from_mode(e.mode.unwrap_or(0o755)))?;
@@ -420,6 +588,91 @@ mod tests {
         assert_eq!(fs::metadata(victim.path()).unwrap().mode() & 0o7777, 0o500);
         assert_eq!(fs::metadata(&victim_child).unwrap().mode() & 0o7777, 0o500);
         assert!(!owner_path.exists());
+    }
+
+    #[test]
+    fn proc_mount_identity_matches_statx() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::open(dir.path()).unwrap();
+        assert_eq!(proc_mount_id(&file).unwrap(), mount_id(&file).unwrap());
+    }
+
+    #[test]
+    fn cleanup_preserves_replaced_owner() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let mut dir = tempfile::tempdir_in(sandbox.path()).unwrap();
+        let storage = OwnedStorage::new(&mut dir).unwrap();
+        fs::rename(dir.path(), sandbox.path().join("moved")).unwrap();
+        fs::create_dir(dir.path()).unwrap();
+        fs::write(dir.path().join("sentinel"), b"safe").unwrap();
+        assert!(storage.cleanup(&[]).is_err());
+        assert_eq!(fs::read(dir.path().join("sentinel")).unwrap(), b"safe");
+        assert!(sandbox.path().join("moved").exists());
+    }
+
+    #[test]
+    fn cleanup_survives_parent_symlink_substitution() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let parent = sandbox.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        // Construct under a private parent without changing process-wide TMPDIR.
+        let mut dir = tempfile::tempdir_in(&parent).unwrap();
+        let storage = OwnedStorage::new(&mut dir).unwrap();
+        let root = dir.path().join("r");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let name = dir.path().file_name().unwrap().to_owned();
+        let fixture = Fixture {
+            dir,
+            root,
+            outside,
+            storage,
+            modes: vec![],
+        };
+        let moved = sandbox.path().join("moved");
+        fs::rename(&parent, &moved).unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        let target = victim.path().join(&name);
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("sentinel"), b"safe").unwrap();
+        std::os::unix::fs::symlink(victim.path(), &parent).unwrap();
+        drop(fixture);
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"safe");
+        assert!(!moved.join(name).exists());
+    }
+
+    #[test]
+    fn cleanup_finds_internal_renames_by_identity() {
+        let fixture = materialize("[[entry]]\npath = 'parent'\nkind = 'dir'\nmode = 0\n[[entry]]\npath = 'parent/child'\nkind = 'dir'\nmode = 0\n");
+        let owner = fixture.dir.path().to_owned();
+        // Linux requires write access on the directory while updating its parent.
+        fixture.modes[0]
+            .set_permissions(Permissions::from_mode(0o700))
+            .unwrap();
+        fs::rename(fixture.root.join("parent"), fixture.outside.join("renamed")).unwrap();
+        fixture.modes[0]
+            .set_permissions(Permissions::from_mode(0o0))
+            .unwrap();
+        drop(fixture);
+        assert!(!owner.exists());
+    }
+
+    #[test]
+    fn cleanup_does_not_restore_directory_moved_outside() {
+        let fixture = materialize("[[entry]]\npath = 'tracked'\nkind = 'dir'\nmode = 0\n");
+        let victim = tempfile::tempdir().unwrap();
+        let destination = victim.path().join("moved");
+        fixture.modes[0]
+            .set_permissions(Permissions::from_mode(0o700))
+            .unwrap();
+        fs::rename(fixture.root.join("tracked"), &destination).unwrap();
+        fixture.modes[0]
+            .set_permissions(Permissions::from_mode(0o0))
+            .unwrap();
+        drop(fixture);
+        assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o7777, 0);
+        fs::set_permissions(destination, Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
