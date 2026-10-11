@@ -143,6 +143,46 @@ Mandatory privileged tests:
 | `deploy_stage_preflight_blocks` | A bad config, missing mount or full state filesystem makes `deploy stage` exit non-zero with **no** changes (service not enabled, config untouched) |
 | `deploy_unstage` | `deploy unstage` stops and disables the service and keeps the state dir; `--purge-state` removes it |
 
+### VM runner parameters and disposable md fixture (G6)
+
+Repeatable `--env NAME=VALUE` accepts only names matching `TIDEMARK_[A-Z0-9_]+`; reject other names before making any connection. Transport the pairs through SSH and sudo next to PATH: `sudo env "PATH=$PATH" NAME=VALUE ... cargo test ...`. Quote values so spaces and shell metacharacters cannot escape the command. `--nocapture` appends `--nocapture` to the test binary arguments after `--`, exposing passing-test diagnostics. Unit-test accepted/rejected names, a value containing a space, quote and semicolon, and argument positions.
+
+`xtask/README.md` must document these commands, run **inside a disposable VM only**, never on a development host. Install `mdadm` as a VM prerequisite. Choose an unused md device (example `/dev/md127`), and retain the returned loop paths for cleanup:
+
+```sh
+fixture_dir=$(mktemp -d /var/tmp/tidemark-md.XXXXXX)
+truncate -s 1G "$fixture_dir/member0" "$fixture_dir/member1"
+member0=$(sudo losetup --find --show "$fixture_dir/member0")
+member1=$(sudo losetup --find --show "$fixture_dir/member1")
+sudo mdadm --create /dev/md127 --metadata=1.2 --level=raid1 --raid-devices=2 "$member0" "$member1"
+sudo mdadm --detail /dev/md127
+```
+
+Invoke the suite from the checkout using the VM’s SSH alias:
+
+```sh
+cargo xtask vm-test --host rocky88 --suite cargo --env TIDEMARK_W1A_MD_DEVICE=/dev/md127 --nocapture
+cargo xtask vm-test --host rocky810 --suite cargo --env TIDEMARK_W1A_MD_DEVICE=/dev/md127 --nocapture
+```
+
+Provision the fixture separately in each VM. After testing, in that VM only, stop the array and remove only these created resources:
+
+```sh
+sudo mdadm --stop /dev/md127
+sudo mdadm --zero-superblock "$member0" "$member1"
+sudo losetup --detach "$member0" "$member1"
+rm -f "$fixture_dir/member0" "$fixture_dir/member1"
+rmdir "$fixture_dir"
+```
+
+Record these Wave 1 findings on both VMs in `docs/handoff/W1-gate.md`; preserve the diagnostic output:
+
+| Finding | Command / evidence |
+|---------|--------------------|
+| Bulkstat v5 at runtime | `cargo xtask vm-test --host <vm> --filter bulkstat_probe_records_kernel_support --nocapture`; record the printed kernel/v1/v5 result (module inspection is insufficient) |
+| `bs_blocks` unit | `cargo xtask vm-test --host <vm> --filter bulkstat_blocks_match_statx --nocapture`; record the measured conversion and all 10,000 `disk_bytes == statx.blocks * 512` comparisons |
+| Default I/O scheduler | In the VM, `sudo tidemark probe --json` for resolved leaves and `cat /sys/block/<leaf>/queue/scheduler` for each leaf; the bracketed scheduler is active |
+
 ## 6. Fault injection
 
 | Fault | Method | Expected |

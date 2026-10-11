@@ -89,7 +89,7 @@ Implement `03` §4 Steps A–F exactly:
 - **Walk mode** link sets: an `FxHashMap<Ino, LinkSetAcc>` built from `DirRecord.links`. In bulk mode, sets arrive complete via `add_link_set`, so no map is needed.
 - **Depth:** computed when the parent is known. Records can arrive child-before-parent in walk mode. Buffer orphans until the parent arrives, then compute depths in `prepare` with an iterative pass. Never recurse; trees can be very deep.
 - **Notable selection:** exactly `03` §4 Step G: deterministic order `(disk desc, final dir id, ino)`, representative = smallest `(final dir id, name)` instance. Selection runs after renumbering, so final ids are known. Workers' local heaps (W1-B) only pre-filter, and must admit ties at the boundary.
-- **projid (bulk mode only):** copy each directory's own project ID into `DirRow.projid` (NULL in walk mode). Nothing else uses it in v1 (`06-project-quotas-deferred.md`).
+- **projid (bulk mode only):** copy each directory's own project ID into `DirRow.projid` (NULL in walk mode). The current product does not otherwise use it (`06-project-quotas-deferred.md`).
 - **Write:** iterative DFS over children sorted by name bytes. Assign preorder ids with checked bounds; assign zero-based notable-file `u32` ids with checked conversion (`max_notable <= u32::MAX`). Build each `path` incrementally in one reusable buffer. Compute `subtree_end`. Emit `DirRow`s in batches of 10,000, then the other row types, translating `DirId`s to final ids through a `Vec<u32>` map.
 - `degraded = errors > 0`.
 
@@ -130,13 +130,14 @@ pub fn run_bulk(p: &BulkParams, mount_fd: BorrowedFd<'_>, geo: &XfsGeometry, gat
 
 - **v5 only:** `tidemark_sys::xfs::bulkstat` uses v5 metadata only; `Unsupported` means bulk mode is unavailable, never permission to use v1 records.
 
+- **Gate ownership:** W2-C resolves leaf devices and builds the `ScanGate`; W2-B uses the supplied gate without duplicating profile selection.
 - **Phase 1:** run `walk()` with `stat_entries = false` on a scoped thread. The collector thread consumes `WalkOutput::Ns`, calls `agg.add_skeleton(&ns)`, and appends `DentRef`s: 12 bytes each (`[u32; 3]` or `#[repr(C, packed(4))]`, read by copy only), one per child plus one self-reference per directory with the high bit of `slot` set.
 - **Sort:** `rayon` `par_sort_unstable_by_key` on `ino`.
 - **Phase 2:**
   - For each AG, take the dent slice via `partition_point` on the AG's inode range.
-  - Workers (`threads`, capped at `agcount`) iterate `tidemark_sys::xfs::bulkstat(fd, start, end, batch)`, calling `gate.acquire(ceil(n / inodes_per_cluster))` per batch, and merge-join with their slice.
+  - Workers (`threads`, capped at `agcount`) iterate `tidemark_sys::xfs::bulkstat(fd, start, end, batch)`, charging `gate.acquire(ceil(batch / inodes_per_cluster))` conservatively before every iterator call (including terminal/error calls); the first charge also covers geometry. They merge-join with their slice.
   - They produce `Joined` messages in batches of 4,096 over a bounded channel to the thread that owns the `Aggregator`. That thread dispatches each to `set_dir_inode` / `add_single` / `add_link_set` / `add_races`.
-  - Translate `mode` to `FileKind`. `disk` comes from `BulkInode.disk_bytes`.
+  - Translate `mode` to `FileKind`. `disk` comes from `BulkInode.disk_bytes`, already in bytes; never multiply it again.
 - **Kind mismatch:** if the dent was a child entry but the inode is now a directory (or vice versa), count a race.
 - **Phase 3:** group needed names by directory, read each directory once (gated), match inode numbers, and report `names_missing` for files gone since phase 1.
 - **Cancellation** is checked between batches; on cancel, drain the channel and return `BulkError::Cancelled`.
@@ -188,23 +189,23 @@ pub fn run_scan(cfg: &Config, req: &ScanRequest, recorder: &dyn ScanRecorder, ca
 
 ### `run_scan` sequence
 
-1. Canonicalise the root; require a directory; find its mount (W1-A); compute `skip_mounts`.
+1. The CLI canonicalizes the original path before constructing `ScanRequest.root` as `RawPath`; never lexically normalize before realpath. Require a directory; find its mount (W1-A); compute `skip_mounts`.
 2. Look up the root's `[[roots]]` config, or defaults when scanning an unconfigured path.
 3. **Host-wide scan lock:** take an exclusive `flock` on `state_dir/scan.lock` (non-blocking). If it's held, return `ScanError::Busy` (ADR-015). The daemon scheduler takes the same lock, so a CLI scan and a daemon scan can never overlap.
 4. **Space guard** (`05` §8). If refused, return `ScanError::NoSpace`.
-5. **Gate:** `gate_from_config(profile_name, &cfg.throttle, &leaves, sampler)` with `leaves = resolve_leaves(dev)` (empty on unavailable discovery) and a bounded sampler built from ordered, all-or-error `read_disk_stats(&leaves)`.
+5. **Gate:** retain the `ScanGate` returned by `gate_from_config(profile_name, &cfg.throttle, &leaves, sampler)` with `leaves = resolve_leaves(dev)` (empty on unavailable discovery) and a bounded sampler built from ordered, all-or-error `read_disk_stats(&leaves)`.
 6. Fallible `ScanId::new(now)` (propagate invalid UTC-year errors; retry a collision with a fresh id, never replace an existing snapshot); `recorder.scan_started`.
 7. Choose the mode (`choose_mode`, `04` §7): auto requires v5. Explicit `--mode bulk` without v5 fails with exit code 5 and a reason naming missing v5 bulkstat. Auto may fall back to walk on a bulk failure before phase 2 starts and records why.
-8. Run walk (W1-B → W2-A on a collector thread) or bulk (W2-B). Report progress every 2 s.
+8. Size the walker output channel from the scan memory budget with `04` §7: `capacity * top_files * bytes_per_candidate <= queued_records_budget`; reserve producer candidates and other state separately, including any threshold class. Run walk (W1-B → W2-A on a collector thread) or bulk (W2-B) with `scan_gate.gate()`. Report progress every 2 s.
 9. `prepared.annotate(…)` for every request annotation.
-10. `SnapshotWriter::create` → `prepared.write(&mut WriterSink)` → `finish(meta)`. Fill `meta` per `05` §1, including phase timings and gate stats.
+10. `SnapshotWriter::create` → `prepared.write(&mut WriterSink)` → `finish(meta)`. Fill `meta` per `05` §1, including phase timings and final gate stats from `scan_gate.stop()` after all scan acquisitions finish. Use `scan_gate.stats()` for observations during the scan; Drop also stops the controller. Profile `max` with rate 0 means unthrottled (`13` G2).
 11. `recorder.scan_finished`; `recorder.dir_series` for directories at depth ≤ `series_depth` (capped at `MAX_SERIES_ROWS = 20_000`, largest first); apply `retention_plan` for this root and delete the files it names.
 12. Return the outcome. The exit code is 3 if degraded or partial.
 
 ### CLI
 
 - `scan` (direct mode; uses a `DirectRecorder` that writes `timeseries.db`, valid only while the daemon is not running): text progress on stderr (single updating line on a TTY; one line per 10 s otherwise). Final summary: mode and reason, duration, dirs/files, `t_disk`, reclaimable, link sets (incomplete), errors, races, snapshot path. `--json` prints `ScanOutcome`. **W6-A adds the daemon branch:** when `tidemarkd` is up, `scan` calls `scan.start` and follows `scan.status`, and `--cancel` calls `scan.cancel`.
-- `snapshots list|show|prune [--dry-run]|rebuild-catalog`. Direct catalog opens stay non-destructive; only reported corruption triggers `catalog::recover_catalog`, with all connections closed and writers stopped. Log preserved recovery file names (`05` §4). A healthy or missing catalog uses ordinary open/rebuild.
+- `snapshots list|show|prune [--dry-run]|rebuild-catalog`. Direct catalog opens perform the header preflight before SQLite (`05` §4) and stay non-destructive; only reported corruption triggers `catalog::recover_catalog`, with all connections closed and writers stopped. Log preserved recovery file names (`05` §4). A healthy or missing catalog uses ordinary open/rebuild.
 - `top`: per `08` §1.4.
   - Columns SIZE, RECLAIM, SHARED (with `H`), FILES, NEWEST (optional `--wide`), and Δ24h when the catalog has a complete snapshot within ±6 h of now − 24 h (looked up per displayed path in the old snapshot).
   - `--depth N` renders a tree; `--sort` and `--min-size` as in the spec. The CLI wrapper’s `Growth` case compares two snapshots (the selected snapshot and the older complete snapshot used for Δ24h), orders by descending signed disk-byte delta and breaks ties by raw path bytes; error if no older snapshot exists. It is not a single-snapshot `SortKey` variant.

@@ -52,7 +52,8 @@ pub fn probe(cfg: &Config, extra_roots: &[RawPath]) -> ProbeReport;            /
 ### Details
 
 - **mountinfo parsing:** fields per proc(5). Optional fields end at `-`. Decode octal escapes (`\040` space, `\011` tab, `\012` newline, `\134` backslash) into raw bytes. `dev = makedev(major, minor)` (use `libc::makedev`).
-- Kernel-object roots such as `net:[4026533000]` are retained as `MountRoot::Object` and still define mount boundaries. Malformed lines are reported and skipped; well-formed records are returned.
+- Kernel-object roots such as `net:[4026533000]` are retained as `MountRoot::Object` and still define mount boundaries. If the mount id, parent id, device and mount point can be decoded, retain the record as a boundary even when later fields are malformed: set those fields to empty and log the line with `tracing::warn!`. If any line’s mount point cannot be decoded, return `Err` for the whole table so callers fail closed. Valid nsfs records are unaffected. When mount discovery returns `Err` and the kernel reports no mount ids, the walker refuses to run.
+- Display mount bytes with `tidemark_core::path::display_lossy_bytes` (SCR-007), shared with `RawPath` and `RawName`; preserve existing escaping behaviour.
 - Canonicalize user paths with realpath before constructing `RawPath`; never lexically normalize first. Unresolved paths produce unknown facts with reasons, never another mount's facts. Escape every displayed mount field like `RawPath::display_lossy`, including valid UTF-8.
 - `read_disk_stats` preserves leaf input order and returns one sample per leaf or fails as a whole.
 
@@ -72,6 +73,7 @@ pub fn probe(cfg: &Config, extra_roots: &[RawPath]) -> ProbeReport;            /
 ### Tests
 
 - Unit: mountinfo parser on real samples (commit 3–4 captured from EL8 systems, including bind mounts, escaped spaces and `/dev/mapper/*` LVM sources); `parse_disk_stat` with 11-, 15- and 17-field variants; recommendation rules table-driven.
+- Mount parsing regressions: a line missing its final field still yields its mount point from `submounts_under`; an undecodable mount point makes the whole table `Err`. Exercise walker refusal with unavailable kernel mount ids.
 - Privileged: probe on a loop XFS reports the correct geometry; `resolve_leaves` on a loop-LVM filesystem returns the loop PVs; a bind mount of a subdirectory shows up in `other_mounts_of_dev` and in `submounts_under`.
 
 ### Acceptance
@@ -120,8 +122,8 @@ pub fn read_dir_entries(dir: &RawPath, gate: &dyn Gate) -> io::Result<Vec<(RawNa
 - `getdents64` via `rustix::fs::Dir` (or `rustix::fs::RawDir` with a caller-provided buffer of `getdents_buf` bytes). Use `statx` via `rustix::fs::statx` with `AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT`.
 - **Paths longer than `PATH_MAX`:** when `openat(AT_FDCWD, path)` returns `ENAMETOOLONG`, fall back to component-wise `openat` from the root with `O_NOFOLLOW` at each step. Test with depth 200.
 - **`DT_UNKNOWN`:** classify with `statx` (mode only). The `ftype=0` loop-XFS test covers it.
-- **Notable files:** Workers emit every candidate that could win global top-N under `(disk desc, final directory id asc, inode asc)`, including all ties at the worker's size cutoff. The heap holds at most `top_files` sizes (configuration cap 200,000), with no worker-wide tie collection. Per `docs/handoff/W1-B-fix.md`, ties live in the current `DirRecord`, capped by the existing 1,000,000 direct-entry limit: exceeding it returns `WalkError::Limit("million-entry directory cap")` and aborts the scan, never silently truncates candidates. At most `threads` producer records and `out.capacity()` queued records are retained (validated bounds 64 and 1,024), giving at most `(threads + out.capacity()) * 1,000,000` notable candidates plus `threads * top_files` heap size values. Consumer retention is the consumer's responsibility; this large finite ceiling is not a measured worst-case RSS guarantee.
-- **Backpressure:** `out` is a bounded channel (capacity 1,024 records). Workers block when the consumer is slow.
+- **Notable files:** A `DirRecord` carries at most `top_files` top-N candidates, chosen by `(disk desc, inode asc)` within that directory. This preserves every possible global top-N winner under `(disk desc, final directory id asc, inode asc)`; cross-directory ties at the worker cutoff are still emitted. A separate over-threshold class must have an exact per-directory bound for `03` §4 Step G, or W1-B writes `docs/handoff/scr-W1-B/SCR-001.md` with the trade-off and implements the safest bounded behaviour. See `13` G3 and `04` §7 for the byte budget; the million-entry cap is not a candidate memory budget.
+- **Backpressure:** `out` is a bounded channel (at most 1,024 records); W2-C sizes its capacity from the scan memory budget using `04` §7. Workers block when the consumer is slow.
 - **Cancellation:** check `cancel` before each directory; return `Err(WalkError::Cancelled)` after draining in-flight workers.
 - **No `unsafe`.** `rustix` gives safe wrappers.
 
@@ -133,6 +135,7 @@ pub fn read_dir_entries(dir: &RawPath, gate: &dyn Gate) -> io::Result<Vec<(RawNa
   - `nonutf8` names round-trip byte-exact.
   - Exclude globs skip both directories and files, recorded as `Skip(Excluded)`.
   - An artificial `skip_mounts` entry is skipped as `Skip(Mount)`.
+  - Several wide directories of equal-sized files with a slow consumer: assert at most `top_files` top-N candidates per record and that every global winner is present; account separately for any bounded threshold class.
   - `wide_dir` (120k entries): one record with `entries = 120000`, memory bounded (assert peak RSS delta < 256 MiB via `/proc/self/statm`).
   - `deep` (depth 200) completes.
   - Namespace mode (`stat_entries=false`) emits `NsRecord`s whose `children` inode numbers match `statx`.
@@ -231,10 +234,23 @@ impl AdaptiveGate {
 pub use tidemark_core::scan::GateStats; // mean_rate/min_rate: f64; throttled_ms/decreases/increases: u64
 /// Pure controller step for unit tests: returns the new rate.
 pub fn controller_step(rate: f64, prev: &[DiskStat], cur: &[DiskStat], dt_ms: f64, p: &AdaptiveParams) -> f64;
+pub struct ScanGate { /* private fields */ }
+impl ScanGate {
+    /// The gate to pass to the walker and the bulk pipeline.
+    pub fn gate(&self) -> Arc<dyn Gate>;
+    /// Statistics so far.
+    pub fn stats(&self) -> GateStats;
+    /// Stop the controller thread (joined within one interval) and return the final statistics.
+    pub fn stop(self) -> GateStats;
+}
 /// `profile` is a profile name: "gentle" | "normal" | any user-defined profile → AdaptiveGate;
 /// "max" → NoopGate (throttle off). Unknown names are a config error caught by Config::validate.
-pub fn gate_from_config(profile: &str, cfg: &ThrottleConfig, leaves: &[BlockDevInfo], sampler: StatSampler)
-    -> Result<Arc<dyn Gate>, ConfigIssue>;
+pub fn gate_from_config(
+    profile: &str,
+    cfg: &ThrottleConfig,
+    leaves: &[BlockDevInfo],
+    sampler: StatSampler,
+) -> Result<ScanGate, ConfigIssue>;
 
 // tidemark-fs::procfs
 pub fn list_pids() -> io::Result<Vec<u32>>;
@@ -266,9 +282,22 @@ impl AttributionCache {
 
 ### Details
 
-- **Token bucket and sampler:** The caller resolves leaves with `blockdev::resolve_leaves`; unavailable discovery means an empty slice and the configured minimum gate rate. `StatSampler` and `read_disk_stats` return exactly one sample per leaf in input order and fail the whole sample if any device cannot be read. Samplers finish within one interval. Signatures stay unchanged; `controller_step` is counter-only, so callers mask utilisation (`io_ticks_ms = 0`) for non-rotational, unknown or multi-queue devices. `FixedGate::new` is private.
+- **Token bucket and sampler:** The caller resolves leaves with `blockdev::resolve_leaves`; unavailable discovery means an empty slice and the configured minimum gate rate. `StatSampler` and `read_disk_stats` return exactly one sample per leaf in input order and fail the whole sample if any device cannot be read. Samplers finish within one interval. Sampler signatures stay unchanged; `controller_step` is counter-only, so callers mask utilisation (`io_ticks_ms = 0`) for non-rotational, unknown or multi-queue devices. `FixedGate::new` is private.
 
 The token bucket accounts for outstanding token debt: elapsed earnings use the previous rate before a rate change, and waiting acquisitions recheck their targets at the new rate. Per `docs/handoff/W1-D-fix.md`, cumulative issued/earned tokens use constant-size mutex/condition-variable state, with no waiter queue; surplus is capped to 0.25 seconds at the current rate.
+
+`GateStats` is `tidemark_core::scan::GateStats`, unchanged. For an adaptive gate the statistics are
+the controller's. For a fixed-rate gate: `mean_rate` and `min_rate` are the fixed rate,
+`throttled_ms` is the measured blocked time, `decreases` and `increases` are 0. For profile `max`
+(no throttling): every field is 0, and the documentation says that a rate of 0 together with
+profile `max` means "unthrottled". Dropping a `ScanGate` without calling `stop` also stops the
+controller. Acquisitions already waiting when `stop` is called complete at the last rate.
+
+Replace the accumulated `f64` counters with exact integer arithmetic (for example
+nano-tokens in `u128`, or `u64` with checked arithmetic and a rebasing step that preserves the
+targets of waiters). Rates stay `f64` in the public API. No counter may wrap or lose precision
+for any legal rate and any run length. Add regressions seeded near 2^53 units, with and without
+outstanding waiters, asserting that each acquisition is still charged.
 
 - **Controller:** exactly `04` §6.2. AIMD, worst leaf device. `util = Δio_ticks / Δt_ms × 100`; `await = Δ(read_ticks + write_ticks) / max(1, Δ(read_ios + write_ios))`. If the sampler errors, keep the current rate and log once.
 - **Attribution cache:** keyed by `(pid, starttime)`, LRU of `capacity` (default 16,384), TTL refresh. A unit is the last cgroup path component ending in `.service`, `.scope` or `.slice`; user sessions map to `user-<uid>`.
@@ -276,6 +305,7 @@ The token bucket accounts for outstanding token debt: elapsed earnings use the p
 ### Tests
 
 - `controller_step` table tests: idle device → rate rises additively to max; util over cap → halves; await over target → halves; min clamp; multiple devices use the worst.
+- Factory-level regression: construct through `gate_from_config`, throttle, stop, and read final statistics; test Drop shutdown and waiting acquisitions completing at the last rate.
 - Token bucket: 4 threads acquiring cost 1 at 1,000/s for 2 s → total within ±5%.
 - Parsers: captured real `/proc` samples, including comm with spaces and parentheses, cgroup v1 and v2 lines, user scopes, fdinfo flags with `O_WRONLY|O_APPEND`.
 - Attribution: PID reuse (same PID, different starttime) is not served from the stale cache entry.
@@ -369,6 +399,7 @@ pub fn space_check_with(statvfs: impl Fn() -> io::Result<FsTotals>, used_by_stat
 - Writer PRAGMAs and the finish sequence exactly as `05` §2. The file is created `0600 root:root` (umask-independent: `fchmod` after create).
 - Reader opens `file:<path>?immutable=1&mode=ro` (rusqlite `OpenFlags::SQLITE_OPEN_URI | SQLITE_OPEN_READ_ONLY`).
 - Query methods use the subtree range technique (`05` §1). `children` sorts in SQL by the requested key, with `name` as tie-break for determinism.
+- Every open of an existing `timeseries.db`, including `Catalog::open` and `TimeSeries::open`, first reads its first 16 bytes without SQLite. If the file exists, is not empty, and does not start with `SQLite format 3\0`, return the corruption error without opening it with SQLite, preserving the DB/WAL/SHM bytes. Missing or empty files are created as today. Valid-header files open normally, with SQLite’s own WAL recovery. Reading Tidemark’s own state file is allowed; the metadata-only rule applies to scanned files.
 - Catalog recovery and raw-byte boundary glob regions follow `05` §3–4 and W1-E fix notes; ordinary opens are non-destructive.
 
 - Time-series schema and compaction exactly `05` §6. Migrations are numbered Rust functions; v1 is the initial schema.
@@ -382,6 +413,7 @@ pub fn space_check_with(statvfs: impl Fn() -> io::Result<FsTotals>, used_by_stat
 - `root_slug` is injective over a test set (including `/data_reports` vs `/data/reports`).
 - `retention_plan`: tables of dates covering DST changes and ISO week boundaries.
 - Compaction is idempotent (run twice → same row counts); downsampled values equal the bucket's last raw value.
+- Garbage DB with original WAL/SHM sidecars: ordinary open fails, then `recover_catalog` succeeds and preserves the original bytes of all three under recovery names; do not recreate sidecars between calls. Keep the valid-header/damaged-page test, letting SQLite decide recovery.
 - `space_check_with` decision table.
 - Performance: inserting 2M `DirRow`s takes under 60 s on the dev box (record the number).
 
