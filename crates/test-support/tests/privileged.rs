@@ -1,13 +1,57 @@
 //! Owned by: W0-C
 //! Disposable VM-only smoke tests; feature gated, never ignored.
 #![cfg(feature = "privileged")]
+use std::{fs as std_fs, io::Write, os::unix::fs::MetadataExt};
 use test_support::{
+    golden::link_semantics_basic,
     lvm::{LoopVg, LvLayout},
     xfs::LoopXfs,
 };
 #[test]
 fn loop_xfs_smoke() {
-    let mut fs = LoopXfs::new(512 * 1024 * 1024, &["-m", "reflink=0"], "noatime");
+    let mut fs = LoopXfs::new(
+        512 * 1024 * 1024,
+        &["-b", "size=4096", "-m", "reflink=0"],
+        "noatime",
+    );
+    // Materialize the worked example entirely on the loop XFS, including
+    // outside links. Do not use the host's default temporary filesystem.
+    let fixture = tempfile::tempdir_in(&fs.mountpoint).unwrap();
+    let root = fixture.path().join("r");
+    for dir in ["a", "b", "c/d", "c/e"] {
+        std_fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let model = link_semantics_basic();
+    for (ino, path) in [(100, "a/x"), (101, "a/big"), (102, "b/z"), (103, "c/d/w")] {
+        let mut file = std_fs::File::create(root.join(path)).unwrap();
+        file.write_all(&vec![0x5a; model.inodes[&ino].apparent as usize])
+            .unwrap();
+        file.sync_all().unwrap();
+    }
+    for (source, target) in [("a/x", "b/y"), ("c/d/w", "c/e/v")] {
+        std_fs::hard_link(root.join(source), root.join(target)).unwrap();
+    }
+    for name in ["z2", "z3"] {
+        std_fs::hard_link(root.join("b/z"), fixture.path().join(name)).unwrap();
+    }
+    std::os::unix::fs::symlink("../a", root.join("c/s")).unwrap();
+    for (ino, path) in [
+        (100, "a/x"),
+        (101, "a/big"),
+        (102, "b/z"),
+        (103, "c/d/w"),
+        (104, "c/s"),
+    ] {
+        let stat = std_fs::symlink_metadata(root.join(path)).unwrap();
+        assert_eq!(
+            stat.blocks() * 512,
+            model.inodes[&ino].disk,
+            "inode {ino} ({path}) on 4 KiB XFS"
+        );
+        assert_eq!(stat.nlink(), u64::from(model.inodes[&ino].nlink));
+        assert_eq!(stat.size(), model.inodes[&ino].apparent);
+    }
+    drop(fixture);
     std::fs::write(fs.mountpoint.join("smoke"), [0x5a; 65536]).unwrap();
     assert!(
         std::fs::metadata(fs.mountpoint.join("smoke"))

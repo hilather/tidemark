@@ -272,6 +272,8 @@ pub fn try_materialize(spec: &str) -> io::Result<Fixture> {
                         left -= n as u64;
                     }
                 }
+                // Resolve delayed allocation before tests measure stat or du.
+                f.sync_all()?;
             }
             "symlink" => {
                 let target = decode_bytes(

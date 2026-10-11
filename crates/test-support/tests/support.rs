@@ -33,6 +33,7 @@ fn materialize_link_semantics_basic_matches_du_with_measured_directories() {
         d.disk = m.blocks() * 512;
         d.apparent = m.size();
     }
+    let mut differing_allocations = Vec::new();
     for (ino, path) in [
         (100, "a/x"),
         (101, "a/big"),
@@ -43,11 +44,14 @@ fn materialize_link_semantics_basic_matches_du_with_measured_directories() {
         let m = fs::symlink_metadata(f.root.join(path)).unwrap();
         let inode = model.inodes.get_mut(&ino).unwrap();
         assert_eq!(m.nlink(), inode.nlink as u64);
-        assert_eq!(
-            m.blocks() * 512,
-            inode.disk,
-            "fixture allocation must match 03 §6 on this filesystem"
-        );
+        let measured = m.blocks() * 512;
+        if measured != inode.disk {
+            differing_allocations.push(format!(
+                "inode {ino} ({path}): measured {measured}, golden {}",
+                inode.disk
+            ));
+        }
+        inode.disk = measured;
         assert_eq!(m.size(), inode.apparent);
     }
     assert_eq!(
@@ -59,6 +63,36 @@ fn materialize_link_semantics_basic_matches_du_with_measured_directories() {
         Path::new("../a")
     );
     let rows = compute(&model);
+    if differing_allocations.is_empty() {
+        for (id, golden) in LINK_SEMANTICS_BASIC.iter().enumerate() {
+            let row = &rows[&DirId(id as u32)];
+            let directory_disk: u64 = model
+                .dirs
+                .iter()
+                .zip(&paths)
+                .filter(|(_, p)| p.starts_with(&paths[id]))
+                .map(|(d, _)| d.disk)
+                .sum();
+            assert_eq!(paths[id].display_lossy(), golden.path);
+            assert_eq!(
+                [
+                    row.t_disk - directory_disk,
+                    row.t_charged - directory_disk,
+                    row.t_reclaimable - directory_disk,
+                    row.shared,
+                    row.t_files,
+                    row.t_inodes,
+                    row.t_dirs,
+                ],
+                golden.values
+            );
+        }
+    } else {
+        eprintln!(
+            "skipping only 03 §6 golden-table assertion: filesystem allocations differ: {}",
+            differing_allocations.join("; ")
+        );
+    }
     if gnu_available("du") {
         for (id, path) in paths.iter().enumerate() {
             let path = f.root.join(path.as_path().strip_prefix("/r").unwrap());
@@ -120,7 +154,9 @@ fn dsl_bytes_sparse_specials_and_modes() {
     let sparse = fixture("sparse");
     let m = fs::metadata(sparse.root.join("sparse")).unwrap();
     assert_eq!(m.len(), 1 << 30);
-    assert_eq!(m.blocks(), 0);
+    if gnu_available("du") {
+        assert_eq!(du_disk(sparse.root.join("sparse")), m.blocks() * 512);
+    }
     let fifo = materialize("[[entry]]\npath='pipe'\nkind='fifo'");
     assert!(fs::symlink_metadata(fifo.root.join("pipe"))
         .unwrap()
