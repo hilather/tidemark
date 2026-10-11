@@ -243,3 +243,8 @@ mod tests {
         }
     }
 }
+
+/// Synchronous daemon API client.
+pub mod client;
+/// Staged deployment.
+pub mod deploy;
