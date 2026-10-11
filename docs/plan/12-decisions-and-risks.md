@@ -97,8 +97,8 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 
 **ADR-019 — No PostgreSQL tracking in v1.**
 - *Context:* owner decision on 2026-10-11: keep disk-usage intelligence simple; database-specific tracking may return later as an add-on.
-- *Decision:* remove the collector and `tidemark-pg`, `tidemark pg`, probe integration, `[postgres]` and PostgreSQL-only keys, `pg.pass`, the three alert kinds and defaults, core types/fields/API, sample table/store functions, service thread, first-boot component, metrics, deploy checks and workspace `postgres` dependency. `[postgres]` is rejected as unknown. The reference design and former wave tasks live in `14-postgres-deferred.md`.
-- *Consequences:* no migration because nothing has been released. Generic annotations and path exclusions remain. A PostgreSQL data directory is scanned normally. Adaptive throttling, scan windows, one scan at a time, `O_NOATIME`, R2 and the `pgbench` performance gate remain to protect the shared-disk workload. R11 no longer applies; ADR-005 needs no client-runtime exception.
+- *Decision:* remove the collector and `tidemark-pg`, `tidemark pg`, probe integration, `[postgres]` and PostgreSQL-only keys, `pg.pass`, the three alert kinds and defaults, core types/fields/API, sample table/store functions, service thread, first-boot component, metrics, deploy checks and workspace `postgres` dependency. `[postgres]` is rejected as unknown. The reference design and former wave tasks live in `14-postgres-deferred.md`. The database benchmark gate was removed with PostgreSQL tracking and replaced by a device utilisation and average-wait gate using the adaptive throttle samples.
+- *Consequences:* no migration because nothing has been released. Generic annotations and path exclusions remain. A PostgreSQL data directory is scanned normally. Adaptive throttling, scan windows, one scan at a time, `O_NOATIME`, R2 and the device utilisation and wait gate remain to protect the shared-disk workload. R11 no longer applies; ADR-005 needs no client-runtime exception.
 
 ---
 
@@ -109,7 +109,7 @@ L = likelihood, I = impact (H/M/L).
 | ID | Risk | L | I | Mitigation | Where |
 |----|------|---|---|------------|-------|
 | R1 | *(removed: project quotas deferred, ADR-007)* | — | — | — | — |
-| R2 | Scans degrade Postgres or app latency on RAID 5 | M | H | Adaptive throttle; windows; `gentle` profile in pilot; one scan at a time; pgbench gate | `04` §6, W1-D, W7-B, P3 |
+| R2 | Scans degrade Postgres or app latency on RAID 5 | M | H | Adaptive throttle; windows; `gentle` profile in pilot; one scan at a time; device utilisation and wait gate | `04` §6, W1-D, W7-B, P3 |
 | R3 | Scans cause atime write storms | L | H | `O_NOATIME` on every directory open; `noatime_no_writes` test | W1-B |
 | R4 | Misleading numbers with hard links lead to wrong deletions | M | H | Normative spec; oracle, property and golden tests; reclaimable column; `H` markers; v5-only bulk metadata (32-bit nlink), never truncated v1 link counts | `03`, W2-A |
 | R5 | Watcher silently blind (namespace, bind mounts, overflow) | M | M | Namespace guard; install E2E test; probe warnings; lossy/overflow metrics and alert | W5-A, W6-C |

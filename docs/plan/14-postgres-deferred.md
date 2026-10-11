@@ -6,7 +6,7 @@
 
 Database connections, credentials, version-adaptive queries, dedicated storage, alerts and daemon wiring expand the tool beyond disk-usage intelligence. No version has been released, so there is no migration or compatibility mode. The v1 schema, config and API simply omit these items; `[postgres]` is an unknown table and is rejected, as are PostgreSQL-only keys and alert kinds.
 
-The adaptive throttle, scan windows, one scan at a time and `O_NOATIME` remain. PostgreSQL shares the disks and is a workload to protect: R2 and the Wave 7 `pgbench` latency gate remain. A data directory on `/data` is scanned like any other directory. Operators can use generic scan and watcher exclusions. Snapshot annotations remain generic, without automatic `pg.*` labels.
+The adaptive throttle, scan windows, one scan at a time and `O_NOATIME` remain. PostgreSQL shares the disks and is a workload to protect: R2 and the Wave 7 device utilisation and wait gate remain. A data directory on `/data` is scanned like any other directory. Operators can use generic scan and watcher exclusions. Snapshot annotations remain generic, without automatic `pg.*` labels.
 
 ## 2. Former collector design (reference)
 
