@@ -41,6 +41,8 @@ tidemarkd/src/
     alerts.rs      AlertEngine every 30 s; deliverers
 ```
 
+`ComponentState` is defined in `tidemark_core::api` and re-exported by `tidemarkd::firstboot`; `VgInfo` is defined there too and re-exported by `tidemark_fs::lvm`. Use these shared payloads, never duplicate them. Report serialization uses the shared path DTO adapters in `08` §1.1/§2.
+
 ### Key behaviours
 
 - **Startup order:**

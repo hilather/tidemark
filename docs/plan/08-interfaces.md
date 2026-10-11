@@ -18,6 +18,8 @@ Everything here is a contract. Changing it after Wave 0 requires a spec-change r
 
 Paths given on the command line are canonicalised (`realpath`) before lookup, so a symlinked path finds the real directory. Output always shows canonical paths.
 
+Machine output uses `JsonDoc<T> { schema: Cow<'static, str>, data: T }`, with owned deserialization (no `#[serde(borrow)]`). Shared report DTO adapters emit a UTF-8 `path` string or mutually exclusive `path_b64` (padded standard base64) for arbitrary bytes, never integer arrays. Apply this to enclosing/nested reports, phantom holders, snapshot paths and directory hot entries; preserve internal raw byte types. Whole-envelope tests cover ASCII, Unicode and invalid UTF-8.
+
 ### 1.2 Commands
 
 | Command | Purpose | Key options | Needs |
@@ -46,6 +48,8 @@ Paths given on the command line are canonicalised (`realpath`) before lookup, so
 | `status` | Daemon health, versions, component states | `--show-config` (print the effective config including default alert rules) | root |
 | `tui [PATH]` | Interactive browser (FR-21) | `--snapshot` | root |
 | `completions <SHELL>` | Shell completions | | — |
+
+`--sort growth` uses a CLI sort wrapper with a `Growth` case, requiring two snapshots; it is not a `snapshot::SortKey` variant. W2-C compares the selected snapshot with the older complete snapshot used for Δ24h, sorts descending signed disk-byte growth with raw-byte path tie breaking, and errors when the older snapshot is unavailable. `writers --window` accepts any positive humantime duration (`2m`, `1h`, etc.); no additional maximum is imposed by this contract. `hot` retains only `1m|5m|15m|60m`. CLI/API throttle overrides accept only `gentle|normal|max`; configured root throttle may select custom profiles.
 
 The privileges column describes an installed system, where all Tidemark files are root-only. The config, snapshots and API socket are `0600 root:root`; state and runtime directories are `0700 root:root`. Administrators use `sudo`; there is no `tidemark` group or `socket_group` key.
 
@@ -90,24 +94,32 @@ The `Δ24h` column appears when a snapshot about 24 h older exists.
 
 | Method | Params | Result (types from `07` §7a unless stated) |
 |--------|--------|--------|
-| `status` | — | `StatusResult { version, uptime_s, components: Vec<ComponentState>, watch_modes: Vec<(mount, mode)>, last_errors: Vec<(component, ts, message)> }` (`ComponentState` from W4-B `firstboot`; names per §5) |
+| `status` | — | `StatusResult { version, uptime_s, components: Vec<ComponentState>, watch_modes: Vec<(mount, mode)>, last_errors: Vec<(component, ts, message)> }` (`ComponentState` defined in core API, re-exported by W4-B `firstboot`; names per §5) |
 | `now` | `mount?` | `NowReport` (`07` §7) |
 | `hot` | `mount?`, `window` (1m/5m/15m/60m), `by` (dir/unit/comm), `limit` | `Vec<HotEntry>` |
-| `lvm` | `mount?` | `LvmResult { mounts: Vec<(mount, LvmNow)>, vgs: Vec<VgInfo>, sampled_at }` (`VgInfo` from W4-A) |
+| `lvm` | `mount?` | `LvmResult { mounts: Vec<(mount, LvmNow)>, vgs: Vec<VgInfo>, sampled_at }` (`VgInfo` defined in core API, re-exported by W4-A `lvm`) |
 | `phantom` | `mount?` | `Vec<PhantomSummary>` (one per mount) |
-| `writers` | `mount?`, `window` | `Vec<OpenWriter>` |
+| `writers` | `mount?`, `window` (positive humantime duration) | `Vec<OpenWriter>` |
 | `pg` | `relations?`, `db?` | `Option<PgNow>` |
 | `alerts.active` / `alerts.history` | `limit?` | `Vec<AlertSummary>` / `Vec<AlertEvent>` |
-| `scan.start` | `root`, `mode?`, `throttle?` | `{scan_id}`, or error `busy` (another scan holds the host lock) |
-| `scan.status` | `root?` | `Vec<ScanStatus>` |
-| `scan.cancel` | `root` | `{cancelled: bool}` |
+| `scan.start` | exactly one of `root`/`root_b64`, `mode?`, `throttle?` | `{scan_id}`, or error `busy` (another scan holds the host lock) |
+| `scan.status` | at most one of `root`/`root_b64` | `Vec<ScanStatus>` |
+| `scan.cancel` | exactly one of `root`/`root_b64` | `{cancelled: bool}` |
 | `config.reload` | — | `{reloaded: bool, warnings: Vec<String>}` |
+
+### Wire types and adapters (SCR-002)
+
+`Request { v: u32, id: String, method: String, params: serde_json::Value }` requires params, with `{}` for no-argument methods. `Response` uses the same version/id, `ok: bool`, and optional `result: serde_json::Value` / `error: ApiError`, omitted when absent. `ApiError { code: ApiErrorCode, message: String }` has the six snake_case codes below. Every listed method has named `*Params`/`*Result` types; collection/optional results alias the exact live payloads above. `limit: usize`, `uptime_s: u64`, `sampled_at: i64`; mounts/grouping labels are `String`. `HotWindow` is only `1m|5m|15m|60m`, `HotBy` only `dir|unit|comm`. `WritersParams.window: Duration` uses humantime serde and must be positive, with no extra contract maximum. Scan mode overrides are `Auto|Walk|Bulk`, throttle overrides `Gentle|Normal|Max`.
+
+Scan params carry `"root":"<utf-8 path>"` or `"root_b64":"<base64>"` (padded standard base64). Exactly one is required for start/cancel; status permits neither to query all roots, or one. Reject both, invalid base64, and invalid paths; deserialize through fallible `RawPath` validation. Internal serde may remain byte-oriented behind explicit DTO adapters. Report paths use the shared `path`/`path_b64` adapters in §1.1. Full DTO/envelope round-trip tests cover ASCII, Unicode, invalid UTF-8 and omitted optional roots. Explicit String mount/root display fields follow `07` §7a.
+
+`tidemark_core::api` defines `ComponentState { name: String, state: String /* ok|degraded|disabled|error */, detail: String }` and `VgInfo { vg: String, size: u64, free: u64 }`; downstream re-exports are `tidemarkd::firstboot::ComponentState` and `tidemark_fs::lvm::VgInfo`.
 
 Error codes: `bad_request`, `forbidden`, `not_found`, `unavailable`, `busy`, `internal`. Requests time out server-side after 10 s.
 
 ## 3. Configuration (`/etc/tidemark/tidemark.toml`)
 
-Durations use humantime (`30s`, `6h`); sizes use binary units (`1GiB`). Unknown keys are rejected with a helpful error. `tidemark status` and `tidemarkd --check-config` validate the file.
+Durations use humantime (`30s`, `6h`); sizes use binary units (`1GiB`) or explicit SI suffixes, with checked u64 arithmetic and fractional-byte truncation. Unknown keys are rejected with a helpful error. `tidemark status` and `tidemarkd --check-config` validate the file.
 
 ```toml
 [general]
@@ -120,7 +132,7 @@ path               = "/data"
 mode               = "auto"            # auto|walk|bulk
 schedule           = "every 6h"        # "every <dur>" | "daily HH:MM" | "off"
 window             = "00:00-06:00"     # optional; scans only START inside this local-time window
-throttle           = "normal"          # gentle|normal|max
+throttle           = "normal"          # gentle|normal|max or a user-defined profile
 exclude            = []                # full-path globs, e.g. "/data/tmp/cache/**"
 series_depth       = 2                 # dirs at <= depth (relative to root) recorded in dir_series (max 20,000 rows per scan)
 big_file_threshold = "1GiB"
@@ -222,9 +234,17 @@ min_free_pct   = 5
   hot_minutes = "7d"
 ```
 
+### Effective config contracts (SCR-003)
+
+`ConfigIssue { field: String, message: String }` reports validation errors at dotted field locations. Config/table structs deny unknown fields; paths use `PathBuf`, sizes `ByteSize`, ordinary durations `Duration` with humantime serde, bounded counts `u32`/`usize`, percentages/latencies `f64`. Root mode/link_instances use enums. Root `throttle: String` may name `gentle`, `normal`, `max` or a configured custom profile. `throttle.profiles: BTreeMap<String, ThrottleProfile>` merges overrides with gentle/normal defaults; reject a profile definition named `max` with an actionable error (reserved `NoopGate` selector).
+
+Absent roots use both example roots; absent per-root window is `None`, while built-in `/data` explicitly has its example window. `Config::load` reads one file capped at `MAX_CONFIG_BYTES = 1 MiB`; missing files return the original I/O error so CLI defaults apply. `Config::default` and deserialization produce effective defaults; default rule merge is idempotent and uses pure core `default_rules(cfg)` (`07` §6.4).
+
+Require `1 <= scan.max_notable <= u32::MAX`, with checked zero-based file-id assignment and SQL conversions. Empty `metrics.listen` disables HTTP; otherwise parse a `SocketAddr` and require `ip().is_loopback()`. Accept IPv4/IPv6 loopback, reject wildcard/external addresses; test each case.
+
 ### Alert rule fields (`AlertRule`, normative)
 
-`AlertRule` is one flat struct with optional fields. `Config::validate` checks that each rule has exactly the fields its kind needs. Field names are as written in TOML; `for` maps to the Rust field `for_` via `#[serde(rename = "for")]`.
+`AlertRule` is one flat struct with optional storage fields. `name`/`kind` are required. Every rule-specific field in a kind’s usage set below is required except applicable `vg`/`pool` globs (effective `*`); reject unused supplied fields and missing required fields even on disabled rules. `above: Option<AlertThreshold>` uses untagged `Number(f64)|Text(String)`; `below`, `window`, `older_than` are `Option<String>` interpreted during validation. `AlertKind` is an enum. `Config::validate` checks that each rule has exactly the fields its kind needs. Field names are as written in TOML; `for` maps to the Rust field `for_` via `#[serde(rename = "for")]`.
 
 | Field | Type | Used by kinds |
 |-------|------|---------------|
@@ -233,14 +253,17 @@ min_free_pct   = 5
 | `enabled` | bool (default true) | all |
 | `for`, `resolve_for` | duration (defaults 5m / 10m) | all |
 | `mount` | path | fs_used_pct, time_to_full, hot_dir_growth, phantom_bytes, watch_lossy |
-| `above` | number, size (`"10GiB"`) or rate (`"50GiB/h"`) | fs_used_pct (percent), hot_dir_growth (rate), dir_growth, phantom_bytes, pg_wal_bytes, pg_slot_retained (sizes), watch_lossy (count) |
+| `above` | number, size (`"10GiB"`) or rate (`"50GiB/h"`) | fs_used_pct (percent), hot_dir_growth (finite nonnegative number in bytes/s or rate string), dir_growth, phantom_bytes, pg_wal_bytes, pg_slot_retained (sizes), watch_lossy (count) |
 | `below` | duration or size | time_to_full (duration), vg_free_low (size) |
 | `window` | duration | time_to_full, hot_dir_growth, pg_archiver_failing, watch_lossy |
 | `path` | glob | hot_dir_growth |
 | `vg`, `pool` | glob (default `*`) | thin_pool_pct (`vg`, `pool`), vg_free_low (`vg`) |
 | `data_above`, `meta_above` | percent | thin_pool_pct |
-| `root`, `depth` | path, integer | dir_growth |
+| `root` | path | dir_growth, scan_stale (required) |
+| `depth` | integer | dir_growth |
 | `older_than` | duration, or `"auto"` | scan_stale (`auto` = 2 × the effective cadence, where a windowed schedule counts as at least 24 h) |
+
+Explicit `scan_stale` rules may target manually scanned roots; generated defaults exclude schedule `off`. Component-dependent rules remain visible but do not fire without available collector/input (`07` §6).
 
 ## 4. Metrics
 

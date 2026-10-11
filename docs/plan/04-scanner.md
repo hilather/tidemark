@@ -192,7 +192,7 @@ A collector thread turns `NsRecord`s into:
 - **Directory skeleton:** `Vec<DirSkel { parent, name, ino, entries, skipped, errors, races }>` indexed by `DirId`.
 - **Dent list:** `Vec<DentRef>`, where `DentRef = { ino: u64, slot: u32 }` packed into 12 bytes (for example `[u32; 3]`).
   - `slot & 0x8000_0000 == 0` means "entry in directory `slot`".
-  - `slot & 0x8000_0000 != 0` means "this inode **is** directory `slot & 0x7FFF_FFFF`". One self-reference is added per directory so the join also delivers each directory's own blocks, mtime and project ID.
+  - `slot & 0x8000_0000 != 0` means "this inode **is** directory `slot & 0x7FFF_FFFF`". Check each directory slot is at most `0x7FFF_FFFF` before setting the flag (at most 2^31 zero-based slots); fail explicitly on overflow, never truncate. One self-reference is added per directory so the join also delivers each directory's own blocks, mtime and project ID.
 
 ### 3.2 Phase 2 — bulkstat join
 

@@ -25,7 +25,7 @@ Both tasks are **strictly read-only** with respect to the system (ADR-008). LVM 
 pub struct LvInfo { pub vg: String, pub lv: String, pub attr: String, pub segtype: String, pub size: u64,
                     pub data_pct: Option<f64>, pub meta_pct: Option<f64>, pub pool_lv: Option<String>,
                     pub dm_path: Option<String>, pub major: Option<u32>, pub minor: Option<u32> }
-pub struct VgInfo { pub vg: String, pub size: u64, pub free: u64 }
+pub use tidemark_core::api::VgInfo; // vg: String, size/free: u64; defined in core
 pub struct LvmReport { pub lvs: Vec<LvInfo>, pub vgs: Vec<VgInfo>, pub sampled_at: i64 }
 pub struct MountLv { pub mount: RawPath, pub vg: String, pub lv: String, pub thin_pool: Option<String> }
 
@@ -97,7 +97,7 @@ impl Client {
 }
 
 // tidemarkd::firstboot (called by W6-A's main once components start)
-pub struct ComponentState { pub name: String, pub state: String /* ok|degraded|disabled|error */, pub detail: String }
+pub use tidemark_core::api::ComponentState; // name/state/detail: String; state: ok|degraded|disabled|error
 pub struct FirstbootInputs { pub version: String, pub config_sha256: String, pub daemon_started_at: i64,
                              pub components: Vec<ComponentState>, pub watch_modes: Vec<(String, String)>,
                              pub first_fs_sample: Option<i64>, pub first_lvm_sample: Option<i64>,
