@@ -27,12 +27,12 @@ pub struct AggConfig {
 /// Metadata-only, bounded scan accumulator. Input errors are deferred to `prepare`.
 pub struct Aggregator {
     cfg: AggConfig,
-    nodes: Vec<Option<Node>>,
+    nodes: Vec<Option<Box<Node>>>,
     links: rustc_hash::FxHashMap<Ino, LinkAcc>,
     bulk_links: Vec<LinkAcc>,
-    candidates: Vec<FileRow>,
+    candidates: notable::Candidates,
     skipped: Vec<SkipRow>,
-    errors: Vec<ErrorRow>,
+    errors: Vec<(usize, ErrorRow)>,
     gone: Vec<GoneRecord>,
     races: u64,
     failed: bool,
@@ -40,7 +40,8 @@ pub struct Aggregator {
 }
 
 // Fixed ceilings bound synthetic or corrupt inputs, independently of scanner budgets.
-const MAX_DIRS: usize = 4_000_000;
+// No budget seam exists in the frozen constructor. Covers 5M with headroom.
+const MAX_DIRS: usize = 16_000_000;
 const MAX_ITEMS: usize = 32_000_000;
 const NONE: u32 = u32::MAX;
 
@@ -52,7 +53,6 @@ struct Totals {
     reclaim: u64,
     files: u64,
     inodes: u64,
-    dirs: u64,
     errors: u64,
     age: [u64; 6],
     newest: i64,
@@ -70,12 +70,8 @@ struct Node {
     projid: Option<u32>,
     entries: u32,
     errors: u32,
-    own_files: u64,
-    symlinks: u64,
-    own_charged: u64,
     own_apparent: u64,
-    union: [u64; 3],
-    stamp: u64,
+    symlinks: u64,
     totals: Totals,
 }
 struct LinkAcc {
@@ -100,7 +96,7 @@ impl Aggregator {
             nodes: Vec::new(),
             links: Default::default(),
             bulk_links: Vec::new(),
-            candidates: Vec::new(),
+            candidates: Default::default(),
             skipped: Vec::new(),
             errors: Vec::new(),
             gone: Vec::new(),
@@ -110,7 +106,10 @@ impl Aggregator {
         }
     }
     fn node(&mut self, id: DirId) -> Option<&mut Node> {
-        let result = self.nodes.get_mut(id.0 as usize).and_then(Option::as_mut);
+        let result = self
+            .nodes
+            .get_mut(id.0 as usize)
+            .and_then(Option::as_deref_mut);
         if result.is_none() {
             self.failed = true;
         }
@@ -150,7 +149,6 @@ impl Aggregator {
             reclaim: rec.own.disk,
             files: rec.own.files,
             inodes: rec.own.files,
-            dirs: 1,
             errors: u64::from(errors),
             age: rec.own.age.0,
             newest: if rec.own.files > 0 {
@@ -173,7 +171,7 @@ impl Aggregator {
         if ok.is_err() {
             self.failed = true;
         }
-        self.nodes[idx] = Some(Node {
+        self.nodes[idx] = Some(Box::new(Node {
             parent: rec.parent.map_or(NONE, |p| p.0),
             depth: 0,
             name: rec
@@ -187,14 +185,10 @@ impl Aggregator {
             projid: rec.projid,
             entries: rec.entries,
             errors,
-            own_files: rec.own.files,
-            symlinks: rec.own.symlinks,
-            own_charged: t.charged,
             own_apparent: t.apparent,
-            union: [0; 3],
-            stamp: 0,
+            symlinks: rec.own.symlinks,
             totals: t,
-        });
+        }));
         for f in rec.notable {
             self.candidate(FileRow {
                 id: 0,
@@ -238,13 +232,16 @@ impl Aggregator {
                 reason: s.reason,
             }));
         // Retain a deterministic bounded sample: sort/truncate again when writing.
-        for e in rec.errors {
-            self.errors.push(ErrorRow {
-                dir_id: Some(rec.id.0),
-                path: e.path,
-                op: e.op,
-                errno: e.errno,
-            });
+        for (ordinal, e) in rec.errors.into_iter().enumerate() {
+            self.errors.push((
+                ordinal,
+                ErrorRow {
+                    dir_id: Some(rec.id.0),
+                    path: e.path,
+                    op: e.op,
+                    errno: e.errno,
+                },
+            ));
             if self.errors.len() > self.cfg.max_stored_errors {
                 self.trim_errors();
             }
@@ -252,21 +249,19 @@ impl Aggregator {
         self.add_races(Some(rec.id), rec.races);
     }
     fn trim_errors(&mut self) {
-        self.errors.sort_by(|a, b| {
+        self.errors.sort_by(|(ai, a), (bi, b)| {
             a.path
                 .as_bytes()
                 .cmp(b.path.as_bytes())
                 .then((a.op as u8).cmp(&(b.op as u8)))
                 .then(a.errno.cmp(&b.errno))
+                .then(a.dir_id.cmp(&b.dir_id))
+                .then(ai.cmp(bi))
         });
         self.errors.truncate(self.cfg.max_stored_errors);
     }
     fn candidate(&mut self, f: FileRow) {
-        if self.candidates.len() >= MAX_ITEMS {
-            self.failed = true;
-        } else {
-            self.candidates.push(f);
-        }
+        self.candidates.insert(f, &self.cfg);
     }
     /// Record a queued directory that could not be traversed, preserving id holes.
     pub fn add_gone(&mut self, g: &GoneRecord) {
@@ -314,11 +309,10 @@ impl Aggregator {
             n.totals.newest = n.totals.newest.max(a.mtime);
             let ok = add(&mut n.totals.disk, a.disk)
                 .and_then(|_| add(&mut n.totals.apparent, a.apparent))
+                .and_then(|_| add(&mut n.own_apparent, a.apparent))
                 .and_then(|_| add(&mut n.totals.charged, a.disk))
                 .and_then(|_| add(&mut n.totals.reclaim, a.disk))
-                .and_then(|_| add(&mut n.totals.age[bucket], a.disk))
-                .and_then(|_| add(&mut n.own_charged, a.disk))
-                .and_then(|_| add(&mut n.own_apparent, a.apparent));
+                .and_then(|_| add(&mut n.totals.age[bucket], a.disk));
             if ok.is_err() {
                 self.failed = true;
             }
@@ -330,12 +324,10 @@ impl Aggregator {
         if let Some(n) = self.node(dir) {
             let ok = add(&mut n.totals.disk, a.disk)
                 .and_then(|_| add(&mut n.totals.apparent, a.apparent))
+                .and_then(|_| add(&mut n.own_apparent, a.apparent))
                 .and_then(|_| add(&mut n.totals.charged, a.disk))
                 .and_then(|_| add(&mut n.totals.reclaim, a.disk))
                 .and_then(|_| add(&mut n.totals.age[bucket], a.disk))
-                .and_then(|_| add(&mut n.own_charged, a.disk))
-                .and_then(|_| add(&mut n.own_apparent, a.apparent))
-                .and_then(|_| add(&mut n.own_files, 1))
                 .and_then(|_| add(&mut n.totals.files, 1))
                 .and_then(|_| add(&mut n.totals.inodes, 1));
             let symlink_error = a.kind == tidemark_core::scan::FileKind::Symlink
@@ -384,7 +376,7 @@ impl Aggregator {
 /// Final metrics and row selections, ready for optional names and annotations.
 pub struct Prepared {
     cfg: AggConfig,
-    nodes: Vec<Option<Node>>,
+    nodes: Vec<Option<Box<Node>>>,
     order: Vec<u32>,
     ids: Vec<u32>,
     ends: Vec<u32>,
@@ -548,11 +540,21 @@ impl Prepared {
                 projid: n.projid,
                 entries: n.entries,
                 errors: n.errors,
-                own_files: n.own_files,
+                own_files: t.files
+                    - n.children
+                        .iter()
+                        .filter_map(|id| self.nodes[*id as usize].as_ref())
+                        .map(|c| c.totals.files)
+                        .sum::<u64>(),
                 own_symlinks: n.symlinks,
-                own_charged: n.own_charged,
+                own_charged: t.charged
+                    - n.children
+                        .iter()
+                        .filter_map(|id| self.nodes[*id as usize].as_ref())
+                        .map(|c| c.totals.charged)
+                        .sum::<u64>(),
                 own_apparent: n.own_apparent,
-                t_dirs: t.dirs,
+                t_dirs: u64::from(self.ends[old as usize] - self.ids[old as usize]) + 1,
                 t_files: t.files,
                 t_inodes: t.inodes,
                 t_disk: t.disk,
@@ -738,16 +740,76 @@ mod measurements {
     #[test]
     fn storage_layout() {
         eprintln!(
-            "Node={} Option<Node>={} Totals={} LinkAcc={} instance={} FileRow={}",
+            "Node={} Option<Box<Node>>={} Totals={} LinkAcc={} instance={} FileRow={}",
             std::mem::size_of::<Node>(),
-            std::mem::size_of::<Option<Node>>(),
+            std::mem::size_of::<Option<Box<Node>>>(),
             std::mem::size_of::<Totals>(),
             std::mem::size_of::<LinkAcc>(),
             std::mem::size_of::<(DirId, Option<RawName>)>(),
             std::mem::size_of::<FileRow>()
         );
-        // Layout ceiling, including inline union and additive accumulators.
-        assert!(std::mem::size_of::<Node>() <= 400);
+        // Node payload ceiling; union/stamp scratch is separate and temporary.
+        assert!(std::mem::size_of::<Node>() <= 232);
         assert!(std::mem::size_of::<LinkAcc>() <= 160);
+    }
+}
+
+#[cfg(test)]
+mod candidate_scale {
+    use super::*;
+    #[test]
+    #[ignore = "scale"]
+    fn five_million_bulk_singles_retain_one_candidate() {
+        let mut agg = Aggregator::new(AggConfig {
+            root: RawPath::new(b"/r".to_vec()).unwrap(),
+            scan_start: 0,
+            top_files: 1,
+            max_notable: 1,
+            big_file_threshold: u64::MAX,
+            link_instances: false,
+            max_stored_errors: 0,
+        });
+        agg.add_dir_record(DirRecord {
+            id: DirId(0),
+            parent: None,
+            name: None,
+            ino: 1,
+            dev: 1,
+            mtime: 0,
+            dir_disk: 0,
+            dir_apparent: 0,
+            projid: None,
+            entries: 0,
+            own: Default::default(),
+            links: vec![],
+            notable: vec![],
+            skipped: vec![],
+            errors: vec![],
+            errors_total: 0,
+            races: 0,
+        });
+        for ino in (2..5_000_002).rev() {
+            agg.add_single(
+                DirId(0),
+                &InodeAttrs {
+                    ino,
+                    kind: tidemark_core::scan::FileKind::Regular,
+                    nlink: 1,
+                    disk: 1,
+                    apparent: 1,
+                    mtime: 0,
+                    projid: None,
+                },
+            );
+            assert_eq!(agg.candidates.len(), 1);
+        }
+        // One inline 72-byte FileRow and two single-node BTree maps; no vector
+        // capacity or sorting scratch proportional to the 5M inputs.
+        assert_eq!(std::mem::size_of::<FileRow>(), 72);
+        agg.candidates.assert_single_bulk_storage_bound();
+        let prepared = agg.prepare().unwrap();
+        assert_eq!(prepared.files.len(), 1);
+        assert_eq!(prepared.files[0].ino, 2);
+        assert_eq!(prepared.summary.files, 5_000_000);
     }
 }

@@ -1,7 +1,7 @@
 //! Owned by: W2-A
 //! Iterative parent-lifting lowest common ancestors.
 use super::{AggError, Node, NONE};
-pub(super) fn lca(nodes: &[Option<Node>], mut a: u32, mut b: u32) -> Result<u32, AggError> {
+pub(super) fn lca(nodes: &[Option<Box<Node>>], mut a: u32, mut b: u32) -> Result<u32, AggError> {
     while a != b {
         let na = nodes
             .get(a as usize)
