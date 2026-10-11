@@ -9,6 +9,7 @@ use clap::Parser;
 fn daemon_unavailable_exit_four() {
     let ctx = Context {
         config: tidemark_core::config::Config::default(),
+        config_path: "/etc/tidemark/tidemark.toml".into(),
         json: true,
         color: false,
     };
@@ -49,6 +50,7 @@ fn duration_and_interval_validation() {
     .is_ok());
     let ctx = Context {
         config: tidemark_core::config::Config::default(),
+        config_path: "/etc/tidemark/tidemark.toml".into(),
         json: false,
         color: false,
     };

@@ -659,8 +659,6 @@ fn real_fixture_cli_all_single_snapshot_sorts_and_growth() {
     // The files and metric rows still come from a real CLI scan of the fixture.
     let catalog = tidemark_store::catalog::Catalog::open(state.path(), true).unwrap();
     let mut old = catalog.list(None).unwrap().remove(0);
-    old.started_at = tidemark_core::time::unix_now() - 86400;
-    catalog.record_finish(&old).unwrap();
     drop(catalog);
     std::fs::write(fixture.root.join("a/added"), vec![1; 16384]).unwrap();
     let scan = fixture_command(state.path(), true)
@@ -673,6 +671,12 @@ fn real_fixture_cli_all_single_snapshot_sorts_and_growth() {
         .clone();
     let scan: serde_json::Value = serde_json::from_slice(&scan.stdout).unwrap();
     let scan_id = scan["data"]["scan_id"].as_str().unwrap();
+    // Scanning rebuilds the catalog from snapshot metadata, so inject the
+    // historical timestamp after the new scan has finished rebuilding it.
+    old.started_at = tidemark_core::time::unix_now() - 86400;
+    let catalog = tidemark_store::catalog::Catalog::open(state.path(), true).unwrap();
+    catalog.record_finish(&old).unwrap();
+    drop(catalog);
     // IDs are deterministic tie breakers, not chronological suffixes. Select the
     // newly published scan explicitly when multiple scans start in one second.
     for json in [false, true] {
@@ -804,13 +808,29 @@ fn scoped_rebuild_refuses_without_changing_other_root_rows() {
         e.file = None;
         catalog.record_start(&e).unwrap();
     }
-    let before = format!("{:?}", catalog.list(Some(&root)).unwrap());
-    let rejected = fixture_command(state.path(), true)
+    let before = catalog.list(Some(&root)).unwrap();
+    fixture_command(state.path(), true)
         .args(["snapshots", "rebuild-catalog", "--root"])
         .arg(first.path())
         .assert()
         .code(2);
-    assert_eq!(before, format!("{:?}", catalog.list(Some(&root)).unwrap()));
+    let after = catalog.list(Some(&root)).unwrap();
+    assert_eq!(before.len(), after.len());
+    for (before, after) in before.iter().zip(&after) {
+        assert_eq!(before.scan_id, after.scan_id);
+        assert_eq!(before.root, after.root);
+        assert_eq!(before.mode, after.mode);
+        assert_eq!(before.started_at, after.started_at);
+        assert_eq!(before.finished_at, after.finished_at);
+        assert_eq!(before.status, after.status);
+        assert_eq!(before.degraded, after.degraded);
+        assert_eq!(before.file, after.file);
+        assert_eq!(before.t_disk, after.t_disk);
+        assert_eq!(before.t_inodes, after.t_inodes);
+        assert_eq!(before.t_dirs, after.t_dirs);
+        assert_eq!(before.errors, after.errors);
+        assert_eq!(before.duration_ms, after.duration_ms);
+    }
 }
 
 #[test]
