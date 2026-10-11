@@ -26,7 +26,7 @@ When a disk fills, operators need to know **immediately** where the space is, wh
 | cgroups | v1 (RHEL 8 default) | Assumed |
 | Scale | 5–50 M inodes on `/data`, 0.5–5 M directories, widest directories 10k–100k+ entries; `/` is much smaller | Estimate (`df -i`) |
 | Links | Many hard-link sets, some spanning report trees; many symlinks, some to directories | Measured in the pilot (`links` report) |
-| Privileges | Daemon runs as root; admins use sudo | Assumed |
+| Privileges | Daemon and CLI run as root only; admins use sudo (help and completions need no root) | Assumed |
 | Deployment | Installed through the existing **hotfix pipeline**, staged at deploy time, enabled automatically on the next reboot | Requirement (FR-25) |
 
 ### Open questions for the team
@@ -86,7 +86,7 @@ Wave files reference these IDs. FR-10 to FR-13 (project quotas) are **deferred**
 | FR-20 | **Metrics**: node_exporter textfile (default) and optional localhost HTTP; cardinality caps. | W6 |
 | FR-21 | **TUI**: ncdu-style browser over snapshots, with diff overlay and on-demand live refresh of a subtree. Read-only. | W7 |
 | FR-22 | **ncdu export**: snapshot → ncdu JSON. | W3 |
-| FR-23 | **Packaging**: RPM for EL8, systemd unit, tmpfiles/sysusers, default config for `/` + `/data`, SELinux sanity. | W6 |
+| FR-23 | **Packaging**: RPM for EL8, systemd unit, tmpfiles, default config for `/` + `/data`, SELinux sanity. | W6 |
 | FR-24 | **LVM awareness**: map each mount to its LV/VG. Sample LV size, VG free space, and thin-pool data/metadata usage (when thin) every 5 minutes. Show it in `now`, `tidemark lvm`, metrics and alerts. | W4 |
 | FR-25 | **Staged deployment**: `tidemark deploy stage` validates everything and enables the service to start on the next boot, changing nothing if a check fails. The daemon writes a first-boot health report. `tidemark deploy verify` gives the hotfix pipeline a pass/fail after the reboot. `deploy unstage` backs it out. | W4/W6 |
 
@@ -101,7 +101,7 @@ Wave files reference these IDs. FR-10 to FR-13 (project quotas) are **deferred**
 | NFR-5 | **Safety**: no symlink following; no file-content reads; no metadata writes; directories opened with `O_NOATIME`, so scans cause no atime write storms. | Code review checklist, tests, strace audit (W7-C) |
 | NFR-6 | **Crash safety**: a crash never leaves a corrupt "latest" snapshot. The time-series DB survives power loss (SQLite WAL). | Fault-injection tests |
 | NFR-7 | **Self-protection**: Tidemark never fills a disk it monitors (state-size cap, free-space floor). It excludes its own state directory from scans and watches. | Tests (W6) |
-| NFR-8 | **Security**: root daemon with a minimal capability set; no network listeners by default; API socket `0660 root:tidemark`; snapshot files `0640` (path names are sensitive). | Review (W7) |
+| NFR-8 | **Security**: root daemon with a minimal capability set; no network listeners by default; API socket `0600 root:root`; config and snapshot files `0600 root:root`; state and runtime directories `0700 root:root`; CLI access is root only (path names are sensitive). | Review (W7) |
 | NFR-9 | **Operability**: journald logs, metrics, runbooks, `tidemark status` self-check, `deploy verify` for automation. | W4/W6/W7 |
 | NFR-10 | **Compatibility**: Rocky/RHEL 8.8–8.10 first-class; should also run on EL9; builds on a `rockylinux:8` container (glibc 2.28). | CI + VM matrix |
 

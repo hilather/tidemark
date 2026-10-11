@@ -106,7 +106,7 @@ Notes:
 
 ## 2. Write path (`SnapshotWriter`, W1-E)
 
-1. Create `<scan_id>.db.tmp` (mode 0640). Set `PRAGMA page_size=32768` before creating any table, then `journal_mode=OFF`, `synchronous=OFF`, `locking_mode=EXCLUSIVE`, `temp_store=MEMORY`, `cache_size=-262144` (256 MiB).
+1. Create `<scan_id>.db.tmp` (mode 0600, owner root:root; retained after rename to `.db`). Set `PRAGMA page_size=32768` before creating any table, then `journal_mode=OFF`, `synchronous=OFF`, `locking_mode=EXCLUSIVE`, `temp_store=MEMORY`, `cache_size=-262144` (256 MiB).
 2. Create tables **without** secondary indexes.
 3. Insert rows with prepared statements in large transactions (about 50,000 rows each). `dirs` rows arrive in ascending `id` order (preorder).
 4. `finish()`: create indexes, run `ANALYZE`, write the final `meta`, close, `fsync` the file, `rename` to `<scan_id>.db`, then `fsync` the directory.

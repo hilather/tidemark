@@ -90,6 +90,11 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 - *Decision:* shell out to the plain reporting commands (shared lock only; `--readonly` is avoided because it suppresses device-mapper status such as thin-pool usage), with a timeout and a 5-minute interval.
 - *Consequences:* a cheap, robust read; thin-pool exhaustion becomes visible even when `df` looks fine.
 
+**ADR-018 — Root-only access; no `tidemark` group.**
+- *Context:* path names in snapshots and API responses are sensitive. The owner wants no group granting access without sudo.
+- *Decision:* the daemon and CLI run as root only; operators use `sudo`. All API methods require peer uid 0. The API socket, config, snapshots and their `.db.tmp` files are `0600 root:root`; state and runtime directories are `0700 root:root`. Remove the socket-group configuration key and group creation from packaging; no group-specific service setting or account-definition file is shipped.
+- *Consequences:* operators use sudo; one less packaging step and no group membership to manage. Non-root CLI commands fail early with the existing precondition exit code 5 and a clear sudo message; `completions` and `--help` remain available without root. No new exit code is added. Root with missing capabilities may still degrade, but non-root scans are rejected. Daemon integration tests that exercise CLI/API access run in privileged VMs.
+
 ---
 
 ## Risk register
@@ -107,7 +112,7 @@ L = likelihood, I = impact (H/M/L).
 | R7 | EL8 kernel behaviour differs from upstream (bulkstat units, v5, fanotify FID) | M | M | Runtime probes; VM tests on 8.8 and 8.10; explicit validation tests | W1-C, W5-A |
 | R8 | Tidemark's own state fills the disk or adds random writes to RAID 5 | L | M | Space guard; retention; state dir on another device; excluded from scans and watch | `05` §8, W1-E |
 | R11 | Postgres collector adds load or locks | L | L–M | Statement and lock timeouts; read-only session; low frequency; per-DB sequential | W5-C |
-| R12 | Path names exposed through metrics or webhooks | M | M | File permissions; loopback-only HTTP; cardinality caps; redaction decision in `security.md` | W6-B, W7-C |
+| R12 | Path names exposed through metrics or webhooks | M | M | Root-only file and API permissions (ADR-018); loopback-only HTTP; cardinality caps; redaction decision in `security.md` | W6-B, W7-C |
 | R13 | Inconsistent or low-quality code from parallel agents | M | M | Frozen contracts; owned paths; independent reviewers; gate reviews | `10` |
 | R14 | Host on unsupported Rocky 8.8 | H | M | Probe warns; P0 recommends updating to 8.10 | P0 |
 | R15 | SELinux denials in enforcing mode | L | M | Install test checks AVCs; runs as `unconfined_service_t` | W6-C |
