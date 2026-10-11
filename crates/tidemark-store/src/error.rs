@@ -4,6 +4,9 @@
 /// A storage operation could not complete.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    /// Snapshot publication was cancelled before rename.
+    #[error("snapshot publication cancelled")]
+    Cancelled,
     /// Cross-task implementation is not available yet.
     #[error("NotYetImplemented")]
     NotYetImplemented,

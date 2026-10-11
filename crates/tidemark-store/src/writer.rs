@@ -293,7 +293,18 @@ impl SnapshotWriter {
         self.check = Some(check);
     }
     /// Build indexes and metadata, sync, and publish without replacing any file.
-    pub fn finish(mut self, final_meta: &SnapshotMeta) -> Result<PathBuf, StoreError> {
+    pub fn finish(self, final_meta: &SnapshotMeta) -> Result<PathBuf, StoreError> {
+        self.finish_with(final_meta, &|| false)
+    }
+    /// Like `finish`, but calls `cancelled` before building indexes, after each index,
+    /// before the final metadata write, and immediately before the rename.
+    /// Cancellation removes the temporary file and returns `StoreError::Cancelled`.
+    /// After rename the snapshot is complete and `cancelled` is not consulted again.
+    pub fn finish_with(
+        mut self,
+        final_meta: &SnapshotMeta,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<PathBuf, StoreError> {
         if final_meta.scan_id != self.meta.scan_id
             || final_meta.root != self.meta.root
             || final_meta.schema_version != 1
@@ -302,13 +313,24 @@ impl SnapshotWriter {
                 "final snapshot identity differs".into(),
             ));
         }
-        self.connection()?.execute_batch(
-            SCHEMA
-                .split("-- Created AFTER bulk load (see §2):")
-                .nth(1)
-                .ok_or_else(|| StoreError::Invalid("missing indexes".into()))?,
-        )?;
+        let check_cancel = || {
+            if cancelled() {
+                Err(StoreError::Cancelled)
+            } else {
+                Ok(())
+            }
+        };
+        check_cancel()?;
+        let indexes = SCHEMA
+            .split("-- Created AFTER bulk load (see §2):")
+            .nth(1)
+            .ok_or_else(|| StoreError::Invalid("missing indexes".into()))?;
+        for index in indexes.split(';').filter(|sql| !sql.trim().is_empty()) {
+            self.connection()?.execute_batch(index)?;
+            check_cancel()?;
+        }
         self.connection()?.execute_batch("ANALYZE; BEGIN;")?;
+        check_cancel()?;
         write_meta(self.connection()?, final_meta)?;
         self.connection()?.execute_batch("COMMIT")?;
         let conn = self
@@ -317,6 +339,7 @@ impl SnapshotWriter {
             .ok_or_else(|| StoreError::Invalid("writer closed".into()))?;
         conn.close().map_err(|(_, e)| StoreError::Sql(e))?;
         File::open(&self.tmp)?.sync_all()?;
+        check_cancel()?;
         // RENAME_NOREPLACE preserves a concurrent publisher with the same scan id.
         rustix::fs::renameat_with(
             rustix::fs::CWD,
