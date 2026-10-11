@@ -5,7 +5,7 @@ use crate::rates::{DirGrowth, MountRates};
 use std::time::Duration;
 use tidemark_core::{
     config::AlertRule,
-    live::{AlertEvent, AlertSummary, HotEntry, LvmNow, PgNow, PhantomSummary, ScanStatus},
+    live::{AlertEvent, AlertSummary, HotEntry, LvmNow, PhantomSummary, ScanStatus},
 };
 
 /// Reserved for W5-D.
@@ -18,8 +18,6 @@ pub struct AlertInputs<'a> {
     pub phantom: &'a [PhantomSummary],
     /// Contract field.
     pub hot_dirs_window: &'a [(String, Vec<HotEntry>)],
-    /// Contract field.
-    pub pg: Option<&'a PgNow>,
     /// Contract field.
     pub scans: &'a [ScanStatus],
     /// Contract field.
@@ -315,7 +313,6 @@ mod tests {
             lvm: &[],
             phantom: &[],
             hot_dirs_window: &[],
-            pg: None,
             scans: &[],
             dir_growth: &[],
             watch_overflows_15m: &[],
@@ -494,7 +491,6 @@ mod guard_tests {
             lvm: &[],
             phantom: &[],
             hot_dirs_window: &[],
-            pg: None,
             scans: &[],
             dir_growth: &[],
             watch_overflows_15m: &[],

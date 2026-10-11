@@ -516,7 +516,7 @@ fn complete_snapshot_and_now_envelopes() {
         hot.as_object_mut()
             .unwrap()
             .extend(path_fields.as_object().unwrap().clone());
-        let now = json!({"generated_at":0,"host":"test","pg":null,"alerts_firing":[],"scans":[],"degraded":[],
+        let now = json!({"generated_at":0,"host":"test","alerts_firing":[],"scans":[],"degraded":[],
             "mounts":[{"mount":"/data","size":100,"used":10,"avail":90,"rate_15m":null,"rate_1h":null,
                 "ttf_secs":null,"lvm":null,"hot_dirs_5m":[hot],"writers_5m":[],
                 "phantom":{"mount":"/data","total_bytes":4,"files":1,"holders":[holder]},

@@ -76,15 +76,6 @@ pub enum AlertKind {
     /// PhantomBytes setting.
     /// PhantomBytes variant.
     PhantomBytes,
-    /// PgWalBytes setting.
-    /// PgWalBytes variant.
-    PgWalBytes,
-    /// PgSlotRetained setting.
-    /// PgSlotRetained variant.
-    PgSlotRetained,
-    /// PgArchiverFailing setting.
-    /// PgArchiverFailing variant.
-    PgArchiverFailing,
     /// ScanStale setting.
     /// ScanStale variant.
     ScanStale,
@@ -247,8 +238,6 @@ pub struct WatchConfig {
     pub hot_depth: u32,
     /// exclude_prefixes setting.
     pub exclude_prefixes: Vec<PathBuf>,
-    /// exclude_postgres setting.
-    pub exclude_postgres: bool,
     /// lru_entries setting.
     pub lru_entries: usize,
 }
@@ -260,7 +249,6 @@ impl Default for WatchConfig {
             events: vec!["close_write".into()],
             hot_depth: 6,
             exclude_prefixes: vec![],
-            exclude_postgres: true,
             lru_entries: 200000,
         }
     }
@@ -286,39 +274,6 @@ impl Default for ProcscanConfig {
             interval: Duration::from_secs(60),
             open_writers: true,
             exclude_prefixes: vec![],
-        }
-    }
-}
-/// PostgresConfig settings from 08 §3.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PostgresConfig {
-    /// enabled setting.
-    pub enabled: bool,
-    /// dsn setting.
-    pub dsn: String,
-    /// interval setting.
-    #[serde(with = "humantime_serde")]
-    pub interval: Duration,
-    /// relations_interval setting.
-    #[serde(with = "humantime_serde")]
-    pub relations_interval: Duration,
-    /// top_relations setting.
-    pub top_relations: usize,
-    /// statement_timeout setting.
-    #[serde(with = "humantime_serde")]
-    pub statement_timeout: Duration,
-}
-impl Default for PostgresConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            dsn: "host=/var/run/postgresql user=tidemark dbname=postgres application_name=tidemark"
-                .into(),
-            interval: Duration::from_secs(300),
-            relations_interval: Duration::from_secs(3600),
-            top_relations: 20,
-            statement_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -614,8 +569,6 @@ pub struct Config {
     pub watch: WatchConfig,
     /// procscan setting.
     pub procscan: ProcscanConfig,
-    /// postgres setting.
-    pub postgres: PostgresConfig,
     /// metrics setting.
     pub metrics: MetricsConfig,
     /// alerts setting.
@@ -648,7 +601,6 @@ impl Default for Config {
             lvm: LvmConfig::default(),
             watch: WatchConfig::default(),
             procscan: ProcscanConfig::default(),
-            postgres: PostgresConfig::default(),
             metrics: MetricsConfig::default(),
             alerts: AlertsConfig::default(),
             retention: RetentionConfig::default(),
@@ -670,7 +622,6 @@ struct ConfigInput {
     lvm: LvmConfig,
     watch: WatchConfig,
     procscan: ProcscanConfig,
-    postgres: PostgresConfig,
     metrics: MetricsConfig,
     alerts: AlertsConfig,
     retention: RetentionConfig,
@@ -686,7 +637,6 @@ impl Default for ConfigInput {
             lvm: LvmConfig::default(),
             watch: WatchConfig::default(),
             procscan: ProcscanConfig::default(),
-            postgres: PostgresConfig::default(),
             metrics: MetricsConfig::default(),
             alerts: AlertsConfig::default(),
             retention: RetentionConfig::default(),
@@ -705,7 +655,6 @@ impl<'de> Deserialize<'de> for Config {
             lvm: input.lvm,
             watch: input.watch,
             procscan: input.procscan,
-            postgres: input.postgres,
             metrics: input.metrics,
             alerts: input.alerts,
             retention: input.retention,
@@ -905,15 +854,6 @@ impl Config {
             ("lvm.interval", self.lvm.interval),
             ("lvm.timeout", self.lvm.timeout),
             ("procscan.interval", self.procscan.interval),
-            ("postgres.interval", self.postgres.interval),
-            (
-                "postgres.relations_interval",
-                self.postgres.relations_interval,
-            ),
-            (
-                "postgres.statement_timeout",
-                self.postgres.statement_timeout,
-            ),
             ("metrics.interval", self.metrics.interval),
             ("alerts.renotify", self.alerts.renotify),
             ("retention.samples.raw", self.retention.samples.raw),
@@ -993,8 +933,6 @@ impl AlertRule {
             VgFreeLow => (&["below"], &["vg"]),
             DirGrowth => (&["root", "depth", "above"], &[]),
             PhantomBytes => (&["mount", "above"], &[]),
-            PgWalBytes | PgSlotRetained => (&["above"], &[]),
-            PgArchiverFailing => (&["window"], &[]),
             ScanStale => (&["root", "older_than"], &[]),
             WatchLossy => (&["mount", "above", "window"], &[]),
         };
@@ -1075,14 +1013,12 @@ impl AlertRule {
                 }
                 (HotDirGrowth, AlertThreshold::Text(s)) => parse_rate(s).is_ok(),
                 (HotDirGrowth, AlertThreshold::Number(n)) => n.is_finite() && *n >= 0.0,
-                (
-                    DirGrowth | PhantomBytes | PgWalBytes | PgSlotRetained,
-                    AlertThreshold::Text(s),
-                ) => s.parse::<ByteSize>().is_ok(),
-                (
-                    DirGrowth | PhantomBytes | PgWalBytes | PgSlotRetained,
-                    AlertThreshold::Number(n),
-                ) => n.is_finite() && *n >= 0.0 && n.fract() == 0.0,
+                (DirGrowth | PhantomBytes, AlertThreshold::Text(s)) => {
+                    s.parse::<ByteSize>().is_ok()
+                }
+                (DirGrowth | PhantomBytes, AlertThreshold::Number(n)) => {
+                    n.is_finite() && *n >= 0.0 && n.fract() == 0.0
+                }
                 _ => false,
             };
             if !valid {
@@ -1164,29 +1100,15 @@ pub fn default_rules(cfg: &Config) -> Vec<AlertRule> {
             ..AlertRule::default()
         });
     }
-    rules.extend([
-        AlertRule {
-            name: "pg_slot_retained".into(),
-            kind: PgSlotRetained,
-            above: Some(AlertThreshold::Text("50GiB".into())),
-            ..AlertRule::default()
-        },
-        AlertRule {
-            name: "pg_archiver_failing".into(),
-            kind: PgArchiverFailing,
-            window: Some("30m".into()),
-            ..AlertRule::default()
-        },
-        AlertRule {
-            name: "thin_pool_pct".into(),
-            kind: ThinPoolPct,
-            vg: Some("*".into()),
-            pool: Some("*".into()),
-            data_above: Some(80.0),
-            meta_above: Some(80.0),
-            ..AlertRule::default()
-        },
-    ]);
+    rules.extend([AlertRule {
+        name: "thin_pool_pct".into(),
+        kind: ThinPoolPct,
+        vg: Some("*".into()),
+        pool: Some("*".into()),
+        data_above: Some(80.0),
+        meta_above: Some(80.0),
+        ..AlertRule::default()
+    }]);
     for root in &cfg.roots {
         if root.schedule != "off" {
             rules.push(AlertRule {

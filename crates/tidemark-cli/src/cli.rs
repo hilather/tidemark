@@ -78,8 +78,6 @@ pub enum Command {
     Phantom(cmd::phantom::Args),
     /// Growing open files.
     Writers(cmd::writers::Args),
-    /// Postgres breakdown.
-    Pg(cmd::pg::Args),
     /// Active alerts; use --all for history.
     Alerts(cmd::alerts::Args),
     /// Foreground event stream for debugging.
@@ -114,7 +112,6 @@ impl Command {
             Self::Lvm(a) => cmd::lvm::run(a, context),
             Self::Phantom(a) => cmd::phantom::run(a, context),
             Self::Writers(a) => cmd::writers::run(a, context),
-            Self::Pg(a) => cmd::pg::run(a, context),
             Self::Alerts(a) => cmd::alerts::run(a, context),
             Self::Watch(a) => cmd::watch::run(a, context),
             Self::Status(a) => cmd::status::run(a, context),

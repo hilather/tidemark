@@ -34,10 +34,5 @@ CREATE TABLE writer_samples  (ts INTEGER NOT NULL, mount TEXT NOT NULL, pid INTE
 CREATE INDEX phantom_ts ON phantom_samples(ts);
 CREATE INDEX writer_ts  ON writer_samples(ts);
 
-CREATE TABLE pg_samples (kind TEXT NOT NULL, name TEXT NOT NULL, res INTEGER NOT NULL, ts INTEGER NOT NULL,
-  value INTEGER NOT NULL,
-  PRIMARY KEY (kind, name, res, ts)) WITHOUT ROWID;
--- kind: database | relation | wal_dir | slot_retained | temp_bytes_total | archiver_failed_total | dead_tuples
-
 CREATE TABLE alerts (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, rule TEXT NOT NULL, subject TEXT NOT NULL,
   state TEXT NOT NULL, value REAL, message TEXT NOT NULL);         -- state: firing|resolved|renotify

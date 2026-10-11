@@ -164,17 +164,6 @@ pub struct WritersParams {
     #[serde(with = "positive_duration")]
     pub window: std::time::Duration,
 }
-/// PgParams API contract (08 §2).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PgParams {
-    /// relations field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub relations: Option<bool>,
-    /// db field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub db: Option<String>,
-}
 /// AlertsActiveParams API contract (08 §2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -258,8 +247,6 @@ pub type HotResult = Vec<HotEntry>;
 pub type PhantomResult = Vec<PhantomSummary>;
 /// Typed result for WritersResult.
 pub type WritersResult = Vec<OpenWriter>;
-/// Typed result for PgResult.
-pub type PgResult = Option<PgNow>;
 /// Typed result for AlertsActiveResult.
 pub type AlertsActiveResult = Vec<AlertSummary>;
 /// Typed result for AlertsHistoryResult.

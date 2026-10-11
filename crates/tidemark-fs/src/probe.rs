@@ -71,7 +71,7 @@ pub struct Recommendation {
     /// Human-readable explanation.
     pub message: String,
 }
-/// Complete filesystem probe; PostgreSQL is composed by the CLI.
+/// Complete filesystem probe.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProbeReport {
     /// Host prerequisites.

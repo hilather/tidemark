@@ -69,7 +69,7 @@ CREATE TABLE link_instances (
 
 CREATE TABLE skipped     (dir_id INTEGER NOT NULL, name BLOB NOT NULL, reason TEXT NOT NULL);   -- mount|other_fs|excluded
 CREATE TABLE errors      (dir_id INTEGER, path BLOB NOT NULL, op TEXT NOT NULL, errno INTEGER NOT NULL);
-CREATE TABLE annotations (dir_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL);  -- e.g. pg.database=app
+CREATE TABLE annotations (dir_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL);
 
 -- Created AFTER bulk load (see §2):
 CREATE UNIQUE INDEX dirs_path      ON dirs(path_hash, path);

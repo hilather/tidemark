@@ -40,14 +40,6 @@ fn json_snapshot_and_text_unknowns() {
             }],
             recommendations: vec![],
         },
-        postgres: [(
-            "reachable".into(),
-            Fact {
-                value: None,
-                why: Some("NotYetImplemented".into()),
-            },
-        )]
-        .into(),
     };
     let mut output = Vec::new();
     write(&report, true, &mut output).unwrap();
@@ -56,13 +48,7 @@ fn json_snapshot_and_text_unknowns() {
     output.clear();
     write(&report, false, &mut output).unwrap();
     let text = String::from_utf8(output).unwrap();
-    for section in [
-        "Host",
-        "Root /data/\\xFF",
-        "PostgreSQL",
-        "Recommendations",
-        "? reachable: unknown (NotYetImplemented)",
-    ] {
+    for section in ["Host", "Root /data/\\xFF", "Recommendations"] {
         assert!(text.contains(section), "{text}");
     }
 }
@@ -115,7 +101,6 @@ fn parsed_mount_fields_cannot_forge_text_lines() {
                 }],
                 recommendations: vec![],
             },
-            postgres: Default::default(),
         };
         let mut output = Vec::new();
         write(&report, false, &mut output).unwrap();

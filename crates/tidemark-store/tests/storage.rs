@@ -169,7 +169,7 @@ fn write_fixture(n: u32) -> (tempfile::TempDir, std::path::PathBuf) {
     .unwrap();
     w.put_annotations(&[AnnotationRow {
         dir_id: 1,
-        key: "pg.database".into(),
+        key: "app.database".into(),
         value: "app".into(),
     }])
     .unwrap();
@@ -243,7 +243,7 @@ fn roundtrip_100k_dirs_and_all_query_families() {
     assert_eq!(s.errors_under(1, 10).unwrap().len(), 1);
     assert_eq!(
         s.annotations(1).unwrap(),
-        vec![("pg.database".into(), "app".into())]
+        vec![("app.database".into(), "app".into())]
     );
     assert!(s
         .link_sets_under(
@@ -596,18 +596,6 @@ fn samples_roundtrip_checked_inserts_and_readonly_opens() {
     };
     t.insert_lvm(std::slice::from_ref(&lvm)).unwrap();
     assert_eq!(t.query_lvm("vg", "lv", 0, 20).unwrap(), vec![lvm]);
-    let pg = PgSample {
-        ts: 12,
-        kind: "database".into(),
-        name: "app".into(),
-        value: 1000,
-    };
-    t.insert_pg(std::slice::from_ref(&pg)).unwrap();
-    assert_eq!(
-        t.query_pg("database", Some("app"), 0, 20).unwrap(),
-        vec![pg.clone()]
-    );
-    assert_eq!(t.query_pg("database", None, 0, 20).unwrap(), vec![pg]);
     let hot = HotMinute {
         mount: "/data".into(),
         scope: "dir".into(),
@@ -723,7 +711,7 @@ fn migrations_backup_existing_v0_and_refuse_future_schema() {
 }
 #[test]
 fn compaction_last_values_idempotence_and_incomplete_buckets() {
-    use tidemark_core::live::{LvmSample, PgSample};
+    use tidemark_core::live::LvmSample;
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("timeseries.db");
     let t = TimeSeries::open(&db, true).unwrap();
@@ -753,14 +741,6 @@ fn compaction_last_values_idempotence_and_incomplete_buckets() {
         lvm(bucket + 301, 3),
     ])
     .unwrap();
-    let pg = |ts, value| PgSample {
-        ts,
-        kind: "database".into(),
-        name: "app".into(),
-        value,
-    };
-    t.insert_pg(&[pg(bucket + 10, 1), pg(bucket + 299, 2), pg(bucket + 301, 3)])
-        .unwrap();
     // A partially expired five-minute bucket must not be frozen by OR IGNORE.
     let cutoff = now - i64::try_from(policy.raw.as_secs()).unwrap();
     let partial = cutoff - cutoff % 300;
@@ -771,8 +751,8 @@ fn compaction_last_values_idempotence_and_incomplete_buckets() {
     ])
     .unwrap();
     let changed = t.compact(now, &policy).unwrap();
-    assert!(changed.inserted >= 9);
-    assert!(changed.deleted >= 9);
+    assert!(changed.inserted >= 6);
+    assert!(changed.deleted >= 6);
     let sql = Connection::open(&db).unwrap();
     assert_eq!(
         sql.query_row(
@@ -786,15 +766,6 @@ fn compaction_last_values_idempotence_and_incomplete_buckets() {
     assert_eq!(
         sql.query_row(
             "SELECT lv_size FROM lvm_samples WHERE res=2 AND ts=?",
-            [bucket],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        3
-    );
-    assert_eq!(
-        sql.query_row(
-            "SELECT value FROM pg_samples WHERE res=2 AND ts=?",
             [bucket],
             |r| r.get::<_, i64>(0)
         )
@@ -1214,11 +1185,6 @@ fn retained_400_day_history_returns_all_tiers() {
                 rusqlite::params![res, ts],
             )
             .unwrap();
-            tx.execute(
-                "INSERT INTO pg_samples VALUES ('database','db',?,?,10)",
-                rusqlite::params![res, ts],
-            )
-            .unwrap();
         }
     }
     tx.commit().unwrap();
@@ -1235,15 +1201,6 @@ fn retained_400_day_history_returns_all_tiers() {
     assert_eq!(
         store
             .query_lvm("vg", "lv", 0, 400 * 86400)
-            .unwrap()
-            .iter()
-            .map(|r| r.ts)
-            .collect::<Vec<_>>(),
-        expected
-    );
-    assert_eq!(
-        store
-            .query_pg("database", Some("db"), 0, 400 * 86400)
             .unwrap()
             .iter()
             .map(|r| r.ts)
@@ -1277,11 +1234,6 @@ fn overlapping_sample_tiers_preserve_selection_for_all_query_families() {
             rusqlite::params![res, ts],
         )
         .unwrap();
-        sql.execute(
-            "INSERT INTO pg_samples VALUES ('database','db',?,?,10)",
-            rusqlite::params![res, ts],
-        )
-        .unwrap();
     }
     for (to, expected) in [
         (4000, vec![20, 400, 600, 3600]),
@@ -1306,17 +1258,6 @@ fn overlapping_sample_tiers_preserve_selection_for_all_query_families() {
                 .collect::<Vec<_>>(),
             expected
         );
-        for name in [Some("db"), None] {
-            assert_eq!(
-                store
-                    .query_pg("database", name, 0, to)
-                    .unwrap()
-                    .iter()
-                    .map(|r| r.ts)
-                    .collect::<Vec<_>>(),
-                expected
-            );
-        }
     }
 }
 

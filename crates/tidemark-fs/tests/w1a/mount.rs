@@ -9,7 +9,7 @@ fn mountinfo_samples_and_bind_mounts() {
     let m = parse_mountinfo(include_bytes!("data/mountinfo")).unwrap();
     assert_eq!(m.len(), 7);
     assert_eq!(m[1].source, "/dev/mapper/rl-data");
-    assert_eq!(m[2].root, MountRoot::Path(raw(b"/postgres")));
+    assert_eq!(m[2].root, MountRoot::Path(raw(b"/database")));
     assert_eq!(m[3].mount_point, raw(b"/data/with space"));
     assert_eq!(m[4].mount_point, raw(b"/data/tab\tline\nslash\\"));
     assert_eq!(m[5].mount_point, raw(b"/data/\xff"));

@@ -12,14 +12,12 @@ pub struct NowReport {
     pub host: String,
     #[doc = "mounts field; see the normative plan for units."]
     pub mounts: Vec<MountNow>,
-    #[doc = "pg field; see the normative plan for units."]
-    pub pg: Option<PgNow>,
     #[doc = "alerts_firing field; see the normative plan for units."]
     pub alerts_firing: Vec<AlertSummary>,
     #[doc = "scans field; see the normative plan for units."]
     pub scans: Vec<ScanStatus>, // last success per root, running scan progress
     #[doc = "degraded field; see the normative plan for units."]
-    pub degraded: Vec<String>, // e.g. "watcher: fd mode only", "pg: unreachable since …"
+    pub degraded: Vec<String>, // e.g. "watcher: fd mode only"
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// MountNow contract.
@@ -269,56 +267,6 @@ pub struct WriterSample {
     pub size: u64,
     #[doc = "disk field; see the normative plan for units."]
     pub disk: u64,
-}
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// PgSample contract.
-pub struct PgSample {
-    #[doc = "ts field; see the normative plan for units."]
-    pub ts: i64,
-    #[doc = "kind field; see the normative plan for units."]
-    pub kind: String, /* 05 §6 kinds */
-    #[doc = "name field; see the normative plan for units."]
-    pub name: String,
-    #[doc = "value field; see the normative plan for units."]
-    pub value: i64,
-}
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// PgSlot contract.
-pub struct PgSlot {
-    #[doc = "name field; see the normative plan for units."]
-    pub name: String,
-    #[doc = "slot_type field; see the normative plan for units."]
-    pub slot_type: String,
-    #[doc = "active field; see the normative plan for units."]
-    pub active: bool,
-    #[doc = "retained_bytes field; see the normative plan for units."]
-    pub retained_bytes: Option<u64>,
-    #[doc = "wal_status field; see the normative plan for units."]
-    pub wal_status: Option<String>,
-}
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// PgNow contract.
-pub struct PgNow {
-    #[doc = "sampled_at field; see the normative plan for units."]
-    pub sampled_at: Option<i64>,
-    #[doc = "unreachable_since field; see the normative plan for units."]
-    pub unreachable_since: Option<i64>,
-    #[doc = "server_version_num field; see the normative plan for units."]
-    pub server_version_num: Option<u32>,
-    #[doc = "databases field; see the normative plan for units."]
-    pub databases: Vec<(String, u64)>,
-    #[doc = "wal_dir_bytes field; see the normative plan for units."]
-    pub wal_dir_bytes: Option<u64>,
-    #[doc = "slots field; see the normative plan for units."]
-    pub slots: Vec<PgSlot>,
-    #[doc = "archiver_failing field; see the normative plan for units."]
-    pub archiver_failing: bool,
-    #[doc = "archiver_last_failed field; see the normative plan for units."]
-    pub archiver_last_failed: Option<i64>,
-    #[doc = "temp_bytes_rate field; see the normative plan for units."]
-    pub temp_bytes_rate: Option<f64>,
-    #[doc = "top_relations field; see the normative plan for units."]
-    pub top_relations: Vec<(String /* db.schema.rel */, u64)>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// Alert lifecycle state.

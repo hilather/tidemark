@@ -1,7 +1,7 @@
 //! Owned by: W1-A
-//! CLI probe runs without dependency implementations or an installed configuration.
+//! CLI probe reports the remaining sections without an installed configuration.
 #[test]
-fn probe_json_has_all_sections_and_unknown_postgres() {
+fn probe_json_has_remaining_sections() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
         .args([
             "--config",
@@ -20,14 +20,10 @@ fn probe_json_has_all_sections_and_unknown_postgres() {
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["schema"], "tidemark.probe.v1");
-    for key in ["host", "roots", "recommendations", "postgres"] {
+    assert_eq!(value["data"].as_object().unwrap().len(), 3);
+    for key in ["host", "roots", "recommendations"] {
         assert!(value["data"].get(key).is_some());
     }
-    assert!(value["data"]["postgres"]["reachable"]["value"].is_null());
-    assert_eq!(
-        value["data"]["postgres"]["reachable"]["why"],
-        "NotYetImplemented"
-    );
 }
 
 #[test]

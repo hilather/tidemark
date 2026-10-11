@@ -1,2 +1,2 @@
-11:memory:/system.slice/postgresql.service
-1:name=systemd:/system.slice/postgresql.service
+11:memory:/system.slice/database.service
+1:name=systemd:/system.slice/database.service

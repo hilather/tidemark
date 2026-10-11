@@ -18,8 +18,6 @@ pub mod services {
     pub mod alerts;
     /// lvm service skeleton.
     pub mod lvm;
-    /// pg service skeleton.
-    pub mod pg;
     /// procscan service skeleton.
     pub mod procscan;
     /// sampler service skeleton.
