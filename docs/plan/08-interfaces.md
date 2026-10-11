@@ -6,6 +6,22 @@ Everything here is a contract. Changing it after Wave 0 requires a spec-change r
 
 ## 1. CLI (`tidemark`)
 
+`diff` first canonicalizes the original live path. On ENOENT, it canonicalizes the longest existing ancestor and appends the unresolved byte names. Refuse `..` in the unresolved suffix; existing symlink/parent semantics are handled by realpath before lexical normalization. This exception applies to diff so removed snapshot paths remain queryable.
+
+```rust
+pub struct WatchEvent { pub at: i64, pub path: RawPath, pub delta: i64, pub attribution: Attribution }
+impl Watcher {
+    pub fn enable_events(&self);
+    pub fn drain_events(&self, limit: usize) -> Vec<WatchEvent>;
+}
+```
+
+Only the foreground consumer enables the 1,000-event buffer; it drops oldest events and counts drops. Daemon construction leaves it absent and uses completed-minute drains. Foreground output shares a 50-lines/s limit across mounts, reports omissions, and emits JSON lines with schema `tidemark.watch.v1` and path/path_b64. MOVED_FROM/MOVED_TO are independent directional events with signed deltas; v1 uses no FAN_RENAME and reports no from-to pairs.
+
+Retry EMFILE/ENFILE/ENOMEM/ENOBUFS with shutdown-aware exponential 50–800 ms waits, retaining the group and marking affected/recovery minutes lossy. Fatal transport failures persist as `WatchMode::Failed`; foreground CLI exits rather than appearing alive. `WatchStats` adds `dropped_events: u64`, `recovering: bool`, `read_errors: u64`. Clear unsafe path caches after loss; clock rollback discards affected ring history and marks the new minute lossy.
+
+`deploy stage --from` validates its source independently of an invalid installed config and installs at `Context.config_path` (global `-c`). Deployment pre-flight and compensation are specified in §5.
+
 ### 1.1 Global options
 
 | Option | Meaning |
@@ -48,7 +64,7 @@ Machine output uses `JsonDoc<T> { schema: Cow<'static, str>, data: T }`, with ow
 | `tui [PATH]` | Interactive browser (FR-21) | `--snapshot` | root |
 | `completions <SHELL>` | Shell completions | | — |
 
-`scan --keep-partial` retains a partial walk snapshot on cancellation; cancelled bulk scans produce no snapshot. `scan --help` explicitly says the option is walk-only. `snapshots prune` deletes retention-selected files, then rebuilds the catalog from remaining files for all roots; `--dry-run` only shows proposed deletions. `snapshots rebuild-catalog --root PATH` validates PATH but rebuilds the catalog for all roots, as its help text states.
+`scan --keep-partial` can retain collected walk rows on cancellation before publication; cancellation observed inside `finish_with` discards even that partial candidate; cancelled bulk scans produce no snapshot. `scan --help` explicitly says the option is walk-only. `snapshots prune` deletes retention-selected files, then rebuilds the catalog from remaining files for all roots; `--dry-run` only shows proposed deletions. `snapshots rebuild-catalog --root PATH` is refused before recovery or mutation; omit `--root` to select global rebuilding.
 
 `--sort growth` uses a CLI sort wrapper with a `Growth` case, requiring two snapshots; it is not a `snapshot::SortKey` variant. W2-C compares the selected snapshot with the older complete snapshot used for Δ24h, sorts descending signed disk-byte growth with raw-byte path tie breaking, and errors when the older snapshot is unavailable. `writers --window` accepts any positive humantime duration (`2m`, `1h`, etc.); no additional maximum is imposed by this contract. `hot` retains only `1m|5m|15m|60m`. CLI/API throttle overrides accept only `gentle|normal|max`; configured root throttle may select custom profiles.
 
@@ -65,7 +81,7 @@ The CLI has no effective-uid check. A non-root user can run it against a config,
 | 2 | Usage or configuration error |
 | 3 | Completed with errors (degraded or partial scan, some queries failed) |
 | 4 | Daemon unavailable (live commands) |
-| 5 | Precondition not met (not root, not XFS, unsupported kernel feature, `deploy stage` pre-flight failed) |
+| 5 | Precondition not met (destinations not writable/ownable as required, not XFS, unsupported kernel feature, `deploy stage` pre-flight failed) |
 | 6 | `deploy verify`: not healthy yet / timed out (details in output) |
 
 ### 1.4 Example: `tidemark top /data --depth 1`
@@ -299,9 +315,10 @@ tidemark deploy verify --wait 5m                    # exit 0 = healthy; 6 = not 
 
 | Check | Blocking? |
 |-------|-----------|
-| Running as root; binaries and unit file present (RPM installed) | yes |
+| Binaries/unit present; destination ancestors writable/searchable and required ownership achievable (no effective-uid gate; ADR-018) | yes |
+| Safe state_dir and no-follow state artifacts, as specified below | yes |
 | Config parses and validates (`Config::validate`) | yes |
-| Every `[[roots]]` path exists, is a directory, and sits on a local filesystem (subtree roots such as `/data/reports` are allowed) | yes |
+| Every `[[roots]]` path exists, is a directory, and sits on an allowlisted local filesystem (xfs, ext2, ext3, ext4, btrfs, tmpfs, zfs, f2fs, jfs, reiserfs; unknown types block; subtree roots allowed) | yes |
 | Every `sampler.mounts` and `watch.mounts` entry is a mount point | yes |
 | `state_dir` filesystem has ≥ 2 GiB free (plus the `min_free_pct` floor) | yes |
 | fanotify available (`probe`), mount namespace OK | warning (watcher would be disabled) |
@@ -311,9 +328,17 @@ tidemark deploy verify --wait 5m                    # exit 0 = healthy; 6 = not 
 
 On success, `deploy stage`:
 
-1. installs the config to `/etc/tidemark/tidemark.toml` (`0600 root:root`), backing up any existing file as `tidemark.toml.<ts>.bak`;
+1. installs the config to the global `-c` destination (default `/etc/tidemark/tidemark.toml`) (`0600 root:root`), backing up any existing file as `tidemark.toml.<ts>.bak`;
 2. runs `systemctl enable tidemarkd`, and also starts it with `--start-now`;
 3. writes `/var/lib/tidemark/deploy/staged.json`, recording the version, time, check results and config hash.
+
+The CLI `Context` carries `pub config_path: PathBuf`; global `-c` names the installed destination. `deploy stage --from` loads and validates its source independently, even when the installed config is missing or invalid. Blocking pre-flight failures change nothing. After pre-flight, publication/service failures trigger best-effort restoration of previous config, marker and staged-record bytes, removal of new backup files, and independent attempts to restore enabled/active service state. Report initiating and compensation errors with instructions to retry stage or unstage. This is not a transaction: downtime, timestamps and newly created empty directories may remain.
+
+Local filesystem eligibility is exactly `xfs`, `ext2`, `ext3`, `ext4`, `btrfs`, `tmpfs`, `zfs`, `f2fs`, `jfs`, `reiserfs`; unknown types block. ADR-018 requires destination writability/searchability and required ownership, with no running-as-root check. Production files are root:root, 0600; state directories 0700.
+
+Stage, unstage and firstboot refuse unsafe `state_dir` before mutations: `/`, nonabsolute paths, `..` components, symlink/nondirectory ancestry, mount points, and paths equal to or containing tracked roots/sampler/watch mounts (including existing roots' canonical locations). Also refuse paths equal to or containing `/etc`, `/usr`, `/var`, `/var/lib`, `/run`, `/home`, `/root`, `/boot`, `/dev`, `/proc`, `/sys`, `/tmp`. This is containment by state_dir: `/var/lib/tidemark` and private descendants of `/tmp` are eligible. Unsafe/mounted deploy subdirectories, symlink/nonregular artifacts and malformed/path-mismatched markers block too. Existing unmarked production directories must already have 0700 root:root; change ownership/mode only for new directories or a valid marker identifying that directory. Marker-backed unstage/firstboot recover tracked roots from the staged config; path-only calls without a marker protect default roots, and CLI unstage also checks loaded roots.
+
+Every operation under state_dir uses no-follow directory handles: component-relative opens, regular-file reads, exclusive temporary writes, renameat/unlinkat and descriptor fsync. Retain handles through service actions and compensation; the installed config is also inspected/read through a verified parent and O_NOFOLLOW.
 
 **On first start after staging**, `tidemarkd` writes `/var/lib/tidemark/deploy/firstboot.json` once it has been running for 2 minutes or once every component has reported, whichever is first. The report holds each component's state (`ok`/`degraded`/`disabled` + reason), the watch mode, the first samples' timestamps and the next scheduled scan per root. A one-line summary also goes to journald.
 

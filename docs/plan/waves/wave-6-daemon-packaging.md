@@ -59,7 +59,9 @@ tidemarkd/src/
   - The alert engine's active set.
   - Scan statuses.
   - Degraded reasons.
-- **`LiveStateView`** builds W5-D's `NowInputs` and `AlertInputs` from these, and answers the API methods.
+- **`LiveStateView`** implements W5-D's `AlertSource` (`07` §6, `13` R2-10), with complete bounded inventories and exact per-rule Duration windows; unavailable data is None, measured empty is Some(empty). Supply ScanAge effective cadence (at least 24h for windowed roots), build optional NowInputs sections and unevaluable diagnostics, and expose diagnostics in alerts/now. Metrics derive firing gauges from active(), not a removed render_metrics method.
+- Retain the `ScanGate` handle through each scan: pass gate() to I/O, observe stats(), stop() after acquisitions finish. Publication uses finish_with and cancellation publishes nothing.
+- Watcher services drain completed minutes only; enable_events/drain_events belong solely to foreground watch. Report WatchMode::Failed and transient recovery. State setup and firstboot obey the unsafe-state refusal/no-follow handle policy in `08` §5.
 - **Scheduler:**
   - Parse `every <dur>` / `daily HH:MM` / `off` and windows `HH:MM-HH:MM` in local time (windows may wrap midnight).
   - At most **one scan at a time across all roots** (protects the array). The scheduler holds the host-wide `state_dir/scan.lock` (W2-C) for each scan, so CLI scans are excluded too. It passes a `ScanRecorder` that forwards to the ts-writer thread.

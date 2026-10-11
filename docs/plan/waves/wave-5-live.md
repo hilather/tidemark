@@ -50,13 +50,17 @@ pub struct WatcherOptions { pub mount: RawPath, pub events: Vec<String>, pub hot
 /// Display strings (status, now, firstboot): "fd/mount", "dfid-name/mount", "dfid-name/filesystem".
 /// FID-only (FAN_REPORT_FID without DFID_NAME) is deliberately not used: without names, resolving
 /// directory-entry events needs a handle→path lookup per event, so the watcher falls back to fd mode.
-pub enum WatchMode { FdMount, DfidNameMount, DfidNameFilesystem }
+pub enum WatchMode { FdMount, DfidNameMount, DfidNameFilesystem, Failed }
 pub enum HotScope { Dir, Unit, Comm }
 pub struct WatchStats { pub mode: WatchMode, pub events_total: u64, pub overflows_total: u64,
-                        pub lossy_minutes_15m: u32, pub dropped_keys: u64 }
+                        pub lossy_minutes_15m: u32, pub dropped_keys: u64, pub dropped_events: u64,
+                        pub recovering: bool, pub read_errors: u64 }
+pub struct WatchEvent { pub at: i64, pub path: RawPath, pub delta: i64, pub attribution: Attribution }
 pub struct Watcher;
 impl Watcher {
     pub fn start(cfg: WatcherOptions, attribution: Arc<AttributionCache>) -> Result<Watcher, WatchError>; // spawns its thread
+    pub fn enable_events(&self); // foreground only; buffer cap 1,000
+    pub fn drain_events(&self, limit: usize) -> Vec<WatchEvent>;
     pub fn mode(&self) -> WatchMode;
     pub fn hot(&self, window_min: u32, scope: HotScope, limit: usize) -> Vec<HotEntry>;
     pub fn drain_completed_minutes(&self, top_k: usize) -> Vec<HotMinute>;   // for timeseries; each minute once
@@ -66,6 +70,8 @@ impl Watcher {
 }
 pub fn namespace_ok() -> io::Result<bool>;   // /proc/self/ns/mnt == /proc/1/ns/mnt
 ```
+
+Follow `13` R2-8: retry transient descriptor shortages, report failed workers, and expose only directional rename events (no FAN_RENAME/pairing).
 
 ### Details
 
@@ -139,6 +145,8 @@ impl ProcScanner {
 
 ---
 
+Process identity follows `07` §4 / `13` R2-9: OpenFile.starttime is compared with attribution; reused PIDs are unknown; procfs is not Gate-charged.
+
 ## W5-C — *(Deferred.)*
 
 ---
@@ -159,29 +167,46 @@ pub struct MountRates { pub mount: String, pub size: u64, pub used: u64, pub ava
 pub struct DirGrowth { pub root: String, pub path: RawPath, pub depth: u32, pub delta: i64, pub between: (String, String) }
 
 // alerts
-pub struct AlertInputs<'a> {
-    pub mounts: &'a [MountRates], pub lvm: &'a [(String /*mount*/, LvmNow)], pub phantom: &'a [PhantomSummary],
-    pub hot_dirs_window: &'a [(String /*mount*/, Vec<HotEntry>)],   // for hot_dir_growth (rule window)
-    pub scans: &'a [ScanStatus], pub dir_growth: &'a [DirGrowth],
-    pub watch_overflows_15m: &'a [(String, u64)], pub state_space_refused: bool,
+pub trait AlertSource {
+    fn fs_sample(&self, mount: &str) -> Option<FsSample>;
+    fn fs_rate(&self, mount: &str, window: Duration) -> Option<f64>;
+    fn hot_dirs(&self, mount: &str, window: Duration) -> Option<Vec<HotEntry>>;
+    fn watch_overflows(&self, mount: &str, window: Duration) -> Option<u64>;
+    fn phantom_bytes(&self, mount: &str) -> Option<u64>;
+    fn lvm(&self) -> Option<Vec<LvmNow>>;
+    fn dir_growth(&self, root: &str, depth: u32) -> Option<Vec<(RawPath, i64)>>;
+    fn scan_age(&self, root: &str) -> Option<ScanAge>;
 }
+pub struct ScanAge { pub last_complete_at: Option<i64>, pub effective_cadence: Option<Duration> }
+pub struct AlertInputs<'a> { pub source: &'a dyn AlertSource, pub state_space_refused: bool }
+pub struct AlertDiagnostic { pub rule: String, pub reason: String }
+
 pub struct AlertEngine;
 impl AlertEngine {
     pub fn new(rules: &[AlertRule], renotify: Duration) -> Result<Self, AlertError>;   // validates rules
     pub fn evaluate(&mut self, now: i64, inputs: &AlertInputs) -> Vec<AlertEvent>;     // firing/resolved/renotify
     pub fn active(&self) -> Vec<AlertSummary>;
+    pub fn diagnostics(&self) -> &[AlertDiagnostic];
 }
 pub trait Deliver: Send { fn deliver(&mut self, ev: &AlertEvent) -> Result<(), DeliverError>; }
 pub struct JournalDeliver;                  // tracing-journald with structured fields
-pub struct WebhookDeliver;                  // ureq; own thread; bounded queue (1,000); 5 s timeout; 3 retries
+pub struct WebhookDeliver; // ureq; queue 1,000; 5s timeout; 3 retries; no separate v1 redaction
+impl WebhookDeliver { pub fn new(url: &str, host: &str) -> Result<Self, DeliverError>; }
 
 // now
 pub struct NowInputs<'a> {
-    pub host: &'a str, pub mounts: &'a [MountRates], pub lvm: &'a [(String /*mount*/, LvmNow)],
-    pub hot_dirs_5m: &'a [(String /*mount*/, Vec<HotEntry>)], pub writers_5m: &'a [(String, Vec<HotEntry>)],
-    pub phantom: &'a [PhantomSummary], pub open_writers: &'a [(String, Vec<OpenWriter>)],
-    pub alerts: &'a [AlertSummary], pub scans: &'a [ScanStatus],
-    pub watch_modes: &'a [(String, String, u32 /*lossy 15m*/)], pub degraded: &'a [String],
+    pub host: &'a str,
+    pub mounts: Option<&'a [MountRates]>,
+    pub lvm: Option<&'a [(String, LvmNow)]>,
+    pub hot_dirs_5m: Option<&'a [(String, Vec<HotEntry>)]>,
+    pub writers_5m: Option<&'a [(String, Vec<HotEntry>)]>,
+    pub phantom: Option<&'a [PhantomSummary]>,
+    pub open_writers: Option<&'a [(String, Vec<OpenWriter>)]>,
+    pub alerts: Option<&'a [AlertSummary]>,
+    pub scans: Option<&'a [ScanStatus]>,
+    pub watch_modes: Option<&'a [(String, String, u32)]>,
+    pub unevaluable: &'a [crate::alerts::AlertDiagnostic],
+    pub degraded: &'a [String],
 }
 pub fn build_now(i: &NowInputs, now: i64) -> NowReport;
 pub fn render_now_text(r: &NowReport, width: usize, color: bool) -> String;
@@ -189,6 +214,7 @@ pub fn render_now_text(r: &NowReport, width: usize, color: bool) -> String;
 
 ### Details
 
+- Source availability, exact rule windows, diagnostics and automatic cadence follow `07` §6 / `13` R2-10. No data never starts, resolves or renotifies; NowInputs distinguishes not measured from measured empty.
 - Rule kinds and semantics exactly as `07` §6.1–6.2: `for` / `resolve_for` hysteresis per `(rule, subject)`, and re-notify while firing. Path globs (`hot_dir_growth`) and VG/pool patterns (`thin_pool_pct`) use `globset`. Threshold strings are parsed with `tidemark_core::units` (`"50GiB/h"`).
 - **Default rules** (`07` §6.4) come from pure `tidemark_core::config::default_rules(cfg)`, wrapped or re-exported by W5-D. The config layer merges them with user rules: a user rule with the same `name` overrides. Follow `07` §6.4 for stable names, scheduled-root stale defaults and collector availability, and `08` §3 for required fields and numeric bytes/s thresholds.
 - `render_now_text` reproduces the layout in `07` §7, wrapping to `width`. With `color = false`, output is plain ASCII-safe (apart from the user's path bytes, which are rendered lossily).

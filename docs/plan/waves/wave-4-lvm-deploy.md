@@ -118,7 +118,9 @@ pub fn write(state_dir: &Path, r: &FirstbootReport) -> io::Result<()>; // atomic
     3. With `--start-now`, also restart (or start) the service.
     4. Write `deploy/staged.json`.
     5. Print a summary, including warnings such as "watcher will be disabled: fanotify unavailable".
-  - **Idempotent:** re-running with the same config is a no-op that reports "already staged".
+  - **Idempotent:** identical config is a no-op only when enabled, the requested start outcome is satisfied and the recorded start option matches. New immediate-start requests restart; disabled services are enabled again.
+  - Preserve `Context.config_path` from global -c; stage validates its source independently of installed-config validity. Refuse unsafe state_dir/artifacts before stage, unstage or firstboot mutations; all state operations use no-follow directory handles (08 §5, 13 R2-7).
+  - After pre-flight, runtime failures attempt best-effort compensation and report initiating/compensation errors. Staging is not a transaction; observed downtime and other residual effects can remain.
 - **`healthy` (first-boot report)** is true when the core components (`sampler`, `scheduler`, `api`, `tswriter`; canonical names in `08` §5) are `ok`. Non-core components may be `degraded`/`disabled`/`error`; they are listed but never block, so a host without LVM verifies.
 - **`deploy verify`:**
   1. The service must be active.

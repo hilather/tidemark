@@ -450,7 +450,7 @@ Plan locations: `04` §3/§8; `08` §1; W2-B interface and W2-C sequence. Affect
 
 **Decision: accepted with modifications.**
 
-No new `WalkConfig` budget field. `scan.memory_budget` is admission control by estimate for mode choice and queue sizing with `04` §7's formula, not a hard guarantee. The service cgroup memory limit supplies the hard bound. The orchestrator logs the working-set estimate and observed process peak RSS after publication, series and retention work. As the integration handoff clarifies, process VmHWM includes earlier or concurrent work and is not an isolated scan allocation measurement.
+**Replaced by R2-1 below.** The earlier estimate-only decision no longer excludes a record byte bound.
 
 Plan locations: `04` §7; W2-C sequence. Affected tasks: W1-B, W2-C, W6-A.
 
@@ -466,11 +466,213 @@ Plan locations: W2-C sequence steps 3/6/10. Affected tasks: W1-E, W2-C.
 
 **Decision: accepted.**
 
-Non-dry-run prune opens a writable catalog, deletes the files returned by the retention plan, then calls `Catalog::rebuild_from_files` globally from remaining snapshot files, removing deleted snapshot rows. `--dry-run` only reports proposed deletions. `snapshots rebuild-catalog --root PATH` validates the path but rebuilds for all roots; help says so. No store interface change.
+Non-dry-run prune opens a writable catalog, deletes the files returned by the retention plan, then calls `Catalog::rebuild_from_files` globally from remaining snapshot files, removing deleted snapshot rows. `--dry-run` only reports proposed deletions. `snapshots rebuild-catalog --root PATH` is refused; omit `--root` for global rebuilding (R2-5 replaces the earlier scoped-command wording). No store interface change.
 
 Plan locations: `05` §7; `08` §1; W2-C CLI. Affected tasks: W2-C, later catalog callers.
 
 ## Wave 5 requests
 
 - `docs/handoff/scr-W5-C/SCR-001.md` and `SCR-002.md` are **closed without a decision** because the PostgreSQL collector was removed (ADR-019).
-- `docs/handoff/scr-W5-D/SCR-1.md` is **open**: alert inputs for arbitrary windows, automatic stale cadence, collector availability and webhook redaction will be decided by a design task before Wave 6 starts. Until then the affected rule inputs stay unevaluated as described in `docs/handoff/W5-D.md`; this record does not approve new input contracts.
+- `docs/handoff/scr-W5-D/SCR-1.md` is **closed by R2-10** below; W5-D-fix supplies the decided integration surface.
+
+
+## Waves 2 to 5 review decisions
+
+These coordinator decisions supersede pending labels in the listed requests and older conflicting plan text. Fix notes are the source for implemented details; their local checks are evidence, not independent verification. `W3-C-finish.md` is missing: its task-specific signatures remain **see the code**; the common accessors are established by STORE-seams. W4-A-fix adds no contract change. ADR-018 root-only access and ADR-019 PostgreSQL deferral remain in force.
+
+### R2-1 — Walker record bound (replaces D3)
+
+Candidate-only queue estimates did not bound link, skip or error storage. A wide directory could exceed the assigned record pool.
+
+**Decision: accepted as specified below.**
+
+`WalkConfig.max_record_bytes: u64` bounds each retained directory record (0 disables the bound only for explicit fixtures). Exceeding it returns `WalkError::Limit(String)` naming the directory, entry count and bound; no record is truncated. Charge before allocation for links, skips, sampled errors, namespace children and candidates, including vector growth, names/paths, padding and candidate heaps.
+
+Let `Q = scan.memory_budget / 4` and `T = threads`. Refuse before starting if `Q < T * 16 MiB`. Compute `C = clamp(floor(Q / 16 MiB) - T, 1, 64)` and `max_record_bytes = floor(Q / (T + C))`. Capacity reaches 1 before the record bound drops below 16 MiB. Admission also checks aggregator estimates and worker buffers/heaps against the remaining budget using wide arithmetic, including bulk-to-walk fallback. Bulk's namespace channel has capacity 2, so bulk admission refuses derived `C < 2`. CLI live walks use the same derived record bound. This replaces D3: aggregate storage remains estimated, while records are explicitly bounded; the service cgroup supplies the hard whole-process limit.
+
+Source notes: W2-C-fix (under docs/handoff/).
+
+Requests closed: scr-W2-C/SCR-002 (memory part; D4 retains collision policy).
+
+Plan locations: 04 §2.2/§7; W2-C. Affected tasks: W1-B, W2-A/B/C, W6-A.
+
+### R2-2 — Checked directory read
+
+A directory can be replaced or mounted over after namespace discovery. A name lookup must check the opened identity before reading.
+
+**Decision: accepted as specified below.**
+
+```rust
+pub fn read_dir_entries_checked(root: &RawPath, dev: DevId, path: &RawPath,
+    expect_ino: Option<Ino>, gate: &dyn Gate) -> io::Result<Vec<(RawName, Ino, FileKind)>>;
+```
+
+`tidemark_fs::walk::read_dir_entries_checked` opens each component relative to no-follow directory handles with O_NOATIME (EPERM fallback). Gated descriptor statx checks device and available mount ID against the opened root before enumeration, and the final inode against the expected phase-1 identity. Outside-root paths and identity/device/mount mismatches return `io::ErrorKind::CrossesDevices`; other open errors retain their I/O error. Without kernel mount IDs, a same-device bind preserving the expected inode cannot be detected. Bulk phase 3 and `links --show-paths` use this helper, never the unchecked read. Bulk failures leave names unresolved and count races; links render missing/replaced directories as `(gone)` and propagate other I/O failures. Apply original excludes and skipped-mount paths before choosing an alias.
+
+Source notes: W2-B-fix; W3-B-finish (under docs/handoff/). The full checked-read signature was transcribed from crates/tidemark-fs/src/walk/getdents.rs.
+
+Requests closed: No separate SCR; W2-B review and W3-B-finish.
+
+Plan locations: 04 §3.3; 08 §1 links; W2-B/W3-B. Affected tasks: W2-B, W3-B, W6-A, W7-C.
+
+### R2-3 — Aggregator bounds
+
+Bulk candidate ingestion retained all single-link files. Sparse discovery IDs also made full node slots costly.
+
+**Decision: accepted as specified below.**
+
+Notable candidates are bounded during ingestion in both modes. Let D be candidate-bearing directories and M=`max_notable`: retain fewer than M rows above the cutoff and at most D*M at the cutoff, plus one transient insertion; below-threshold ties tighten to D*min(`top_files`, M). After final directory numbering, lazily drain into a selection capped at M in `(disk desc, final directory id asc, inode asc)` order. This is exact but does not promise O(M) memory independent of D.
+
+The fixed fallback directory limit is `MAX_DIRS = 16_000_000`; exceeding it returns `AggError::Capacity`. Node payload is 232 bytes, sparse `Option<Box<Node>>` slots 8 bytes, or 240 bytes per populated directory before names, children, allocator overhead and vector slack. The 200-byte target was not reached. Linked scans additionally need temporary 32-byte union/stamp scratch slots plus numbering vectors; this ceiling is not a guarantee of fitting the configured budget.
+
+Source notes: W2-A-fix (under docs/handoff/).
+
+Requests closed: scr-W2-A/SCR-001 already closed by SCR-008; error totals remain unchanged.
+
+Plan locations: 04 §7; W2-A. Affected tasks: W2-A/B/C, W6-A, W7-B.
+
+### R2-4 — Store access and cancellable publication
+
+Private reader state blocked streamed SQL queries. A pre-finish cancellation check could not observe cancellation during index construction and sync.
+
+**Decision: accepted as specified below.**
+
+```rust
+impl Snapshot {
+    pub(crate) fn conn(&self) -> &rusqlite::Connection;
+    pub(crate) fn file(&self) -> &std::path::Path;
+}
+impl SnapshotWriter {
+    pub fn finish_with(self, final_meta: &SnapshotMeta,
+        cancelled: &dyn Fn() -> bool) -> Result<PathBuf, StoreError>;
+}
+```
+
+The internal accessors support streaming bound read-only queries and immutable/read-only ATTACH; detach attached databases on every exit. `finish` delegates with an always-false callback. `finish_with` checks cancellation before indexes, after each of seven indexes, before metadata, and after close/file sync immediately before non-replacing rename. `StoreError::Cancelled` removes unpublished temporary output; the orchestrator maps it to `ScanError::Cancelled` and records cancellation without a published file. Publication cancellation discards even a keep-partial candidate. No callback runs after rename; cancellation is observed at checkpoints, not atomically with the flag and rename.
+
+Source notes: STORE-seams; W3-A-finish; W3-B-finish (under docs/handoff/).
+
+Requests closed: scr-W3-A/SCR-1; scr-W3-B/SCR-001; scr-W3-C/SCR-001; publication seam from W2-C review.
+
+Plan locations: 05 §2/§3/§5; W2-C. Affected tasks: W1-E, W2-C, W3-A/B/C, W6-A.
+
+### R2-5 — Prune and global catalog rebuild
+
+Deleting files without reconciling the catalog left stale query entries. A scoped global rebuild would discard unrelated roots’ historical rows.
+
+**Decision: accepted as specified below.**
+
+Prune deletes retention-selected files and globally rebuilds the catalog from surviving snapshots; dry-run only reports deletions. Automatic retention and emergency pruning reconcile the catalog too; expired partial/failed artifacts are considered before protected complete snapshots. `snapshots rebuild-catalog --root PATH` is refused before recovery or mutation: omit `--root` for an explicit global rebuild. This follows W2-C-fix more precisely than the older D5 text, because the global store rebuild cannot preserve another root's historical failed/running rows.
+
+Source notes: W2-C-fix (under docs/handoff/).
+
+Requests closed: No separate SCR; W2-C review, replaces D5 scoped wording.
+
+Plan locations: 05 §7/§8; 08 §1; W2-C. Affected tasks: W2-C, W6-A, W7-D.
+
+### R2-6 — Diff of removed paths
+
+Realpath fails when a queried snapshot directory has been deleted. Resolving unresolved parent components would make ancestor fallback ambiguous.
+
+**Decision: accepted as specified below.**
+
+`diff` first canonicalizes the original live path. On ENOENT, it canonicalizes the longest existing ancestor and appends the unresolved byte names. Refuse `..` in the unresolved suffix; existing symlink/parent semantics are handled by realpath before lexical normalization. This exception applies to diff so removed snapshot paths remain queryable.
+
+Source notes: W3-A-finish (under docs/handoff/).
+
+Requests closed: scr-W3-A/SCR-2.
+
+Plan locations: 08 §1.1; W3-A. Affected tasks: W3-A, W7-A/D.
+
+### R2-7 — Deployment confinement and compensation
+
+The installed config path was lost before dispatch. Runtime service and file publication failures cannot satisfy an all-or-nothing guarantee.
+
+**Decision: accepted as specified below.**
+
+The CLI `Context` carries `pub config_path: PathBuf`; global `-c` names the installed destination. `deploy stage --from` loads and validates its source independently, even when the installed config is missing or invalid. Blocking pre-flight failures change nothing. After pre-flight, publication/service failures trigger best-effort restoration of previous config, marker and staged-record bytes, removal of new backup files, and independent attempts to restore enabled/active service state. Report initiating and compensation errors with instructions to retry stage or unstage. This is not a transaction: downtime, timestamps and newly created empty directories may remain.
+
+Local filesystem eligibility is exactly `xfs`, `ext2`, `ext3`, `ext4`, `btrfs`, `tmpfs`, `zfs`, `f2fs`, `jfs`, `reiserfs`; unknown types block. ADR-018 requires destination writability/searchability and required ownership, with no running-as-root check. Production files are root:root, 0600; state directories 0700.
+
+Stage, unstage and firstboot refuse unsafe `state_dir` before mutations: `/`, nonabsolute paths, `..` components, symlink/nondirectory ancestry, mount points, and paths equal to or containing tracked roots/sampler/watch mounts (including existing roots' canonical locations). Also refuse paths equal to or containing `/etc`, `/usr`, `/var`, `/var/lib`, `/run`, `/home`, `/root`, `/boot`, `/dev`, `/proc`, `/sys`, `/tmp`. This is containment by state_dir: `/var/lib/tidemark` and private descendants of `/tmp` are eligible. Unsafe/mounted deploy subdirectories, symlink/nonregular artifacts and malformed/path-mismatched markers block too. Existing unmarked production directories must already have 0700 root:root; change ownership/mode only for new directories or a valid marker identifying that directory. Marker-backed unstage/firstboot recover tracked roots from the staged config; path-only calls without a marker protect default roots, and CLI unstage also checks loaded roots.
+
+Every operation under state_dir uses no-follow directory handles: component-relative opens, regular-file reads, exclusive temporary writes, renameat/unlinkat and descriptor fsync. Retain handles through service actions and compensation; the installed config is also inspected/read through a verified parent and O_NOFOLLOW.
+
+Source notes: W4-B-fix (under docs/handoff/).
+
+Requests closed: scr-W4-B/SCR-001, SCR-002, SCR-003.
+
+Plan locations: 08 §1/§5; 11 P3/P5; ADR-016; W4-B. Affected tasks: W4-B, W6-A/C, W7-C/D.
+
+### R2-8 — Watcher foreground events and directional renames
+
+Aggregates cannot reconstruct individual event attribution. Directional fanotify records lack a reliable pairing cookie.
+
+**Decision: accepted as specified below.**
+
+```rust
+pub struct WatchEvent { pub at: i64, pub path: RawPath, pub delta: i64, pub attribution: Attribution }
+impl Watcher {
+    pub fn enable_events(&self);
+    pub fn drain_events(&self, limit: usize) -> Vec<WatchEvent>;
+}
+```
+
+Only the foreground consumer enables the 1,000-event buffer; it drops oldest events and counts drops. Daemon construction leaves it absent and uses completed-minute drains. Foreground output shares a 50-lines/s limit across mounts, reports omissions, and emits JSON lines with schema `tidemark.watch.v1` and path/path_b64. MOVED_FROM/MOVED_TO are independent directional events with signed deltas; v1 uses no FAN_RENAME and reports no from-to pairs.
+
+Retry EMFILE/ENFILE/ENOMEM/ENOBUFS with shutdown-aware exponential 50–800 ms waits, retaining the group and marking affected/recovery minutes lossy. Fatal transport failures persist as `WatchMode::Failed`; foreground CLI exits rather than appearing alive. `WatchStats` adds `dropped_events: u64`, `recovering: bool`, `read_errors: u64`. Clear unsafe path caches after loss; clock rollback discards affected ring history and marks the new minute lossy.
+
+Source notes: W5-A-fix (under docs/handoff/).
+
+Requests closed: scr-W5-A/SCR-001, SCR-002.
+
+Plan locations: 07 §3; 08 §1; W5-A. Affected tasks: W5-A, W6-A, W7-C/D.
+
+### R2-9 — Process identity and procfs charging
+
+PID reuse between enumeration and attribution can assign an open inode to another process. Procfs metadata reads are not disk scan I/O.
+
+**Decision: accepted as specified below.**
+
+`OpenFile.starttime: u64` is the process identity validated around enumeration. Compare it with later `Attribution.starttime`; mismatch produces comm `?` and no unit for both phantom and writers. `/proc` reads do no disk I/O and are not charged to Gate; O_NOATIME does not apply. Existing bounded scanner caps remain. Writer reports use the actual baseline-to-latest timestamp span, not the requested window; positive growth with zero measured span is omitted.
+
+Source notes: W5-B-fix (under docs/handoff/).
+
+Requests closed: scr-W5-B/SCR-001 (identity accepted, procfs Gate proposal rejected).
+
+Plan locations: 07 §4; W5-B. Affected tasks: W1-D, W5-B, W6-A.
+
+### R2-10 — Rule-scoped alert source and unavailable measurements
+
+Fixed aggregate windows could not evaluate arbitrary configured rule windows or automatic cadence. Missing measurements could appear as healthy zeros or resolve existing alerts.
+
+**Decision: accepted as specified below.**
+
+```rust
+pub trait AlertSource {
+    fn fs_sample(&self, mount: &str) -> Option<FsSample>;
+    fn fs_rate(&self, mount: &str, window: Duration) -> Option<f64>;
+    fn hot_dirs(&self, mount: &str, window: Duration) -> Option<Vec<HotEntry>>;
+    fn watch_overflows(&self, mount: &str, window: Duration) -> Option<u64>;
+    fn phantom_bytes(&self, mount: &str) -> Option<u64>;
+    fn lvm(&self) -> Option<Vec<LvmNow>>;
+    fn dir_growth(&self, root: &str, depth: u32) -> Option<Vec<(RawPath, i64)>>;
+    fn scan_age(&self, root: &str) -> Option<ScanAge>;
+}
+pub struct ScanAge { pub last_complete_at: Option<i64>, pub effective_cadence: Option<Duration> }
+pub struct AlertInputs<'a> { pub source: &'a dyn AlertSource, pub state_space_refused: bool }
+pub struct AlertDiagnostic { pub rule: String, pub reason: String }
+impl AlertEngine { pub fn diagnostics(&self) -> &[AlertDiagnostic]; }
+```
+
+Query the source per rule and exact Duration window; dir_growth compares snapshots and has no window. Inventories must be complete and bounded: `Some(empty)` confirms absence, `None` means unavailable. A rule without data is not evaluable: preserve state, values and timers without starting, resolving or renotifying; pause continuity and restart pending/clearing evidence on the next known observation. Show diagnostic reasons in alerts and `NowInputs.unevaluable`, propagated through `NowReport.degraded`. Unknown thin-pool percentages cannot resolve an active alert. Healthy unseen subjects allocate no state; the private 10,000-pair cap reports admission failures and protects unavailable active states.
+
+`older_than = "auto"` is twice effective cadence; windowed schedules supply at least 24h cadence, non-windowed short cadences remain valid. Unknown cadence is diagnostic; a known root with no complete scan breaches staleness. Measured NowInputs sections use Option: None is “not measured”, Some(empty) is measured empty. Preserve the frozen core report via degraded reasons and never display an unavailable phantom placeholder as measured zero.
+
+`WebhookDeliver::new(url, host)` has two arguments; there is no separate webhook redaction rule or config key in v1. Preserve escaped subjects and the documented fields/text. Only 2xx succeeds; redirects are disabled and failed deliveries, with the existing bounded queue, timeout and retries.
+
+Source notes: W5-D-fix (under docs/handoff/). Full AlertSource signatures were transcribed from crates/tidemark-live/src/alerts/mod.rs because the note describes, rather than enumerates, its eight methods.
+
+Requests closed: scr-W5-D/SCR-1 (accepted source/availability; no separate redaction).
+
+Plan locations: 07 §6/§7; W5-D; W6-A/B. Affected tasks: W5-D, W6-A/B, W7-C/D.

@@ -99,6 +99,7 @@ pub struct WalkConfig {
     pub skip_mounts: Vec<RawPath>,     // from mount::submounts_under
     pub big_file_threshold: u64,
     pub top_files: usize,
+    pub max_record_bytes: u64,         // 13 R2-1; derived from scan.memory_budget; overflow is Limit(String)
     pub scan_start: i64,
     pub getdents_buf: usize,
     pub io_idle: bool,                 // per-worker tidemark_sys::ioprio::set_current_thread_idle()
@@ -112,8 +113,10 @@ pub struct WalkSummary {
 pub fn walk(cfg: &WalkConfig, gate: &dyn Gate, cancel: &AtomicBool,
             out: crossbeam_channel::Sender<WalkOutput>) -> Result<WalkSummary, WalkError>;
 
-/// One directory, used by bulk phase 3, `links --show-paths` and `top --live`.
+/// Unchecked one-directory helper; bulk phase 3 and links use the checked helper below.
 pub fn read_dir_entries(dir: &RawPath, gate: &dyn Gate) -> io::Result<Vec<(RawName, Ino, FileKind)>>;
+pub fn read_dir_entries_checked(root: &RawPath, dev: DevId, path: &RawPath,
+    expect_ino: Option<Ino>, gate: &dyn Gate) -> io::Result<Vec<(RawName, Ino, FileKind)>>; // 04 §3.3
 ```
 
 ### Implementation notes
@@ -267,7 +270,7 @@ pub fn read_uid(pid: u32) -> io::Result<u32>;
 
 /// One pass over /proc/[pid]/fd/*: every fd whose target is a regular file on one of `devs`.
 /// Shared primitive for phantom detection and open writers (W5-B procscan).
-pub struct OpenFile { pub pid: u32, pub fd: u32, pub target: Vec<u8> /* readlink text */,
+pub struct OpenFile { pub pid: u32, pub starttime: u64, pub fd: u32, pub target: Vec<u8> /* readlink text */,
                       pub dev: DevId, pub ino: Ino, pub nlink: u64, pub size: u64, pub disk: u64,
                       pub flags: Option<u32> /* fdinfo flags when want_flags */ }
 pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenFile>>;
@@ -345,6 +348,7 @@ impl SnapshotWriter {
     pub fn put_annotations(&mut self, rows: &[AnnotationRow]) -> Result<(), StoreError>;
     pub fn space_check_every(&mut self, rows: u64, check: Box<dyn FnMut() -> SpaceVerdict + Send>);
     pub fn finish(self, final_meta: &SnapshotMeta) -> Result<PathBuf, StoreError>;
+    pub fn finish_with(self, final_meta: &SnapshotMeta, cancelled: &dyn Fn() -> bool) -> Result<PathBuf, StoreError>; // 05 §2; Cancelled publishes nothing
     pub fn abort(self);                                                             // also on Drop
 }
 

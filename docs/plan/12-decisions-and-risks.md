@@ -80,7 +80,7 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 
 **ADR-016 — Staged deployment for the hotfix pipeline.**
 - *Decision:*
-  - `deploy stage` does all validation up front and is all-or-nothing. It enables the service but doesn't start it.
+  - `deploy stage` validates before mutation: blocking pre-flight failures change nothing. Later failures attempt best-effort compensation and report residual errors; it is not a transaction (13 R2-7). It enables the service and starts it only with `--start-now`.
   - The daemon writes a first-boot report.
   - `deploy verify` gives a machine-checkable result.
 - *Consequences:* Tidemark rides existing reboot cycles with no manual steps. Since nothing touches boot-critical config, a bad deploy can't affect the reboot itself.
@@ -117,7 +117,7 @@ L = likelihood, I = impact (H/M/L).
 | R7 | EL8 kernel behaviour differs from upstream (bulkstat units, v5, fanotify FID) | M | M | EL8 5.0.0 headers lack v5; module inspection found v5 handlers in 477.27.1.el8_8 and 553.172.1.el8_10, not runtime ioctl evidence. Hand-transcribed ABI pinned to gcc layouts (`04` §5.1); runtime probes and units tests on both VMs remain gates | W1-C, W5-A |
 | R8 | Tidemark's own state fills the disk or adds random writes to RAID 5 | L | M | Space guard; retention; state dir on another device; excluded from scans and watch | `05` §8, W1-E |
 | R11 | *(removed: collector deferred, ADR-019)* | — | — | — | — |
-| R12 | Path names exposed through metrics or webhooks | M | M | Root-only file and API permissions (ADR-018); loopback-only HTTP; cardinality caps; redaction decision in `security.md` | W6-B, W7-C |
+| R12 | Path names exposed through metrics or webhooks | M | M | Root-only file and API permissions (ADR-018); loopback-only HTTP; cardinality caps; document escaped webhook payload exposure; no separate v1 redaction (13 R2-10) | W6-B, W7-C |
 | R13 | Inconsistent or low-quality code from parallel agents | M | M | Frozen contracts; owned paths; independent reviewers; gate reviews | `10` |
 | R14 | Host on unsupported Rocky 8.8 | H | M | Probe warns; P0 recommends updating to 8.10 | P0 |
 | R15 | SELinux denials in enforcing mode | L | M | Install test checks AVCs; runs as `unconfined_service_t` | W6-C |

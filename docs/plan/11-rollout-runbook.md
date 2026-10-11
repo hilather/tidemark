@@ -46,10 +46,12 @@ Add these steps to the pilot host's hotfix:
 
 ```bash
 dnf install -y ./tidemark-<ver>-1.el8.x86_64.rpm
-tidemark deploy stage --from ./tidemark.toml        # non-zero exit → nothing changed; fix and retry
+tidemark deploy stage --from ./tidemark.toml        # pre-flight failure changes nothing; later failure requires inspection
 # … hotfix reboot …
 tidemark deploy verify --wait 5m                      # non-zero → see output; Tidemark is not healthy
 ```
+
+On stage failure, read the initiating and compensation errors. A blocking pre-flight failure changes nothing; a failure after pre-flight attempts best-effort compensation and may leave changes or observed service downtime. Inspect state, then retry stage or unstage; staging is not a transaction.
 
 After verify:
 

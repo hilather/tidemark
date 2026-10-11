@@ -117,10 +117,23 @@ All SQLite readers/writers use checked integer conversions: reject negative unsi
 1. Create `<scan_id>.db.tmp` (mode 0600, owner root:root; retained after rename to `.db`). Set `PRAGMA page_size=32768` before creating any table, then `journal_mode=OFF`, `synchronous=OFF`, `locking_mode=EXCLUSIVE`, `temp_store=MEMORY`, `cache_size=-262144` (256 MiB).
 2. Create tables **without** secondary indexes.
 3. Insert rows with prepared statements in large transactions (about 50,000 rows each). `dirs` rows arrive in ascending `id` order (preorder).
-4. `finish()`: create indexes, run `ANALYZE`, write the final `meta`, close, `fsync` the file, publish without replacement to `<scan_id>.db` (refuse an existing id and retry with a fresh `ScanId`), then `fsync` the directory.
+4. `finish()`: create indexes, run `ANALYZE`, write the final `meta`, close, `fsync` the file, publish without replacement to `<scan_id>.db` (refuse an existing id; writer creation may retry, publication collision fails without retry), then `fsync` the directory.
 5. On error or drop without `finish()`, delete the `.tmp`.
 
 Durability during the build is pointless (a crash discards the scan), so the expensive journaling settings are off. Durability of the finished file comes from the final `fsync` and rename.
+
+```rust
+impl Snapshot {
+    pub(crate) fn conn(&self) -> &rusqlite::Connection;
+    pub(crate) fn file(&self) -> &std::path::Path;
+}
+impl SnapshotWriter {
+    pub fn finish_with(self, final_meta: &SnapshotMeta,
+        cancelled: &dyn Fn() -> bool) -> Result<PathBuf, StoreError>;
+}
+```
+
+The internal accessors support streaming bound read-only queries and immutable/read-only ATTACH; detach attached databases on every exit. `finish` delegates with an always-false callback. `finish_with` checks cancellation before indexes, after each of seven indexes, before metadata, and after close/file sync immediately before non-replacing rename. `StoreError::Cancelled` removes unpublished temporary output; the orchestrator maps it to `ScanError::Cancelled` and records cancellation without a published file. Publication cancellation discards even a keep-partial candidate. No callback runs after rename; cancellation is observed at checkpoints, not atomically with the flag and rename.
 
 ## 3. Read path (`Snapshot`, W1-E)
 
@@ -277,12 +290,14 @@ Retention always keeps each root's newest complete snapshot, even with `recent =
 
 Partial and failed snapshots are deleted after 24 h. `tidemark snapshots prune --dry-run` shows what would go. Non-dry-run prune opens a writable catalog, deletes the snapshot files returned by the retention plan, then calls `Catalog::rebuild_from_files` for all roots using the files that remain. This removes deleted snapshots from the catalog without changing the store interface.
 
+Prune deletes retention-selected files and globally rebuilds the catalog from surviving snapshots; dry-run only reports deletions. Automatic retention and emergency pruning reconcile the catalog too; expired partial/failed artifacts are considered before protected complete snapshots. `snapshots rebuild-catalog --root PATH` is refused before recovery or mutation: omit `--root` for an explicit global rebuild. This follows W2-C-fix more precisely than the older D5 text, because the global store rebuild cannot preserve another root's historical failed/running rows.
+
 ## 8. Space guard (NFR-7)
 
 Before starting a scan, the daemon and CLI check the state filesystem:
 
 - `estimate = previous snapshot size × 1.25`, or `dirs_estimate × 300 B` if there is no previous snapshot.
-- If `state_dir` usage plus the estimate would exceed `max_state_size`, or free space would drop below the floor, **first prune**: delete the oldest snapshots that aren't in the `recent` set or each root's protected newest complete snapshot (largest root first) until the scan fits. Only if it still doesn't fit, refuse to start and raise alert `state_space`. The floor is `max(min_free_pct × size, 2 GiB)`.
+- If `state_dir` usage plus the estimate would exceed `max_state_size`, or free space would drop below the floor, **first prune**: consider expired partial/failed artifacts, then delete the oldest complete snapshots that aren't in the `recent` set or each root's protected newest complete snapshot (largest root first) until the scan fits. Only if it still doesn't fit, refuse to start and raise alert `state_space`. The floor is `max(min_free_pct × size, 2 GiB)`.
 - Pruning never deletes the `recent` set or a root's newest complete snapshot; it logs every deletion.
 - During the scan, the writer re-checks free space every 100,000 rows and aborts cleanly if the floor is crossed.
 

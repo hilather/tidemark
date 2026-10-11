@@ -78,6 +78,18 @@ Rules:
 - Mount-mark limitation: in fd mode, writes made through a *different* mount of the same filesystem (bind mounts, other mount namespaces) are not seen. The probe lists bind mounts of watched filesystems so operators know.
 - **Mount namespace:** the daemon must share the host mount namespace (`02` §8, ADR-013). Before marking, the watcher compares `/proc/self/ns/mnt` with `/proc/1/ns/mnt` and refuses to start, with a loud error, if they differ.
 
+```rust
+pub struct WatchEvent { pub at: i64, pub path: RawPath, pub delta: i64, pub attribution: Attribution }
+impl Watcher {
+    pub fn enable_events(&self);
+    pub fn drain_events(&self, limit: usize) -> Vec<WatchEvent>;
+}
+```
+
+Only the foreground consumer enables the 1,000-event buffer; it drops oldest events and counts drops. Daemon construction leaves it absent and uses completed-minute drains. Foreground output shares a 50-lines/s limit across mounts, reports omissions, and emits JSON lines with schema `tidemark.watch.v1` and path/path_b64. MOVED_FROM/MOVED_TO are independent directional events with signed deltas; v1 uses no FAN_RENAME and reports no from-to pairs.
+
+Retry EMFILE/ENFILE/ENOMEM/ENOBUFS with shutdown-aware exponential 50–800 ms waits, retaining the group and marking affected/recovery minutes lossy. Fatal transport failures persist as `WatchMode::Failed`; foreground CLI exits rather than appearing alive. `WatchStats` adds `dropped_events: u64`, `recovering: bool`, `read_errors: u64`. Clear unsafe path caches after loss; clock rollback discards affected ring history and marks the new minute lossy.
+
 ### 3.3 Aggregation (`LiveState.hot`)
 
 - 60 one-minute buckets (a ring). Each bucket has three bounded maps:
@@ -96,7 +108,7 @@ Mask: `FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO | FAN_CLOSE_WRITE
 - Resolve the directory with `open_by_handle_at(mount_fd, handle, O_PATH)` (needs `CAP_DAC_READ_SEARCH`), then `readlink`. Cache handle→path in an LRU of 100,000.
 - `CLOSE_WRITE`: `fstatat(dirfd, name)` for size.
 - `DELETE`: count it, and estimate freed bytes from the LRU if the inode was seen before.
-- Renames are recorded as `from → to` pairs. They're useful for spotting bulk moves between trees.
+- Renames are directional MOVED_FROM/MOVED_TO events only. V1 reports no from-to pairs and does not use FAN_RENAME.
 
 ## 4. Process scanner (`tidemark-live::procscan`, W5-B, every 60 s)
 
@@ -124,6 +136,9 @@ This catches log files and long-running writers, including runaway database temp
 - Cost: one `readlink` + `stat` per fd and one small read per candidate. Expect well under a second for tens of thousands of fds. Ignore `ENOENT`/`ESRCH` from exiting processes.
 
 ### 4.3 Attribution helper (shared with the watcher)
+
+`OpenFile.starttime: u64` is the process identity validated around enumeration. Compare it with later `Attribution.starttime`; mismatch produces comm `?` and no unit for both phantom and writers. `/proc` reads do no disk I/O and are not charged to Gate; O_NOATIME does not apply. Existing bounded scanner caps remain. Writer reports use the actual baseline-to-latest timestamp span, not the requested window; positive growth with zero measured span is omitted.
+
 
 `pid → { comm, unit, uid }`, read from:
 
@@ -161,6 +176,29 @@ Nine configurable rule kinds remain; `state_space` is an internal alert.
 - Re-notify every `renotify` (default 4 h) while firing.
 
 Numeric `hot_dir_growth.above` must be finite and nonnegative and means bytes/s; equivalent rate strings evaluate identically. Rules whose collector/input is disabled or unavailable remain visible in effective config but do not fire. Thin-pool rules evaluate only tracked thin LVs.
+
+```rust
+pub trait AlertSource {
+    fn fs_sample(&self, mount: &str) -> Option<FsSample>;
+    fn fs_rate(&self, mount: &str, window: Duration) -> Option<f64>;
+    fn hot_dirs(&self, mount: &str, window: Duration) -> Option<Vec<HotEntry>>;
+    fn watch_overflows(&self, mount: &str, window: Duration) -> Option<u64>;
+    fn phantom_bytes(&self, mount: &str) -> Option<u64>;
+    fn lvm(&self) -> Option<Vec<LvmNow>>;
+    fn dir_growth(&self, root: &str, depth: u32) -> Option<Vec<(RawPath, i64)>>;
+    fn scan_age(&self, root: &str) -> Option<ScanAge>;
+}
+pub struct ScanAge { pub last_complete_at: Option<i64>, pub effective_cadence: Option<Duration> }
+pub struct AlertInputs<'a> { pub source: &'a dyn AlertSource, pub state_space_refused: bool }
+pub struct AlertDiagnostic { pub rule: String, pub reason: String }
+impl AlertEngine { pub fn diagnostics(&self) -> &[AlertDiagnostic]; }
+```
+
+Query the source per rule and exact Duration window; dir_growth compares snapshots and has no window. Inventories must be complete and bounded: `Some(empty)` confirms absence, `None` means unavailable. A rule without data is not evaluable: preserve state, values and timers without starting, resolving or renotifying; pause continuity and restart pending/clearing evidence on the next known observation. Show diagnostic reasons in alerts and `NowInputs.unevaluable`, propagated through `NowReport.degraded`. Unknown thin-pool percentages cannot resolve an active alert. Healthy unseen subjects allocate no state; the private 10,000-pair cap reports admission failures and protects unavailable active states.
+
+`older_than = "auto"` is twice effective cadence; windowed schedules supply at least 24h cadence, non-windowed short cadences remain valid. Unknown cadence is diagnostic; a known root with no complete scan breaches staleness. Measured NowInputs sections use Option: None is “not measured”, Some(empty) is measured empty. Preserve the frozen core report via degraded reasons and never display an unavailable phantom placeholder as measured zero.
+
+`WebhookDeliver::new(url, host)` has two arguments; there is no separate webhook redaction rule or config key in v1. Preserve escaped subjects and the documented fields/text. Only 2xx succeeds; redirects are disabled and failed deliveries, with the existing bounded queue, timeout and retries.
 
 ### 6.3 Delivery
 
@@ -203,6 +241,8 @@ pub struct MountNow {
     pub watch_mode: String, pub lossy_minutes_15m: u32,
 }
 ```
+
+Measured `NowInputs` sections are optional: None is not measured, Some(empty) is measured empty. `NowInputs.unevaluable: &[AlertDiagnostic]` adds rule diagnostics to `NowReport.degraded`. Missing phantom and LVM sections render “not measured”; required core placeholders never imply measured zero.
 
 Example render:
 
