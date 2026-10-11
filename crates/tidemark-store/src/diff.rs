@@ -46,12 +46,9 @@ pub struct DiffRow {
 /// Compare a target subtree in two immutable snapshots of the same root.
 ///
 /// Missing targets on one side produce new or removed rows. A target absent
-/// on both sides is an error. Results and intermediate rows are capped at
-/// 1,000,000; exceeding the cap returns an error instead of truncating inputs.
-/// Deltas are checked against the signed 64-bit output contract.
-///
-/// The current reader interface requires bounded subtree queries and a sorted
-/// merge; the ATTACH implementation awaits SCR-1. Neither snapshot is written.
+/// on both sides is an error. Only the requested output is collected; SQL joins
+/// stream the selected rows without a subtree-size cap. Output limits remain
+/// bounded at 1,000,000. Neither snapshot is written.
 pub fn diff(
     new: &Snapshot,
     old: &Path,
@@ -65,59 +62,19 @@ pub fn diff(
     check_roots(new, &old)?;
     let n = new.dir_by_path(target)?;
     let o = old.dir_by_path(target)?;
-    if n.is_none() && o.is_none() {
-        return Err(StoreError::Invalid(
-            "target absent from both snapshots".into(),
-        ));
-    }
-    let mut n = subtree(new, n.as_ref(), metric, max_depth_rel)?
-        .into_iter()
-        .peekable();
-    let mut o = subtree(&old, o.as_ref(), metric, max_depth_rel)?
-        .into_iter()
-        .peekable();
-    let mut rows = Vec::new();
-    loop {
-        let order = match (n.peek(), o.peek()) {
-            (Some(n), Some(o)) => n.path.cmp(&o.path),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => break,
-        };
-        if rows.len() == CAP {
-            return Err(StoreError::Invalid("diff exceeds row cap".into()));
-        }
-        match order {
-            std::cmp::Ordering::Less => {
-                if let Some(n) = n.next() {
-                    rows.push(make_row(&n.path, n.depth_rel, Some(n.value), None)?);
-                }
-            }
-            std::cmp::Ordering::Greater => {
-                if let Some(o) = o.next() {
-                    rows.push(make_row(&o.path, o.depth_rel, None, Some(o.value))?);
-                }
-            }
-            std::cmp::Ordering::Equal => {
-                if let (Some(n), Some(o)) = (n.next(), o.next()) {
-                    rows.push(make_row(
-                        &n.path,
-                        n.depth_rel,
-                        Some(n.value),
-                        Some(o.value),
-                    )?);
-                }
-            }
-        }
-    }
-    rows.sort_by(|a, b| {
-        b.delta
-            .unsigned_abs()
-            .cmp(&a.delta.unsigned_abs())
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    rows.truncate(limit);
-    Ok(rows)
+    check_target(&n, &o)?;
+    with_old(new, &old, || {
+        joined(
+            new,
+            n.as_ref(),
+            o.as_ref(),
+            metric,
+            max_depth_rel,
+            limit,
+            None,
+        )
+        .map(|(rows, _)| rows)
+    })
 }
 
 /// One dominant child selected during iterative descent.
@@ -145,8 +102,8 @@ pub struct Explanation {
 /// Follow the largest same-direction child while it meets ratio and minimum.
 ///
 /// Ratio must be finite and in `(0, 1]`. Ties use raw path bytes; shrinkage
-/// mirrors growth. Steps, direct children and returned contributors are capped
-/// at 1,000,000. `own_delta` always compares own charged bytes, including when
+/// mirrors growth. Steps and returned contributors are capped at 1,000,000;
+/// direct children are joined in SQL without a child-count cap. `own_delta` always compares own charged bytes, including when
 /// the selected subtree metric is reclaimable bytes or file entries.
 pub fn explain(
     new: &Snapshot,
@@ -177,33 +134,17 @@ pub fn explain(
     )?;
     let mut current_delta = target_delta;
     let mut steps = Vec::new();
-    loop {
-        let mut children = std::collections::BTreeMap::new();
-        if let Some(r) = &n {
-            for c in new.children(r.id, tidemark_core::snapshot::SortKey::Name, CAP + 1)? {
-                children.insert(c.path.clone(), (Some(value(&c, metric)), None));
-            }
-        }
-        if let Some(r) = &o {
-            for c in old.children(r.id, tidemark_core::snapshot::SortKey::Name, CAP + 1)? {
-                if children.len() == CAP && !children.contains_key(&c.path) {
-                    return Err(StoreError::Invalid("explain exceeds child cap".into()));
-                }
-                children.entry(c.path.clone()).or_insert((None, None)).1 = Some(value(&c, metric));
-            }
-        }
-        let mut contributors = Vec::with_capacity(children.len());
-        for (p, (nv, ov)) in children {
-            contributors.push(make_row(&p, 1, nv, ov)?);
-        }
-        contributors.sort_by(|a, b| {
-            let signed = if current_delta < 0 {
-                a.delta.cmp(&b.delta)
-            } else {
-                b.delta.cmp(&a.delta)
-            };
-            signed.then_with(|| a.path.cmp(&b.path))
-        });
+    with_old(new, &old, || loop {
+        // Keep the dominant candidate even when no spread rows were requested.
+        let (mut contributors, spread_children) = joined(
+            new,
+            n.as_ref(),
+            o.as_ref(),
+            metric,
+            1,
+            top.max(1),
+            Some(current_delta),
+        )?;
         let dominant = contributors.first().filter(|c| {
             current_delta != 0
                 && c.delta.signum() == current_delta.signum()
@@ -224,13 +165,6 @@ pub fn explain(
             n = new.dir_by_path(&path)?;
             o = old.dir_by_path(&path)?;
         } else {
-            let spread_children = u32::try_from(
-                contributors
-                    .iter()
-                    .filter(|c| c.delta.signum() == current_delta.signum() && c.delta != 0)
-                    .count(),
-            )
-            .map_err(|_| StoreError::Integer("child count".into()))?;
             contributors.truncate(top);
             return Ok(Explanation {
                 target_delta,
@@ -243,7 +177,7 @@ pub fn explain(
                 spread_children,
             });
         }
-    }
+    })
 }
 
 // Matches the existing reader result cap. No traversal recursion is used.
@@ -295,41 +229,228 @@ fn make_row(
     })
 }
 
-struct SideRow {
-    path: RawPath,
-    depth_rel: u32,
-    value: u64,
+fn check_target(
+    n: &Option<tidemark_core::snapshot::DirRow>,
+    o: &Option<tidemark_core::snapshot::DirRow>,
+) -> Result<(), StoreError> {
+    if n.is_none() && o.is_none() {
+        return Err(StoreError::Invalid(
+            "target absent from both snapshots".into(),
+        ));
+    }
+    Ok(())
 }
-fn subtree(
-    snapshot: &Snapshot,
-    root: Option<&tidemark_core::snapshot::DirRow>,
+
+fn with_old<T>(
+    new: &Snapshot,
+    old: &Snapshot,
+    query: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut uri = String::from("file:");
+    // Absolute paths avoid SQLite URI authority/relative-path ambiguity.
+    let file = std::fs::canonicalize(old.file())?;
+    for &byte in file.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/.-_".contains(&byte) {
+            uri.push(char::from(byte));
+        } else {
+            uri.push('%');
+            uri.push_str(&crate::writer::hex(&[byte]));
+        }
+    }
+    uri.push_str("?immutable=1&mode=ro");
+    let mmap: i64 = new
+        .conn()
+        .pragma_query_value(Some("main"), "mmap_size", |r| r.get(0))?;
+    new.conn().execute("ATTACH DATABASE ?1 AS o", [uri])?;
+    // All statements/cursors are dropped by the closure before detachment,
+    // including on query/conversion errors. Drop also covers unwinding.
+    struct Attachment<'a> {
+        conn: &'a rusqlite::Connection,
+        mmap: i64,
+        attached: bool,
+        restore: bool,
+    }
+    impl Drop for Attachment<'_> {
+        fn drop(&mut self) {
+            if self.attached {
+                if let Err(error) = self.conn.execute("DETACH DATABASE o", []) {
+                    tracing::warn!(%error, "could not detach old snapshot");
+                }
+            }
+            if self.restore {
+                if let Err(error) = self
+                    .conn
+                    .pragma_update(Some("main"), "mmap_size", self.mmap)
+                {
+                    tracing::warn!(%error, "could not restore snapshot mapping limit");
+                }
+            }
+        }
+    }
+    let mut attachment = Attachment {
+        conn: new.conn(),
+        mmap,
+        attached: true,
+        restore: true,
+    };
+    // Random hash-index probes otherwise churn SQLite's small page cache.
+    // Bound read-only mappings at 1 GiB per database (2 GiB address space total),
+    // falling back to ordinary page reads above that range or without mmap.
+    // These connection-local PRAGMAs never modify either snapshot. SQLite does
+    // not support bind parameters for PRAGMA settings; use its typed API with
+    // a fixed constant and the previously read integer, never caller input.
+    const MMAP_BYTES: i64 = 1 << 30;
+    new.conn()
+        .pragma_update(Some("main"), "mmap_size", MMAP_BYTES)?;
+    new.conn()
+        .pragma_update(Some("o"), "mmap_size", MMAP_BYTES)?;
+    let result = query();
+    let detached = new.conn().execute("DETACH DATABASE o", []);
+    attachment.attached = detached.is_err();
+    let restored = new.conn().pragma_update(Some("main"), "mmap_size", mmap);
+    attachment.restore = restored.is_err();
+    let result = result?;
+    detached?;
+    restored?;
+    Ok(result)
+}
+
+// The only interpolated SQL fragments are closed internal choices. Every
+// path/range/depth/limit/direction is bound. Both branches match by hash AND
+// full byte path; different preorder ids between snapshots are irrelevant.
+#[allow(clippy::too_many_arguments)]
+fn joined(
+    new: &Snapshot,
+    n: Option<&tidemark_core::snapshot::DirRow>,
+    o: Option<&tidemark_core::snapshot::DirRow>,
     metric: DiffMetric,
     depth: u32,
-) -> Result<Vec<SideRow>, StoreError> {
-    let Some(root) = root else {
-        return Ok(Vec::new());
+    limit: usize,
+    direction: Option<i64>,
+) -> Result<(Vec<DiffRow>, u32), StoreError> {
+    let column = match metric {
+        DiffMetric::Disk => "t_disk",
+        DiffMetric::Reclaimable => "t_reclaimable",
+        DiffMetric::Files => "t_files",
     };
-    let mut rows = snapshot
-        .subtree_dirs(
-            root.id,
-            depth,
-            tidemark_core::snapshot::SortKey::Name,
-            CAP + 1,
-        )?
-        .into_iter()
-        .map(|row| {
-            let value = value(&row, metric);
-            let depth_rel = row
-                .depth
-                .checked_sub(root.depth)
-                .ok_or_else(|| StoreError::Invalid("subtree depth precedes target".into()))?;
-            Ok(SideRow {
-                path: row.path,
-                depth_rel,
-                value,
-            })
-        })
-        .collect::<Result<Vec<_>, StoreError>>()?;
-    rows.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    Ok(rows)
+    let (n_filter, o_filter, order, count) = if direction.is_some() {
+        (
+            "n.parent_id = :n_lo",
+            "o2.parent_id = :o_lo",
+            "delta * :sign DESC, path",
+            "SUM(CASE WHEN delta * :count_sign > 0 THEN 1 ELSE 0 END) OVER ()",
+        )
+    } else {
+        (
+            "n.id BETWEEN :n_lo AND :n_hi AND n.depth <= :n_depth",
+            "o2.id BETWEEN :o_lo AND :o_hi AND o2.depth <= :o_depth",
+            "ABS(delta) DESC, path",
+            "0",
+        )
+    };
+    let sql = format!(
+        "SELECT path, depth_rel, new_value, old_value, {count} FROM (
+         SELECT n.path, n.depth - :n_base AS depth_rel,
+                n.{column} AS new_value, o2.{column} AS old_value,
+                n.{column} - COALESCE(o2.{column}, 0) AS delta
+         FROM main.dirs n LEFT JOIN o.dirs o2
+           ON o2.path_hash = n.path_hash AND o2.path = n.path
+         WHERE {n_filter}
+         UNION ALL
+         SELECT o2.path, o2.depth - :o_base, NULL, o2.{column}, -o2.{column}
+         FROM o.dirs o2 WHERE {o_filter}
+           AND NOT EXISTS (SELECT 1 FROM main.dirs n
+                           WHERE n.path_hash = o2.path_hash AND n.path = o2.path)
+         ) ORDER BY {order} LIMIT :limit"
+    );
+    let mut statement = new.conn().prepare(&sql)?;
+    // Bind only parameters present in the chosen query variant.
+    let mut bind = |name: &str, value: i64| -> Result<(), StoreError> {
+        if let Some(index) = statement.parameter_index(name)? {
+            statement.raw_bind_parameter(index, value)?;
+        }
+        Ok(())
+    };
+    for (prefix, root) in [("n", n), ("o", o)] {
+        bind(
+            &format!(":{prefix}_lo"),
+            root.map_or(-1, |r| i64::from(r.id)),
+        )?;
+        bind(
+            &format!(":{prefix}_hi"),
+            root.map_or(-1, |r| i64::from(r.subtree_end)),
+        )?;
+        let base = root.map_or(0, |r| i64::from(r.depth));
+        bind(&format!(":{prefix}_base"), base)?;
+        bind(&format!(":{prefix}_depth"), base + i64::from(depth))?;
+    }
+    bind(":limit", crate::error::sql_limit(limit)?)?;
+    bind(
+        ":sign",
+        if direction.is_some_and(|d| d < 0) {
+            -1
+        } else {
+            1
+        },
+    )?;
+    bind(":count_sign", direction.map_or(0, i64::signum))?;
+    let mut cursor = statement.raw_query();
+    let mut rows = Vec::new();
+    let mut count = 0;
+    while let Some(row) = cursor.next()? {
+        let path = RawPath::new(row.get::<_, Vec<u8>>(0)?)?;
+        let depth_rel = row.get::<_, u32>(1)?;
+        let nv = crate::error::read_optional_u64(row, 2)?;
+        let ov = crate::error::read_optional_u64(row, 3)?;
+        count = row.get(4)?;
+        rows.push(make_row(&path, depth_rel, nv, ov)?);
+    }
+    Ok((rows, count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_restores_mapping_limit_and_detaches_on_error_and_unwind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = crate::test_meta();
+        meta.schema_version = 1;
+        let a = crate::writer::SnapshotWriter::create(dir.path(), &meta)
+            .unwrap()
+            .finish(&meta)
+            .unwrap();
+        meta.scan_id = tidemark_core::time::ScanId::new(20).unwrap();
+        let b = crate::writer::SnapshotWriter::create(dir.path(), &meta)
+            .unwrap()
+            .finish(&meta)
+            .unwrap();
+        let old = Snapshot::open(&a).unwrap();
+        let new = Snapshot::open(&b).unwrap();
+        let mapping = || -> i64 {
+            new.conn()
+                .pragma_query_value(Some("main"), "mmap_size", |r| r.get(0))
+                .unwrap()
+        };
+        let original = mapping();
+        let error = with_old(&new, &old, || -> Result<(), StoreError> {
+            assert!(new.conn().execute("DELETE FROM o.dirs", []).is_err());
+            assert!(new.conn().execute("DELETE FROM main.dirs", []).is_err());
+            Err(StoreError::Invalid("injected query failure".into()))
+        });
+        assert!(matches!(error, Err(StoreError::Invalid(_))));
+        assert_eq!(mapping(), original);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = with_old(&new, &old, || -> Result<(), StoreError> {
+                panic!("injected query unwind");
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(mapping(), original);
+        // Both previous attachments must be gone before this succeeds.
+        assert_eq!(with_old(&new, &old, || Ok(42)).unwrap(), 42);
+        assert_eq!(mapping(), original);
+    }
 }
