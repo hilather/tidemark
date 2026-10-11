@@ -1,6 +1,7 @@
 //! Owned by: W0-C
 //! Temporary fixtures and independent metadata reference oracles.
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 pub mod fixture;
 pub mod golden;
 #[cfg(feature = "privileged")]

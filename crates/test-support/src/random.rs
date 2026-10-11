@@ -211,7 +211,12 @@ pub enum SizeDist {
     /// Constant bytes.
     Fixed(u64),
     /// Uniform integer bytes.
-    Uniform { min: u64, max: u64 },
+    Uniform {
+        /// Inclusive lower bound in bytes.
+        min: u64,
+        /// Inclusive upper bound in bytes.
+        max: u64,
+    },
 }
 /// Bounded deterministic generation parameters. `dirs` includes root; `files`
 /// counts distinct inodes and `link_sets` selects the first such inodes.

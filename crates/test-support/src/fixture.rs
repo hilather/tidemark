@@ -6,8 +6,12 @@ use std::{
     ffi::OsString,
     fs::{self, File, Permissions},
     io::{self, Write},
-    os::unix::{ffi::OsStringExt, fs::PermissionsExt, net::UnixListener},
-    path::{Path, PathBuf},
+    os::unix::{
+        ffi::OsStringExt,
+        fs::{MetadataExt, PermissionsExt},
+        net::UnixListener,
+    },
+    path::{Component, Path, PathBuf},
 };
 use tempfile::TempDir;
 use tidemark_core::units::ByteSize;
@@ -22,12 +26,41 @@ pub struct Fixture {
     pub root: PathBuf,
     /// Entries deliberately outside the scan root.
     pub outside: PathBuf,
-    modes: Vec<PathBuf>,
+    owner: File,
+    modes: Vec<(PathBuf, File)>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        for p in &self.modes {
-            let _ = fs::set_permissions(p, Permissions::from_mode(0o700));
+        // Paths are relative to the retained owner handle, never the mutable
+        // public root/outside paths. Parents are restored before descendants.
+        for (path, saved) in &self.modes {
+            let verified = (|| -> io::Result<File> {
+                let mut current = self.owner.try_clone()?;
+                for component in path.components() {
+                    let Component::Normal(name) = component else {
+                        return Err(invalid("non-relative cleanup path"));
+                    };
+                    current = File::from(rustix::fs::openat(
+                        &current,
+                        name,
+                        rustix::fs::OFlags::PATH
+                            | rustix::fs::OFlags::DIRECTORY
+                            | rustix::fs::OFlags::NOFOLLOW
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    )?);
+                }
+                Ok(current)
+            })();
+            if let Ok(current) = verified {
+                if let (Ok(found), Ok(original)) = (current.metadata(), saved.metadata()) {
+                    if (found.dev(), found.ino()) == (original.dev(), original.ino()) {
+                        // The original writable handle also works for mode-000
+                        // directories; O_PATH traversal handles cannot be chmod-ed.
+                        let _ = saved.set_permissions(Permissions::from_mode(0o700));
+                    }
+                }
+            }
         }
     }
 }
@@ -159,7 +192,16 @@ pub fn try_materialize(spec: &str) -> io::Result<Fixture> {
     let outside = dir.path().join("outside");
     fs::create_dir(&root)?;
     fs::create_dir(&outside)?;
+    let owner = File::from(rustix::fs::open(
+        dir.path(),
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?);
     let mut fixture = Fixture {
+        owner,
         dir,
         root,
         outside,
@@ -316,7 +358,17 @@ pub fn try_materialize(spec: &str) -> io::Result<Fixture> {
         .filter(|(e, _)| e.kind == "dir" && e.mode.is_some())
         .collect();
     modes.sort_by_key(|(_, p)| p.components().count());
-    fixture.modes = modes.iter().map(|(_, p)| p.clone()).collect();
+    fixture.modes = modes
+        .iter()
+        .map(|(_, p)| {
+            Ok((
+                p.strip_prefix(fixture.dir.path())
+                    .map_err(|e| invalid(e.to_string()))?
+                    .to_path_buf(),
+                File::open(p)?,
+            ))
+        })
+        .collect::<io::Result<_>>()?;
     for (e, path) in modes.into_iter().rev() {
         fs::set_permissions(path, Permissions::from_mode(e.mode.unwrap_or(0o755)))?;
     }
@@ -331,4 +383,100 @@ pub fn materialize_file(path: impl AsRef<Path>) -> Fixture {
     let spec = fs::read_to_string(path.as_ref())
         .unwrap_or_else(|e| panic!("cannot read fixture spec: {e}"));
     materialize(&spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn substitution(intermediate: bool, outside: bool) {
+        let section = if outside { "outside" } else { "entry" };
+        let fixture = materialize(&format!(
+            "[[{section}]]\npath = 'parent'\nkind = 'dir'\nmode = 320\n[[{section}]]\npath = 'parent/child'\nkind = 'dir'\nmode = 320\n"
+        ));
+        let owner_path = fixture.dir.path().to_owned();
+        let base = if outside {
+            &fixture.outside
+        } else {
+            &fixture.root
+        };
+        let victim = tempfile::tempdir().unwrap();
+        let victim_child = victim.path().join("child");
+        fs::create_dir(&victim_child).unwrap();
+        fs::set_permissions(victim.path(), Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&victim_child, Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(base.join("parent"), Permissions::from_mode(0o700)).unwrap();
+        let replaced = base.join(if intermediate {
+            "parent"
+        } else {
+            "parent/child"
+        });
+        fs::set_permissions(&replaced, Permissions::from_mode(0o700)).unwrap();
+        fs::rename(&replaced, base.join("saved")).unwrap();
+        std::os::unix::fs::symlink(victim.path(), &replaced).unwrap();
+        drop(fixture);
+        assert_eq!(fs::metadata(victim.path()).unwrap().mode() & 0o7777, 0o500);
+        assert_eq!(fs::metadata(&victim_child).unwrap().mode() & 0o7777, 0o500);
+        assert!(!owner_path.exists());
+    }
+
+    #[test]
+    fn cleanup_skips_final_symlink() {
+        substitution(false, false);
+    }
+    #[test]
+    fn cleanup_skips_intermediate_symlink() {
+        substitution(true, false);
+    }
+    #[test]
+    fn outside_cleanup_skips_symlinks() {
+        substitution(false, true);
+        substitution(true, true);
+    }
+    #[test]
+    fn cleanup_skips_missing_and_replaced_entries() {
+        for replacement in ["missing", "file", "directory"] {
+            let fixture = materialize("[[entry]]\npath = 'tracked'\nkind = 'dir'\nmode = 320\n");
+            let path = fixture.root.join("tracked");
+            fs::remove_dir(&path).unwrap();
+            match replacement {
+                "file" => {
+                    fs::write(&path, b"safe").unwrap();
+                }
+                "directory" => {
+                    fs::create_dir(&path).unwrap();
+                }
+                _ => {}
+            }
+            if replacement != "missing" {
+                fs::set_permissions(&path, Permissions::from_mode(0o500)).unwrap();
+                // Retain a handle so its mode can be inspected after removal.
+                let handle = File::open(&path).unwrap();
+                drop(fixture);
+                assert_eq!(handle.metadata().unwrap().mode() & 0o7777, 0o500);
+            } else {
+                drop(fixture);
+            }
+        }
+    }
+
+    #[test]
+    fn random_tree_removal_does_not_follow_symlinks() {
+        let fixture = crate::random::random_tree(42, crate::random::RandomTreeParams::default());
+        let path = fixture.dir.path().to_owned();
+        let victim = tempfile::tempdir().unwrap();
+        fs::write(victim.path().join("sentinel"), b"safe").unwrap();
+        std::os::unix::fs::symlink(victim.path(), fixture.root.join("victim")).unwrap();
+        drop(fixture);
+        assert!(victim.path().join("sentinel").exists());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cleanup_restores_inaccessible_parents_first() {
+        let fixture = materialize("[[entry]]\npath = 'parent'\nkind = 'dir'\nmode = 0\n[[entry]]\npath = 'parent/child'\nkind = 'dir'\nmode = 0\n");
+        let path = fixture.dir.path().to_owned();
+        drop(fixture);
+        assert!(!path.exists());
+    }
 }

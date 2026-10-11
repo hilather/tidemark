@@ -61,6 +61,12 @@ impl CliError {
         }
     }
 }
+fn command_error(error: anyhow::Error) -> CliError {
+    error
+        .downcast::<CliError>()
+        .unwrap_or_else(CliError::Runtime)
+}
+
 /// Root-only access hint for permission errors, without an effective-uid gate.
 pub const ACCESS_HINT: &str = "Tidemark's files are root-only; run this command with sudo.";
 
@@ -91,7 +97,7 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
                 color: false,
             },
         )
-        .map_err(CliError::Runtime);
+        .map_err(command_error);
     }
     let mut config = load_config(&cli.config)?;
     if let Some(path) = cli.state_dir {
@@ -134,7 +140,7 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
             json: cli.json,
             color,
         })
-        .map_err(CliError::Runtime)
+        .map_err(command_error)
 }
 /// Process entry point with clap's help and usage statuses intact.
 pub fn main_entry() -> std::process::ExitCode {
@@ -193,6 +199,34 @@ mod tests {
         let error = run(cli).unwrap_err();
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("general.state_dir"));
+    }
+    #[test]
+    fn command_errors_preserve_exit_codes_through_context() {
+        for contextual in [false, true] {
+            let errors = [
+                CliError::Configuration("config".into()),
+                CliError::Partial("partial".into()),
+                CliError::Unavailable("daemon".into()),
+                CliError::Precondition("precondition".into()),
+                CliError::Unhealthy("verify".into()),
+            ];
+            for (error, code) in errors.into_iter().zip(2..=6) {
+                let error = anyhow::Error::new(error);
+                let error = if contextual {
+                    error.context("command context")
+                } else {
+                    error
+                };
+                assert_eq!(command_error(error).exit_code(), code);
+            }
+            let error = anyhow::anyhow!("runtime");
+            let error = if contextual {
+                error.context("command context")
+            } else {
+                error
+            };
+            assert_eq!(command_error(error).exit_code(), 1);
+        }
     }
     #[test]
     fn exit_codes() {
