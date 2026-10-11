@@ -1117,15 +1117,25 @@ fn recover_corrupt_catalog_preserves_database_and_sidecars() {
     for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
         std::fs::write(state.path().join(name), name.as_bytes()).unwrap();
     }
-    assert!(Catalog::open(state.path(), true).is_err());
-    assert_eq!(
-        std::fs::read(state.path().join("timeseries.db")).unwrap(),
-        b"timeseries.db"
-    );
-    // SQLite may remove invalid sidecars during an ordinary open; install them
-    // after the nondestructive database-open assertion to test explicit recovery.
-    for name in ["timeseries.db-wal", "timeseries.db-shm"] {
-        std::fs::write(state.path().join(name), name.as_bytes()).unwrap();
+    for rw in [false, true] {
+        for error in [
+            Catalog::open(state.path(), rw).err().unwrap(),
+            TimeSeries::open(&state.path().join("timeseries.db"), rw)
+                .err()
+                .unwrap(),
+        ] {
+            assert!(matches!(
+                error,
+                tidemark_store::StoreError::Sql(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::NotADatabase
+            ));
+        }
+        for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
+            assert_eq!(
+                std::fs::read(state.path().join(name)).unwrap(),
+                name.as_bytes()
+            );
+        }
     }
     let catalog = tidemark_store::catalog::recover_catalog(state.path()).unwrap();
     assert_eq!(catalog.list(None).unwrap().len(), 1);
@@ -1307,5 +1317,54 @@ fn overlapping_sample_tiers_preserve_selection_for_all_query_families() {
                 expected
             );
         }
+    }
+}
+
+#[test]
+fn timeseries_header_preflight_handles_empty_short_and_valid_headers() {
+    let state = tempfile::tempdir().unwrap();
+    let db = state.path().join("timeseries.db");
+    std::fs::write(&db, []).unwrap();
+    drop(TimeSeries::open(&db, true).unwrap());
+    drop(TimeSeries::open(&db, false).unwrap());
+
+    for bytes in [
+        b"S".as_slice(),
+        b"SQLite format 3".as_slice(),
+        b"garbage database bytes".as_slice(),
+    ] {
+        std::fs::write(&db, bytes).unwrap();
+        assert!(matches!(
+            TimeSeries::open(&db, true).err().unwrap(),
+            tidemark_store::StoreError::Sql(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::NotADatabase
+        ));
+        assert_eq!(std::fs::read(&db).unwrap(), bytes);
+    }
+
+    // A valid header with a truncated first page must reach SQLite.
+    let db = state.path().join("damaged.db");
+    let mut damaged = vec![0; 100];
+    damaged[..16].copy_from_slice(b"SQLite format 3\0");
+    damaged[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+    damaged[18] = 1;
+    damaged[19] = 1;
+    damaged[21..24].copy_from_slice(&[64, 32, 32]);
+    damaged[28..32].copy_from_slice(&1_u32.to_be_bytes());
+    std::fs::write(&db, &damaged).unwrap();
+    let direct = Connection::open(&db)
+        .unwrap()
+        .execute_batch("SELECT name FROM sqlite_master;")
+        .unwrap_err();
+    let actual = TimeSeries::open(&db, true).err().unwrap();
+    match (actual, direct) {
+        (
+            tidemark_store::StoreError::Sql(rusqlite::Error::SqliteFailure(actual, _)),
+            rusqlite::Error::SqliteFailure(expected, _),
+        ) => {
+            assert_eq!(actual, expected);
+            assert_eq!(actual.code, rusqlite::ErrorCode::DatabaseCorrupt);
+        }
+        errors => panic!("unexpected errors: {errors:?}"),
     }
 }
