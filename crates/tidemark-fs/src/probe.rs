@@ -256,19 +256,36 @@ pub fn probe(cfg: &Config, extra_roots: &[RawPath]) -> ProbeReport {
     let mounts = mount::read_mountinfo();
     let mut roots = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
-    let configured = cfg
-        .roots
-        .iter()
-        .filter_map(|r| RawPath::from_path(&r.path).ok());
+    let configured = cfg.roots.iter().map(|r| r.path.clone());
     let mut truncated = false;
-    for requested in configured.chain(extra_roots.iter().cloned()) {
+    for requested in configured.chain(extra_roots.iter().map(|r| r.as_path().to_path_buf())) {
         if seen.len() == 1024 {
             truncated = true;
             break;
         }
-        let canonical = canon::canonicalize(requested.as_path());
-        let root = canonical.as_ref().unwrap_or(&requested).clone();
-        if !seen.insert(root.clone()) {
+        let canonical = canon::canonicalize(&requested);
+        // An unresolved label is for display only, never for discovery.
+        let root = match &canonical {
+            Ok(root) => root.clone(),
+            Err(_) => {
+                let absolute = if requested.is_absolute() {
+                    requested.clone()
+                } else {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                        .join(&requested)
+                };
+                match RawPath::from_path(&absolute) {
+                    Ok(label) => label,
+                    Err(error) => {
+                        tracing::warn!(%error, "invalid probe root label");
+                        continue;
+                    }
+                }
+            }
+        };
+        let canonical_error = canonical.as_ref().err().map(ToString::to_string);
+        if !seen.insert((root.clone(), canonical_error.clone())) {
             continue;
         }
         let mut report = RootFacts {
@@ -278,15 +295,17 @@ pub fn probe(cfg: &Config, extra_roots: &[RawPath]) -> ProbeReport {
             mount_point: None,
             other_mounts: None,
         };
-        if let Err(e) = canonical {
+        if let Err(e) = &canonical {
             report
                 .facts
                 .insert("canonical_path".into(), Fact::unknown(e));
         }
-        let selected = mounts
-            .as_ref()
-            .ok()
-            .and_then(|m| mount::mount_for_path(m, &report.root));
+        let selected = canonical.as_ref().ok().and_then(|_| {
+            mounts
+                .as_ref()
+                .ok()
+                .and_then(|m| mount::mount_for_path(m, &report.root))
+        });
         match selected {
             Some(m) => {
                 report.mount_point = Some(m.mount_point.to_json());
@@ -294,9 +313,10 @@ pub fn probe(cfg: &Config, extra_roots: &[RawPath]) -> ProbeReport {
                     "mount_point".into(),
                     Fact::known(m.mount_point.display_lossy()),
                 );
-                report
-                    .facts
-                    .insert("fs_type".into(), Fact::known(&m.fs_type));
+                report.facts.insert(
+                    "fs_type".into(),
+                    Fact::known(mount::display_field(m.fs_type.as_bytes())),
+                );
                 report.facts.insert("source".into(), Fact::known(&m.source));
                 report
                     .facts
@@ -377,10 +397,9 @@ pub fn probe(cfg: &Config, extra_roots: &[RawPath]) -> ProbeReport {
                 }
             }
             None => {
-                let why = mounts
-                    .as_ref()
-                    .err()
-                    .map(ToString::to_string)
+                let why = canonical_error
+                    .clone()
+                    .or_else(|| mounts.as_ref().err().map(ToString::to_string))
                     .unwrap_or_else(|| "no containing mount found".into());
                 for key in [
                     "mount_point",
@@ -406,6 +425,20 @@ pub fn probe(cfg: &Config, extra_roots: &[RawPath]) -> ProbeReport {
                     report.facts.insert(key.into(), Fact::unknown(&why));
                 }
             }
+        }
+        if let Some(why) = canonical_error {
+            for key in [
+                "total_bytes",
+                "free_bytes",
+                "available_bytes",
+                "total_inodes",
+                "free_inodes",
+                "lvm",
+            ] {
+                report.facts.insert(key.into(), Fact::unknown(&why));
+            }
+            roots.push(report);
+            continue;
         }
         capacity_facts(&mut report);
         report.facts.insert(

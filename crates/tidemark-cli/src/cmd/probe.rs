@@ -11,20 +11,7 @@ pub struct Args {
 
 /// Execute the read-only probe and append PostgreSQL discovery.
 pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
-    let roots = args
-        .root
-        .iter()
-        .map(|p| {
-            // Keep a missing absolute root in the report so its unknown reason is visible.
-            let absolute = if p.is_absolute() {
-                p.clone()
-            } else {
-                std::env::current_dir()?.join(p)
-            };
-            tidemark_core::path::RawPath::from_path(&absolute).map_err(anyhow::Error::from)
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let filesystem = tidemark_fs::probe::probe(&context.config, &roots);
+    let filesystem = filesystem_report(args, &context.config);
     let mut postgres = std::collections::BTreeMap::new();
     let fact = |value: Option<String>, why: Option<String>| tidemark_fs::probe::Fact { value, why };
     match tidemark_pg::probe_from_config(&context.config.postgres) {
@@ -73,3 +60,23 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         &mut std::io::stdout().lock(),
     )
 }
+
+fn filesystem_report(
+    args: &Args,
+    config: &tidemark_core::config::Config,
+) -> tidemark_fs::probe::ProbeReport {
+    // Keep original paths until the filesystem collector performs realpath.
+    let mut config = config.clone();
+    config.roots.extend(
+        args.root
+            .iter()
+            .map(|path| tidemark_core::config::RootConfig {
+                path: path.clone(),
+                ..Default::default()
+            }),
+    );
+    tidemark_fs::probe::probe(&config, &[])
+}
+#[cfg(test)]
+#[path = "../../tests/w1a/paths.rs"]
+mod tests;
