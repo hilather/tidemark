@@ -59,6 +59,7 @@ pub struct ScanEntry {
 pub struct Catalog {
     conn: Connection,
     state_dir: PathBuf,
+    recovery_files: Vec<PathBuf>,
 }
 fn row(r: &Row<'_>) -> rusqlite::Result<ScanEntry> {
     let path = r.get::<_, Vec<u8>>(1)?;
@@ -124,7 +125,12 @@ impl Catalog {
         Ok(Self {
             conn: crate::timeseries::open_connection(&state_dir.join("timeseries.db"), rw)?,
             state_dir: state_dir.to_owned(),
+            recovery_files: Vec::new(),
         })
+    }
+    /// Paths preserved by explicit recovery; historical samples remain in these files.
+    pub fn recovery_files(&self) -> &[PathBuf] {
+        &self.recovery_files
     }
     /// List records newest first, optionally restricted to exact root bytes.
     pub fn list(&self, root: Option<&RawPath>) -> Result<Vec<ScanEntry>, StoreError> {
@@ -258,4 +264,46 @@ impl Catalog {
         tx.commit()?;
         Ok(count)
     }
+}
+
+/// Preserve the shared database and sidecars, then rebuild from published snapshots.
+///
+/// The caller must stop writers and close all catalog/sample connections first.
+/// Historical samples remain in `Catalog::recovery_files()` and are unavailable in
+/// the new database. Ordinary `Catalog::open` never performs this recovery.
+pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError> {
+    // A private, exclusively created directory supplies a collision-free namespace.
+    let mut recovery = None;
+    for sequence in 0..10_000u32 {
+        let path = state_dir.join(format!("timeseries-recovery-{sequence}"));
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {
+                recovery = Some(path);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let recovery =
+        recovery.ok_or_else(|| StoreError::Invalid("recovery namespace exhausted".into()))?;
+    let mut preserved = Vec::new();
+    for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
+        let source = state_dir.join(name);
+        let destination = recovery.join(name);
+        match fs::rename(&source, &destination) {
+            Ok(()) => {
+                tracing::warn!(path=%destination.display(), "preserved shared database recovery artifact");
+                preserved.push(destination);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    fs::File::open(&recovery)?.sync_all()?;
+    fs::File::open(state_dir)?.sync_all()?;
+    let mut catalog = Catalog::open(state_dir, true)?;
+    catalog.recovery_files = preserved;
+    catalog.rebuild_from_files()?;
+    Ok(catalog)
 }

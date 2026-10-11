@@ -417,7 +417,8 @@ impl Snapshot {
     /// Fetch link sets charged inside this subtree and count stored instances.
     ///
     /// Depth boundaries select sets crossing two or more regions (including outside).
-    /// Glob boundaries currently return NotYetImplemented; see the W1-E handoff.
+    /// Glob regions are matching directory subtrees; the deepest match owns an instance.
+    /// Sets must cross regions (unmatched instances share an outside region).
     pub fn link_sets_under(
         &self,
         id: u32,
@@ -429,10 +430,81 @@ impl Snapshot {
                 "boundary globs and depth are mutually exclusive".into(),
             ));
         }
-        if !filter.boundary.is_empty() {
-            return Err(StoreError::NotYetImplemented);
-        }
         let d = self.dir(id)?;
+        if !filter.boundary.is_empty() {
+            crate::error::check_result_bound(&filter.boundary)?;
+            let mut builder = globset::GlobSetBuilder::new();
+            for pattern in &filter.boundary {
+                builder.add(
+                    globset::GlobBuilder::new(pattern)
+                        .literal_separator(true)
+                        .build()
+                        .map_err(|e| StoreError::Invalid(format!("invalid boundary glob: {e}")))?,
+                );
+            }
+            let globs = builder
+                .build()
+                .map_err(|e| StoreError::Invalid(e.to_string()))?;
+            let mut stmt = self.conn.prepare(
+                "SELECT id,subtree_end,path FROM dirs WHERE id BETWEEN ? AND ? ORDER BY id",
+            )?;
+            let mut rows = stmt.query(params![id, d.subtree_end])?;
+            let mut regions = Vec::new();
+            let mut stack: Vec<(u32, u32)> = Vec::new();
+            while let Some(row) = rows.next()? {
+                let dir_id: u32 = row.get(0)?;
+                let end: u32 = row.get(1)?;
+                let bytes: Vec<u8> = row.get(2)?;
+                while stack.last().is_some_and(|&(_, end)| end < dir_id) {
+                    stack.pop();
+                }
+                if globs.is_match_candidate(&globset::Candidate::from_bytes(&bytes)) {
+                    stack.push((dir_id, end));
+                }
+                regions.push((dir_id, stack.last().map(|&(id, _)| id)));
+                crate::error::check_result_bound(&regions)?;
+            }
+            // Stream candidates in the normal order; apply the result limit after crossing.
+            let mut candidates = self.conn.prepare("SELECT l.*,d.path,(SELECT COUNT(*) FROM link_instances i WHERE i.ino=l.ino) FROM link_sets l JOIN dirs d ON d.id=l.lca_dir_id WHERE d.id BETWEEN ?1 AND ?2 AND (?3=0 OR l.complete=0) ORDER BY l.disk DESC,d.path,l.ino")?;
+            let mut rows = candidates.query(params![id, d.subtree_end, filter.incomplete])?;
+            let mut result = Vec::new();
+            while result.len() < limit {
+                let Some(row) = rows.next()? else {
+                    break;
+                };
+                let hit = LinkSetHit {
+                    row: link_row(row)?,
+                    lca_path: decode_path(row.get(8)?)?,
+                    instance_count: crate::error::read_u64(row, 9)?,
+                };
+                let mut instances = self
+                    .conn
+                    .prepare("SELECT dir_id FROM link_instances WHERE ino=?")?;
+                let mut instance_rows = instances.query([sql_u64(hit.row.ino)?])?;
+                let mut first = None;
+                let mut crossing = false;
+                while let Some(instance) = instance_rows.next()? {
+                    let instance_id: u32 = instance.get(0)?;
+                    let region = regions
+                        .binary_search_by_key(&instance_id, |&(id, _)| id)
+                        .ok()
+                        .and_then(|i| regions[i].1);
+                    match first {
+                        None => first = Some(region),
+                        Some(previous) if previous != region => {
+                            crossing = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if crossing {
+                    result.push(hit);
+                    crate::error::check_result_bound(&result)?;
+                }
+            }
+            return Ok(result);
+        }
         let depth = filter
             .boundary_depth
             .map(|rel| u64::from(d.depth) + u64::from(rel))

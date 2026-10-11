@@ -157,7 +157,27 @@ pub fn space_check_with(
     {
         return refuse("maximum state size would be exceeded");
     }
-    let floor = ((stat.size as f64 * policy.min_free_pct / 100.0).ceil() as u64).max(2 << 30);
+    // Decode the nonnegative finite f64 as an exact binary rational.
+    let bits = policy.min_free_pct.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as u32;
+    let mantissa = (bits & ((1u64 << 52) - 1)) | if exponent == 0 { 0 } else { 1u64 << 52 };
+    let shift = if exponent == 0 { 1074 } else { 1075 - exponent };
+    // u64 * 53-bit mantissa fits u128; checked operations retain conservative failure.
+    let numerator = u128::from(stat.size).checked_mul(u128::from(mantissa));
+    let percentage = match numerator {
+        Some(0) => 0,
+        Some(n) if shift >= 121 => u128::from(n != 0),
+        Some(n) => {
+            let Some(denominator) = (1u128 << shift).checked_mul(100) else {
+                return refuse("free-space floor overflow");
+            };
+            n / denominator + u128::from(n % denominator != 0)
+        }
+        None => return refuse("free-space floor overflow"),
+    };
+    let Ok(floor) = u64::try_from(percentage.max(2 << 30)) else {
+        return refuse("free-space floor overflow");
+    };
     if stat.avail.checked_sub(estimate).is_none_or(|n| n < floor) {
         return refuse("state filesystem free-space floor would be crossed");
     }
