@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-privileged = []
+privileged = ["test-support/privileged"]
 
 [lints]
 workspace = true
@@ -16,3 +16,23 @@ tidemark-core.workspace = true
 thiserror.workspace = true
 globset.workspace = true
 crossbeam-channel.workspace = true
+tidemark-sys.workspace = true
+libc.workspace = true
+rustix.workspace = true
+crossbeam-deque.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+test-support.workspace = true
+tempfile.workspace = true
+proptest.workspace = true
+insta.workspace = true
+
+[[bench]]
+name = "walk"
+harness = false

@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-privileged = []
+privileged = ["test-support/privileged"]
 
 [[bin]]
 name = "tidemark"
@@ -16,7 +16,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-tidemark-core = { path = "../tidemark-core" }
+tidemark-core.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 anyhow.workspace = true
@@ -25,7 +25,11 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 humantime.workspace = true
+tidemark-fs.workspace = true
+tidemark-pg.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
 tempfile.workspace = true
+test-support.workspace = true
+insta.workspace = true
