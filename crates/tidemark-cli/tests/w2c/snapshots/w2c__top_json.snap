@@ -1,0 +1,50 @@
+---
+source: crates/tidemark-cli/tests/w2c/main.rs
+expression: doc
+---
+{
+  "data": [
+    {
+      "age0": 4096,
+      "age1": 0,
+      "age2": 0,
+      "age3": 0,
+      "age4": 0,
+      "age5": 0,
+      "delta": -4,
+      "depth": 0,
+      "dir_apparent": 0,
+      "dir_disk": 0,
+      "entries": 1,
+      "errors": 0,
+      "id": 0,
+      "ino": 1,
+      "live_disk": null,
+      "max_entries": 1,
+      "mtime": 100,
+      "name": [
+        97,
+        255
+      ],
+      "newest_mtime": 100,
+      "own_apparent": 4096,
+      "own_charged": 4096,
+      "own_files": 1,
+      "own_symlinks": 0,
+      "parent_id": null,
+      "path_b64": "L2H/",
+      "path_hash": 4628345102523123898,
+      "projid": null,
+      "subtree_end": 3,
+      "t_apparent": 4096,
+      "t_charged": 4096,
+      "t_dirs": 1,
+      "t_disk": 4096,
+      "t_errors": 0,
+      "t_files": 1,
+      "t_inodes": 1,
+      "t_reclaimable": 2048
+    }
+  ],
+  "schema": "tidemark.top.v1"
+}

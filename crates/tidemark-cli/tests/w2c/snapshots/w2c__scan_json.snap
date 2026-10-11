@@ -1,0 +1,32 @@
+---
+source: crates/tidemark-cli/tests/w2c/main.rs
+expression: doc
+---
+{
+  "data": {
+    "degraded": false,
+    "duration_ms": 2000,
+    "file": {
+      "path": "/state/a.db"
+    },
+    "mode": "walk",
+    "mode_reason": "test",
+    "scan_id": "fixture",
+    "status": "complete",
+    "summary": {
+      "degraded": false,
+      "dirs": 4,
+      "errors": 0,
+      "files": 3,
+      "incomplete_link_sets": 0,
+      "inodes": 0,
+      "link_sets": 0,
+      "races": 0,
+      "skipped": 0,
+      "t_apparent": 0,
+      "t_disk": 4096,
+      "t_reclaimable": 2048
+    }
+  },
+  "schema": "tidemark.scan.v1"
+}
