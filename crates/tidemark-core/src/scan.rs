@@ -134,6 +134,7 @@ pub enum ErrOp {
 /// ScanErrorRec contract.
 pub struct ScanErrorRec {
     #[doc = "path field; see the normative plan for units."]
+    #[serde(flatten, with = "crate::path::report_path")]
     pub path: RawPath,
     #[doc = "op field; see the normative plan for units."]
     pub op: ErrOp,
@@ -305,6 +306,8 @@ pub enum ScanMode {
 
 /// Controller statistics persisted in snapshot metadata (W1-D contract).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// Shared throttle statistics; `tidemark_fs::throttle` must re-export this type
+/// rather than define an incompatible copy.
 pub struct GateStats {
     /// Mean allowed metadata I/O units per second.
     pub mean_rate: f64,

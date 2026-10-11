@@ -6,6 +6,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::{fmt, str::FromStr};
 
 /// A nonnegative byte count; TOML/JSON accept integers or unit strings.
+/// Decimal fractions truncate to whole bytes; both explicit SI and binary units
+/// are supported, with checked arithmetic that rejects overflow.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct ByteSize(
@@ -84,7 +86,12 @@ impl fmt::Display for ByteSize {
         f.write_str(&fmt_bytes(self.0))
     }
 }
+fn rounded(value: f64) -> f64 {
+    let scale = 10_f64.powf(2.0 - value.log10().floor());
+    (value * scale).round() / scale
+}
 fn significant(value: f64) -> String {
+    let value = rounded(value);
     let digits = if value >= 100.0 {
         0
     } else if value >= 10.0 {
@@ -103,6 +110,10 @@ pub fn fmt_bytes(bytes: u64) -> String {
     let mut unit = 0;
     let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     while value >= 1024.0 && unit < units.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value.round() >= 1024.0 && unit < units.len() - 1 {
         value /= 1024.0;
         unit += 1;
     }
@@ -127,16 +138,23 @@ pub fn parse_rate(input: &str) -> Result<f64, CoreError> {
     }
     Ok(size.parse::<ByteSize>()?.0 as f64 / seconds)
 }
-/// Signed binary rate, expressed per second.
+/// Signed binary rate with three significant digits and unit carry; below 1 KiB/s bytes remain exact.
 pub fn fmt_rate(bytes_per_sec: f64) -> String {
     if !bytes_per_sec.is_finite() {
         return "unknown".into();
+    }
+    if bytes_per_sec.abs() < 1024.0 {
+        return format!("{bytes_per_sec} B/s");
     }
     let sign = if bytes_per_sec < 0.0 { "-" } else { "" };
     let mut value = bytes_per_sec.abs();
     let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     let mut unit = 0;
     while value >= 1024.0 && unit < units.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value.round() >= 1024.0 && unit < units.len() - 1 {
         value /= 1024.0;
         unit += 1;
     }

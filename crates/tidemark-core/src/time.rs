@@ -23,8 +23,11 @@ pub struct ScanId(
     pub String,
 );
 impl ScanId {
-    /// Build from an injected Unix time; suffix hashes the process id and a per-process sequence.
-    pub fn new(now: i64) -> Self {
+    /// Build from injected Unix seconds in UTC years 0000 through 9999.
+    /// Returns an error outside that range. The process/time/sequence hash suffix
+    /// is neither cryptographic nor a uniqueness guarantee. Snapshot writers must
+    /// refuse an existing ID and retry with a fresh ID, never replace it.
+    pub fn new(now: i64) -> Result<Self, CoreError> {
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let suffix = xxhash_rust::xxh3::xxh3_64(
@@ -38,8 +41,8 @@ impl ScanId {
         let date = chrono::DateTime::from_timestamp(now, 0)
             .filter(|d| (0..=9999).contains(&chrono::Datelike::year(d)))
             .map(|d| d.format("%Y%m%dT%H%M%SZ").to_string())
-            .unwrap_or_else(|| "19700101T000000Z".into());
-        Self(format!("{date}-{suffix:08x}"))
+            .ok_or_else(|| CoreError::Parse("scan timestamp outside UTC years 0000–9999".into()))?;
+        Ok(Self(format!("{date}-{suffix:08x}")))
     }
     /// Borrow the identifier string.
     pub fn as_str(&self) -> &str {
@@ -80,10 +83,10 @@ mod tests {
     }
     #[test]
     fn scan_id_format() {
-        let id = ScanId::new(0);
+        let id = ScanId::new(0).unwrap();
         assert_eq!(&id.as_str()[..17], "19700101T000000Z-");
         assert_eq!(id.as_str().len(), 25);
         assert!(id.as_str()[17..].chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(id, ScanId::new(0));
+        assert_ne!(id, ScanId::new(0).unwrap());
     }
 }

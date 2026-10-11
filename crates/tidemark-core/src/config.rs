@@ -175,7 +175,7 @@ pub struct ScanConfig {
     pub bulk_batch: u32,
     /// link_instances setting.
     pub link_instances: LinkInstances,
-    /// max_notable setting.
+    /// Positive notable-file cap, at most `u32::MAX`; consumers assign checked zero-based IDs.
     pub max_notable: usize,
     /// max_stored_errors setting.
     pub max_stored_errors: usize,
@@ -424,7 +424,7 @@ pub struct ThrottleConfig {
     /// sample_interval setting.
     #[serde(with = "humantime_serde")]
     pub sample_interval: Duration,
-    /// profiles setting.
+    /// User profiles; `max` is reserved for the no-throttling selector.
     #[serde(deserialize_with = "deserialize_profiles")]
     pub profiles: BTreeMap<String, ThrottleProfile>,
 }
@@ -517,7 +517,7 @@ pub struct AlertRule {
     pub resolve_for: Duration,
     /// mount setting.
     pub mount: Option<PathBuf>,
-    /// above setting.
+    /// Threshold; numeric hot-directory growth values are bytes per second.
     pub above: Option<AlertThreshold>,
     /// below setting.
     pub below: Option<String>,
@@ -714,7 +714,7 @@ impl<'de> Deserialize<'de> for Config {
         Ok(config)
     }
 }
-/// Maximum config input size; bounds file reading and parser allocations.
+/// Maximum config input size (1 MiB); bounds file reading and parser allocations.
 pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// A validation issue tied to a configuration field.
@@ -732,7 +732,7 @@ impl std::fmt::Display for ConfigIssue {
 }
 impl std::error::Error for ConfigIssue {}
 impl Config {
-    /// Read exactly one TOML file. Missing files are reported to the caller.
+    /// Read exactly one TOML file, capped at 1 MiB. Missing files are reported to the caller.
     pub fn load(path: &Path) -> Result<Self, CoreError> {
         use std::io::Read;
         let file = std::fs::File::open(path)?;
@@ -855,10 +855,22 @@ impl Config {
         if !self.metrics.textfile.as_os_str().is_empty() {
             absolute(issues, "metrics.textfile", &self.metrics.textfile);
         }
-        if !self.metrics.listen.is_empty()
-            && self.metrics.listen.parse::<std::net::SocketAddr>().is_err()
-        {
-            issue(issues, "metrics.listen", "expected IP:port or empty string");
+        if !self.metrics.listen.is_empty() {
+            match self.metrics.listen.parse::<std::net::SocketAddr>() {
+                Ok(addr) if addr.ip().is_loopback() => {}
+                _ => issue(
+                    issues,
+                    "metrics.listen",
+                    "expected loopback IP:port or empty string",
+                ),
+            }
+        }
+        if self.scan.max_notable > u32::MAX as usize {
+            issue(
+                issues,
+                "scan.max_notable",
+                "must be at most u32::MAX (4294967295)",
+            );
         }
         if !(1..=64).contains(&self.scan.threads) {
             issue(issues, "scan.threads", "expected 1–64 workers");
@@ -919,6 +931,13 @@ impl Config {
                 issue(issues, field, "duration must be positive");
             }
         }
+        if self.throttle.profiles.contains_key("max") {
+            issue(
+                issues,
+                "throttle.profiles.max",
+                "max is reserved for no throttling; remove this profile definition",
+            );
+        }
         for (field, profile) in &self.throttle.profiles {
             if !profile.max_util_pct.is_finite() || !(0.0..=100.0).contains(&profile.max_util_pct) {
                 issue(
@@ -976,7 +995,7 @@ impl AlertRule {
             PhantomBytes => (&["mount", "above"], &[]),
             PgWalBytes | PgSlotRetained => (&["above"], &[]),
             PgArchiverFailing => (&["window"], &[]),
-            ScanStale => (&["older_than"], &[]),
+            ScanStale => (&["root", "older_than"], &[]),
             WatchLossy => (&["mount", "above", "window"], &[]),
         };
         let fields = [
@@ -1055,6 +1074,7 @@ impl AlertRule {
                     n.is_finite() && *n >= 0.0 && n.fract() == 0.0
                 }
                 (HotDirGrowth, AlertThreshold::Text(s)) => parse_rate(s).is_ok(),
+                (HotDirGrowth, AlertThreshold::Number(n)) => n.is_finite() && *n >= 0.0,
                 (
                     DirGrowth | PhantomBytes | PgWalBytes | PgSlotRetained,
                     AlertThreshold::Text(s),
@@ -1084,22 +1104,17 @@ impl AlertRule {
     }
 }
 /// Shipped enabled alert rules from 07 §6.4, scoped to configured mounts.
-/// The primary mount uses the base rule name; other mounts append `:<mount>`.
+/// Only `/data` uses the base name. Other mounts and scheduled roots append `:<path>`.
+/// Suffixes retain printable ASCII except backslash; all other bytes (including
+/// backslash and UTF-8 multibyte bytes) become uppercase `\xNN` escapes.
+/// Roots with schedule `off` have no generated stale rule. Collector-dependent
+/// rules remain visible, but consumers must not fire them without available input;
+/// thin-pool rules apply only to tracked thin LVs.
 pub fn default_rules(cfg: &Config) -> Vec<AlertRule> {
     use AlertKind::*;
     let mut rules = Vec::new();
-    let primary = cfg
-        .sampler
-        .mounts
-        .iter()
-        .find(|m| m.as_path() == Path::new("/data"))
-        .or_else(|| cfg.sampler.mounts.first());
     for mount in &cfg.sampler.mounts {
-        let suffix = if Some(mount) == primary {
-            String::new()
-        } else {
-            format!(":{}", mount.display())
-        };
+        let suffix = subject_suffix(mount);
         for (name, kind, above, below, window, seconds) in [
             (
                 "fs_used_pct",
@@ -1139,11 +1154,7 @@ pub fn default_rules(cfg: &Config) -> Vec<AlertRule> {
         }
     }
     for mount in &cfg.watch.mounts {
-        let suffix = if Some(mount) == primary {
-            String::new()
-        } else {
-            format!(":{}", mount.display())
-        };
+        let suffix = subject_suffix(mount);
         rules.push(AlertRule {
             name: format!("watch_lossy{suffix}"),
             kind: WatchLossy,
@@ -1167,12 +1178,6 @@ pub fn default_rules(cfg: &Config) -> Vec<AlertRule> {
             ..AlertRule::default()
         },
         AlertRule {
-            name: "scan_stale".into(),
-            kind: ScanStale,
-            older_than: Some("auto".into()),
-            ..AlertRule::default()
-        },
-        AlertRule {
             name: "thin_pool_pct".into(),
             kind: ThinPoolPct,
             vg: Some("*".into()),
@@ -1182,7 +1187,33 @@ pub fn default_rules(cfg: &Config) -> Vec<AlertRule> {
             ..AlertRule::default()
         },
     ]);
+    for root in &cfg.roots {
+        if root.schedule != "off" {
+            rules.push(AlertRule {
+                name: format!("scan_stale{}", subject_suffix(&root.path)),
+                kind: ScanStale,
+                root: Some(root.path.clone()),
+                older_than: Some("auto".into()),
+                ..AlertRule::default()
+            });
+        }
+    }
     rules
+}
+fn subject_suffix(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    if path == Path::new("/data") {
+        return String::new();
+    }
+    let mut suffix = String::from(":");
+    for &byte in path.as_os_str().as_bytes() {
+        if (0x20..=0x7e).contains(&byte) && byte != b'\\' {
+            suffix.push(char::from(byte));
+        } else {
+            suffix.push_str(&format!("\\x{byte:02X}"));
+        }
+    }
+    suffix
 }
 impl Config {
     /// Fill in shipped alerts; user rules with equal names override defaults.

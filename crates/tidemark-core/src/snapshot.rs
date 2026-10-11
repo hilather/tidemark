@@ -10,7 +10,11 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 /// SnapshotMeta storage contract (05 §1).
+/// Consumers must use checked SQL integer conversions and checked count/ID
+/// arithmetic. Bulk directory slots must fit 31 bits before setting the
+/// self-reference flag; narrower internal depths must be checked, never truncated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SnapshotMetaWire", into = "SnapshotMetaWire")]
 pub struct SnapshotMeta {
     /// schema_version column; sizes are bytes and timestamps Unix seconds.
     pub schema_version: u32,
@@ -18,7 +22,7 @@ pub struct SnapshotMeta {
     pub tool_version: String,
     /// scan_id column; sizes are bytes and timestamps Unix seconds.
     pub scan_id: ScanId,
-    /// root column; sizes are bytes and timestamps Unix seconds.
+    /// Root bytes; report JSON uses mutually exclusive `root`/`root_b64` fields.
     pub root: RawPath,
     /// root_display column; sizes are bytes and timestamps Unix seconds.
     pub root_display: String,
@@ -87,6 +91,7 @@ pub struct DirRow {
     /// Raw name bytes; the root directory row stores the full root path.
     pub name: Vec<u8>,
     /// Full absolute normalized raw path.
+    #[serde(flatten, with = "crate::path::report_path")]
     pub path: RawPath,
     /// xxh3_64 of raw path bytes reinterpreted as i64.
     pub path_hash: i64,
@@ -148,7 +153,7 @@ pub struct DirRow {
 /// FileRow storage contract (05 §1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileRow {
-    /// Row identifier; directory ids are preorder indices (root = 0).
+    /// Notable-file row identifier, zero-based and assigned with checked conversion.
     pub id: u32,
     /// Containing directory id.
     pub dir_id: u32,
@@ -192,7 +197,7 @@ pub struct LinkInstanceRow {
     pub ino: u64,
     /// Containing directory id.
     pub dir_id: u32,
-    /// Raw entry name; nullable when bulk name resolution lost a race.
+    /// Raw entry name; None for bulk snapshots, resolved live on demand.
     pub name: Option<RawName>,
 }
 /// SkipRow storage contract (05 §1).
@@ -211,6 +216,7 @@ pub struct ErrorRow {
     /// Containing directory id.
     pub dir_id: Option<u32>,
     /// Full absolute normalized raw path.
+    #[serde(flatten, with = "crate::path::report_path")]
     pub path: RawPath,
     /// Metadata operation that failed.
     pub op: ErrOp,
@@ -263,9 +269,9 @@ pub struct FileFilter {
 pub struct LinkFilter {
     /// Restrict results to incomplete link sets.
     pub incomplete: bool,
-    /// Full-path boundary globs.
+    /// Full-path boundary globs; mutually exclusive with `boundary_depth`.
     pub boundary: Vec<String>,
-    /// Optional boundary depth relative to the query directory.
+    /// Optional boundary depth relative to the query directory; mutually exclusive with globs.
     pub boundary_depth: Option<u32>,
 }
 /// FileHit storage contract (05 §1).
@@ -274,6 +280,7 @@ pub struct FileHit {
     /// Stored snapshot row.
     pub row: FileRow,
     /// Full path, or None if a bulk name-resolution race lost the name.
+    #[serde(flatten, with = "crate::path::report_optional_path")]
     pub path: Option<RawPath>,
 }
 /// LinkSetHit storage contract (05 §1).
@@ -281,8 +288,136 @@ pub struct FileHit {
 pub struct LinkSetHit {
     /// Stored snapshot row.
     pub row: LinkSetRow,
-    /// Full raw path of the link-set LCA.
+    /// Full raw path of the link-set LCA, serialized as `path`/`path_b64`.
+    #[serde(flatten, with = "crate::path::report_path")]
     pub lca_path: RawPath,
     /// Number of stored link instances for this set.
     pub instance_count: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotMetaWire {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    root: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::path::present_string"
+    )]
+    root_b64: Option<String>,
+    schema_version: u32,
+    tool_version: String,
+    scan_id: ScanId,
+    root_display: String,
+    mode: ScanMode,
+    mode_reason: String,
+    status: SnapshotStatus,
+    degraded: bool,
+    exclude: Vec<String>,
+    link_instances: LinkInstances,
+    started_at: i64,
+    finished_at: i64,
+    host: String,
+    kernel: String,
+    os_release: String,
+    fs_uuid: String,
+    fs_dev: u64,
+    fs_blocksize: u64,
+    threads: u32,
+    throttle_profile: String,
+    dirs: u64,
+    files: u64,
+    inodes: u64,
+    errors: u64,
+    races: u64,
+    skipped: u64,
+    noatime_fallbacks: u64,
+    phase_ms: BTreeMap<String, u64>,
+    gate_stats: GateStats,
+}
+impl From<SnapshotMeta> for SnapshotMetaWire {
+    fn from(value: SnapshotMeta) -> Self {
+        let (root, root_b64) = crate::path::encode_fields(Some(value.root.as_bytes()));
+        Self {
+            root,
+            root_b64,
+            schema_version: value.schema_version,
+            tool_version: value.tool_version,
+            scan_id: value.scan_id,
+            root_display: value.root_display,
+            mode: value.mode,
+            mode_reason: value.mode_reason,
+            status: value.status,
+            degraded: value.degraded,
+            exclude: value.exclude,
+            link_instances: value.link_instances,
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+            host: value.host,
+            kernel: value.kernel,
+            os_release: value.os_release,
+            fs_uuid: value.fs_uuid,
+            fs_dev: value.fs_dev,
+            fs_blocksize: value.fs_blocksize,
+            threads: value.threads,
+            throttle_profile: value.throttle_profile,
+            dirs: value.dirs,
+            files: value.files,
+            inodes: value.inodes,
+            errors: value.errors,
+            races: value.races,
+            skipped: value.skipped,
+            noatime_fallbacks: value.noatime_fallbacks,
+            phase_ms: value.phase_ms,
+            gate_stats: value.gate_stats,
+        }
+    }
+}
+impl TryFrom<SnapshotMetaWire> for SnapshotMeta {
+    type Error = String;
+    fn try_from(value: SnapshotMetaWire) -> Result<Self, Self::Error> {
+        let root =
+            crate::path::decode_fields::<serde::de::value::Error>(value.root, value.root_b64)
+                .map_err(|e| e.to_string())?
+                .map(RawPath::new)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+        let root = root.ok_or_else(|| "root or root_b64 is required".to_owned())?;
+        Ok(Self {
+            root,
+            schema_version: value.schema_version,
+            tool_version: value.tool_version,
+            scan_id: value.scan_id,
+            root_display: value.root_display,
+            mode: value.mode,
+            mode_reason: value.mode_reason,
+            status: value.status,
+            degraded: value.degraded,
+            exclude: value.exclude,
+            link_instances: value.link_instances,
+            started_at: value.started_at,
+            finished_at: value.finished_at,
+            host: value.host,
+            kernel: value.kernel,
+            os_release: value.os_release,
+            fs_uuid: value.fs_uuid,
+            fs_dev: value.fs_dev,
+            fs_blocksize: value.fs_blocksize,
+            threads: value.threads,
+            throttle_profile: value.throttle_profile,
+            dirs: value.dirs,
+            files: value.files,
+            inodes: value.inodes,
+            errors: value.errors,
+            races: value.races,
+            skipped: value.skipped,
+            noatime_fallbacks: value.noatime_fallbacks,
+            phase_ms: value.phase_ms,
+            gate_stats: value.gate_stats,
+        })
+    }
 }
