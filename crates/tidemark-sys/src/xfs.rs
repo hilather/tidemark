@@ -66,6 +66,7 @@ pub fn geometry(fd: BorrowedFd<'_>) -> io::Result<XfsGeometry> {
     })
 }
 /// Availability to this caller (permission failures count as unavailable).
+/// Bulk metadata mode requires `v5 == true`; v1 is diagnostic only.
 pub struct BulkstatSupport {
     /// Legacy pointer-based bulkstat is callable.
     pub v1: bool,
@@ -88,7 +89,7 @@ pub struct BulkInode {
     pub ino: u64,
     /// File type and permission bits.
     pub mode: u32,
-    /// Hard-link count (v1 is limited by its 16-bit ABI).
+    /// Exact 32-bit hard-link count from v5 bulkstat.
     pub nlink: u32,
     /// Owner user ID.
     pub uid: u32,
@@ -136,8 +137,8 @@ pub fn ag_ino_range(geo: &XfsGeometry, agno: u32) -> (u64, u64) {
 // Bounds memory to < 32 MiB across kernel and converted buffers. The caller
 // receives InvalidInput rather than silent batch truncation for larger values.
 const MAX_BATCH: usize = 65_536;
-/// Iterate allocated inodes in [start, end), preferring v5 when supported.
-/// v1 resumes strictly after lastip; v5 resumes at its returned next inode.
+/// Iterate allocated inodes in [start, end) using v5 bulkstat only.
+/// V5 resumes at its returned next inode. Unsupported kernels must use walk mode.
 /// Each error is yielded once and terminates the iterator. No syscall occurs for
 /// an empty interval. The caller must charge these metadata calls to its Gate.
 pub fn bulkstat(fd: BorrowedFd<'_>, start: u64, end: u64, batch: usize) -> BulkstatIter<'_> {
@@ -146,21 +147,12 @@ pub fn bulkstat(fd: BorrowedFd<'_>, start: u64, end: u64, batch: usize) -> Bulks
         start,
         end,
         batch,
-        last: start.saturating_sub(1),
         next_ino: start,
         blocksize: None,
         agno: None,
-        backend: Backend::Unknown,
-        legacy: Vec::new(),
         modern: Vec::new(),
         done: start >= end,
     }
-}
-#[derive(Clone, Copy)]
-enum Backend {
-    Unknown,
-    V1,
-    V5,
 }
 /// Bounded, descriptor-borrowing iterator over ascending XFS inode metadata.
 pub struct BulkstatIter<'a> {
@@ -168,12 +160,9 @@ pub struct BulkstatIter<'a> {
     start: u64,
     end: u64,
     batch: usize,
-    last: u64,
     next_ino: u64,
     blocksize: Option<u32>,
     agno: Option<u32>,
-    backend: Backend,
-    legacy: Vec<MaybeUninit<xfs_bstat>>,
     modern: Vec<u64>,
     done: bool,
 }
@@ -192,6 +181,11 @@ fn request_v1(
     last: &mut u64,
     buffer: &mut [MaybeUninit<xfs_bstat>],
 ) -> io::Result<usize> {
+    #[cfg(test)]
+    if tests::V1_MOCK.with(|mock| mock.get()) {
+        tests::V1_CALLS.with(|calls| calls.set(calls.get() + 1));
+        return Ok(1);
+    }
     let mut count = 0i32;
     let mut req = xfs_fsop_bulkreq {
         lastip: last,
@@ -207,6 +201,16 @@ fn request_v1(
         return Err(invalid_data("invalid bulkstat output count"));
     }
     Ok(count as usize)
+}
+fn v5_ioctl(fd: BorrowedFd<'_>, buffer: &mut [u64]) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(result) = tests::V5_MOCK.with(|mock| mock.borrow_mut().as_mut().map(|f| f(buffer)))
+    {
+        return result;
+    }
+    // SAFETY: request_v5 supplies an aligned, initialized allocation matching
+    // the advertised header and record capacity for this synchronous ioctl.
+    ioctl_result(unsafe { libc::ioctl(fd.as_raw_fd(), XFS_IOC_BULKSTAT, buffer.as_mut_ptr()) })
 }
 fn request_v5(
     fd: BorrowedFd<'_>,
@@ -232,9 +236,7 @@ fn request_v5(
     unsafe {
         buffer.as_mut_ptr().cast::<xfs_bulk_ireq>().write(header);
     }
-    // SAFETY: the contiguous allocation has the UAPI flexible-array layout and
-    // advertised capacity; the kernel retains no pointers after this call.
-    ioctl_result(unsafe { libc::ioctl(fd.as_raw_fd(), XFS_IOC_BULKSTAT, buffer.as_mut_ptr()) })?;
+    v5_ioctl(fd, buffer)?;
     // SAFETY: the aligned initialized header remains in the live allocation.
     let header = unsafe { buffer.as_ptr().cast::<xfs_bulk_ireq>().read() };
     if header.ocount as usize > batch {
@@ -242,33 +244,10 @@ fn request_v5(
     }
     Ok((header.ocount as usize, header.ino))
 }
-// v1 bs_blocks is in filesystem blocks. Conversion is centralized here;
+// v5 bs_blocks is in filesystem blocks. Conversion is centralized here;
 // bulkstat_blocks_match_statx validates this against statx's 512-byte units.
 fn blocks_to_bytes(blocks: u64, blocksize: u32) -> Option<u64> {
     blocks.checked_mul(u64::from(blocksize))
-}
-fn bulk_disk_bytes(bs: &xfs_bstat, blocksize: u32) -> u64 {
-    blocks_to_bytes(bs.bs_blocks.max(0) as u64, blocksize).unwrap_or(u64::MAX)
-}
-fn convert_v1(bs: &xfs_bstat, blocksize: u32) -> io::Result<BulkInode> {
-    if bs.bs_size < 0
-        || bs.bs_blocks < 0
-        || blocks_to_bytes(bs.bs_blocks as u64, blocksize).is_none()
-    {
-        return Err(invalid_data("negative or overflowing bulkstat size"));
-    }
-    Ok(BulkInode {
-        ino: bs.bs_ino,
-        mode: u32::from(bs.bs_mode),
-        nlink: u32::from(bs.bs_nlink),
-        uid: bs.bs_uid,
-        gid: bs.bs_gid,
-        size: bs.bs_size as u64,
-        disk_bytes: bulk_disk_bytes(bs, blocksize),
-        mtime: bs.bs_mtime.tv_sec,
-        projid: u32::from(bs.bs_projid_hi) << 16 | u32::from(bs.bs_projid_lo),
-        xflags: bs.bs_xflags,
-    })
 }
 fn convert_v5(bs: &xfs_bulkstat, blocksize: u32) -> io::Result<BulkInode> {
     Ok(BulkInode {
@@ -313,67 +292,46 @@ impl BulkstatIter<'_> {
                 geo.blocksize
             }
         };
-        if matches!(self.backend, Backend::Unknown | Backend::V5) {
-            if self.modern.is_empty() {
-                self.modern.resize(8 + 24 * self.batch, 0);
-            }
-            match request_v5(
+        if self.modern.is_empty() {
+            self.modern.resize(8 + 24 * self.batch, 0);
+        }
+        let (count, next) =
+            request_v5(
                 self.fd,
                 self.next_ino,
                 self.batch,
                 self.agno,
                 &mut self.modern,
-            ) {
-                Ok((count, next)) => {
-                    self.backend = Backend::V5;
-                    let mut result = Vec::with_capacity(count);
-                    for i in 0..count {
-                        // SAFETY: count was checked against allocated slots; the
-                        // header is 8 u64s, each record 24 u64s. Storage is aligned,
-                        // initialized and live; all record fields are integers.
-                        let bs = unsafe {
-                            self.modern
-                                .as_ptr()
-                                .add(8 + i * 24)
-                                .cast::<xfs_bulkstat>()
-                                .read()
-                        };
-                        result.push(convert_v5(&bs, blocksize)?);
-                    }
-                    if count > 0 && next <= self.next_ino {
-                        return Err(invalid_data("v5 cursor did not advance"));
-                    }
-                    self.next_ino = next;
-                    return self.finish_batch(result);
+            )
+            .map_err(|error| {
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOTTY | libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+                ) {
+                    io::Error::new(io::ErrorKind::Unsupported,
+                    "v5 bulkstat is unavailable; v1 is not used because its link counts are 16-bit")
+                } else {
+                    error
                 }
-                Err(e)
-                    if matches!(self.backend, Backend::Unknown)
-                        && matches!(
-                            e.raw_os_error(),
-                            Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::ENOSYS)
-                        ) =>
-                {
-                    self.backend = Backend::V1;
-                    self.modern = Vec::new();
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        if self.legacy.is_empty() {
-            self.legacy.resize(self.batch, MaybeUninit::zeroed());
-        }
-        let previous = self.last;
-        let count = request_v1(self.fd, &mut self.last, &mut self.legacy)?;
+            })?;
         let mut result = Vec::with_capacity(count);
-        for slot in &self.legacy[..count] {
-            // SAFETY: the count is validated and these slots were initialized to
-            // zero before the kernel filled them. All bstat fields are integers.
-            let bs = unsafe { slot.assume_init_ref() };
-            result.push(convert_v1(bs, blocksize)?);
+        for i in 0..count {
+            // SAFETY: count was checked against allocated slots; the header is
+            // 8 u64s, each record 24 u64s. Storage is aligned, initialized and
+            // live; all record fields are integers.
+            let bs = unsafe {
+                self.modern
+                    .as_ptr()
+                    .add(8 + i * 24)
+                    .cast::<xfs_bulkstat>()
+                    .read()
+            };
+            result.push(convert_v5(&bs, blocksize)?);
         }
-        if count > 0 && self.last <= previous {
-            return Err(invalid_data("v1 cursor did not advance"));
+        if count > 0 && next <= self.next_ino {
+            return Err(invalid_data("v5 cursor did not advance"));
         }
+        self.next_ino = next;
         self.finish_batch(result)
     }
     fn finish_batch(&mut self, mut result: Vec<BulkInode>) -> io::Result<Vec<BulkInode>> {
@@ -423,6 +381,56 @@ impl std::iter::FusedIterator for BulkstatIter<'_> {}
 mod tests {
     use super::*;
     use std::{fs::File, os::fd::AsFd};
+    type Mock = Box<dyn FnMut(&mut [u64]) -> io::Result<()>>;
+    thread_local! {
+        pub(super) static V1_MOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static V1_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static V5_MOCK: std::cell::RefCell<Option<Mock>> = const { std::cell::RefCell::new(None) };
+    }
+    #[test]
+    fn unavailable_v5_never_returns_legacy_metadata() {
+        let file = File::open("/").unwrap();
+        V1_MOCK.with(|mock| mock.set(true));
+        assert_eq!(
+            request_v1(file.as_fd(), &mut 0, &mut [MaybeUninit::zeroed()]).unwrap(),
+            1
+        );
+        V1_CALLS.with(|calls| calls.set(0));
+        for errno in [libc::ENOTTY, libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
+            V5_MOCK.with(|mock| {
+                *mock.borrow_mut() =
+                    Some(Box::new(move |_| Err(io::Error::from_raw_os_error(errno))))
+            });
+            let mut iter = bulkstat(file.as_fd(), 0, u64::MAX, 1);
+            // Geometry is supplied to avoid real ioctls in this unprivileged test.
+            iter.blocksize = Some(4096);
+            let error = iter.next().unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("v5 bulkstat is unavailable"));
+            assert!(error
+                .to_string()
+                .contains("v1 is not used because its link counts are 16-bit"));
+            assert!(iter.next().is_none());
+            V1_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+            V5_MOCK.with(|mock| *mock.borrow_mut() = None);
+        }
+        V1_MOCK.with(|mock| mock.set(false));
+    }
+    #[test]
+    fn v5_permission_errors_keep_errno() {
+        let file = File::open("/").unwrap();
+        V5_MOCK.with(|mock| {
+            *mock.borrow_mut() = Some(Box::new(|_| Err(io::Error::from_raw_os_error(libc::EPERM))))
+        });
+        let mut iter = bulkstat(file.as_fd(), 0, u64::MAX, 1);
+        iter.blocksize = Some(4096);
+        let error = iter.next().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        assert!(iter.next().is_none());
+        V5_MOCK.with(|mock| *mock.borrow_mut() = None);
+    }
+
     fn geo(agblocks: u32, blocksize: u32, inodesize: u32) -> XfsGeometry {
         XfsGeometry {
             blocksize,
@@ -450,37 +458,6 @@ mod tests {
         assert_eq!(ag_ino_range(&geo(1024, 4096, 8192), 0), (0, 0));
         assert_eq!(ag_ino_range(&geo(1024, 4000, 512), 0), (0, 0));
         assert_eq!(ag_ino_range(&geo(u32::MAX, 1 << 31, 1), 2), (0, 0));
-    }
-    #[test]
-    fn blocks_are_filesystem_units_and_times_are_signed_seconds() {
-        let mut raw = xfs_bstat {
-            bs_blocks: 7,
-            bs_size: 3,
-            bs_projid_hi: 0x1234,
-            bs_projid_lo: 0xabcd,
-            bs_nlink: u16::MAX,
-            bs_mtime: xfs_bstime {
-                tv_sec: -1,
-                tv_nsec: 999_999_999,
-            },
-            ..Default::default()
-        };
-        assert_eq!(bulk_disk_bytes(&raw, 4096), 28672);
-        let converted = convert_v1(&raw, 4096).unwrap();
-        assert_eq!(converted.mtime, -1);
-        assert_eq!(converted.projid, 0x1234abcd);
-        assert_eq!(converted.nlink, 65535);
-        for sec in [i64::MIN, -2_147_483_649, 0, 2_147_483_648, i64::MAX] {
-            raw.bs_mtime.tv_sec = sec;
-            assert_eq!(convert_v1(&raw, 4096).unwrap().mtime, sec);
-        }
-        raw.bs_blocks = -1;
-        assert!(convert_v1(&raw, 4096).is_err());
-        raw.bs_blocks = i64::MAX;
-        assert!(convert_v1(&raw, 4096).is_err());
-        raw.bs_blocks = 0;
-        raw.bs_size = -1;
-        assert!(convert_v1(&raw, 4096).is_err());
     }
     #[test]
     fn v5_preserves_wide_links_and_project_id() {
@@ -566,45 +543,5 @@ mod tests {
             );
             assert!(iter.next().is_none());
         }
-    }
-    #[cfg(feature = "privileged")]
-    #[test]
-    fn legacy_v1_matches_metadata() {
-        use std::os::unix::fs::MetadataExt;
-        let fs = test_support::xfs::LoopXfs::new(512 << 20, &[], "noatime");
-        let path = fs.mountpoint.join("legacy");
-        use std::{io::Write, os::unix::fs::OpenOptionsExt};
-        let mut file = File::create(&path).unwrap();
-        file.write_all(&[0x42; 4097]).unwrap();
-        file.set_len(65536).unwrap();
-        file.sync_all().unwrap();
-        let metadata = std::fs::symlink_metadata(path).unwrap();
-        let mount = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NOATIME | libc::O_CLOEXEC)
-            .open(&fs.mountpoint)
-            .unwrap();
-        let mut iter = bulkstat(mount.as_fd(), 0, u64::MAX, 1);
-        iter.backend = Backend::V1;
-        let found = iter
-            .flat_map(|r| r.unwrap())
-            .find(|r| r.ino == metadata.ino())
-            .unwrap();
-        assert_eq!(
-            (
-                found.size,
-                found.disk_bytes,
-                found.nlink,
-                found.mode,
-                found.mtime
-            ),
-            (
-                metadata.size(),
-                metadata.blocks() * 512,
-                metadata.nlink() as u32,
-                metadata.mode(),
-                metadata.mtime()
-            )
-        );
     }
 }

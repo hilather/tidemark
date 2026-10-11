@@ -4,6 +4,9 @@
 // kernel-headers-4.18.0-553.172.1.el8_10, /usr/include/xfs/xfs_fs.h.
 // Coordinator's gcc measurements on x86_64: bstime 16/8, bstat 136/8,
 // bulkreq 32/8, geom_v1 112/8, geom 112/8 (size/alignment in bytes).
+// v5 bulk_ireq, bulkstat and flexible-array bulkstat_req: coordinator gcc
+// measurements on x86_64 in rockylinux:9, xfsprogs-devel-6.4.0-7.el9.
+// Their kernel ABI also applies to EL8, whose userspace header lacks v5.
 // No generation command: these definitions were transcribed by hand.
 #![allow(non_camel_case_types, dead_code)]
 
@@ -111,9 +114,6 @@ pub(crate) const XFS_FSOP_GEOM_FLAGS_V5SB: u32 = 0x8000;
 pub(crate) const XFS_FSOP_GEOM_FLAGS_FTYPE: u32 = 0x10000;
 pub(crate) const XFS_FSOP_GEOM_FLAGS_REFLINK: u32 = 0x100000;
 
-// v5: NOT present in the EL8 header; layout from upstream kernel UAPI,
-// unverified on EL8. Source: Linux v5.10 fs/xfs/libxfs/xfs_fs.h
-// https://github.com/torvalds/linux/blob/v5.10/fs/xfs/libxfs/xfs_fs.h
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct xfs_bulk_ireq {
@@ -156,10 +156,20 @@ pub(crate) struct xfs_bulkstat {
     pub bs_checked: u16,
     pub bs_mode: u16,
     pub bs_pad2: u16,
-    pub bs_pad: [u64; 7],
+    pub bs_extents64: u64,
+    pub bs_pad: [u64; 6],
 }
-pub(crate) const XFS_IOC_BULKSTAT: libc::c_ulong = ioctl(2, 127, size_of::<xfs_bulk_ireq>());
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct xfs_bulkstat_req {
+    pub hdr: xfs_bulk_ireq,
+    pub bulkstat: [xfs_bulkstat; 0],
+}
+pub(crate) const XFS_IOC_BULKSTAT: libc::c_ulong = ioctl(2, 127, size_of::<xfs_bulkstat_req>());
 pub(crate) const XFS_BULK_IREQ_AGNO: u32 = 1;
+pub(crate) const XFS_BULK_IREQ_SPECIAL: u32 = 2;
+pub(crate) const XFS_BULKSTAT_VERSION_V5: u16 = 5;
+pub(crate) const XFS_IOC_INUMBERS: libc::c_ulong = ioctl(2, 128, size_of::<xfs_bulk_ireq>());
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -184,10 +194,8 @@ mod tests {
             bs_forkoff: 114, bs_projid_hi: 116, bs_pad: 118,
             bs_cowextsize: 124, bs_dmevmask: 128, bs_dmstate: 132, bs_aextents: 134);
         layout!(xfs_fsop_bulkreq, 32, 8; lastip: 0, icount: 8, ubuffer: 16, ocount: 24);
-        layout!(xfs_fsop_geom, 112, 8; blocksize: 0, agblocks: 8, agcount: 12,
-            inodesize: 24, flags: 92, uuid: 64, dirblocksize: 104, version: 88, logsunit: 108);
-        layout!(xfs_fsop_geom_v1, 112, 8; blocksize: 0, agblocks: 8, agcount: 12,
-            inodesize: 24, flags: 92, uuid: 64, dirblocksize: 104, version: 88);
+        layout!(xfs_fsop_geom, 112, 8; blocksize: 0, rtextsize: 4, agblocks: 8, agcount: 12, logblocks: 16, sectsize: 20, inodesize: 24, imaxpct: 28, datablocks: 32, rtblocks: 40, rtextents: 48, logstart: 56, uuid: 64, sunit: 80, swidth: 84, version: 88, flags: 92, logsectsize: 96, rtsectsize: 100, dirblocksize: 104, logsunit: 108);
+        layout!(xfs_fsop_geom_v1, 112, 8; blocksize: 0, rtextsize: 4, agblocks: 8, agcount: 12, logblocks: 16, sectsize: 20, inodesize: 24, imaxpct: 28, datablocks: 32, rtblocks: 40, rtextents: 48, logstart: 56, uuid: 64, sunit: 80, swidth: 84, version: 88, flags: 92, logsectsize: 96, rtsectsize: 100, dirblocksize: 104);
     }
     #[test]
     fn rocky8_measured_field_widths() {
@@ -242,8 +250,20 @@ mod tests {
     #[test]
     fn upstream_v5_layout() {
         layout!(xfs_bulk_ireq, 64, 8; ino: 0, flags: 8, icount: 12, ocount: 16, agno: 20, reserved: 24);
-        layout!(xfs_bulkstat, 192, 8; bs_ino: 0, bs_blocks: 16, bs_mtime: 40,
-            bs_nlink: 112, bs_mode: 132, bs_pad: 136);
+        layout!(xfs_bulkstat, 192, 8; bs_ino: 0, bs_size: 8, bs_blocks: 16, bs_xflags: 24, bs_atime: 32, bs_mtime: 40, bs_ctime: 48, bs_btime: 56, bs_gen: 64, bs_uid: 68, bs_gid: 72, bs_projectid: 76, bs_atime_nsec: 80, bs_mtime_nsec: 84, bs_ctime_nsec: 88, bs_btime_nsec: 92, bs_blksize: 96, bs_rdev: 100, bs_cowextsize_blks: 104, bs_extsize_blks: 108, bs_nlink: 112, bs_extents: 116, bs_aextents: 120, bs_version: 124, bs_forkoff: 126, bs_sick: 128, bs_checked: 130, bs_mode: 132, bs_pad2: 134, bs_extents64: 136, bs_pad: 144);
+        layout!(xfs_bulkstat_req, 64, 8; hdr: 0, bulkstat: 64);
         assert_eq!(XFS_IOC_BULKSTAT, 0x8040587f);
+        assert_eq!(
+            (XFS_IOC_BULKSTAT >> 16) & 0x3fff,
+            size_of::<xfs_bulkstat_req>() as libc::c_ulong
+        );
+        assert_eq!(XFS_IOC_INUMBERS, 0x80405880);
+        assert_eq!(
+            (XFS_IOC_INUMBERS >> 16) & 0x3fff,
+            size_of::<xfs_bulk_ireq>() as libc::c_ulong
+        );
+        assert_eq!(XFS_BULK_IREQ_AGNO, 1);
+        assert_eq!(XFS_BULK_IREQ_SPECIAL, 2);
+        assert_eq!(XFS_BULKSTAT_VERSION_V5, 5);
     }
 }
