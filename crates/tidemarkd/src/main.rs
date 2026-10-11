@@ -1,6 +1,7 @@
-//! Owned by: W0-B
-//! tidemarkd binary skeleton; argument parsing follows in W0-B.
+//! Owned by: W6-A
+//! Thin daemon executable entry point.
 
 #![forbid(unsafe_code)]
-
-fn main() {}
+fn main() -> std::process::ExitCode {
+    tidemarkd::main_entry()
+}
