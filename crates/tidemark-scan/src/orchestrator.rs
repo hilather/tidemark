@@ -533,7 +533,7 @@ pub fn run_scan(
                 .collect();
             status = publication_status(status, mode, req.keep_partial, cancel)?;
             meta.status = status;
-            let file = finish_snapshot(writer, &meta)?;
+            let file = finish_snapshot(writer, &meta, &|| cancel.load(Ordering::Acquire))?;
             entry.status = if status == SnapshotStatus::Partial {
                 "partial"
             } else {
@@ -1034,7 +1034,12 @@ fn recorded<T>(
             .load(std::sync::atomic::Ordering::Acquire)
     {
         let (now, duration) = finish();
-        entry.status = "failed".into();
+        entry.status = if matches!(result, Err(ScanError::Cancelled)) {
+            "cancelled"
+        } else {
+            "failed"
+        }
+        .into();
         entry.finished_at = Some(now);
         entry.duration_ms = Some(duration);
         if let Err(cleanup) = recorder.scan_finished(entry) {
@@ -1116,7 +1121,6 @@ fn publication_status(
     keep: bool,
     cancel: &AtomicBool,
 ) -> Result<SnapshotStatus, ScanError> {
-    // The store currently exposes no cancellation seam inside finish's index/sync/rename work.
     if cancel.load(std::sync::atomic::Ordering::Acquire) {
         if mode == ScanMode::Bulk || !keep {
             return Err(ScanError::Cancelled);
@@ -1148,8 +1152,10 @@ fn admit_memory(
 fn finish_snapshot(
     writer: tidemark_store::writer::SnapshotWriter,
     meta: &tidemark_core::snapshot::SnapshotMeta,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<PathBuf, ScanError> {
-    writer.finish(meta).map_err(|e| match e {
+    writer.finish_with(meta, cancelled).map_err(|e| match e {
+        tidemark_store::StoreError::Cancelled => ScanError::Cancelled,
         tidemark_store::StoreError::Io(ref io)
             if io.kind() == std::io::ErrorKind::AlreadyExists =>
         {
@@ -1490,7 +1496,7 @@ mod tests {
             assert_eq!(
                 *rec.0.lock().unwrap(),
                 if fail {
-                    vec!["start:running", "finish:failed"]
+                    vec!["start:running", "finish:cancelled"]
                 } else {
                     vec!["start:running", "finish:complete", "series"]
                 }
@@ -1671,6 +1677,107 @@ mod tests {
         assert_eq!(std::fs::read(file).unwrap(), b"kept");
     }
     #[test]
+    fn cancellation_during_publication_is_recorded_and_never_kept() {
+        use std::cell::Cell;
+        struct CatalogRecorder<'a>(&'a std::path::Path, &'a Recorder);
+        impl ScanRecorder for CatalogRecorder<'_> {
+            fn scan_started(&self, e: &ScanEntry) -> Result<(), ScanError> {
+                Catalog::open(self.0, true)?.record_start(e)?;
+                self.1.scan_started(e)
+            }
+            fn scan_finished(&self, e: &ScanEntry) -> Result<(), ScanError> {
+                Catalog::open(self.0, true)?.record_finish(e)?;
+                self.1.scan_finished(e)
+            }
+            fn dir_series(
+                &self,
+                _: &RawPath,
+                _: &str,
+                _: i64,
+                _: &[DirRow],
+            ) -> Result<(), ScanError> {
+                Ok(())
+            }
+        }
+        let fixture = test_support::materialize("[[entry]]\npath='file'\nkind='file'\nsize=8\n");
+        let state = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.general.state_dir = state.path().to_owned();
+        let req = ScanRequest {
+            root: RawPath::from_path(&fixture.root).unwrap(),
+            mode: ModeRequest::Walk,
+            throttle: Some("max".into()),
+            threads: Some(1),
+            exclude_extra: vec![],
+            keep_partial: false,
+            annotations: vec![],
+        };
+        let outcome = run_scan(
+            &cfg,
+            &req,
+            &Recorder::default(),
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap();
+        let existing = outcome.file.unwrap();
+        let bytes = std::fs::read(&existing).unwrap();
+        let mut meta = tidemark_store::reader::Snapshot::open(&existing)
+            .unwrap()
+            .meta()
+            .clone();
+        for keep_partial in [false, true] {
+            meta.scan_id =
+                tidemark_core::time::ScanId::new(meta.started_at + 1 + i64::from(keep_partial))
+                    .unwrap();
+            meta.status = if keep_partial {
+                SnapshotStatus::Partial
+            } else {
+                SnapshotStatus::Complete
+            };
+            let dir = existing.parent().unwrap();
+            let writer = tidemark_store::writer::SnapshotWriter::create(dir, &meta).unwrap();
+            let cancel = AtomicBool::new(false);
+            let checks = Cell::new(0);
+            let recorder = Recorder::default();
+            let catalog_dir = tempfile::tempdir().unwrap();
+            let catalog = Catalog::open(catalog_dir.path(), true).unwrap();
+            let catalog_recorder = CatalogRecorder(catalog_dir.path(), &recorder);
+            let mut e = entry();
+            let result = recorded(
+                &mut e,
+                &catalog_recorder,
+                || (102, 2000),
+                |_, _| {
+                    finish_snapshot(writer, &meta, &|| {
+                        checks.set(checks.get() + 1);
+                        // The first index has completed when cancellation arrives.
+                        if checks.get() == 2 {
+                            cancel.store(true, Ordering::Release);
+                        }
+                        cancel.load(Ordering::Acquire)
+                    })
+                },
+            );
+            assert!(matches!(result, Err(ScanError::Cancelled)));
+            assert_eq!(checks.get(), 2);
+            assert_eq!(e.status, "cancelled");
+            let stored = catalog.get(&e.scan_id).unwrap().unwrap();
+            assert_eq!(stored.status, "cancelled");
+            assert_eq!(stored.finished_at, Some(102));
+            assert!(stored.file.is_none());
+            assert!(e.file.is_none());
+            assert_eq!(e.finished_at, Some(102));
+            assert_eq!(
+                *recorder.0.lock().unwrap(),
+                ["start:running", "finish:cancelled"]
+            );
+            assert!(!dir.join(format!("{}.db", meta.scan_id)).exists());
+            assert!(!dir.join(format!("{}.db.tmp", meta.scan_id)).exists());
+            assert_eq!(std::fs::read(&existing).unwrap(), bytes);
+        }
+    }
+    #[test]
     fn finish_collision_preserves_existing_snapshot_and_removes_temporary_file() {
         let fixture = test_support::materialize("[[entry]]\npath='file'\nkind='file'\nsize=8\n");
         let state = tempfile::tempdir().unwrap();
@@ -1703,7 +1810,7 @@ mod tests {
         let temporary = dir.join(format!("{}.db.tmp", meta.scan_id));
         std::fs::write(&existing, b"existing snapshot must survive").unwrap();
         assert!(matches!(
-            finish_snapshot(writer, &meta),
+            finish_snapshot(writer, &meta, &|| false),
             Err(ScanError::PublicationCollision)
         ));
         assert_eq!(

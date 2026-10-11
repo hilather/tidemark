@@ -1309,3 +1309,44 @@ fn timeseries_header_preflight_handles_empty_short_and_valid_headers() {
         errors => panic!("unexpected errors: {errors:?}"),
     }
 }
+
+#[test]
+fn finish_cancels_at_every_publication_checkpoint() {
+    use std::cell::Cell;
+    // One before indexes, seven after individual indexes, one before metadata,
+    // and one immediately before rename. Successful finish must not check afterwards.
+    const CHECKPOINTS: usize = 10;
+    for cancel_at in 1..=CHECKPOINTS + 1 {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_meta = meta();
+        let existing = SnapshotWriter::create(tmp.path(), &old_meta)
+            .unwrap()
+            .finish(&old_meta)
+            .unwrap();
+        let old_bytes = std::fs::read(&existing).unwrap();
+        let mut m = old_meta.clone();
+        m.scan_id = serde_json::from_str("\"20260101T000001Z-00000000\"").unwrap();
+        let writer = SnapshotWriter::create(tmp.path(), &m).unwrap();
+        let published = tmp.path().join(format!("{}.db", m.scan_id));
+        let temporary = tmp.path().join(format!("{}.db.tmp", m.scan_id));
+        let calls = Cell::new(0);
+        let result = writer.finish_with(&m, &|| {
+            calls.set(calls.get() + 1);
+            calls.get() == cancel_at
+        });
+        if cancel_at <= CHECKPOINTS {
+            assert!(matches!(result, Err(tidemark_store::StoreError::Cancelled)));
+            assert!(!published.exists());
+            assert_eq!(calls.get(), cancel_at);
+        } else {
+            assert_eq!(result.unwrap(), published);
+            assert_eq!(calls.get(), CHECKPOINTS);
+            assert_eq!(
+                Snapshot::open(&published).unwrap().meta().status,
+                SnapshotStatus::Complete
+            );
+        }
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read(&existing).unwrap(), old_bytes);
+    }
+}

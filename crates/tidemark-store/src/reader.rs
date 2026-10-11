@@ -41,6 +41,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 pub struct Snapshot {
     conn: Connection,
     meta: SnapshotMeta,
+    file: std::path::PathBuf,
 }
 
 fn decode_path(bytes: Vec<u8>) -> rusqlite::Result<RawPath> {
@@ -266,6 +267,20 @@ fn order(sort: SortKey) -> &'static str {
     }
 }
 impl Snapshot {
+    /// The read-only, immutable SQLite connection of this snapshot. For streamed queries inside
+    /// this crate. Callers must not write, must use bound parameters, and must detach anything
+    /// they attach.
+    #[allow(dead_code)] // Sibling query owners adopt this seam in their follow-up tasks.
+    pub(crate) fn conn(&self) -> &rusqlite::Connection {
+        &self.conn
+    }
+    /// The snapshot file this reader was opened from (to ATTACH it read-only and immutable from
+    /// another snapshot's connection).
+    #[allow(dead_code)] // Sibling query owners adopt this seam in their follow-up tasks.
+    pub(crate) fn file(&self) -> &std::path::Path {
+        &self.file
+    }
+
     /// Open an immutable snapshot without acquiring SQLite locks.
     ///
     /// ```no_run
@@ -289,7 +304,11 @@ impl Snapshot {
                 "metadata version disagrees with database".into(),
             ));
         }
-        Ok(Self { conn, meta })
+        Ok(Self {
+            conn,
+            meta,
+            file: path.to_path_buf(),
+        })
     }
     /// Return scan metadata without querying the database.
     pub fn meta(&self) -> &SnapshotMeta {
@@ -585,6 +604,60 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
+    fn fixture(name: &str) -> (tempfile::TempDir, super::Snapshot) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(name);
+        let mut meta = crate::test_meta();
+        meta.schema_version = 1;
+        let writer = crate::writer::SnapshotWriter::create(dir.path(), &meta).unwrap();
+        let published = writer.finish(&meta).unwrap();
+        std::fs::rename(published, &file).unwrap();
+        (dir, super::Snapshot::open(&file).unwrap())
+    }
+    #[test]
+    fn connection_streams_bound_query_rows() {
+        let (_dir, snapshot) = fixture("stream.db");
+        let mut statement = snapshot
+            .conn()
+            .prepare("SELECT key FROM meta WHERE key >= ? ORDER BY key")
+            .unwrap();
+        let mut rows = statement.query(["schema_version"]).unwrap();
+        let mut count = 0;
+        while let Some(row) = rows.next().unwrap() {
+            let key: String = row.get(0).unwrap();
+            assert!(key.as_str() >= "schema_version");
+            count += 1;
+        }
+        assert!(count > 1);
+        assert!(snapshot.conn().execute("DELETE FROM meta", []).is_err());
+    }
+    #[test]
+    fn attach_snapshot_file_read_only_immutable_and_detach() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_new_dir, new) = fixture("new.db");
+        let (_old_dir, old) = fixture("old ?#%\u{00ff}.db");
+        let mut uri = String::from("file:");
+        for byte in old.file().as_os_str().as_bytes() {
+            uri.push('%');
+            uri.push_str(&format!("{byte:02X}"));
+        }
+        uri.push_str("?mode=ro&immutable=1");
+        new.conn()
+            .execute("ATTACH DATABASE ? AS old", [uri])
+            .unwrap();
+        let count: i64 = new.conn().query_row(
+            "SELECT COUNT(*) FROM main.meta n JOIN old.meta o USING(key) WHERE n.value = o.value",
+            [], |row| row.get(0)
+        ).unwrap();
+        assert!(count > 1);
+        assert!(new.conn().execute("DELETE FROM old.meta", []).is_err());
+        new.conn().execute_batch("DETACH DATABASE old").unwrap();
+        assert!(new.conn().prepare("SELECT * FROM old.meta").is_err());
+        assert_eq!(
+            super::Snapshot::open(old.file()).unwrap().meta().scan_id,
+            old.meta().scan_id
+        );
+    }
     #[test]
     fn metadata_fixture_remains_constructible() {
         assert_eq!(crate::test_meta().root.as_bytes(), b"/");
