@@ -1,0 +1,3 @@
+28 1 8:2 / / rw,relatime - xfs /dev/sda2 rw,seclabel,attr2,inode64
+40 28 253:1 / /data rw,noatime - xfs /dev/mapper/vg_data-lv_data rw,seclabel,attr2,inode64
+41 40 253:1 /db\040files /data/db\040mirror rw,noatime - xfs /dev/mapper/vg_data-lv_data rw,seclabel,attr2,inode64

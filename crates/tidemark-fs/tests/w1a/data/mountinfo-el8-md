@@ -1,0 +1,2 @@
+28 1 8:2 / / rw,relatime - xfs /dev/sda2 rw,seclabel,attr2,inode64
+40 28 9:0 / /data rw,noatime - xfs /dev/md0 rw,seclabel,attr2,inode64
