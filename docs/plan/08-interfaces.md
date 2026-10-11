@@ -16,7 +16,7 @@ Everything here is a contract. Changing it after Wave 0 requires a spec-change r
 | `--color auto\|always\|never` | Terminal colour |
 | `-v / -q` | Log verbosity to stderr |
 
-Paths given on the command line are canonicalised (`realpath`) before lookup, so a symlinked path finds the real directory. Output always shows canonical paths.
+Paths given on the command line are canonicalised (`realpath`) before construction of `RawPath` and before lookup; lexical normalization never precedes realpath, so a symlinked path finds the real directory. Output always shows canonical paths.
 
 Machine output uses `JsonDoc<T> { schema: Cow<'static, str>, data: T }`, with owned deserialization (no `#[serde(borrow)]`). Shared report DTO adapters emit a UTF-8 `path` string or mutually exclusive `path_b64` (padded standard base64) for arbitrary bytes, never integer arrays. Apply this to enclosing/nested reports, phantom holders, snapshot paths and directory hot entries; preserve internal raw byte types. Whole-envelope tests cover ASCII, Unicode and invalid UTF-8.
 
@@ -318,7 +318,7 @@ tidemark deploy verify --wait 5m                    # exit 0 = healthy; 6 = not 
 | Every `sampler.mounts` and `watch.mounts` entry is a mount point | yes |
 | `state_dir` filesystem has ≥ 2 GiB free (plus the `min_free_pct` floor) | yes |
 | fanotify available (`probe`), mount namespace OK | warning (watcher would be disabled) |
-| XFS + bulkstat available on `/data` | warning (walk mode would be used) |
+| XFS + v5 bulkstat available on `/data` | warning (walk mode would be used) |
 | LVM visible (`lvs` succeeds) | warning |
 | Postgres reachable with `pg_monitor` (if enabled) | warning |
 | A previous version staged/running | info (config backed up, service restarted only with `--start-now`) |

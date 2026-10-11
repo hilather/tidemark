@@ -1,6 +1,6 @@
-# 13 — W0-B1 contract decisions
+# 13 — Contract decisions
 
-The coordinator accepts every finding in `docs/reviews/W0-B1-review.md` and decides SCR-001–004 **MODIFY (accepted with modifications)** and SCR-005–006 **ACCEPT** as specified below. This decision record takes precedence over the “Decision: Pending” lines in `docs/handoff/SCR-001.md` through `SCR-006.md`. These are the decided contracts for later tasks; the implementation changes are a separate task.
+This record also covers the accepted Wave 1 requests and reviews below. The coordinator accepts every finding in `docs/reviews/W0-B1-review.md` and decides SCR-001–004 **MODIFY (accepted with modifications)** and SCR-005–006 **ACCEPT** as specified below. This decision record takes precedence over the “Decision: Pending” lines in `docs/handoff/SCR-001.md` through `SCR-006.md`. These are the decided contracts for later tasks; the implementation changes are a separate task.
 
 ## SCR-001 — Snapshot types, filters and bounds
 
@@ -79,7 +79,7 @@ Plan locations: W0-A deliverable 3 and W0-B Cross-task stubs; W1 entry; `05` §3
 
 ## SCR-006 — `du` apparent-size oracle
 
-The normative `t_apparent` definition includes directory `st_size`, but GNU `du` apparent mode differs across releases. Coreutils 8.30, shipped with Rocky Linux 8, counts directory sizes; coreutils 9.2 and later count only regular files and symbolic links in apparent mode.
+The normative `t_apparent` definition includes directory `st_size`, but GNU `du` apparent mode differs across releases. In a `rockylinux:8` container, `du (GNU coreutils) 8.30` was measured to count directory sizes; coreutils 9.2 and later count only regular files and symbolic links in apparent mode.
 
 **Decision: accepted.**
 
@@ -108,3 +108,107 @@ Plan locations: `03` §2–3; `09` §3; `01` NFR-1; W2-C oracle tests. Affected 
 | N1 | Notable-file row id; bulk instance names absent by design, resolved live: `05` §1. |
 | N2 | Watcher threshold key above (overflow count): `07` §6.1. |
 | N3 | Alert state firing/resolved/renotify: `05` §6, matching `07` §7a. |
+
+---
+
+## Wave 1 decisions
+
+These final coordinator decisions supersede pending request text in the Wave 1 handoffs. Implementation details cited below follow the fix notes; module inspection is not runtime verification.
+
+### Mount roots
+
+Kernel-object mount roots from nsfs are not paths. Rejecting them must not invalidate other mounts in the table.
+
+**Decision: accepted.**
+
+`MountInfo.root` is `enum MountRoot { Path(RawPath), Object(Vec<u8>) }`. Object roots such as `net:[4026533000]` remain mount boundaries. Report and skip malformed lines, returning well-formed records.
+
+Plan locations: W1-A interface/details; `04` §2.2. Affected tasks: W1-A, W1-B, W2-C.
+
+### Query paths
+
+Lexical normalization before realpath can change what a symlink-containing path resolves to. Unresolved paths must not borrow another mount’s facts, and printable UTF-8 still needs safe escaping.
+
+**Decision: accepted.**
+
+Canonicalize the user-supplied path (resolve symlinks as realpath) before constructing `RawPath`; never lexically normalize first. Return unknown facts with the reason on resolution failure. Escape every displayed mount field like `RawPath::display_lossy`, whether valid UTF-8 or not.
+
+Plan locations: W1-A details; SCR-004 above. Affected tasks: W1-A, W2-C, later query renderers.
+
+### Bulk mode requires v5 bulkstat
+
+Legacy v1 bulkstat has a 16-bit link count: 65,537 arrives as 1 without detectable overflow. Exact link counts determine reclaimable space (`03` §4).
+
+**Decision: accepted.**
+
+`tidemark_sys::xfs::bulkstat` uses `XFS_IOC_BULKSTAT` v5 with 32-bit `bs_nlink` only, returning `Unsupported` when unavailable. `bulkstat_probe` still reports `BulkstatSupport { v1, v5 }`. Auto chooses bulk only with v5; explicit `--mode bulk` without it fails with exit code 5 and a message naming the reason. Walk uses exact `statx` counts.
+
+The EL8 userspace header (`xfsprogs-devel-5.0.0-12.el8`, `/usr/include/xfs/xfs_fs.h`) lacks the v5 structures and `XFS_IOC_BULKSTAT`. Module-binary inspection of `xfs.ko` in `kernel-core-4.18.0-477.27.1.el8_8` (Rocky 8.8) and kernel 4.18.0-553.172.1.el8_10 (Rocky 8.10) found `xfs_ioc_bulkstat`, `xfs_bulk_ireq_setup` and `xfs_bulkstat_to_bstat`. This establishes handler presence, not successful ioctl execution; runtime probes on both VMs remain a Wave 1 gate item.
+
+Bindings are hand-transcribed, not bindgen output, and pinned by layout tests to sizes and offsets measured with `gcc`: `xfs_bstat` 136 bytes, `xfs_bstime` 16, `xfs_fsop_bulkreq` 32, `xfs_fsop_geom` 112 from the EL8 header; `xfs_bulkstat` 192, `xfs_bulk_ireq` 64 and `XFS_IOC_BULKSTAT` `0x8040587f` measured against `xfsprogs-devel-6.4.0-7.el9` (same kernel ABI).
+
+Plan locations: `04` §5/§7; W1-C notes/gate; W2-B/C; `12` R4/R7. Affected tasks: W1-A/C, W2-B/C, W7-B.
+
+### Throttle
+
+Counter-only samples need stable leaf identity and meaningful utilisation. Immutable acquisition deadlines ignore rate decreases while work is already waiting.
+
+**Decision: accepted.**
+
+Signatures are unchanged. The caller resolves leaves with `blockdev::resolve_leaves`; unavailable discovery means an empty slice and the configured minimum gate rate. `StatSampler` and `read_disk_stats` return exactly one sample per leaf in input order and fail the whole sample if any device cannot be read. Samplers finish within one interval. Signatures stay unchanged; `controller_step` is counter-only, so callers mask utilisation (`io_ticks_ms = 0`) for non-rotational, unknown or multi-queue devices. `FixedGate::new` is private.
+
+The token bucket accounts for outstanding token debt: elapsed earnings use the previous rate before a rate change, and waiting acquisitions recheck their targets at the new rate. Per `docs/handoff/W1-D-fix.md`, cumulative issued/earned tokens use constant-size mutex/condition-variable state, with no waiter queue; surplus is capped to 0.25 seconds at the current rate.
+
+Plan locations: `04` §6.2; W1-A/D notes; W2-C gate setup. Affected tasks: W1-A/D, W2-B/C.
+
+### Store
+
+Retention can otherwise remove a root’s last usable snapshot with zero recent retention. A corrupt shared database cannot be rebuilt through a catalog that failed to open, and lossy glob matching changes path meaning.
+
+**Decision: accepted.**
+
+Always keep each root’s newest complete snapshot regardless of policy. `Catalog::open` remains non-destructive. After an open reports corruption, callers stop writers and close all catalog/sample connections, then call `tidemark_store::catalog::recover_catalog(state_dir)` to preserve the database and WAL/SHM sidecars by rename, create a fresh database and rebuild the catalog from valid snapshot files. The daemon at startup and `snapshots rebuild-catalog` use this path only on reported corruption and log the preserved paths. Per `docs/handoff/W1-E-fix.md`, preservation uses an exclusively created private `timeseries-recovery-N` directory inside `state_dir`, with at most 10,000 namespace attempts and directory syncs; no artifacts are deleted. `Catalog::recovery_files() -> &[PathBuf]` reports the preserved paths. Historical samples are unavailable in the new database but remain in those artifacts.
+
+`LinkFilter.boundary` globs match complete raw directory path bytes with literal separators (`*` stays within a component). Per W1-E fix, deepest matching ancestor defines a region, unmatched instances share an outside region, and sets crossing distinct regions are selected; region/pattern storage is bounded by the existing 1,000,000-row cap and errors above it.
+
+Plan locations: `05` §3/§4/§7–8; W1-E; W2-C; W6-A startup. Affected tasks: W1-E, W2-C, W3-B, W6-A.
+
+### Notable files
+
+Worker-local filename tie breaking can discard the global winner before final directory ids are assigned. Global selection needs all candidates tied at the size cutoff.
+
+**Decision: accepted.**
+
+Workers emit every candidate that could win global top-N under `(disk desc, final directory id asc, inode asc)`, including all ties at the worker's size cutoff. The heap holds at most `top_files` sizes (configuration cap 200,000), with no worker-wide tie collection. Per `docs/handoff/W1-B-fix.md`, ties live in the current `DirRecord`, capped by the existing 1,000,000 direct-entry limit: exceeding it returns `WalkError::Limit("million-entry directory cap")` and aborts the scan, never silently truncates candidates. At most `threads` producer records and `out.capacity()` queued records are retained (validated bounds 64 and 1,024), giving at most `(threads + out.capacity()) * 1,000,000` notable candidates plus `threads * top_files` heap size values. Consumer retention is the consumer's responsibility; this large finite ceiling is not a measured worst-case RSS guarantee.
+
+Plan locations: `04` §2.2; W1-B notes; W2-A selection. Affected tasks: W1-B, W2-A/B.
+
+### Measured du oracle
+
+SCR-006’s target-platform claim now has a measurement. The directory-inclusive metric remains normative across differing coreutils behaviour.
+
+**Decision: accepted.**
+
+In a `rockylinux:8` container, `du (GNU coreutils) 8.30` with `--apparent-size` was measured to count directory sizes; coreutils 9.2 and later do not. SCR-006 stands: probe local behaviour and normalize using measured directory/non-regular inode sizes when needed, never a version-string branch.
+
+Plan locations: SCR-006 above; `09` §3. Affected tasks: W0-C, W1-B, W2-A/C.
+
+### Filesystem-dependent test numbers
+
+A `cargo test` run on overlayfs in a `rockylinux:8` container exposed literal allocation and directory-size assumptions. Such literals test the host filesystem rather than the contract.
+
+**Decision: accepted.**
+
+Measure allocated sizes (`st_blocks`), directory sizes and `du` figures; do not assert filesystem-dependent literals. Assert the `03` §6 worked example exactly only in the in-memory reference test and privileged loop-XFS test.
+
+Plan locations: `09` §1; W1-B tests/acceptance; W2-A golden tests. Affected tasks: All fixture-test owners, especially W0-C, W1-B/C/E, W2-A/C.
+
+### CLI surface tests
+
+Surface tests that require an unimplemented-command error fail as implementations land. Those tests should verify the stable command contract.
+
+**Decision: accepted.**
+
+Assert commands, flags, help, parsing and exit-code mapping only, never that a command remains unimplemented.
+
+Plan locations: `09` §1; W1-A SCR-002. Affected tasks: W0-A, W1-A, W2-C and later CLI owners.

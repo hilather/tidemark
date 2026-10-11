@@ -5,7 +5,7 @@ The scanner turns a directory tree into per-directory records with the aggregato
 | Mode | How | Needs | Best when |
 |------|-----|-------|-----------|
 | **walk** | Parallel `getdents64` + `statx(AT_SYMLINK_NOFOLLOW)` per entry | Read access (root for full coverage) | Any filesystem; scan root is a small part of the filesystem; reference implementation |
-| **bulk** | Phase 1: parallel `getdents64` only (names → inode numbers). Phase 2: XFS bulkstat per allocation group, merge-joined by inode number. Phase 3: name lookup for notable files only. | XFS, `CAP_SYS_ADMIN`, memory for the join | The scan root covers most of an XFS filesystem; cold caches on HDD RAID |
+| **bulk** | Phase 1: parallel `getdents64` only (names → inode numbers). Phase 2: XFS bulkstat per allocation group, merge-joined by inode number. Phase 3: name lookup for notable files only. | XFS with v5 bulkstat, `CAP_SYS_ADMIN`, memory for the join | The scan root covers most of an XFS filesystem; cold caches on HDD RAID |
 | **auto** (default) | Chooses using §7 | — | — |
 
 Walk mode is the **oracle** for bulk mode: on a quiescent tree, both must produce byte-identical snapshot rows.
@@ -168,10 +168,12 @@ Notes:
 - **`O_NOATIME` matters on RAID 5.** `getdents` counts as a read access. Under `relatime`, the first scan touching a directory more than 24 h after its last access updates its atime: a metadata **write** per directory, which turns a read-only scan into millions of small random writes on parity RAID. Root (`CAP_FOWNER`) can always use `O_NOATIME`. `statx` never updates atime.
 - Only one directory fd per worker is open at a time, so fd usage is bounded by `threads + small constant`.
 - `mount_points` is built once from `/proc/self/mountinfo`. It is the set of mount targets strictly under the root; mountinfo octal escapes such as `\040` must be decoded. It catches same-device bind mounts, which `st_dev` cannot.
-- Notable-file admission: emit if `disk ≥ big_file_threshold` or if the worker-local min-heap of size `top_files` would admit it. The aggregator keeps the global top-N plus everything at or above the threshold, capped at `max_notable` (default 200,000).
+- Notable-file admission: emit if `disk ≥ big_file_threshold` or if the worker-local size min-heap of size `top_files` would admit it, including all ties at its cutoff. The aggregator keeps the global top-N plus everything at or above the threshold, capped at `max_notable` (default 200,000).
 - Each worker calls `ioprio_set(IOPRIO_CLASS_IDLE)` for itself (I/O priority is per thread) and the process runs at `nice 10`. These are best-effort only; see §6.
 
 The aggregator tolerates `DirId` holes: a `Gone` record removes that id from the tree and, for `OtherFs`, adds a `Skip` to the parent. On a quiescent tree no `Gone` records occur, so bulk/walk equality is unaffected.
+
+Workers emit every candidate that could win global top-N under `(disk desc, final directory id asc, inode asc)`, including all ties at the worker's size cutoff. The heap holds at most `top_files` sizes (configuration cap 200,000), with no worker-wide tie collection. Per `docs/handoff/W1-B-fix.md`, ties live in the current `DirRecord`, capped by the existing 1,000,000 direct-entry limit: exceeding it returns `WalkError::Limit("million-entry directory cap")` and aborts the scan, never silently truncates candidates. At most `threads` producer records and `out.capacity()` queued records are retained (validated bounds 64 and 1,024), giving at most `(threads + out.capacity()) * 1,000,000` notable candidates plus `threads * top_files` heap size values. Consumer retention is the consumer's responsibility; this large finite ceiling is not a measured worst-case RSS guarantee.
 
 ### 2.3 Output ordering
 
@@ -237,17 +239,21 @@ After aggregation, the global top-N and over-threshold files are known by `(DirI
 | Need | Interface | Notes |
 |------|-----------|-------|
 | Geometry | `XFS_IOC_FSGEOMETRY_V1` (ioctl nr 100, always present) → blocksize, agblocks, agcount, inodesize, uuid **and the `flags` word**, which already carries `XFS_FSOP_GEOM_FLAGS_V5SB`, `…_FTYPE` and `…_REFLINK`. Don't rely on the newer geometry ioctls: in EL8's xfsprogs headers `XFS_IOC_FSGEOMETRY` names the v5 struct (nr 126), which a 4.18-based kernel may not implement. | Read-only |
-| Bulk inode stats | `XFS_IOC_FSBULKSTAT` with `struct xfs_fsop_bulkreq` / `struct xfs_bstat` (v1, present since early XFS). Probe for v5 `XFS_IOC_BULKSTAT` (`struct xfs_bulk_ireq`, per-AG flag) and prefer it when present. | **Requires `CAP_SYS_ADMIN`** |
+| Bulk inode stats | `XFS_IOC_BULKSTAT` (v5, `struct xfs_bulk_ireq` / `struct xfs_bulkstat`, 32-bit `bs_nlink`) only. `bulkstat_probe` reports both v1 and v5, but v1 is never used for metadata. | **Requires `CAP_SYS_ADMIN`** |
 
-**Generate the FFI *structs* with `bindgen` from `<xfs/xfs_fs.h>` (xfsprogs-devel).** Commit the generated code; don't regenerate at build time. bindgen does not expand function-like macros, so **hand-define the ioctl request numbers** (`_IOR`/`_IOWR` arithmetic in a `const fn`), each with a test that checks its size field against `size_of` of the generated struct. Add `size_of` and `offset_of` tests for every struct. In `xfs_bstat`, the 16-bit fields are `bs_mode`, `bs_projid_lo`/`bs_projid_hi` and `bs_forkoff` (`bs_nlink` is 32-bit), and the timestamp structs have padding, so hand-written layouts are a classic source of bugs.
+Legacy `XFS_IOC_FSBULKSTAT` reports `bs_nlink` in 16 bits: 65,537 links arrive as 1 with no detectable overflow. Since link counts determine reclaimable space (`03` §4), `bulkstat` uses v5 only and returns `io::ErrorKind::Unsupported` when unavailable. Walk mode uses exact `statx` link counts.
+
+The EL8 userspace header (`xfsprogs-devel-5.0.0-12.el8`, `/usr/include/xfs/xfs_fs.h`) lacks the v5 structures and `XFS_IOC_BULKSTAT`. Module-binary inspection of `xfs.ko` in `kernel-core-4.18.0-477.27.1.el8_8` (Rocky 8.8) and kernel 4.18.0-553.172.1.el8_10 (Rocky 8.10) found `xfs_ioc_bulkstat`, `xfs_bulk_ireq_setup` and `xfs_bulkstat_to_bstat`. This establishes handler presence, not successful ioctl execution; runtime probes on both VMs remain a Wave 1 gate item.
+
+Bindings are hand-transcribed, not bindgen output, and pinned by layout tests to sizes and offsets measured with `gcc`: `xfs_bstat` 136 bytes, `xfs_bstime` 16, `xfs_fsop_bulkreq` 32, `xfs_fsop_geom` 112 from the EL8 header; `xfs_bulkstat` 192, `xfs_bulk_ireq` 64 and `XFS_IOC_BULKSTAT` `0x8040587f` measured against `xfsprogs-devel-6.4.0-7.el9` (same kernel ABI).
 
 ### 5.2 Iteration ranges
 
-v1 bulkstat returns inodes with number `> *lastip`. For AG *k*, start with `lastip = (k << agino_bits) − 1` (or 0 for k = 0) and stop at the first inode ≥ `(k+1) << agino_bits`.
+v5 starts inclusively at the requested inode, uses the per-AG request flag, advances from the returned cursor, and stops at the exclusive end or an empty batch. Never fall back to v1 records.
 
 ### 5.3 What bulkstat gives us for free
 
-`bs_projid_lo/hi` gives the project ID of every inode. v1 only records each directory's ID (`dirs.projid`, normally 0) so a future project-quota add-on (`06-project-quotas-deferred.md`) has the data; nothing in v1 depends on it.
+v5 `bs_projectid` gives the project ID of every inode. v1 only records each directory's ID (`dirs.projid`, normally 0) so a future project-quota add-on (`06-project-quotas-deferred.md`) has the data; nothing in v1 depends on it.
 
 ### 5.4 Units validation (mandatory test)
 
@@ -274,7 +280,7 @@ v1 bulkstat returns inodes with number `> *lastip`. For AG *k*, start with `last
   - `util = Δio_ticks / Δt`
   - `await = Δ(read_ticks + write_ticks) / Δ(read_ios + write_ios)`
 - It takes the **worst** device.
-- **`await` is the primary signal.** `%util` is only meaningful for single-queue rotational disks (md members, plain SATA/SAS). For a hardware-RAID LUN, or any blk-mq device that serves requests in parallel, `%util` reads 100% while capacity remains, so it is ignored for leaves that are non-rotational or report more than one hardware queue (`/sys/block/<dev>/mq/` has more than one entry).
+- **`await` is the primary signal.** `%util` is only meaningful for single-queue rotational disks (md members, plain SATA/SAS). For a hardware-RAID LUN, or any blk-mq device that serves requests in parallel, `%util` reads 100% while capacity remains, so it is ignored for leaves with unknown device/queue properties, that are non-rotational or report more than one hardware queue (`/sys/block/<dev>/mq/` has more than one entry).
 - AIMD:
   - If `util > max_util_pct` or `await > target_latency_ms`, then `r = max(min, r × 0.5)`.
   - Otherwise `r = min(max, r + 0.05 × max)`.
@@ -289,11 +295,15 @@ v1 bulkstat returns inodes with number `> *lastip`. For AG *k*, start with `last
   Real targets come from the pilot baseline.
 - Our own I/O counts toward `util` on purpose: the goal is to keep the array below the cap, whoever is causing the load.
 
+The caller resolves leaves with `blockdev::resolve_leaves`; unavailable discovery means an empty slice and the configured minimum gate rate. `StatSampler` and `read_disk_stats` return exactly one sample per leaf in input order and fail the whole sample if any device cannot be read. Samplers finish within one interval. Signatures stay unchanged; `controller_step` is counter-only, so callers mask utilisation (`io_ticks_ms = 0`) for non-rotational, unknown or multi-queue devices. `FixedGate::new` is private.
+
+The token bucket accounts for outstanding token debt: elapsed earnings use the previous rate before a rate change, and waiting acquisitions recheck their targets at the new rate. Per `docs/handoff/W1-D-fix.md`, cumulative issued/earned tokens use constant-size mutex/condition-variable state, with no waiter queue; surplus is capped to 0.25 seconds at the current rate.
+
 ## 7. Mode selection (`auto`)
 
 Choose **bulk** if all of the following hold, otherwise choose **walk** and log the reason:
 
-1. The filesystem is XFS, bulkstat works (probe), and the effective UID has `CAP_SYS_ADMIN`.
+1. The filesystem is XFS, `bulkstat_probe.v5` is true, and the effective UID has `CAP_SYS_ADMIN`.
 2. `ftype = 1` (phase 1 needs `d_type` to find directories without stat).
 3. The root covers ≥ 50% of the filesystem's used inodes, estimated from the previous snapshot's `t_inodes` or assumed true when the root is the mount point. Bulkstat cost scales with the **whole filesystem**, not the root.
 4. The memory estimate fits `memory_budget`:
@@ -305,6 +315,8 @@ Choose **bulk** if all of the following hold, otherwise choose **walk** and log 
    ```
 
 The walk-mode estimate is `dirs × 320 + link_entries × 72 + 64 MiB`. If it exceeds the budget, the scan still runs but logs a warning; the cap is enforced by the systemd `MemoryLimit`.
+
+An explicit `--mode bulk` without v5 fails with exit code 5 and a message naming missing v5 bulkstat; it does not fall back to v1 metadata.
 
 ## 8. Cancellation, failures and partial snapshots
 

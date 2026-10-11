@@ -19,6 +19,10 @@ The two failure modes that matter most are **wrong numbers** (people delete the 
 
 `cargo test` runs everything that needs no privileges. Privileged tests are compiled **only** with the `privileged` cargo feature (every member crate declares it). That is the guard; they are not `#[ignore]`d. Long scale tests use `#[ignore = "scale"]`. `cargo xtask vm-test` runs the privileged suite, plus `--suite install|fault` for the script-based suites.
 
+Tests must measure allocated sizes (`st_blocks`), directory sizes and `du` figures rather than assert literals dependent on the filesystem. Overlayfs in a `rockylinux:8` container exposed these assumptions. Assert `03` §6 exactly only in the in-memory reference test and privileged loop-XFS test; ordinary disk fixtures use measured metadata/oracles.
+
+CLI surface tests assert commands, flags, help, parsing and exit-code mapping only; never assert that a command remains unimplemented.
+
 ## 2. Fixture DSL (`test-support`, W0-C)
 
 Trees are declared in TOML and materialised into a `tempfile::TempDir`:
@@ -97,7 +101,7 @@ Shared fixtures live in `test-support/fixtures/*.toml`. Mandatory ones:
 | Filesystem totals | `df -B1 --output=size,used,avail` | Sampler values |
 | Bulk vs walk | Walk-mode snapshot | Bulk-mode snapshot: all `dirs` columns except `projid` must be equal |
 
-`t_disk` is compared directly with `du -sxB1` on every version. The normative `t_apparent` includes directory `st_size` (`03` §2–3). GNU coreutils 8.30, shipped with Rocky Linux 8, counts directory sizes in apparent mode, so equality holds directly on the target. Coreutils 9.2 and later count only regular files and symbolic links in apparent mode.
+`t_disk` is compared directly with `du -sxB1` on every version. The normative `t_apparent` includes directory `st_size` (`03` §2–3). In a `rockylinux:8` container, `du (GNU coreutils) 8.30` was measured to count directory sizes in apparent mode, so equality holds directly on the target. Coreutils 9.2 and later count only regular files and symbolic links in apparent mode.
 
 For apparent-size comparisons, probe the local `du -sxB1 --apparent-size` with an empty directory and compare its output with the measured directory `st_size` to learn whether it counts directory sizes. When it does not, normalize by adding the measured `st_size` of every directory in the compared subtree (including its root), and of any other non-regular, non-symlink inode with non-zero `st_size`, to the `du` figure before comparing with `t_apparent`. Count distinct inodes and use the same subtree boundaries as the metric. The probe decides; never branch on a version string.
 
