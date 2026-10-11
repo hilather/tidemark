@@ -28,15 +28,16 @@ fn report(
     build_now(
         &NowInputs {
             host: "db-01",
-            mounts,
-            lvm: &[],
-            hot_dirs_5m: &[],
-            writers_5m: &[],
-            phantom: &[],
-            open_writers: &[],
-            alerts: &[],
-            scans: &[],
-            watch_modes: modes,
+            mounts: Some(mounts),
+            lvm: Some(&[]),
+            hot_dirs_5m: Some(&[]),
+            writers_5m: Some(&[]),
+            phantom: Some(&[]),
+            open_writers: Some(&[]),
+            alerts: Some(&[]),
+            scans: Some(&[]),
+            watch_modes: Some(modes),
+            unevaluable: &[],
             degraded,
         },
         100,
@@ -119,4 +120,89 @@ fn narrow_and_controls() {
     let text = render_now_text(&r, 1, false);
     assert!(!text.contains('\x1b'));
     assert!(text.lines().all(|l| l.chars().count() <= 1));
+}
+#[test]
+fn byte_names_and_escaped_paths_are_distinct() {
+    let mut r = report(&[mount("/data", false)], &[], &[]);
+    for key in [b"proc\xff".to_vec(), b"proc\xfe".to_vec()] {
+        r.mounts[0].writers_5m.push(tidemark_core::live::HotEntry {
+            key,
+            events: 1,
+            files: 1,
+            bytes_delta: 1,
+            top_unit: None,
+            lossy: false,
+        });
+    }
+    r.mounts[0].mount = "/data\n".into();
+    let a = render_now_text(&r, 1000, false);
+    assert!(a.contains("proc\\xFF"));
+    assert!(a.contains("proc\\xFE"));
+    r.mounts[0].mount = "/data\\n".into();
+    let b = render_now_text(&r, 1000, false);
+    assert_ne!(a, b);
+    assert!(b.contains("/data\\x5Cn"));
+}
+#[test]
+fn missing_sections_and_alert_diagnostics_are_visible() {
+    let diagnostic = [tidemark_live::alerts::AlertDiagnostic {
+        rule: "stale".into(),
+        reason: "effective scan cadence unavailable".into(),
+    }];
+    let mut inputs = NowInputs {
+        host: "host",
+        mounts: Some(&[]),
+        lvm: Some(&[]),
+        hot_dirs_5m: Some(&[]),
+        writers_5m: Some(&[]),
+        phantom: Some(&[]),
+        open_writers: Some(&[]),
+        alerts: Some(&[]),
+        scans: Some(&[]),
+        watch_modes: Some(&[]),
+        unevaluable: &diagnostic,
+        degraded: &[],
+    };
+    let measured = build_now(&inputs, 0);
+    assert_eq!(measured.degraded.len(), 1);
+    inputs.phantom = None;
+    let missing = build_now(&inputs, 0);
+    assert!(missing
+        .degraded
+        .iter()
+        .any(|s| s == "phantom: not measured"));
+    assert!(render_now_text(&missing, 1000, false)
+        .contains("alert stale: not evaluable: effective scan cadence unavailable"));
+    inputs.mounts = None;
+    inputs.lvm = None;
+    inputs.hot_dirs_5m = None;
+    inputs.writers_5m = None;
+    inputs.open_writers = None;
+    inputs.alerts = None;
+    inputs.scans = None;
+    inputs.watch_modes = None;
+    assert_eq!(build_now(&inputs, 0).degraded.len(), 10);
+}
+
+#[test]
+fn missing_phantom_is_not_rendered_as_zero() {
+    let mounts = [mount("/data", false)];
+    let inputs = NowInputs {
+        host: "host",
+        mounts: Some(&mounts),
+        lvm: None,
+        hot_dirs_5m: None,
+        writers_5m: None,
+        phantom: None,
+        open_writers: None,
+        alerts: None,
+        scans: None,
+        watch_modes: None,
+        unevaluable: &[],
+        degraded: &[],
+    };
+    let text = render_now_text(&build_now(&inputs, 0), 1000, false);
+    assert!(text.contains("deleted-but-open not measured"));
+    assert!(!text.contains("deleted-but-open 0 B"));
+    assert!(text.contains("lvm not measured"));
 }

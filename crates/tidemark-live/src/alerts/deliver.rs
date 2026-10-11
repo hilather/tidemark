@@ -23,7 +23,6 @@ pub struct WebhookDeliver {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
     host: String,
-    redact_paths: bool,
 }
 struct Shared {
     queue: Mutex<(VecDeque<serde_json::Value>, bool)>,
@@ -52,8 +51,7 @@ impl Deliver for JournalDeliver {
 }
 impl WebhookDeliver {
     /// Start a worker with a 1,000-event queue and a five-second request timeout.
-    /// Path-bearing subjects and messages are redacted when `redact_paths` is true.
-    pub fn new(url: &str, host: &str, redact_paths: bool) -> Result<Self, DeliverError> {
+    pub fn new(url: &str, host: &str) -> Result<Self, DeliverError> {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err(DeliverError::Failed("expected HTTP(S) URL".into()));
         }
@@ -89,7 +87,11 @@ impl WebhookDeliver {
                         continue;
                     };
                     for attempt in 0..4 {
-                        if agent.post(&url).send_json(&body).is_ok() {
+                        if agent
+                            .post(&url)
+                            .send_json(&body)
+                            .is_ok_and(|r| r.status().is_success())
+                        {
                             break;
                         }
                         if attempt == 3 {
@@ -119,7 +121,6 @@ impl WebhookDeliver {
             shared,
             worker: Some(worker),
             host: host.into(),
-            redact_paths,
         })
     }
     /// Number of oldest queued events discarded at the queue cap.
@@ -133,16 +134,8 @@ impl WebhookDeliver {
 }
 impl Deliver for WebhookDeliver {
     fn deliver(&mut self, ev: &AlertEvent) -> Result<(), DeliverError> {
-        let subject = if self.redact_paths && ev.subject.starts_with('/') {
-            "[redacted]"
-        } else {
-            &ev.subject
-        };
-        let message = if self.redact_paths {
-            "Tidemark alert"
-        } else {
-            &ev.message
-        };
+        let subject = &ev.subject;
+        let message = &ev.message;
         let body = serde_json::json!({"rule":ev.rule,"subject":subject,"state":ev.state,"value":ev.value,"message":message,"host":self.host,"ts":ev.ts,"text":format!("{} {}: {}",ev.rule,subject,message)});
         let mut q = self.shared.queue.lock();
         if q.1 {
@@ -186,10 +179,10 @@ mod tests {
         }
     }
     #[test]
-    fn webhook_json_and_redaction() {
+    fn webhook_json_preserves_fields() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let mut sink =
-            WebhookDeliver::new(&format!("http://{}", server.server_addr()), "host", true).unwrap();
+            WebhookDeliver::new(&format!("http://{}", server.server_addr()), "host").unwrap();
         sink.deliver(&event()).unwrap();
         let mut request = server
             .recv_timeout(Duration::from_secs(6))
@@ -199,25 +192,42 @@ mod tests {
         let mut body = String::new();
         request.as_reader().read_to_string(&mut body).unwrap();
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["subject"], "[redacted]");
+        assert_eq!(value["subject"], "/secret/path");
+        assert_eq!(value["rule"], "full");
+        assert_eq!(value["message"], "/secret/path full");
+        assert_eq!(value["state"], "firing");
+        assert_eq!(value["value"], 95.0);
         assert_eq!(value["host"], "host");
         assert_eq!(value["ts"], 42);
-        assert!(!body.contains("secret"));
+        assert!(body.contains("secret"));
+        assert_eq!(value["text"], "full /secret/path: /secret/path full");
         request.respond(tiny_http::Response::empty(200)).unwrap();
     }
     #[test]
     fn retries_are_bounded() {
+        retry_status(503);
+    }
+    #[test]
+    fn redirects_are_failed_deliveries() {
+        retry_status(302);
+    }
+    fn retry_status(status: u16) {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let mut sink =
-            WebhookDeliver::new(&format!("http://{}", server.server_addr()), "host", false)
-                .unwrap();
+            WebhookDeliver::new(&format!("http://{}", server.server_addr()), "host").unwrap();
         sink.deliver(&event()).unwrap();
         for _ in 0..4 {
             let request = server
                 .recv_timeout(Duration::from_secs(6))
                 .unwrap()
                 .unwrap();
-            request.respond(tiny_http::Response::empty(503)).unwrap();
+            assert_eq!(request.url(), "/");
+            let mut response = tiny_http::Response::empty(status);
+            if status == 302 {
+                response
+                    .add_header(tiny_http::Header::from_bytes("Location", "/redirected").unwrap());
+            }
+            request.respond(response).unwrap();
         }
         for _ in 0..100 {
             if sink.failed() == 1 {
@@ -243,7 +253,6 @@ mod tests {
             shared,
             worker: None,
             host: "host".into(),
-            redact_paths: false,
         };
         for ts in 0..1001 {
             let mut ev = event();
@@ -254,7 +263,7 @@ mod tests {
         assert_eq!(sink.shared.queue.lock().0.front().unwrap()["ts"], 1);
         sink.shared.queue.lock().1 = true;
         assert!(matches!(sink.deliver(&event()), Err(DeliverError::Stopped)));
-        assert!(WebhookDeliver::new("file:///bad", "host", true).is_err());
+        assert!(WebhookDeliver::new("file:///bad", "host").is_err());
         JournalDeliver.deliver(&event()).unwrap();
     }
 }
@@ -266,7 +275,7 @@ mod timeout_test {
     fn request_timeout_bounds_shutdown() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let mut sink =
-            WebhookDeliver::new(&format!("http://{}", server.server_addr()), "host", true).unwrap();
+            WebhookDeliver::new(&format!("http://{}", server.server_addr()), "host").unwrap();
         let event = AlertEvent {
             ts: 0,
             rule: "test".into(),

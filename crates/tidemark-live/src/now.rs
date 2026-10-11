@@ -7,38 +7,50 @@ use tidemark_core::live::{
 };
 
 /// Borrowed collector inputs for an injected-time report.
+/// None is not measured; Some(empty) is a complete, measured empty section.
+/// Unavailable sections and alert diagnostics survive in NowReport.degraded.
 pub struct NowInputs<'a> {
     /// Contract field.
     pub host: &'a str,
     /// Contract field.
-    pub mounts: &'a [MountRates],
+    pub mounts: Option<&'a [MountRates]>,
     /// Contract field.
-    pub lvm: &'a [(String, LvmNow)],
+    pub lvm: Option<&'a [(String, LvmNow)]>,
     /// Contract field.
-    pub hot_dirs_5m: &'a [(String, Vec<HotEntry>)],
+    pub hot_dirs_5m: Option<&'a [(String, Vec<HotEntry>)]>,
     /// Contract field.
-    pub writers_5m: &'a [(String, Vec<HotEntry>)],
+    pub writers_5m: Option<&'a [(String, Vec<HotEntry>)]>,
     /// Contract field.
-    pub phantom: &'a [PhantomSummary],
+    pub phantom: Option<&'a [PhantomSummary]>,
     /// Contract field.
-    pub open_writers: &'a [(String, Vec<OpenWriter>)],
+    pub open_writers: Option<&'a [(String, Vec<OpenWriter>)]>,
     /// Contract field.
-    pub alerts: &'a [AlertSummary],
+    pub alerts: Option<&'a [AlertSummary]>,
     /// Contract field.
-    pub scans: &'a [ScanStatus],
+    pub scans: Option<&'a [ScanStatus]>,
     /// Contract field.
-    pub watch_modes: &'a [(String, String, u32)],
+    pub watch_modes: Option<&'a [(String, String, u32)]>,
     /// Contract field.
+    pub unevaluable: &'a [crate::alerts::AlertDiagnostic],
+    /// Explicit collector degradation.
     pub degraded: &'a [String],
 }
 /// Join collector facts by mount and preserve explicit degradation.
 pub fn build_now(i: &NowInputs, now: i64) -> NowReport {
+    let mounts = i.mounts.unwrap_or(&[]);
+    let lvm = i.lvm.unwrap_or(&[]);
+    let hot_dirs_5m = i.hot_dirs_5m.unwrap_or(&[]);
+    let writers_5m = i.writers_5m.unwrap_or(&[]);
+    let phantom = i.phantom.unwrap_or(&[]);
+    let open_writers = i.open_writers.unwrap_or(&[]);
+    let alerts = i.alerts.unwrap_or(&[]);
+    let scans = i.scans.unwrap_or(&[]);
+    let watch_modes = i.watch_modes.unwrap_or(&[]);
     use tidemark_core::live::MountNow;
-    let mut mounts: Vec<_> = i
-        .mounts
+    let mut mounts: Vec<_> = mounts
         .iter()
         .map(|m| {
-            let watch = i.watch_modes.iter().find(|(name, _, _)| name == &m.mount);
+            let watch = watch_modes.iter().find(|(name, _, _)| name == &m.mount);
             MountNow {
                 mount: m.mount.clone(),
                 size: m.size,
@@ -47,15 +59,13 @@ pub fn build_now(i: &NowInputs, now: i64) -> NowReport {
                 rate_15m: m.rate_15m,
                 rate_1h: m.rate_1h,
                 ttf_secs: m.ttf.map(|d| d.as_secs()),
-                lvm: i
-                    .lvm
+                lvm: lvm
                     .iter()
                     .find(|(name, _)| name == &m.mount)
                     .map(|(_, v)| v.clone()),
-                hot_dirs_5m: entries(i.hot_dirs_5m, &m.mount),
-                writers_5m: entries(i.writers_5m, &m.mount),
-                phantom: i
-                    .phantom
+                hot_dirs_5m: entries(hot_dirs_5m, &m.mount),
+                writers_5m: entries(writers_5m, &m.mount),
+                phantom: phantom
                     .iter()
                     .find(|p| p.mount == m.mount)
                     .cloned()
@@ -65,8 +75,7 @@ pub fn build_now(i: &NowInputs, now: i64) -> NowReport {
                         files: 0,
                         holders: vec![],
                     }),
-                open_writers_top: i
-                    .open_writers
+                open_writers_top: open_writers
                     .iter()
                     .find(|(name, _)| name == &m.mount)
                     .map(|(_, v)| v.clone())
@@ -80,7 +89,29 @@ pub fn build_now(i: &NowInputs, now: i64) -> NowReport {
         .collect();
     mounts.sort_by(|a, b| a.mount.as_bytes().cmp(b.mount.as_bytes()));
     let mut degraded = i.degraded.to_vec();
+    for (section, available) in [
+        ("mounts", i.mounts.is_some()),
+        ("lvm", i.lvm.is_some()),
+        ("hot_dirs_5m", i.hot_dirs_5m.is_some()),
+        ("writers_5m", i.writers_5m.is_some()),
+        ("phantom", i.phantom.is_some()),
+        ("open_writers", i.open_writers.is_some()),
+        ("alerts", i.alerts.is_some()),
+        ("scans", i.scans.is_some()),
+        ("watch_modes", i.watch_modes.is_some()),
+    ] {
+        if !available {
+            degraded.push(format!("{section}: not measured"));
+        }
+    }
+    for d in i.unevaluable {
+        degraded.push(format!("alert {}: not evaluable: {}", d.rule, d.reason));
+    }
     for m in &mounts {
+        if i.phantom.is_none() {
+            degraded.push(format!("phantom {}: not measured", m.mount));
+        }
+
         if m.watch_mode == "unavailable" {
             degraded.push(format!("watcher {}: unavailable", m.mount));
         } else if m.watch_mode.starts_with("fd") {
@@ -95,9 +126,9 @@ pub fn build_now(i: &NowInputs, now: i64) -> NowReport {
     }
     degraded.sort();
     degraded.dedup();
-    let mut scans = i.scans.to_vec();
+    let mut scans = scans.to_vec();
     scans.sort_by(|a, b| a.root.cmp(&b.root));
-    let mut alerts = i.alerts.to_vec();
+    let mut alerts = alerts.to_vec();
     alerts.sort_by(|a, b| (&a.rule, &a.subject).cmp(&(&b.rule, &b.subject)));
     NowReport {
         generated_at: now,
@@ -130,6 +161,11 @@ pub fn render_now_text(r: &NowReport, width: usize, color: bool) -> String {
         escape(&r.host),
         timestamp(r.generated_at)
     )];
+    let missing = |section: &str| {
+        r.degraded
+            .iter()
+            .any(|d| d == &format!("{section}: not measured"))
+    };
     for m in &r.mounts {
         let pct = if m.size == 0 {
             "unknown".into()
@@ -156,6 +192,7 @@ pub fn render_now_text(r: &NowReport, width: usize, color: bool) -> String {
             trend
         ));
         lines.push(match &m.lvm {
+            None if missing("lvm") => "  lvm not measured".into(),
             None => "  lvm n/a".into(),
             Some(l) => format!(
                 "  lvm {}/{} {}  VG free {}{}",
@@ -194,11 +231,15 @@ pub fn render_now_text(r: &NowReport, width: usize, color: bool) -> String {
                 ));
             }
         }
-        lines.push(format!(
-            "  deleted-but-open {} ({} files)",
-            fmt_bytes(m.phantom.total_bytes),
-            m.phantom.files
-        ));
+        if missing("phantom") {
+            lines.push("  deleted-but-open not measured".into());
+        } else {
+            lines.push(format!(
+                "  deleted-but-open {} ({} files)",
+                fmt_bytes(m.phantom.total_bytes),
+                m.phantom.files
+            ));
+        }
         for h in &m.phantom.holders {
             lines.push(format!(
                 "    {} (pid {}, {}) {} {}",
@@ -271,20 +312,10 @@ pub fn render_now_text(r: &NowReport, width: usize, color: bool) -> String {
     out
 }
 fn escape(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| {
-            if c.is_control() {
-                c.escape_default().collect::<Vec<_>>()
-            } else {
-                vec![c]
-            }
-        })
-        .collect()
+    tidemark_core::path::display_lossy_bytes(s.as_bytes())
 }
 fn bytes_display(b: &[u8]) -> String {
-    tidemark_core::path::RawPath::new(b.to_vec())
-        .map(|p| p.display_lossy())
-        .unwrap_or_else(|_| escape(&String::from_utf8_lossy(b)))
+    tidemark_core::path::display_lossy_bytes(b)
 }
 
 fn signed_bytes(bytes: i64) -> String {
