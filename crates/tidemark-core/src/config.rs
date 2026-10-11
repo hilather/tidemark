@@ -1105,8 +1105,8 @@ impl AlertRule {
 }
 /// Shipped enabled alert rules from 07 §6.4, scoped to configured mounts.
 /// Only `/data` uses the base name. Other mounts and scheduled roots append `:<path>`.
-/// Suffixes retain printable ASCII except backslash; all other bytes (including
-/// backslash and UTF-8 multibyte bytes) become uppercase `\xNN` escapes.
+/// Suffixes retain `/` and ASCII `[A-Za-z0-9._-]`; every other byte (including
+/// percent, colon, space, backslash and UTF-8 multibyte bytes) becomes uppercase `%XX`.
 /// Roots with schedule `off` have no generated stale rule. Collector-dependent
 /// rules remain visible, but consumers must not fire them without available input;
 /// thin-pool rules apply only to tracked thin LVs.
@@ -1200,6 +1200,8 @@ pub fn default_rules(cfg: &Config) -> Vec<AlertRule> {
     }
     rules
 }
+/// Preserve `/` and ASCII `[A-Za-z0-9._-]`; encode every other path byte as
+/// uppercase `%XX`. Only `/data` has no suffix.
 fn subject_suffix(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
     if path == Path::new("/data") {
@@ -1207,10 +1209,10 @@ fn subject_suffix(path: &Path) -> String {
     }
     let mut suffix = String::from(":");
     for &byte in path.as_os_str().as_bytes() {
-        if (0x20..=0x7e).contains(&byte) && byte != b'\\' {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-') {
             suffix.push(char::from(byte));
         } else {
-            suffix.push_str(&format!("\\x{byte:02X}"));
+            suffix.push_str(&format!("%{byte:02X}"));
         }
     }
     suffix
@@ -1244,6 +1246,25 @@ mod tests {
     const EXAMPLE: &str = include_str!("../tests/example.toml");
     #[test]
     fn example_verbatim_and_roundtrip() {
+        let document = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/plan/08-interfaces.md"),
+        )
+        .unwrap();
+        let section = document
+            .split_once("## 3. Configuration (")
+            .unwrap()
+            .1
+            .split_once("\n## 4.")
+            .unwrap()
+            .0;
+        let example = section
+            .split_once("```toml\n")
+            .unwrap()
+            .1
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        assert_eq!(EXAMPLE.as_bytes(), format!("{example}\n").as_bytes());
         let config: Config = toml::from_str(EXAMPLE).unwrap();
         assert!(config.validate().is_empty(), "{:?}", config.validate());
         assert_eq!(config.scan.memory_budget, ByteSize(1280 << 20));

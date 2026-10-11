@@ -318,8 +318,39 @@ fn stable_default_names_and_scheduled_roots() {
         "/x\\xFF".into(),
     ];
     let names = subjects(&cfg);
-    assert!(names.contains_key("fs_full_soon:/x\\xFF"));
-    assert!(names.contains_key("fs_full_soon:/x\\x5CxFF"));
+    assert!(names.contains_key("fs_full_soon:/x%FF"));
+    assert!(names.contains_key("fs_full_soon:/x%5CxFF"));
+}
+
+#[test]
+fn percent_encoded_default_names_and_disabled_overrides() {
+    for (subject, name) in [
+        ("/srv:blue", "fs_full_soon:/srv%3Ablue"),
+        ("/x%y", "fs_full_soon:/x%25y"),
+        ("/x y", "fs_full_soon:/x%20y"),
+        ("/x\\y", "fs_full_soon:/x%5Cy"),
+        ("/données", "fs_full_soon:/donn%C3%A9es"),
+        ("/AZaz09._-", "fs_full_soon:/AZaz09._-"),
+    ] {
+        let mut cfg = Config::default();
+        cfg.sampler.mounts = vec![subject.into()];
+        assert_eq!(subjects(&cfg)[name], PathBuf::from(subject));
+        cfg.alerts.rule = vec![AlertRule {
+            name: name.into(),
+            kind: AlertKind::TimeToFull,
+            enabled: false,
+            mount: Some(subject.into()),
+            below: Some("12h".into()),
+            window: Some("1h".into()),
+            ..AlertRule::default()
+        }];
+        cfg.merge_default_rules();
+        cfg.merge_default_rules();
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+        let rules: Vec<_> = cfg.alerts.rule.iter().filter(|r| r.name == name).collect();
+        assert_eq!(rules.len(), 1);
+        assert!(!rules[0].enabled);
+    }
 }
 
 #[test]

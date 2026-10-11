@@ -8,7 +8,7 @@ path               = "/data"
 mode               = "auto"            # auto|walk|bulk
 schedule           = "every 6h"        # "every <dur>" | "daily HH:MM" | "off"
 window             = "00:00-06:00"     # optional; scans only START inside this local-time window
-throttle           = "normal"          # gentle|normal|max
+throttle           = "normal"          # gentle|normal|max or a user-defined profile
 exclude            = []                # full-path globs, e.g. "/data/tmp/cache/**"
 series_depth       = 2                 # dirs at <= depth (relative to root) recorded in dir_series (max 20,000 rows per scan)
 big_file_threshold = "1GiB"
