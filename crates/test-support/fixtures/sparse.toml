@@ -1,0 +1,8 @@
+[[entry]]
+path = "sparse"
+kind = "file"
+sparse = "1GiB"
+[[entry]]
+path = "empty"
+kind = "file"
+size = 0

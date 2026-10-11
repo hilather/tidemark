@@ -1,0 +1,16 @@
+[[entry]]
+path = "a"
+kind = "symlink"
+target = "b"
+[[entry]]
+path = "b"
+kind = "symlink"
+target = "a"
+[[entry]]
+path = "dir/up"
+kind = "symlink"
+target = ".."
+[[entry]]
+path = "dangling"
+kind = "symlink"
+target = "absent"

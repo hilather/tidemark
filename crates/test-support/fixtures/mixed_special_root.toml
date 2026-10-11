@@ -1,0 +1,4 @@
+# Explicit root-only extension; never materialized by the unprivileged suite.
+[[entry]]
+path = "null"
+kind = "char"
