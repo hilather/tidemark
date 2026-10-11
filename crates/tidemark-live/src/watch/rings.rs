@@ -30,7 +30,12 @@ impl Rings {
     }
     pub fn advance(&mut self, now: i64) {
         let minute = now.div_euclid(60) * 60;
-        if self.buckets.back().is_some_and(|b| b.minute >= minute) {
+        // Reset on rollback: discarded history cannot be attributed to the new timeline.
+        let rollback = self.buckets.back().is_some_and(|b| b.minute > minute);
+        if rollback {
+            self.buckets.clear();
+        }
+        if self.buckets.back().is_some_and(|b| b.minute == minute) {
             return;
         }
         if let Some(last) = self.buckets.back_mut() {
@@ -54,7 +59,7 @@ impl Rings {
         self.buckets.push_back(Bucket {
             minute,
             maps: std::array::from_fn(|_| BTreeMap::new()),
-            lossy: false,
+            lossy: rollback,
             drained: false,
             seen: HashSet::new(),
         });
@@ -118,8 +123,15 @@ impl Rings {
         };
         let cutoff = now.div_euclid(60) * 60 - i64::from(window.clamp(1, 60) - 1) * 60;
         let mut sum: BTreeMap<Vec<u8>, HotEntry> = BTreeMap::new();
-        let lossy = self.buckets.iter().any(|b| b.minute >= cutoff && b.lossy);
-        for bucket in self.buckets.iter().filter(|b| b.minute >= cutoff) {
+        let lossy = self
+            .buckets
+            .iter()
+            .any(|b| b.minute >= cutoff && b.minute <= now.div_euclid(60) * 60 && b.lossy);
+        for bucket in self
+            .buckets
+            .iter()
+            .filter(|b| b.minute >= cutoff && b.minute <= now.div_euclid(60) * 60)
+        {
             for row in bucket.maps[index].values() {
                 let entry = sum.entry(row.key.clone()).or_insert(HotEntry {
                     key: row.key.clone(),
@@ -139,7 +151,11 @@ impl Rings {
     pub fn lossy(&self, now: i64) -> u32 {
         self.buckets
             .iter()
-            .filter(|b| b.minute >= now.div_euclid(60) * 60 - 14 * 60 && b.lossy)
+            .filter(|b| {
+                b.minute >= now.div_euclid(60) * 60 - 14 * 60
+                    && b.minute <= now.div_euclid(60) * 60
+                    && b.lossy
+            })
             .count() as u32
     }
     pub fn drain(&mut self, now: i64, mount: &str, top_k: usize) -> Vec<HotMinute> {
@@ -233,7 +249,15 @@ mod tests {
         }
         assert_eq!(r.buckets.len(), 60);
         r.advance(0);
-        assert_eq!(r.buckets.len(), 60);
-        assert_eq!(r.hot(5940, 60, HotScope::Comm, 1)[0].bytes_delta, 60);
+        assert_eq!(r.buckets.len(), 1);
+        assert!(r.hot(0, 60, HotScope::Comm, 1).is_empty());
+        assert_eq!(r.lossy(0), 1);
+        r.add(0, keys(1), 5, None, (1, 1));
+        assert_eq!(r.hot(0, 1, HotScope::Dir, 1)[0].bytes_delta, 5);
+        assert!(r.hot(-60, 1, HotScope::Dir, 1).is_empty());
+        assert_eq!(r.lossy(-60), 0);
+        assert!(r.drain(0, "/", 5).is_empty());
+        assert_eq!(r.drain(60, "/", 5).len(), 3);
+        assert!(r.drain(60, "/", 5).is_empty());
     }
 }

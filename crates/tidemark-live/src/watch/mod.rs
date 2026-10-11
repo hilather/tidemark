@@ -3,7 +3,7 @@
 
 use parking_lot::Mutex;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     io,
     os::fd::{AsFd, OwnedFd},
     sync::{
@@ -13,7 +13,7 @@ use std::{
     thread::JoinHandle,
 };
 use tidemark_core::{
-    live::{HotEntry, HotMinute},
+    live::{Attribution, HotEntry, HotMinute},
     path::RawPath,
 };
 use tidemark_fs::attribution::AttributionCache;
@@ -38,6 +38,8 @@ pub struct WatcherOptions {
 pub enum WatchMode {
     /// Contract variant.
     FdMount,
+    /// Worker exited after an unrecoverable transport error.
+    Failed,
     /// Contract variant.
     DfidNameMount,
     /// Contract variant.
@@ -65,6 +67,24 @@ pub struct WatchStats {
     pub lossy_minutes_15m: u32,
     /// Contract field.
     pub dropped_keys: u64,
+    /// Foreground events discarded when the bounded buffer filled.
+    pub dropped_events: u64,
+    /// Whether the worker is retrying a transient resource failure.
+    pub recovering: bool,
+    /// Transport errors observed by the worker.
+    pub read_errors: u64,
+}
+/// One directional foreground event; move events are never correlated into pairs.
+#[derive(Clone, Debug)]
+pub struct WatchEvent {
+    /// Unix timestamp in seconds.
+    pub at: i64,
+    /// Raw event path using the shared path/path_b64 adapter.
+    pub path: RawPath,
+    /// Signed allocated-byte change.
+    pub delta: i64,
+    /// Best-effort process attribution.
+    pub attribution: Attribution,
 }
 /// Owns a bounded background watcher and joins it on stop or drop.
 pub struct Watcher {
@@ -80,6 +100,11 @@ struct State {
     dirty: BTreeSet<RawPath>,
     events: u64,
     overflows: u64,
+    failed: bool,
+    recovering: bool,
+    read_errors: u64,
+    stream: Option<VecDeque<WatchEvent>>,
+    dropped_events: u64,
 }
 fn now() -> i64 {
     tidemark_core::time::unix_now()
@@ -120,20 +145,16 @@ impl Watcher {
                 }
             }
         }
-        let (group, mode) = match selected {
-            Some(v) => v,
-            None => {
-                if !caps.fd_mode {
-                    return Err(WatchError::Unsupported);
-                }
-                let group =
-                    Fanotify::init(InitMode::FdMode).map_err(|_| WatchError::Unsupported)?;
-                group
-                    .mark_mount(cfg.mount.as_path(), event_mask)
-                    .map_err(|_| WatchError::Unsupported)?;
-                (group, WatchMode::FdMount)
+        let (group, mode) = select_group(selected, || {
+            if !caps.fd_mode {
+                return Err(WatchError::Unsupported);
             }
-        };
+            let group = Fanotify::init(InitMode::FdMode).map_err(|_| WatchError::Unsupported)?;
+            group
+                .mark_mount(cfg.mount.as_path(), event_mask)
+                .map_err(|_| WatchError::Unsupported)?;
+            Ok(group)
+        })?;
         let mount_fd = rustix::fs::open(
             cfg.mount.as_path(),
             rustix::fs::OFlags::PATH
@@ -155,6 +176,11 @@ impl Watcher {
             dirty: BTreeSet::new(),
             events: 0,
             overflows: 0,
+            failed: false,
+            recovering: false,
+            read_errors: 0,
+            stream: None,
+            dropped_events: 0,
         }));
         let worker_state = state.clone();
         let worker_shutdown = shutdown.clone();
@@ -175,6 +201,9 @@ impl Watcher {
                     handles: fidmode::HandlePaths::new(100_000),
                 };
                 loop {
+                    if worker_stopping.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let group_fd = group.as_fd();
                     let mut poll = [
                         rustix::event::PollFd::new(&group_fd, rustix::event::PollFlags::IN),
@@ -192,24 +221,40 @@ impl Watcher {
                             continue;
                         }
                         tracing::warn!(%error,"fanotify poll failed");
-                        worker_state.lock().rings.overflow(now());
+                        if processor.transport_error(&io::Error::from(error), now(), &worker_state)
+                            && retry_wait(worker_shutdown.as_ref(), &worker_stopping, 5)
+                        {
+                            continue;
+                        }
                         break;
                     }
                     if !poll[1].revents().is_empty() {
                         break;
                     }
-                    worker_state.lock().rings.advance(now());
+                    {
+                        let mut state = worker_state.lock();
+                        if state.recovering {
+                            state.rings.overflow(now());
+                        } else {
+                            state.rings.advance(now());
+                        }
+                    }
                     if poll[0].revents().is_empty() {
                         continue;
                     }
-                    let events = match group.read(&mut buffer) {
-                        Ok(events) => events,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(error) => {
-                            tracing::warn!(%error,"fanotify read failed");
-                            worker_state.lock().rings.overflow(now());
-                            break;
-                        }
+                    let Some(events) = read_recover(
+                        || {
+                            group
+                                .read(&mut buffer)
+                                .map(|events| events.collect::<Vec<_>>())
+                        },
+                        &mut processor,
+                        &worker_state,
+                        worker_shutdown.as_ref(),
+                        &worker_stopping,
+                        now,
+                    ) else {
+                        break;
                     };
                     for event in events {
                         if worker_stopping.load(Ordering::Relaxed) {
@@ -217,7 +262,7 @@ impl Watcher {
                         }
                         let at = now();
                         let Ok(event) = event else {
-                            worker_state.lock().rings.overflow(at);
+                            processor.loss(at, &worker_state);
                             continue;
                         };
                         processor.process(event, at, &worker_state);
@@ -235,7 +280,11 @@ impl Watcher {
     }
     /// Return the reporting mode selected by successful marks.
     pub fn mode(&self) -> WatchMode {
-        self.mode
+        if self.state.lock().failed {
+            WatchMode::Failed
+        } else {
+            self.mode
+        }
     }
     /// Sum the most recent 1–60 minute buckets and return ranked entries.
     pub fn hot(&self, window_min: u32, scope: HotScope, limit: usize) -> Vec<HotEntry> {
@@ -249,6 +298,21 @@ impl Watcher {
             .lock()
             .rings
             .drain(now(), &self.mount.display_lossy(), top_k)
+    }
+    /// Enable the optional 1,000-event foreground buffer. Daemon watchers do not allocate it.
+    pub fn enable_events(&self) {
+        self.state
+            .lock()
+            .stream
+            .get_or_insert_with(|| VecDeque::with_capacity(1000));
+    }
+    /// Remove and return up to `limit` of the oldest buffered events.
+    pub fn drain_events(&self, limit: usize) -> Vec<WatchEvent> {
+        let mut state = self.state.lock();
+        let Some(stream) = &mut state.stream else {
+            return Vec::new();
+        };
+        stream.drain(..limit.min(stream.len())).collect()
     }
     /// Remove and return dirty directories underneath a component-wise root prefix.
     pub fn take_dirty(&self, under: &RawPath) -> Vec<RawPath> {
@@ -267,13 +331,25 @@ impl Watcher {
     /// Read counters and the loss indicator for the latest fifteen minute buckets.
     pub fn stats(&self) -> WatchStats {
         let mut state = self.state.lock();
-        state.rings.advance(now());
+        let at = now();
+        if state.failed || state.recovering {
+            state.rings.overflow(at);
+        } else {
+            state.rings.advance(at);
+        }
         WatchStats {
-            mode: self.mode,
+            mode: if state.failed {
+                WatchMode::Failed
+            } else {
+                self.mode
+            },
             events_total: state.events,
             overflows_total: state.overflows,
-            lossy_minutes_15m: state.rings.lossy(now()),
+            lossy_minutes_15m: state.rings.lossy(at),
             dropped_keys: state.rings.dropped,
+            dropped_events: state.dropped_events,
+            recovering: state.recovering,
+            read_errors: state.read_errors,
         }
     }
     /// Wake the worker and join it, closing the group and all event descriptors.
@@ -287,6 +363,64 @@ impl Watcher {
             let _ = thread.join();
         }
     }
+}
+fn select_group<T>(
+    rich: Option<(T, WatchMode)>,
+    fd: impl FnOnce() -> Result<T, WatchError>,
+) -> Result<(T, WatchMode), WatchError> {
+    match rich {
+        Some(selected) => Ok(selected),
+        None => fd().map(|group| (group, WatchMode::FdMount)),
+    }
+}
+// A read is bounded by the 64 KiB transport buffer, including this collected batch.
+fn read_recover<T>(
+    mut read: impl FnMut() -> io::Result<T>,
+    processor: &mut Processor<'_>,
+    state: &Mutex<State>,
+    shutdown: &OwnedFd,
+    stopping: &AtomicBool,
+    clock: impl Fn() -> i64,
+) -> Option<T> {
+    let mut failures = 0u32;
+    while !stopping.load(Ordering::Relaxed) {
+        match read() {
+            Ok(events) => {
+                let mut state = state.lock();
+                if state.recovering {
+                    state.rings.overflow(clock());
+                }
+                state.recovering = false;
+                return Some(events);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                tracing::warn!(%error, "fanotify read failed");
+                if !processor.transport_error(&error, clock(), state) {
+                    return None;
+                }
+                failures = failures.saturating_add(1);
+                if !retry_wait(shutdown, stopping, failures) {
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+// Wait only on shutdown, so a readable group cannot turn resource recovery into a busy loop.
+fn retry_wait(shutdown: &OwnedFd, stopping: &AtomicBool, failures: u32) -> bool {
+    let millis = (25u64 << failures.min(5)).min(1000);
+    let mut poll = [rustix::event::PollFd::new(
+        shutdown,
+        rustix::event::PollFlags::IN,
+    )];
+    let timeout = rustix::event::Timespec {
+        tv_sec: (millis / 1000) as i64,
+        tv_nsec: ((millis % 1000) * 1_000_000) as i64,
+    };
+    let _ = rustix::event::poll(&mut poll, Some(&timeout));
+    poll[0].revents().is_empty() && !stopping.load(Ordering::Relaxed)
 }
 /// Compare the current and PID 1 mount-namespace identities.
 pub fn namespace_ok() -> io::Result<bool> {
@@ -302,17 +436,41 @@ struct Processor<'a> {
     handles: fidmode::HandlePaths,
 }
 impl Processor<'_> {
+    fn loss(&mut self, at: i64, state: &Mutex<State>) {
+        self.handles.clear();
+        self.paths.clear();
+        let mut state = state.lock();
+        state.rings.overflow(at);
+        state.dirty.clear();
+        state.dirty.insert(self.cfg.mount.clone());
+    }
+    fn transport_error(&mut self, error: &io::Error, at: i64, state: &Mutex<State>) -> bool {
+        self.loss(at, state);
+        let retry = error.raw_os_error().is_some_and(|code| {
+            [
+                rustix::io::Errno::NOMEM,
+                rustix::io::Errno::NFILE,
+                rustix::io::Errno::MFILE,
+                rustix::io::Errno::NOBUFS,
+            ]
+            .iter()
+            .any(|errno| errno.raw_os_error() == code)
+        }) || error.kind() == io::ErrorKind::WouldBlock;
+        let mut state = state.lock();
+        state.read_errors = state.read_errors.saturating_add(1);
+        state.recovering = retry;
+        state.failed = !retry;
+        retry
+    }
     fn process(&mut self, event: RawEvent, at: i64, state: &Mutex<State>) {
-        let cfg = self.cfg;
-        let attribution = self.attribution;
         let mount_fd = self.mount_fd;
-        let sizes = &mut self.sizes;
         let is_fid = matches!(&event, RawEvent::Fid { .. });
         let event_mask = match &event {
             RawEvent::Fd { mask, .. } | RawEvent::Fid { mask, .. } => *mask,
             RawEvent::Overflow => 0,
         };
         if matches!(event, RawEvent::Overflow) {
+            self.loss(at, state);
             let mut state = state.lock();
             state.overflows = state.overflows.saturating_add(1);
             state.rings.overflow(at);
@@ -348,10 +506,24 @@ impl Processor<'_> {
             }
             RawEvent::Overflow => return,
         };
-        let Ok((pid, path, stat, created)) = resolved else {
-            state.lock().rings.overflow(at);
+        let Ok(resolved) = resolved else {
+            self.loss(at, state);
             return;
         };
+        self.record(resolved, event_mask, is_fid, at, state);
+    }
+    fn record(
+        &mut self,
+        resolved: (i32, RawPath, Option<rustix::fs::Stat>, i64),
+        event_mask: u64,
+        is_fid: bool,
+        at: i64,
+        state: &Mutex<State>,
+    ) {
+        let (pid, path, stat, created) = resolved;
+        let cfg = self.cfg;
+        let attribution = self.attribution;
+        let sizes = &mut self.sizes;
         if !path.starts_with(&cfg.mount) || cfg.exclude_prefixes.iter().any(|p| path.starts_with(p))
         {
             return;
@@ -386,6 +558,21 @@ impl Processor<'_> {
         let key = dir_key(&parent, &cfg.mount, cfg.hot_depth);
         let mut state = state.lock();
         state.events = state.events.saturating_add(1);
+        if let Some(stream) = &mut state.stream {
+            let full = stream.len() == 1000;
+            if full {
+                stream.pop_front();
+            }
+            stream.push_back(WatchEvent {
+                at,
+                path,
+                delta,
+                attribution: who.clone(),
+            });
+            if full {
+                state.dropped_events = state.dropped_events.saturating_add(1);
+            }
+        }
         state.rings.add(
             at,
             [
@@ -450,6 +637,7 @@ fn dir_key(parent: &RawPath, mount: &RawPath, depth: usize) -> RawPath {
 impl std::fmt::Display for WatchMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::Failed => "failed",
             Self::FdMount => "fd/mount",
             Self::DfidNameMount => "dfid-name/mount",
             Self::DfidNameFilesystem => "dfid-name/filesystem",
@@ -467,6 +655,11 @@ mod tests {
             dirty: BTreeSet::new(),
             events: 0,
             overflows: 0,
+            failed: false,
+            recovering: false,
+            read_errors: 0,
+            stream: None,
+            dropped_events: 0,
         })
     }
     #[test]
@@ -540,9 +733,204 @@ mod tests {
         );
         assert_eq!(state.lock().events, 2);
         assert_eq!(state.lock().dirty.len(), 1);
+        // Independent direction records carry their own paths and measured deltas.
+        let directions = empty_state();
+        directions.lock().stream = Some(VecDeque::new());
+        let from_path = RawPath::from_path(&file).unwrap();
+        let to_path = RawPath::from_path(&included.join("destination")).unwrap();
+        processor.paths.remember(&from_path, (1, 1), disk);
+        processor.record(
+            (0, from_path.clone(), None, 0),
+            mask::MOVED_FROM,
+            true,
+            at,
+            &directions,
+        );
+        let stat = rustix::fs::stat(&file).unwrap();
+        processor.record(
+            (0, to_path.clone(), Some(stat), at),
+            mask::MOVED_TO,
+            true,
+            at,
+            &directions,
+        );
+        {
+            let directions = directions.lock();
+            let events = directions.stream.as_ref().unwrap();
+            assert_eq!(
+                (events[0].path.clone(), events[0].delta),
+                (from_path, -disk)
+            );
+            assert_eq!((events[1].path.clone(), events[1].delta), (to_path, disk));
+            assert_eq!(directions.events, 2);
+        }
+        let renamed_fd = std::fs::File::open(&included).unwrap();
+        processor
+            .handles
+            .put((1, vec![1]), RawPath::from_path(&included).unwrap());
+        processor
+            .paths
+            .remember(&RawPath::from_path(&file).unwrap(), (1, 1), disk);
+        std::fs::rename(&included, excluded.join("moved")).unwrap();
         processor.process(RawEvent::Overflow, at, &state);
+        assert!(processor.handles.get(&(1, vec![1])).is_none());
+        let (fresh, _, _) = fidmode::resolve_fd(
+            renamed_fd.as_fd(),
+            1,
+            &[1],
+            Some(b"raw-file"),
+            mask::CLOSE_WRITE,
+            &mut processor.handles,
+        )
+        .unwrap();
+        assert!(fresh.starts_with(&cfg.exclude_prefixes[0]));
+        assert_eq!(fresh.as_path(), excluded.join("moved/raw-file"));
+        assert!(processor
+            .paths
+            .remove(&RawPath::from_path(&file).unwrap())
+            .is_none());
+        processor.process(
+            RawEvent::Fd {
+                mask: mask::CLOSE_WRITE,
+                pid: 0,
+                fd: std::fs::File::open(excluded.join("moved/raw-file"))
+                    .unwrap()
+                    .into(),
+            },
+            at,
+            &state,
+        );
+        assert_eq!(state.lock().events, 2);
+        let live = temp.path().join("resumed");
+        std::fs::write(&live, b"fixture").unwrap();
+        state.lock().stream = Some(VecDeque::new());
+        let shutdown = rustix::event::eventfd(0, rustix::event::EventfdFlags::NONBLOCK).unwrap();
+        let stopping = AtomicBool::new(false);
+        let mut reads = 0;
+        let event = read_recover(
+            || {
+                reads += 1;
+                if reads == 1 {
+                    Err(io::Error::from_raw_os_error(24))
+                } else {
+                    Ok(RawEvent::Fd {
+                        mask: mask::CLOSE_WRITE,
+                        pid: 0,
+                        fd: std::fs::File::open(&live).unwrap().into(),
+                    })
+                }
+            },
+            &mut processor,
+            &state,
+            &shutdown,
+            &stopping,
+            || at,
+        )
+        .unwrap();
+        processor.process(event, at, &state);
+        assert_eq!(reads, 2);
+        assert_eq!(state.lock().events, 3);
+        assert!(!state.lock().recovering);
+        assert_eq!(state.lock().read_errors, 1);
+        for n in 0..1001 {
+            processor.process(
+                RawEvent::Fd {
+                    mask: mask::CLOSE_WRITE,
+                    pid: 0,
+                    fd: std::fs::File::open(&live).unwrap().into(),
+                },
+                at + n,
+                &state,
+            );
+        }
+        assert_eq!(state.lock().stream.as_ref().unwrap().len(), 1000);
+        assert_eq!(state.lock().dropped_events, 2);
+        assert!(!processor.transport_error(&io::Error::from_raw_os_error(9), at, &state));
+        assert!(state.lock().failed);
+        stopping.store(true, Ordering::Relaxed);
+        assert!(!retry_wait(&shutdown, &stopping, 30));
+        stopping.store(false, Ordering::Relaxed);
+        rustix::io::write(&shutdown, &1u64.to_ne_bytes()).unwrap();
+        let started = std::time::Instant::now();
+        assert!(!retry_wait(&shutdown, &stopping, 30));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
         assert_eq!(state.lock().overflows, 1);
-        assert!(state.lock().rings.hot(at, 1, HotScope::Dir, 1)[0].lossy);
+        assert!(state.lock().rings.lossy(at) > 0);
+        let watcher = Watcher {
+            mode: WatchMode::FdMount,
+            state: Arc::new(state),
+            shutdown: Arc::new(shutdown),
+            stopping: Arc::new(stopping),
+            thread: None,
+            mount: cfg.mount.clone(),
+        };
+        assert_eq!(watcher.mode(), WatchMode::Failed);
+        let drained = watcher.drain_events(3);
+        assert_eq!(
+            drained.iter().map(|e| e.at).collect::<Vec<_>>(),
+            vec![at + 1, at + 2, at + 3]
+        );
+        watcher.state.lock().rings.advance(at + 2000);
+        assert_eq!(watcher.stats().mode, WatchMode::Failed);
+        assert!(watcher.stats().lossy_minutes_15m > 0);
+        assert_eq!(watcher.stats().read_errors, 2);
+        assert_eq!(watcher.drain_events(usize::MAX).len(), 997);
+    }
+    #[cfg(feature = "privileged")]
+    #[test]
+    fn kernel_overflow_worker_survives_and_resumes() {
+        use std::time::{Duration, Instant};
+        let fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
+        let watcher = Watcher::start(
+            WatcherOptions {
+                mount: RawPath::from_path(&fs.mountpoint).unwrap(),
+                events: vec![],
+                hot_depth: 6,
+                exclude_prefixes: vec![],
+                lru_entries: 1000,
+            },
+            Arc::new(AttributionCache::new(Duration::from_secs(60), 10)),
+        )
+        .unwrap();
+        // Hold the worker's processing lock so its bounded kernel queue must overflow.
+        let held = watcher.state.lock();
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 100000 ]; do : > \"$1/$i\"; i=$((i+1)); done",
+                "w5a",
+            ])
+            .arg(&fs.mountpoint)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while watcher.stats().overflows_total == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(watcher.stats().overflows_total > 0);
+        assert!(watcher.stats().lossy_minutes_15m > 0);
+        watcher.enable_events();
+        let path = fs.mountpoint.join("after-overflow");
+        assert!(std::process::Command::new("sh")
+            .args(["-c", "echo resumed > \"$1\"", "w5a"])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = false;
+        while Instant::now() < deadline && !seen {
+            seen = watcher
+                .drain_events(1000)
+                .iter()
+                .any(|event| event.path.as_path() == path);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(seen);
+        assert_ne!(watcher.mode(), WatchMode::Failed);
+        watcher.stop();
     }
     #[test]
     fn synthetic_batch_fd_count_stable() {
@@ -584,6 +972,8 @@ mod tests {
             handles: fidmode::HandlePaths::new(100_000),
         };
         let state = empty_state();
+        let fixture = temp.path().join("fixture");
+        std::fs::write(&fixture, b"metadata-only fixture").unwrap();
         let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
         let before = count();
         for _ in 0..1000 {
@@ -592,14 +982,41 @@ mod tests {
                     RawEvent::Fd {
                         mask: mask::CLOSE_WRITE,
                         pid,
-                        fd: std::fs::File::open(temp.path()).unwrap().into(),
+                        fd: std::fs::File::open(&fixture).unwrap().into(),
                     },
                     at,
                     &state,
                 );
             }
         }
+        assert_eq!(state.lock().events, 1000);
+        assert!(!state.lock().failed);
         assert_eq!(count(), before);
+    }
+    #[test]
+    fn rich_mark_failure_selects_fd_fallback() {
+        let mut fallback_called = false;
+        let (group, mode) = select_group(None, || {
+            fallback_called = true;
+            Ok(42)
+        })
+        .unwrap();
+        assert!(fallback_called);
+        assert_eq!(group, 42);
+        assert_eq!(mode, WatchMode::FdMount);
+        assert!(matches!(
+            select_group::<u8>(None, || Err(WatchError::Unsupported)),
+            Err(WatchError::Unsupported)
+        ));
+        assert_eq!(
+            select_group(
+                Some((7, WatchMode::DfidNameMount)),
+                || -> Result<u8, WatchError> { panic!("unnecessary fallback") }
+            )
+            .unwrap()
+            .1,
+            WatchMode::DfidNameMount
+        );
     }
     #[test]
     fn component_prefixes_and_hot_depth() {

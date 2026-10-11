@@ -15,6 +15,16 @@ pub(super) fn resolve(
     cache: &mut HandlePaths,
 ) -> io::Result<(RawPath, Option<rustix::fs::Stat>, i64)> {
     let fd = open_by_handle(mount, ty, handle)?;
+    resolve_fd(fd.as_fd(), ty, handle, name, event_mask, cache)
+}
+pub(super) fn resolve_fd(
+    fd: BorrowedFd<'_>,
+    ty: i32,
+    handle: &[u8],
+    name: Option<&[u8]>,
+    event_mask: u64,
+    cache: &mut HandlePaths,
+) -> io::Result<(RawPath, Option<rustix::fs::Stat>, i64)> {
     let Some(name) = name else {
         let (path, stat, created) = super::fdmode::resolve(fd.as_fd())?;
         return Ok((path, Some(stat), created));
@@ -37,9 +47,9 @@ pub(super) fn resolve(
     if event_mask & (mask::DELETE | mask::MOVED_FROM) != 0 {
         return Ok((path, None, 0));
     }
-    let stat = rustix::fs::statat(&fd, name.as_path(), rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+    let stat = rustix::fs::statat(fd, name.as_path(), rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
     let created = rustix::fs::statx(
-        &fd,
+        fd,
         name.as_path(),
         rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         rustix::fs::StatxFlags::BTIME,
@@ -64,6 +74,10 @@ impl PathSizes {
             sequence: 0,
             cap,
         }
+    }
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
     }
     pub fn remember(&mut self, path: &RawPath, id: (u64, u64), disk: i64) {
         if self.cap == 0 {
