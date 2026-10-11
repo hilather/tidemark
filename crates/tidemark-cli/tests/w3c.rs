@@ -89,7 +89,7 @@ fn scanned_nonutf8_preserved_or_lossy_and_escaped() {
 #[test]
 fn export_mode_overwrite_state_protection_and_wide_json() {
     use std::os::unix::fs::PermissionsExt;
-    let (fixture, temp, _) = scan(include_str!("../../test-support/fixtures/nonutf8.toml"));
+    let (fixture, temp, snap) = scan(include_str!("../../test-support/fixtures/nonutf8.toml"));
     let run = |args: &[&std::ffi::OsStr]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
             .arg("--config")
@@ -176,6 +176,42 @@ fn export_mode_overwrite_state_protection_and_wide_json() {
         .unwrap()
         .iter()
         .all(|r| r.get("path").is_some() || r.get("path_b64").is_some()));
+    // A malformed immutable snapshot triggers an export error after output has
+    // started. Publication must leave neither the target nor a temporary file.
+    let malformed = tempfile::tempdir().unwrap();
+    let mut row = snap.root().unwrap();
+    row.dir_disk = 1;
+    row.own_charged = 0;
+    let mut writer =
+        tidemark_store::writer::SnapshotWriter::create(malformed.path(), snap.meta()).unwrap();
+    writer.put_dirs(&[row]).unwrap();
+    let bad_snapshot = writer.finish(snap.meta()).unwrap();
+    let snapshots: Vec<_> = std::fs::read_dir(
+        temp.path()
+            .join("state/snapshots")
+            .join(tidemark_store::catalog::root_slug(&snap.meta().root)),
+    )
+    .unwrap()
+    .map(|entry| entry.unwrap().path())
+    .collect();
+    let snapshot_file = snapshots
+        .iter()
+        .find(|path| path.extension().is_some_and(|ext| ext == "db"))
+        .unwrap();
+    std::fs::copy(bad_snapshot, snapshot_file).unwrap();
+    let failed = temp.path().join("failed.json");
+    let mut failure_args = args;
+    failure_args[5] = failed.as_os_str();
+    let result = run(&failure_args);
+    assert!(!result.status.success());
+    assert!(!failed.exists());
+    assert!(std::fs::read_dir(temp.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(b".tidemark-export-")
+    }));
 }
 #[cfg(feature = "privileged")]
 #[test]

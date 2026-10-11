@@ -3,7 +3,7 @@
 
 use crate::{reader::Snapshot, StoreError};
 use std::io::Write;
-use tidemark_core::{path::RawPath, snapshot::FileFilter};
+use tidemark_core::path::RawPath;
 
 /// Name encoding and relative directory depth for an ncdu export.
 pub struct NcduOptions {
@@ -24,18 +24,17 @@ pub struct ExportStats {
     /// Total additive disk bytes emitted.
     pub disk_bytes: u64,
 }
-// Public Snapshot queries materialize results. Fail explicitly rather than
-// allocating a million FileHits until SCR-001 supplies a cursor.
-const MAX_NOTABLE_QUERY: usize = 4096;
 // Directory depth is bounded independently of input tree width.
 const MAX_OPEN_ARRAYS: usize = 65536;
+// Reader sorting scratch lives in memory. LIMIT bounds SQLite's top-N sorter
+// even without a (dir_id, name, ino) index; keyset pages impose no total cap.
+const FILE_PAGE_ROWS: u32 = 256;
 
 /// Stream ncdu v1.2 arrays in preorder without recursion or a resident tree.
 ///
 /// Depth-limited descendants are represented by an aggregate file so the disk
 /// total remains additive. Missing bulk-mode names remain in the aggregate.
-/// The current reader contract requires a bounded subtree notable-file query;
-/// exports exceeding 4096 notable files in a queried subtree fail explicitly.
+/// Notable files are streamed one row at a time from a per-directory SQL cursor.
 pub fn export_ncdu(
     snap: &Snapshot,
     under: &RawPath,
@@ -45,29 +44,28 @@ pub fn export_ncdu(
     let root = snap
         .dir_by_path(under)?
         .ok_or_else(|| StoreError::Invalid("export root absent from snapshot".into()))?;
-    let mut hits = snap.subtree_files(root.id, &FileFilter::default(), MAX_NOTABLE_QUERY + 1)?;
-    if hits.len() > MAX_NOTABLE_QUERY {
-        return Err(StoreError::Invalid(
-            "ncdu export notable subtree exceeds 4096-row cap (SCR-W3-C-001)".into(),
-        ));
-    }
-    hits.retain(|h| h.row.nlink == 1 && h.row.name.is_some());
-    hits.sort_by(|a, b| {
-        a.row
-            .dir_id
-            .cmp(&b.row.dir_id)
-            .then_with(|| a.row.name.cmp(&b.row.name))
-            .then_with(|| a.row.ino.cmp(&b.row.ino))
-    });
-    let mut hits = hits.into_iter().peekable();
+    let mut files = snap.conn().prepare(
+        "SELECT name, apparent, disk, ino, id FROM files
+         WHERE dir_id = ?1 AND nlink = 1 AND name IS NOT NULL
+           AND (?2 IS NULL OR (name, ino, id) > (?2, ?3, ?4))
+         ORDER BY name, ino, id LIMIT ?5",
+    )?;
     let metadata = serde_json::json!({"progname":"tidemark", "progver":snap.meta().tool_version,
         "timestamp":snap.meta().started_at, "note":"Sizes are the charged (additive) view."});
     write!(out, "[1,2,{metadata},")?;
     let mut stack: Vec<u32> = Vec::new();
     let mut stats = ExportStats::default();
-    let mut next = Some(root.id);
-    while let Some(id) = next {
-        let dir = snap.dir(id)?;
+    let mut directories = snap
+        .conn()
+        .prepare("SELECT * FROM dirs WHERE id BETWEEN ?1 AND ?2 ORDER BY id")?;
+    let mut directory_rows = directories.query(rusqlite::params![root.id, root.subtree_end])?;
+    let mut next_id = root.id;
+    while let Some(row) = directory_rows.next()? {
+        let id: u32 = row.get(0)?;
+        if id < next_id {
+            continue;
+        }
+        let dir = crate::reader::dir_row(row)?;
         while stack.last().is_some_and(|end| *end < id) {
             out.write_all(b"]")?;
             stack.pop();
@@ -109,29 +107,53 @@ pub fn export_ncdu(
             .own_files
             .checked_add(dir.own_symlinks)
             .ok_or_else(|| StoreError::Integer("aggregate file count".into()))?;
-        while hits.peek().is_some_and(|h| h.row.dir_id < id) {
-            hits.next();
-        }
-        while hits.peek().is_some_and(|h| h.row.dir_id == id) {
-            let Some(hit) = hits.next() else {
-                break;
-            };
-            let f = hit.row;
-            if let Some(name) = f.name {
+        let mut after: Option<(Vec<u8>, i64, u32)> = None;
+        loop {
+            let mut rows = files.query(rusqlite::params![
+                id,
+                after.as_ref().map(|key| &key.0),
+                after.as_ref().map(|key| key.1),
+                after.as_ref().map(|key| key.2),
+                FILE_PAGE_ROWS,
+            ])?;
+            let mut last: Option<(Vec<u8>, i64, u32)> = None;
+            let mut emitted = 0;
+            while let Some(file) = rows.next()? {
+                let name = file.get_ref(0)?.as_blob().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        Box::new(error),
+                    )
+                })?;
+                let file_apparent = crate::error::read_u64(file, 1)?;
+                let file_disk = crate::error::read_u64(file, 2)?;
+                let ino = crate::error::read_u64(file, 3)?;
                 disk = disk
-                    .checked_sub(f.disk)
+                    .checked_sub(file_disk)
                     .ok_or_else(|| StoreError::Invalid("notable disk exceeds own charge".into()))?;
-                apparent = apparent.checked_sub(f.apparent).ok_or_else(|| {
+                apparent = apparent.checked_sub(file_apparent).ok_or_else(|| {
                     StoreError::Invalid("notable apparent exceeds own apparent".into())
                 })?;
                 count = count
                     .checked_sub(1)
                     .ok_or_else(|| StoreError::Invalid("notable count exceeds own count".into()))?;
                 out.write_all(b",")?;
-                info(out, name.as_bytes(), f.apparent, f.disk, f.ino, None, opts)?;
+                info(out, name, file_apparent, file_disk, ino, None, opts)?;
                 stats.files += 1;
-                add_disk(&mut stats, f.disk)?;
+                add_disk(&mut stats, file_disk)?;
+                emitted += 1;
+                // Retain only the final row's key, never the page or subtree.
+                let key = last.get_or_insert_with(|| (Vec::new(), 0, 0));
+                key.0.clear();
+                key.0.extend_from_slice(name);
+                key.1 = file.get(3)?;
+                key.2 = file.get(4)?;
             }
+            if emitted < FILE_PAGE_ROWS {
+                break;
+            }
+            after = last;
         }
         out.write_all(b",")?;
         info(
@@ -172,11 +194,10 @@ pub fn export_ncdu(
         }
         stack.push(dir.subtree_end);
         let last = if cut { dir.subtree_end } else { id };
-        next = if last < root.subtree_end {
-            last.checked_add(1)
-        } else {
-            None
-        };
+        if last >= root.subtree_end {
+            break;
+        }
+        next_id = last + 1; // last < root.subtree_end <= u32::MAX
     }
     if stats.disk_bytes != root.t_charged {
         return Err(StoreError::Invalid(
