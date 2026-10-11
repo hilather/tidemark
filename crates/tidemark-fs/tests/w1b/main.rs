@@ -23,6 +23,7 @@ fn config(root: &std::path::Path) -> WalkConfig {
         scan_start: 2_000_000_000,
         getdents_buf: 4096,
         io_idle: true,
+        max_record_bytes: 64 * 1024 * 1024,
     }
 }
 fn collect(cfg: &WalkConfig) -> (WalkSummary, Vec<WalkOutput>) {
@@ -596,7 +597,7 @@ fn worker_panic_joins_instead_of_hanging() {
     let (tx, _rx) = crossbeam_channel::bounded(1);
     assert!(matches!(
         walk(&cfg, &gate, &AtomicBool::new(false), tx),
-        Err(WalkError::Limit("worker panicked"))
+        Err(WalkError::Limit(m)) if m == "worker panicked"
     ));
 }
 
@@ -723,6 +724,6 @@ fn threshold_overflow_refuses_without_truncation() {
     let (tx, _rx) = crossbeam_channel::bounded(1);
     assert!(matches!(
         walk(&cfg, &NoopGate, &AtomicBool::new(false), tx),
-        Err(WalkError::Limit("4096 threshold candidates per directory"))
+        Err(WalkError::Limit(m)) if m == "4096 threshold candidates per directory"
     ));
 }
