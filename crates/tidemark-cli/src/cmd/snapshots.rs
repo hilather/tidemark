@@ -37,7 +37,7 @@ pub enum Command {
     },
     /// Rebuild the snapshot catalog for all roots.
     RebuildCatalog {
-        /// Validate this root path; rebuilding still includes all roots.
+        /// Scoped rebuilding is unavailable; omit this option for a global rebuild.
         #[arg(long, value_name = "ROOT")]
         root: Option<std::path::PathBuf>,
     },
@@ -55,6 +55,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         .as_deref()
         .map(tidemark_fs::canon::canonicalize)
         .transpose()?;
+    if matches!(args.command, Command::RebuildCatalog { .. }) && root_arg.is_some() {
+        return Err(crate::CliError::Configuration(
+            "rebuild-catalog is global; --root is unsupported; omit --root to rebuild all roots"
+                .into(),
+        )
+        .into());
+    }
     let _lock = if mutation {
         if std::os::unix::net::UnixStream::connect(&context.config.general.socket).is_ok() {
             return Err(crate::CliError::Precondition(

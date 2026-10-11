@@ -15,7 +15,7 @@ pub enum WalkError {
     Io(#[from] io::Error),
     /// Invalid settings or a documented memory cap was reached.
     #[error("walker limit: {0}")]
-    Limit(&'static str),
+    Limit(String),
     /// The output consumer disconnected.
     #[error("output consumer disconnected")]
     Disconnected,
@@ -50,6 +50,9 @@ pub struct WalkConfig {
     pub getdents_buf: usize,
     /// Request best-effort idle I/O priority on every worker.
     pub io_idle: bool,
+    /// Upper bound, in bytes, for one directory record (its entries' link references, names,
+    /// skips, error samples and notable candidates). 0 means no bound (tests only).
+    pub max_record_bytes: u64,
 }
 
 /// Completed scan counters, including errors whose stored details were capped.

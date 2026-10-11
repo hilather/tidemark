@@ -63,7 +63,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         .into());
     }
     // Apply filters before the final limit, especially for cross-snapshot growth.
-    let rows = snapshot.subtree_dirs(dir.id, depth, key, 1_000_000)?;
+    let rows = snapshot.subtree_dirs(dir.id, depth, key, 1_000_001)?;
     let live = if args.live {
         Some(live_rows(&path, context)?)
     } else {
@@ -124,6 +124,7 @@ fn older_snapshot(
         .into_iter()
         .filter(|e| {
             e.status == "complete"
+                && e.file.as_ref().is_some_and(|p| p.is_file())
                 && e.scan_id != current.meta().scan_id.to_string()
                 && e.started_at < current.meta().started_at
                 && e.started_at.abs_diff(target) <= 21600
@@ -197,6 +198,11 @@ fn live_rows(
         scan_start: now,
         getdents_buf: usize::try_from(context.config.scan.getdents_buf.0)?,
         io_idle: true,
+        max_record_bytes: tidemark_scan::orchestrator::record_limits(
+            context.config.scan.memory_budget.0,
+            threads,
+        )?
+        .1,
     };
     let mut agg = Aggregator::new(AggConfig {
         root: path.clone(),
