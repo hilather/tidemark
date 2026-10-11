@@ -4,7 +4,7 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// All.
+    /// Include alert history.
     #[arg(long)]
     pub all: bool,
 }

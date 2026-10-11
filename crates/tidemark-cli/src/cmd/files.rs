@@ -4,22 +4,22 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Path.
+    /// Directory path to query (canonicalised before lookup).
     #[arg(value_name = "PATH")]
     pub path: Option<std::path::PathBuf>,
-    /// Limit.
+    /// Maximum number of results.
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
-    /// Min size.
+    /// Minimum file or directory size.
     #[arg(long, value_name = "SIZE")]
     pub min_size: Option<tidemark_core::units::ByteSize>,
-    /// Older than.
+    /// Select files older than this duration.
     #[arg(long, value_name = "DUR", value_parser = humantime::parse_duration)]
     pub older_than: Option<std::time::Duration>,
-    /// Newer than.
+    /// Select files newer than this duration.
     #[arg(long, value_name = "DUR", value_parser = humantime::parse_duration)]
     pub newer_than: Option<std::time::Duration>,
-    /// Snapshot.
+    /// Snapshot ID to query.
     #[arg(long, value_name = "ID")]
     pub snapshot: Option<String>,
 }

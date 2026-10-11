@@ -4,13 +4,13 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Path.
+    /// Directory path to query (canonicalised before lookup).
     #[arg(value_name = "PATH")]
     pub path: Option<std::path::PathBuf>,
-    /// Min entries.
+    /// Minimum number of directory entries.
     #[arg(long, value_name = "N", default_value_t = 10000)]
     pub min_entries: usize,
-    /// Limit.
+    /// Maximum number of results.
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
 }

@@ -4,10 +4,10 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Path.
+    /// Directory path to query (canonicalised before lookup).
     #[arg(value_name = "PATH")]
     pub path: Option<std::path::PathBuf>,
-    /// Snapshot.
+    /// Snapshot ID to query.
     #[arg(long, value_name = "ID")]
     pub snapshot: Option<String>,
 }

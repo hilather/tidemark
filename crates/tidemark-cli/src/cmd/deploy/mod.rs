@@ -17,11 +17,11 @@ pub struct Args {
 /// Deployment operation.
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// Stage deployment.
+    /// Pre-flight checks, install config, enable the service for next boot.
     Stage(stage::Args),
-    /// Verify deployment.
+    /// Post-reboot pass/fail for the pipeline.
     Verify(verify::Args),
-    /// Undo deployment.
+    /// Stop and disable the service; keep state.
     Unstage(unstage::Args),
 }
 /// Dispatch deployment.

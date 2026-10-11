@@ -15,7 +15,7 @@ pub fn json<T: serde::Serialize>(
     serde_json::to_writer(
         &mut *output,
         &tidemark_core::json::JsonDoc {
-            schema: command_schema,
+            schema: command_schema.into(),
             data,
         },
     )?;

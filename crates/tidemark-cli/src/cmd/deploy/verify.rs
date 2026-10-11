@@ -4,7 +4,7 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Wait.
+    /// Poll until healthy or this duration expires.
     #[arg(long, value_name = "DUR", value_parser = humantime::parse_duration)]
     pub wait: Option<std::time::Duration>,
 }

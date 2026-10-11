@@ -4,10 +4,10 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Purge state.
+    /// Also delete state_dir.
     #[arg(long)]
     pub purge_state: bool,
-    /// Yes.
+    /// Confirm unstaging without prompting.
     #[arg(long)]
     pub yes: bool,
 }

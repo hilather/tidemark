@@ -4,25 +4,25 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Root.
+    /// Root path to scan or select.
     #[arg(value_name = "ROOT")]
     pub root: Option<std::path::PathBuf>,
-    /// Mode.
+    /// Scan mode: auto, walk or bulk.
     #[arg(long, value_parser = ["auto", "walk", "bulk"])]
     pub mode: Option<String>,
-    /// Throttle.
+    /// Scan throttle preset.
     #[arg(long, value_parser = ["gentle", "normal", "max"])]
     pub throttle: Option<String>,
-    /// Threads.
+    /// Number of scan worker threads.
     #[arg(long, value_name = "N")]
     pub threads: Option<usize>,
-    /// Exclude.
+    /// Full-path globs to exclude from the scan.
     #[arg(long, value_name = "GLOB", num_args = 1.., action = clap::ArgAction::Append)]
     pub exclude: Vec<String>,
-    /// Keep partial.
+    /// Keep the partial snapshot if the scan is interrupted.
     #[arg(long)]
     pub keep_partial: bool,
-    /// Cancel.
+    /// Ask the daemon to cancel the running scan of ROOT.
     #[arg(long)]
     pub cancel: bool,
 }

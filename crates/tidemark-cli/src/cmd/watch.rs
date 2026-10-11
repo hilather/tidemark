@@ -4,10 +4,10 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Mount.
+    /// Filter by mount path.
     #[arg(long, value_name = "M")]
     pub mount: Option<std::path::PathBuf>,
-    /// Events.
+    /// Comma-separated events to watch.
     #[arg(long, value_delimiter = ',', value_parser = ["close_write", "modify"])]
     pub events: Vec<String>,
 }

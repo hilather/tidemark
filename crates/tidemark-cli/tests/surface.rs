@@ -290,3 +290,96 @@ fn documented_defaults_and_json_completion() {
     assert_eq!(value["schema"], "tidemark.completions.v1");
     assert!(value["data"].as_str().unwrap().contains("complete"));
 }
+
+#[test]
+fn all_commands_and_arguments_have_real_help() {
+    fn check(description: Option<&clap::builder::StyledStr>, name: &str) {
+        let text = description.unwrap_or_else(|| panic!("missing help for {name}"));
+        let text = text.to_string();
+        let text = text.trim().trim_end_matches('.');
+        assert!(!text.is_empty(), "empty help for {name}");
+        assert!(
+            !text.strip_suffix(" command").is_some_and(|prefix| {
+                !prefix.is_empty() && !prefix.chars().any(char::is_whitespace)
+            }),
+            "placeholder help for {name}: {text}"
+        );
+    }
+    let mut tree = Cli::command();
+    tree.build();
+    let mut pending = vec![&tree];
+    while let Some(command) = pending.pop() {
+        check(command.get_about(), command.get_name());
+        for argument in command.get_arguments() {
+            check(argument.get_help(), argument.get_id().as_str());
+        }
+        pending.extend(command.get_subcommands());
+    }
+}
+
+#[test]
+fn rendered_json_deserializes_from_owned_string() {
+    let mut output = Vec::new();
+    tidemark_cli::render::json(
+        "tidemark.top.v1",
+        serde_json::json!({"label": "directory", "bytes": 123}),
+        &mut output,
+    )
+    .unwrap();
+    let input = String::from_utf8(output).unwrap();
+    assert!(input.ends_with('\n'));
+    let document: tidemark_core::json::JsonDoc<serde_json::Value> =
+        serde_json::from_str(&input).unwrap();
+    drop(input);
+    assert_eq!(document.schema, "tidemark.top.v1");
+    assert!(matches!(document.schema, std::borrow::Cow::Owned(_)));
+    assert_eq!(document.data["bytes"], 123);
+}
+
+#[test]
+fn writers_accepts_positive_durations_and_hot_keeps_fixed_windows() {
+    for value in ["1ns", "2m", "1h", "90s", "100000h"] {
+        let cli = Cli::try_parse_from(["tidemark", "writers", "--window", value]).unwrap();
+        let tidemark_cli::cli::Command::Writers(args) = cli.command else {
+            panic!("wrong command");
+        };
+        assert_eq!(args.window, Some(humantime::parse_duration(value).unwrap()));
+        let params = tidemark_core::api::WritersParams {
+            mount: None,
+            window: args.window.unwrap(),
+        };
+        let wire = serde_json::to_string(&params).unwrap();
+        let decoded: tidemark_core::api::WritersParams = serde_json::from_str(&wire).unwrap();
+        assert_eq!(decoded.window, params.window);
+        assert!(Cli::try_parse_from(["tidemark", "hot", "--window", value]).is_err());
+    }
+    for value in ["0s", "0ns", "-1s", "bad"] {
+        assert!(Cli::try_parse_from(["tidemark", "writers", "--window", value]).is_err());
+    }
+    for value in ["1m", "5m", "15m", "60m"] {
+        assert!(Cli::try_parse_from(["tidemark", "hot", "--window", value]).is_ok());
+    }
+}
+
+#[test]
+fn top_sort_includes_snapshot_metrics_and_cli_growth() {
+    use tidemark_cli::cmd::top::Sort;
+    for (value, expected) in [
+        ("disk", Sort::Disk),
+        ("apparent", Sort::Apparent),
+        ("reclaimable", Sort::Reclaimable),
+        ("charged", Sort::Charged),
+        ("files", Sort::Files),
+        ("inodes", Sort::Inodes),
+        ("newest", Sort::Newest),
+        ("name", Sort::Name),
+        ("growth", Sort::Growth),
+    ] {
+        let cli = Cli::try_parse_from(["tidemark", "top", "--sort", value]).unwrap();
+        let tidemark_cli::cli::Command::Top(args) = cli.command else {
+            panic!("wrong command");
+        };
+        assert_eq!(args.sort, Some(expected));
+    }
+    assert!(Cli::try_parse_from(["tidemark", "top", "--sort", "bad"]).is_err());
+}

@@ -11,7 +11,7 @@ use crate::cmd;
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// Config.
+    /// Config file; use built-in defaults if missing.
     #[arg(
         short = 'c',
         long,
@@ -20,19 +20,19 @@ pub struct Cli {
         default_value = "/etc/tidemark/tidemark.toml"
     )]
     pub config: std::path::PathBuf,
-    /// State dir.
+    /// Override general.state_dir.
     #[arg(long, global = true, value_name = "DIR")]
     pub state_dir: Option<std::path::PathBuf>,
-    /// Json.
+    /// Machine output with a command-specific schema.
     #[arg(long, global = true)]
     pub json: bool,
-    /// Color.
+    /// Terminal colour policy.
     #[arg(long, global = true, value_enum, default_value = "auto")]
     pub color: Color,
-    /// Verbose.
+    /// Increase log verbosity on stderr.
     #[arg(short = 'v', global = true, action = clap::ArgAction::Count, conflicts_with = "quiet")]
     pub verbose: u8,
-    /// Quiet.
+    /// Decrease log verbosity on stderr.
     #[arg(short = 'q', global = true, action = clap::ArgAction::Count)]
     pub quiet: u8,
     /// Requested command.
@@ -52,49 +52,49 @@ pub enum Color {
 /// All CLI commands.
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// probe command.
+    /// Capability and environment report.
     Probe(cmd::probe::Args),
-    /// scan command.
+    /// Run a scan and write a snapshot.
     Scan(cmd::scan::Args),
-    /// top command.
+    /// Directory drill-down.
     Top(cmd::top::Args),
-    /// files command.
+    /// Largest files.
     Files(cmd::files::Args),
-    /// wide command.
+    /// Widest directories.
     Wide(cmd::wide::Args),
-    /// diff command.
+    /// Snapshot diff.
     Diff(cmd::diff::Args),
-    /// links command.
+    /// Hard-link topology.
     Links(cmd::links::Args),
-    /// symlinks command.
+    /// Live symlink analysis.
     Symlinks(cmd::symlinks::Args),
-    /// now command.
+    /// Live situation.
     Now(cmd::now::Args),
-    /// hot command.
+    /// Hot directories/writers.
     Hot(cmd::hot::Args),
-    /// lvm command.
+    /// LV/VG/thin-pool status and trend.
     Lvm(cmd::lvm::Args),
-    /// phantom command.
+    /// Deleted-but-open files.
     Phantom(cmd::phantom::Args),
-    /// writers command.
+    /// Growing open files.
     Writers(cmd::writers::Args),
-    /// pg command.
+    /// Postgres breakdown.
     Pg(cmd::pg::Args),
-    /// alerts command.
+    /// Active alerts; use --all for history.
     Alerts(cmd::alerts::Args),
-    /// watch command.
+    /// Foreground event stream for debugging.
     Watch(cmd::watch::Args),
-    /// status command.
+    /// Daemon health, versions, component states.
     Status(cmd::status::Args),
-    /// tui command.
+    /// Interactive browser.
     Tui(cmd::tui::Args),
-    /// snapshots command.
+    /// Snapshot catalog.
     Snapshots(cmd::snapshots::Args),
-    /// export command.
+    /// ncdu JSON export.
     Export(cmd::export::Args),
-    /// deploy command.
+    /// Pre-flight checks, service deployment and post-reboot verification.
     Deploy(cmd::deploy::Args),
-    /// completions command.
+    /// Shell completions.
     Completions(cmd::completions::Args),
 }
 impl Command {
