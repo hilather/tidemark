@@ -2,7 +2,7 @@
 //! Pure scan mode selection with explicit refusal reasons.
 
 use tidemark_core::scan::ScanMode;
-/// Reserved for W2-C.
+/// Requested scan mode.
 pub enum ModeRequest {
     /// Contract variant.
     Auto,
@@ -11,7 +11,7 @@ pub enum ModeRequest {
     /// Contract variant.
     Bulk,
 }
-/// Reserved for W2-C.
+/// Filesystem and prior-snapshot facts used for mode admission.
 pub struct ModeFacts {
     /// Contract field.
     pub is_xfs: bool,
@@ -30,7 +30,7 @@ pub struct ModeFacts {
     /// Contract field.
     pub dirs_estimate: u64,
 }
-/// Reserved for W2-C.
+/// Choose a mode and a human-readable reason without filesystem I/O.
 pub fn choose_mode(f: &ModeFacts, req: &ModeRequest, memory_budget: u64) -> (ScanMode, String) {
     if matches!(req, ModeRequest::Walk) {
         return (ScanMode::Walk, "walk explicitly requested".into());
@@ -59,7 +59,7 @@ pub fn choose_mode(f: &ModeFacts, req: &ModeRequest, memory_budget: u64) -> (Sca
             "root covers less than 50% of used inodes or coverage is unknown".into(),
         );
     }
-    // Compute here rather than depending on W2-B's currently inert estimate.
+    // Keep the estimate in wide arithmetic for conservative admission.
     // Rounded-up dents and checked wide arithmetic make overflow conservative.
     let dents = (u128::from(f.fs_used_inodes) * 11).div_ceil(10);
     let estimate = dents * 12 + u128::from(f.dirs_estimate) * 320 + (64u128 << 20);

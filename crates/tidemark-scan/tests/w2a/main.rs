@@ -120,6 +120,7 @@ fn bulk_model(tree: &ModelTree) -> VecSink {
             children: vec![],
             skipped: r.skipped,
             errors: r.errors,
+            errors_total: r.errors_total,
             races: r.races,
         });
         agg.set_dir_inode(
@@ -250,6 +251,7 @@ fn record(id: u32, parent: Option<u32>) -> DirRecord {
         notable: vec![],
         skipped: vec![],
         errors: vec![],
+        errors_total: 0,
         races: 0,
     }
 }
@@ -340,6 +342,7 @@ fn holes_errors_races_and_annotations() {
             errno: 5,
         },
     ];
+    r.errors_total = 2;
     agg.add_dir_record(r);
     agg.add_dir_record(record(3, Some(0)));
     agg.add_gone(&GoneRecord {
@@ -703,6 +706,7 @@ fn ages_nonutf8_errors_and_own_metrics() {
     t.inodes.get_mut(&101).unwrap().kind = FileKind::Other;
     let paths = t.paths();
     for (id, d) in t.dirs.iter_mut().enumerate() {
+        d.errors_total += 1;
         d.errors.push(ScanErrorRec {
             path: paths[id].clone(),
             op: ErrOp::Open,
@@ -752,6 +756,7 @@ fn bulk_projid_and_disabled_instances() {
         children: vec![9],
         skipped: vec![],
         errors: vec![],
+        errors_total: 0,
         races: 0,
     });
     agg.set_dir_inode(
@@ -788,4 +793,43 @@ fn bulk_projid_and_disabled_instances() {
     assert_eq!(s.annotations.len(), 1);
     assert!(s.link_instances.is_empty());
     assert_eq!(s.link_sets.len(), 1);
+}
+
+#[test]
+fn uncapped_directory_errors_survive_walk_and_namespace_sampling() {
+    let root = RawPath::new(b"/r".to_vec()).unwrap();
+    let mut records = vec![record(0, None), record(1, Some(0)), record(2, Some(0))];
+    records[1].errors_total = 10_017;
+    records[2].errors_total = 10_123;
+    records[1].errors.push(ScanErrorRec {
+        path: root.clone(),
+        op: ErrOp::Open,
+        errno: 13,
+    });
+    let walk = collect(records.clone(), config(root.clone(), 0));
+    assert_eq!(walk.dirs[0].t_errors, 20_140);
+    assert_eq!(walk.errors.len(), 1);
+    let mut agg = Aggregator::new(config(root, 0));
+    for r in records {
+        agg.add_skeleton(&NsRecord {
+            id: r.id,
+            parent: r.parent,
+            name: r.name,
+            ino: r.ino,
+            dev: r.dev,
+            entries: r.entries,
+            children: vec![],
+            skipped: r.skipped,
+            errors: r.errors,
+            errors_total: r.errors_total,
+            races: r.races,
+        });
+    }
+    let prepared = agg.prepare().unwrap();
+    assert_eq!(prepared.summary().errors, 20_140);
+    let mut bulk = VecSink::default();
+    prepared.write(&mut bulk).unwrap();
+    for (a, b) in walk.dirs.iter().zip(&bulk.dirs) {
+        assert_eq!((a.errors, a.t_errors), (b.errors, b.t_errors));
+    }
 }

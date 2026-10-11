@@ -27,6 +27,8 @@ pub struct ModelDir {
     pub mtime: i64,
     /// Scanner errors attributed to this directory.
     pub errors: Vec<ScanErrorRec>,
+    /// All direct errors, including omitted detail rows.
+    pub errors_total: u32,
     /// Skipped entries counted in direct width.
     pub skipped: Vec<Skip>,
 }
@@ -162,6 +164,7 @@ impl ModelTree {
                 notable: vec![],
                 skipped: d.skipped.clone(),
                 errors: d.errors.clone(),
+                errors_total: d.errors_total,
                 races: 0,
             })
             .collect();
@@ -308,6 +311,7 @@ pub fn model_tree(seed: u64, p: RandomTreeParams) -> ModelTree {
             apparent: 0,
             mtime: 0,
             errors: vec![],
+            errors_total: 0,
             skipped: vec![],
         }],
         inodes: BTreeMap::new(),
@@ -326,6 +330,7 @@ pub fn model_tree(seed: u64, p: RandomTreeParams) -> ModelTree {
             apparent: 0,
             mtime: tree.now - rng.index(40_000_001) as i64,
             errors: vec![],
+            errors_total: 0,
             skipped: vec![],
         });
         depth.push(dep);

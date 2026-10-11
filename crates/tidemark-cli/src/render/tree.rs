@@ -36,6 +36,24 @@ pub fn signed_bytes(n: i128) -> String {
         super::size::bytes(magnitude)
     )
 }
+/// Describe the snapshot backing a text report, with an injected observation time.
+pub fn snapshot_header(
+    meta: &tidemark_core::snapshot::SnapshotMeta,
+    now: i64,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let age = now.saturating_sub(meta.started_at).max(0) as u64;
+    writeln!(
+        out,
+        "Snapshot {} · {:?} · {}s ago · {:?}{}",
+        meta.scan_id,
+        meta.mode,
+        age,
+        meta.status,
+        if meta.degraded { " (degraded)" } else { "" }
+    )?;
+    Ok(())
+}
 /// Render rows as an iterative tree, preserving the caller's sibling ordering.
 pub fn directories(
     rows: &[Directory],

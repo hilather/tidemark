@@ -35,9 +35,9 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Rebuild the snapshot catalog.
+    /// Rebuild the snapshot catalog for all roots.
     RebuildCatalog {
-        /// Root path to scan or select.
+        /// Validate this root path; rebuilding still includes all roots.
         #[arg(long, value_name = "ROOT")]
         root: Option<std::path::PathBuf>,
     },
@@ -72,7 +72,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     let catalog = if matches!(args.command, Command::RebuildCatalog { .. }) {
         tidemark_scan::orchestrator::open_catalog(state, true)?
     } else {
-        Catalog::open(state, false)?
+        Catalog::open(state, mutation)?
     };
     let mut out = std::io::stdout().lock();
     match &args.command {
@@ -154,6 +154,9 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     }
                 }
                 ids.push(id);
+            }
+            if !dry_run {
+                catalog.rebuild_from_files()?;
             }
             if context.json {
                 crate::render::json(

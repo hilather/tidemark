@@ -416,7 +416,6 @@ fn rebuild_preserves_corrupt_database_and_dry_prune_is_read_only() {
 }
 
 #[test]
-#[ignore = "needs W2-A"]
 fn scan_then_top_files_and_snapshots_end_to_end() {
     use std::ffi::OsStr;
     let fixture = test_support::materialize_file(
@@ -575,7 +574,6 @@ fn sigint_records_failed_and_leaves_no_snapshot() {
     assert!(!state.path().join("snapshots").exists());
 }
 #[test]
-#[ignore = "needs W2-A"]
 fn sigint_keep_partial_publishes_partial_and_is_not_latest() {
     let (output, state) = interrupt_scan(true);
     assert_eq!(
@@ -592,4 +590,171 @@ fn sigint_keep_partial_publishes_partial_and_is_not_latest() {
     assert!(catalog.latest(&rows[0].root).unwrap().is_none());
     let snapshot = tidemark_store::reader::Snapshot::open(rows[0].file.as_ref().unwrap()).unwrap();
     assert_eq!(snapshot.meta().status, SnapshotStatus::Partial);
+}
+
+fn fixture_command(state: &Path, json: bool) -> assert_cmd::Command {
+    let mut command = assert_cmd::Command::new(env!("CARGO_BIN_EXE_tidemark"));
+    command
+        .arg("--config")
+        .arg(state.join("config.toml"))
+        .arg("--state-dir")
+        .arg(state);
+    if json {
+        command.arg("--json");
+    }
+    command
+}
+
+#[test]
+fn real_fixture_cli_all_single_snapshot_sorts_and_growth() {
+    let fixture = test_support::materialize(include_str!(
+        "../../../test-support/fixtures/link_semantics_basic.toml"
+    ));
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(state.path().join("config.toml"), "[scan]\nthreads=2\n").unwrap();
+    for json in [false, true] {
+        fixture_command(state.path(), json)
+            .arg("scan")
+            .arg(&fixture.root)
+            .args(["--mode", "walk", "--throttle", "max"])
+            .assert()
+            .success();
+        fixture_command(state.path(), json)
+            .args(["snapshots", "list"])
+            .assert()
+            .success();
+        fixture_command(state.path(), json)
+            .arg("files")
+            .arg(&fixture.root)
+            .assert()
+            .success();
+        for sort in [
+            "disk",
+            "apparent",
+            "reclaimable",
+            "charged",
+            "files",
+            "inodes",
+            "newest",
+            "name",
+        ] {
+            let output = fixture_command(state.path(), json)
+                .arg("top")
+                .arg(&fixture.root)
+                .args(["--depth", "2", "--sort", sort])
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            if json {
+                let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(doc["schema"], "tidemark.top.v1");
+                assert!(!doc["data"].as_array().unwrap().is_empty());
+            } else {
+                assert!(String::from_utf8_lossy(&output.stdout).contains("SIZE"));
+            }
+        }
+    }
+    // Inject the historical catalog timestamp needed by the frozen 24h growth contract.
+    // The files and metric rows still come from a real CLI scan of the fixture.
+    let catalog = tidemark_store::catalog::Catalog::open(state.path(), true).unwrap();
+    let mut old = catalog.list(None).unwrap().remove(0);
+    old.started_at = tidemark_core::time::unix_now() - 86400;
+    catalog.record_finish(&old).unwrap();
+    drop(catalog);
+    std::fs::write(fixture.root.join("a/added"), vec![1; 16384]).unwrap();
+    let scan = fixture_command(state.path(), true)
+        .arg("scan")
+        .arg(&fixture.root)
+        .args(["--mode", "walk", "--throttle", "max"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let scan: serde_json::Value = serde_json::from_slice(&scan.stdout).unwrap();
+    let scan_id = scan["data"]["scan_id"].as_str().unwrap();
+    // IDs are deterministic tie breakers, not chronological suffixes. Select the
+    // newly published scan explicitly when multiple scans start in one second.
+    for json in [false, true] {
+        let output = fixture_command(state.path(), json)
+            .arg("top")
+            .arg(&fixture.root)
+            .args(["--depth", "2", "--sort", "growth", "--snapshot", scan_id])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        if json {
+            let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(doc["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["delta"].as_i64().is_some_and(|d| d > 0)));
+        }
+    }
+}
+
+#[test]
+fn non_xfs_modes_and_scan_lock_are_explicit() {
+    let fixture = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(state.path().join("config.toml"), "[scan]\nthreads=2\n").unwrap();
+    // No assumption about the host mount: the non-XFS assertion is conditional on its actual type.
+    if !tidemark_fs::mount::read_mountinfo()
+        .unwrap()
+        .iter()
+        .any(|m| m.fs_type == "xfs" && fixture.path().starts_with(m.mount_point.as_path()))
+    {
+        fixture_command(state.path(), false)
+            .arg("scan")
+            .arg(fixture.path())
+            .args(["--mode", "bulk", "--throttle", "max"])
+            .assert()
+            .code(5);
+        let output = fixture_command(state.path(), true)
+            .arg("scan")
+            .arg(fixture.path())
+            .args(["--mode", "auto", "--throttle", "max"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(doc["data"]["mode"], "walk");
+        assert!(doc["data"]["mode_reason"].as_str().unwrap().contains("XFS"));
+    }
+    let _lock = tidemark_scan::orchestrator::ScanLock::acquire(state.path()).unwrap();
+    let output = fixture_command(state.path(), false)
+        .arg("scan")
+        .arg(fixture.path())
+        .args(["--mode", "walk", "--throttle", "max"])
+        .assert()
+        .code(5)
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Busy"));
+}
+
+#[test]
+fn prune_rebuilds_catalog_for_remaining_files() {
+    let fixture = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let root = RawPath::from_path(fixture.path()).unwrap();
+    let now = tidemark_core::time::unix_now();
+    let old = publish(state.path(), &root, now - 86400, [4096; 4]);
+    let current = publish(state.path(), &root, now, [8192; 4]);
+    std::fs::write(
+        state.path().join("config.toml"),
+        "[retention.snapshots]\nrecent=1\ndaily=0\nweekly=0\n",
+    )
+    .unwrap();
+    fixture_command(state.path(), true)
+        .args(["snapshots", "prune"])
+        .assert()
+        .success();
+    let catalog = tidemark_store::catalog::Catalog::open(state.path(), false).unwrap();
+    assert!(catalog.get(&old).unwrap().is_none());
+    assert!(catalog.get(&current).unwrap().is_some());
+    assert_eq!(catalog.list(None).unwrap().len(), 1);
 }

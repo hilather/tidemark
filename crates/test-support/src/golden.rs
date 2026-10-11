@@ -67,6 +67,7 @@ pub fn link_semantics_basic() -> ModelTree {
             apparent: 0,
             mtime: 0,
             errors: vec![],
+            errors_total: 0,
             skipped: vec![],
         });
     }

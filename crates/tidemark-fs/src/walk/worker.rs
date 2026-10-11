@@ -307,6 +307,11 @@ fn error(
         });
     }
 }
+fn set_error_total(record: &mut DirRecord, before: u64, after: u64) -> Result<(), WalkError> {
+    record.errors_total =
+        u32::try_from(after - before).map_err(|_| WalkError::Limit("directory error count"))?;
+    Ok(())
+}
 fn directory(
     s: &Shared<'_>,
     t: Task,
@@ -315,6 +320,7 @@ fn directory(
     heap: &mut BinaryHeap<Reverse<u64>>,
     buffer: &mut [MaybeUninit<u8>],
 ) -> Result<WalkOutput, WalkError> {
+    let errors_before = c.errors;
     let opened = getdents::open(&t.path, s.gate, &mut c.falls);
     if let Err(e) = &opened {
         if race(e) {
@@ -397,6 +403,7 @@ fn directory(
         notable: Vec::new(),
         skipped: Vec::new(),
         errors: Vec::new(),
+        errors_total: 0,
         races: 0,
     };
     let mut children = Vec::new();
@@ -631,6 +638,7 @@ fn directory(
         f.disk < s.cfg.big_file_threshold
             && heap.peek().is_some_and(|Reverse(cutoff)| f.disk >= *cutoff)
     }));
+    set_error_total(&mut r, errors_before, c.errors)?;
     c.dirs += 1;
     c.entries += u64::from(r.entries);
     c.races += u64::from(r.races);
@@ -653,6 +661,7 @@ fn directory(
             children,
             skipped: r.skipped,
             errors: r.errors,
+            errors_total: r.errors_total,
             races: r.races,
         }))
     }
@@ -708,8 +717,33 @@ mod tests {
                 &e,
             );
         }
+        set_error_total(&mut record, 0, counts.errors).unwrap();
+        assert_eq!(record.errors_total, (MAX_ERRORS + 17) as u32);
+        let before = counts.errors;
+        let mut next = model.to_dir_records().remove(1);
+        for _ in 0..23 {
+            error(
+                &s,
+                &mut next,
+                &mut counts,
+                cfg.root.clone(),
+                ErrOp::Open,
+                &e,
+            );
+        }
+        set_error_total(&mut next, before, counts.errors).unwrap();
+        assert_eq!(next.errors_total, 23);
+        assert!(next.errors.is_empty());
+        assert_eq!(
+            u64::from(record.errors_total) + u64::from(next.errors_total),
+            counts.errors
+        );
+        assert!(matches!(
+            set_error_total(&mut next, 0, u64::from(u32::MAX) + 1),
+            Err(WalkError::Limit(_))
+        ));
         assert_eq!(record.errors.len(), MAX_ERRORS);
-        assert_eq!(counts.errors, (MAX_ERRORS + 17) as u64);
+        assert_eq!(counts.errors, (MAX_ERRORS + 40) as u64);
         assert!(record
             .errors
             .iter()

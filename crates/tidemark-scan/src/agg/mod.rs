@@ -116,7 +116,12 @@ impl Aggregator {
         }
         result
     }
-    /// Consume one walk record, including its single-link totals and candidates.
+    /// Whether any directory has arrived, used for early partial cancellation.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// Consume a directory and its uncapped direct error total.
     pub fn add_dir_record(&mut self, rec: DirRecord) {
         if self.failed {
             return;
@@ -137,13 +142,7 @@ impl Aggregator {
             self.failed = true;
             return;
         }
-        let errors = match count(rec.errors.len()) {
-            Ok(n) => n,
-            Err(_) => {
-                self.failed = true;
-                return;
-            }
-        };
+        let errors = rec.errors_total;
         let mut t = Totals {
             disk: rec.own.disk,
             apparent: rec.own.apparent,
@@ -295,6 +294,7 @@ impl Aggregator {
             notable: Vec::new(),
             skipped: ns.skipped.clone(),
             errors: ns.errors.clone(),
+            errors_total: ns.errors_total,
             races: ns.races,
         });
     }
@@ -395,6 +395,7 @@ pub struct Prepared {
     errors: Vec<ErrorRow>,
     annotations: Vec<AnnotationRow>,
     summary: AggSummary,
+    pub(crate) namespace_errors: Option<u64>,
     ignored_annotations: u64,
     invalid_annotations: bool,
 }
@@ -674,9 +675,6 @@ mod rollup;
 /// Aggregation failures.
 #[derive(Debug, thiserror::Error)]
 pub enum AggError {
-    /// Implementation is not available.
-    #[error("NotYetImplemented")]
-    NotYetImplemented,
     /// Arithmetic or identifier conversion exceeded its contract width.
     #[error("aggregation arithmetic overflow")]
     Overflow,

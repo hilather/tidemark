@@ -1,18 +1,18 @@
 //! Owned by: W0-A
-//! tidemark-scan crate skeleton.
+//! Bounded scan pipelines, aggregation, progress and snapshot lifecycle.
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
-/// agg module skeleton.
+/// agg scan module.
 pub mod agg;
-/// bulk module skeleton.
+/// bulk scan module.
 pub mod bulk;
-/// mode module skeleton.
+/// mode scan module.
 pub mod mode;
-/// orchestrator module skeleton.
+/// orchestrator scan module.
 pub mod orchestrator;
-/// progress module skeleton.
+/// progress scan module.
 pub mod progress;
 
 pub use agg::SinkError;

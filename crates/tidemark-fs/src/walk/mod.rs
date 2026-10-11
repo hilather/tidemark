@@ -28,6 +28,7 @@ use tidemark_core::{
 /// Walker settings. Resource caps are 65,536 in-flight tasks, 64 MiB of task
 /// paths, one million entries per record, and 10,000 stored errors per scan.
 /// A breached cap fails explicitly rather than silently dropping records.
+#[derive(Clone)]
 pub struct WalkConfig {
     /// Absolute byte-preserving scan root.
     pub root: RawPath,

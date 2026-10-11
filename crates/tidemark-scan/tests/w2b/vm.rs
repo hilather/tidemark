@@ -37,6 +37,7 @@ fn bulk_sink(root: RawPath, mount: &std::path::Path) -> (VecSink, BulkStats) {
         &geo,
         &NoopGate,
         &AtomicBool::new(false),
+        &|_| {},
         aggregator(root),
     )
     .unwrap();
@@ -100,6 +101,7 @@ fn bulk_refuses_ftype_zero() {
             &geo,
             &NoopGate,
             &AtomicBool::new(false),
+            &|_| {},
             aggregator(root)
         ),
         Err(BulkError::Unsupported(_))

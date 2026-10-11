@@ -98,6 +98,7 @@ fn materialize_link_semantics_basic_matches_du_with_measured_directories() {
             let path = f.root.join(path.as_path().strip_prefix("/r").unwrap());
             let row = &rows[&DirId(id as u32)];
             assert_eq!(du_disk(&path), row.t_disk);
+            assert_eq!(du_apparent_normalized(&path).unwrap(), row.t_apparent);
             let counts_dirs = du_apparent_counts_directories().unwrap();
             let dir_apparent: u64 = model
                 .dirs
@@ -307,6 +308,7 @@ fn reference_handles_same_directory_links_races_negative_mtimes_and_errors() {
     copy.name = RawName::new(b"another".to_vec()).unwrap();
     t.entries.push(copy);
     t.inodes.get_mut(&100).unwrap().mtime = 1;
+    t.dirs[1].errors_total += 1;
     t.dirs[1].errors.push(ScanErrorRec {
         path: t.root.clone(),
         op: ErrOp::Statx,

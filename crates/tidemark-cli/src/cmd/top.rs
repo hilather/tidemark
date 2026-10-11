@@ -97,12 +97,20 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         });
     }
     hits.truncate(args.limit);
+    let mut out = std::io::stdout().lock();
+    if !context.json {
+        crate::render::tree::snapshot_header(
+            snapshot.meta(),
+            tidemark_core::time::unix_now(),
+            &mut out,
+        )?;
+    }
     crate::render::tree::directories(
         &hits,
         args.wide,
         crate::render::tree::ascii_locale(),
         context.json,
-        &mut std::io::stdout().lock(),
+        &mut out,
     )
 }
 fn older_snapshot(

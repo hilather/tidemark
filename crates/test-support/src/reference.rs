@@ -62,7 +62,7 @@ pub fn compute(tree: &ModelTree) -> BTreeMap<DirId, Metrics> {
             m.age[age_bucket(tree.now, d.mtime)] += d.disk;
             m.newest_mtime = m.newest_mtime.max(d.mtime);
             m.t_dirs += 1;
-            m.t_errors += d.errors.len() as u64;
+            m.t_errors += u64::from(d.errors_total);
             let width = tree.dirs.iter().filter(|d| d.parent == Some(id)).count()
                 + tree.entries.iter().filter(|e| e.dir == id).count()
                 + d.skipped.len();

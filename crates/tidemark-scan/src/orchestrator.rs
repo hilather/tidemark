@@ -10,7 +10,7 @@ use tidemark_core::{
     snapshot::DirRow,
 };
 use tidemark_store::catalog::ScanEntry;
-/// Reserved for W2-C.
+/// Root, mode and output policy for one serialized scan.
 pub struct ScanRequest {
     /// Contract field.
     pub root: RawPath,
@@ -27,7 +27,7 @@ pub struct ScanRequest {
     /// Contract field.
     pub annotations: Vec<(RawPath, String, String)>,
 }
-/// Reserved for W2-C.
+/// Published snapshot identity, mode, metrics and timing.
 pub struct ScanOutcome {
     /// Contract field.
     pub scan_id: String,
@@ -47,7 +47,7 @@ pub struct ScanOutcome {
     pub duration: Duration,
 }
 
-/// Reserved for W2-C.
+/// Lifecycle and series sink supplied by the CLI or daemon.
 pub trait ScanRecorder: Send + Sync {
     /// Reserved for W2-C.
     fn scan_started(&self, e: &ScanEntry) -> Result<(), ScanError>;
@@ -62,7 +62,7 @@ pub trait ScanRecorder: Send + Sync {
         rows: &[DirRow],
     ) -> Result<(), ScanError>;
 }
-/// Reserved for W2-C.
+/// Run one scan under the host lock and publish its snapshot without replacement.
 pub fn run_scan(
     cfg: &Config,
     req: &ScanRequest,
@@ -155,7 +155,8 @@ pub fn run_scan(
         fs_used_inodes: used,
         dirs_estimate,
     };
-    let (mode, reason) = crate::mode::choose_mode(&facts, &req.mode, cfg.scan.memory_budget.0);
+    let (mut mode, mut reason) =
+        crate::mode::choose_mode(&facts, &req.mode, cfg.scan.memory_budget.0);
     if matches!(req.mode, ModeRequest::Bulk) && mode != ScanMode::Bulk {
         return Err(ScanError::Precondition(format!(
             "bulk mode unavailable: {reason}"
@@ -165,6 +166,19 @@ pub fn run_scan(
     if !(1..=64).contains(&threads) {
         return Err(ScanError::Precondition("threads must be 1..=64".into()));
     }
+    let memory_estimate = if mode == ScanMode::Bulk {
+        crate::bulk::estimate_memory(used, dirs_estimate)
+    } else {
+        dirs_estimate
+            .saturating_mul(320)
+            .saturating_add(used.saturating_mul(72))
+            .saturating_add(64 << 20)
+    };
+    tracing::info!(
+        memory_estimate,
+        memory_budget = cfg.scan.memory_budget.0,
+        "scan memory admission estimate; service cgroup supplies the hard limit"
+    );
     let capacity = channel_capacity(
         cfg.scan.memory_budget.0,
         threads,
@@ -229,7 +243,7 @@ pub fn run_scan(
                     skips.push(state);
                 }
             }
-            let walk_cfg = tidemark_fs::walk::WalkConfig {
+            let mut walk_cfg = tidemark_fs::walk::WalkConfig {
                 root: req.root.clone(),
                 threads,
                 stat_entries: mode == ScanMode::Walk,
@@ -244,79 +258,156 @@ pub fn run_scan(
                     .map_err(|_| ScanError::Resource("getdents buffer overflow".into()))?,
                 io_idle: true,
             };
-            let agg = crate::agg::Aggregator::new(crate::agg::AggConfig {
-                root: req.root.clone(),
-                scan_start: now,
-                top_files: root_cfg.top_files,
-                big_file_threshold: root_cfg.big_file_threshold.0,
-                max_notable: cfg.scan.max_notable,
-                link_instances: cfg.scan.link_instances
-                    == tidemark_core::config::LinkInstances::All,
-                max_stored_errors: cfg.scan.max_stored_errors,
-            });
+            let new_agg = || {
+                crate::agg::Aggregator::new(crate::agg::AggConfig {
+                    root: req.root.clone(),
+                    scan_start: now,
+                    top_files: root_cfg.top_files,
+                    big_file_threshold: root_cfg.big_file_threshold.0,
+                    max_notable: cfg.scan.max_notable,
+                    link_instances: cfg.scan.link_instances
+                        == tidemark_core::config::LinkInstances::All,
+                    max_stored_errors: cfg.scan.max_stored_errors,
+                })
+            };
             let mut phases = std::collections::BTreeMap::new();
             let mut walk_totals = None;
-            let (mut prepared, noatime, partial) = if mode == ScanMode::Walk {
-                let (agg, walk_result) = collect_walk(
-                    &walk_cfg,
-                    gate.as_ref(),
-                    cancel,
-                    agg,
-                    capacity,
-                    progress,
-                    previous.as_ref().and_then(|p| p.t_inodes),
-                    req.keep_partial,
-                )?;
-                let (noatime, partial) = match walk_result {
-                    Ok(s) => {
-                        phases.insert("walk".into(), milliseconds(s.elapsed));
-                        walk_totals = Some((s.errors, s.races));
-                        (s.noatime_fallbacks, false)
+            let (mut prepared, noatime, partial) = loop {
+                let agg = new_agg();
+                if mode == ScanMode::Walk {
+                    let (mut agg, walk_result) = collect_walk(
+                        &walk_cfg,
+                        gate.as_ref(),
+                        cancel,
+                        agg,
+                        capacity,
+                        progress,
+                        previous.as_ref().and_then(|p| p.t_inodes),
+                        req.keep_partial,
+                    )?;
+                    let (noatime, partial) = match walk_result {
+                        Ok(s) => {
+                            phases.insert("walk".into(), milliseconds(s.elapsed));
+                            walk_totals = Some((s.errors, s.races));
+                            (s.noatime_fallbacks, false)
+                        }
+                        Err(tidemark_fs::walk::WalkError::Cancelled) if req.keep_partial => {
+                            (0, true)
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    phases.insert("walk".into(), milliseconds(start.elapsed()));
+                    if partial && agg.is_empty() {
+                        // Cancellation can arrive during walker setup, before any record is emitted.
+                        // Preserve only the already observed root metadata in that partial snapshot.
+                        agg.add_dir_record(tidemark_core::scan::DirRecord {
+                            id: tidemark_core::scan::DirId(0),
+                            parent: None,
+                            name: None,
+                            ino: root_stat.st_ino,
+                            dev: root_stat.st_dev,
+                            mtime: root_stat.st_mtime,
+                            dir_disk: u64::try_from(root_stat.st_blocks)
+                                .map_err(|_| {
+                                    ScanError::Resource("negative root block count".into())
+                                })?
+                                .saturating_mul(512),
+                            dir_apparent: u64::try_from(root_stat.st_size)
+                                .map_err(|_| ScanError::Resource("negative root size".into()))?,
+                            projid: None,
+                            entries: 0,
+                            own: Default::default(),
+                            links: vec![],
+                            notable: vec![],
+                            skipped: vec![],
+                            errors: vec![],
+                            errors_total: 0,
+                            races: 0,
+                        });
                     }
-                    Err(tidemark_fs::walk::WalkError::Cancelled) if req.keep_partial => (0, true),
-                    Err(e) => return Err(e.into()),
-                };
-                phases.insert("walk".into(), milliseconds(start.elapsed()));
-                (agg.prepare()?, noatime, partial)
-            } else {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(ScanError::Cancelled);
+                    break (agg.prepare()?, noatime, partial);
+                } else {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(ScanError::Cancelled);
+                    }
+                    let geo = geometry.as_ref().ok_or_else(|| {
+                        ScanError::Precondition("XFS geometry unavailable".into())
+                    })?;
+                    let params = crate::bulk::BulkParams {
+                        walk: walk_cfg.clone(),
+                        batch: cfg.scan.bulk_batch as usize,
+                        threads,
+                    };
+                    let result = crate::bulk::run_bulk(
+                        &params,
+                        root_fd.as_fd(),
+                        geo,
+                        gate.as_ref(),
+                        cancel,
+                        &|p| {
+                            progress(&Progress {
+                                phase: p.phase,
+                                dirs: p.dirs,
+                                entries: p.entries,
+                                errors: p.errors,
+                                races: p.races,
+                                rate: gate.current_rate(),
+                                elapsed: start.elapsed(),
+                                eta: None,
+                            })
+                        },
+                        agg,
+                    );
+                    let (prepared, stats) = match result {
+                        Ok(value) => value,
+                        Err(_) if cancel.load(Ordering::Relaxed) => {
+                            return Err(ScanError::Cancelled)
+                        }
+                        Err(
+                            e @ (crate::bulk::BulkError::Unsupported(_)
+                            | crate::bulk::BulkError::BeforePhase2(_)),
+                        ) if matches!(req.mode, ModeRequest::Auto) => {
+                            reason = format!("walk fallback: {e}");
+                            tracing::warn!(%reason, "bulk scan fell back to walk");
+                            mode = ScanMode::Walk;
+                            entry.mode = mode;
+                            walk_cfg.stat_entries = true;
+                            continue;
+                        }
+                        Err(crate::bulk::BulkError::Cancelled) => return Err(ScanError::Cancelled),
+                        Err(e) => return Err(e.into()),
+                    };
+                    for (name, ms) in ["namespace", "bulkstat", "names"]
+                        .into_iter()
+                        .zip(stats.phase_ms)
+                    {
+                        phases.insert(name.into(), ms);
+                    }
+                    break (prepared, stats.noatime_fallbacks, false);
                 }
-                let geo = geometry
-                    .as_ref()
-                    .ok_or_else(|| ScanError::Precondition("XFS geometry unavailable".into()))?;
-                let params = crate::bulk::BulkParams {
-                    walk: walk_cfg,
-                    batch: cfg.scan.bulk_batch as usize,
-                    threads,
-                };
-                let (prepared, stats) = crate::bulk::run_bulk(
-                    &params,
-                    root_fd.as_fd(),
-                    geo,
-                    gate.as_ref(),
-                    cancel,
-                    agg,
-                )?;
-                for (name, ms) in ["namespace", "bulkstat", "names"]
-                    .into_iter()
-                    .zip(stats.phase_ms)
-                {
-                    phases.insert(name.into(), ms);
-                }
-                (prepared, 0, false)
             };
-            if cancel.load(Ordering::Relaxed) && !req.keep_partial {
+            if cancel.load(Ordering::Relaxed) && (mode == ScanMode::Bulk || !req.keep_partial) {
                 return Err(ScanError::Cancelled);
             }
             for (path, key, value) in &req.annotations {
                 prepared.annotate(path, key, value);
             }
+            let expected_errors = walk_totals
+                .map(|(errors, _)| errors)
+                .or(prepared.namespace_errors);
             let mut summary = prepared.summary();
-            if let Some((errors, races)) = walk_totals {
-                summary.errors = errors;
+            if let Some(errors) = expected_errors {
+                if summary.errors != errors {
+                    tracing::warn!(
+                        records = summary.errors,
+                        walker = errors,
+                        "directory error totals disagree with walker summary"
+                    );
+                    summary.degraded = true;
+                }
+            }
+            if let Some((_, races)) = walk_totals {
                 summary.races = races;
-                summary.degraded = errors > 0;
             }
             let status = if partial || cancel.load(Ordering::Relaxed) {
                 SnapshotStatus::Partial
@@ -387,10 +478,18 @@ pub fn run_scan(
             };
             let writing = Instant::now();
             let mut summary = prepared.write(&mut sink)?;
-            if let Some((errors, races)) = walk_totals {
-                summary.errors = errors;
+            if let Some(errors) = expected_errors {
+                if summary.errors != errors {
+                    tracing::warn!(
+                        records = summary.errors,
+                        walker = errors,
+                        "directory error totals disagree with walker summary"
+                    );
+                    summary.degraded = true;
+                }
+            }
+            if let Some((_, races)) = walk_totals {
                 summary.races = races;
-                summary.degraded = errors > 0;
             }
             meta.phase_ms
                 .insert("write".into(), milliseconds(writing.elapsed()));
@@ -400,7 +499,7 @@ pub fn run_scan(
                 .into_iter()
                 .map(|r| r.0 .0)
                 .collect();
-            let file = writer.finish(&meta)?;
+            let file = finish_snapshot(writer, &meta)?;
             entry.status = if status == SnapshotStatus::Partial {
                 "partial"
             } else {
@@ -432,6 +531,11 @@ pub fn run_scan(
                     delete_snapshot(&cfg.general.state_dir, path)?;
                 }
             }
+            tracing::info!(
+                memory_estimate,
+                peak_rss_bytes = observed_peak_rss(),
+                "scan memory observation"
+            );
             Ok(ScanOutcome {
                 scan_id: entry.scan_id.clone(),
                 file: Some(file),
@@ -446,12 +550,12 @@ pub fn run_scan(
     )
 }
 
-/// Reserved error shape for the owning task.
+/// Typed scan lifecycle failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {
-    /// Implementation is not available.
-    #[error("NotYetImplemented")]
-    NotYetImplemented,
+    /// Another snapshot already owns the publication path; no retry is performed.
+    #[error("snapshot publication collision; existing snapshot preserved")]
+    PublicationCollision,
     /// Filesystem operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -649,7 +753,7 @@ fn collect_walk(
                     Ok(WalkOutput::Dir(rec)) => {
                         counts.dirs += 1;
                         counts.entries += u64::from(rec.entries);
-                        counts.errors += rec.errors.len() as u64;
+                        counts.errors += u64::from(rec.errors_total);
                         counts.races += u64::from(rec.races);
                         agg.add_dir_record(rec);
                     }
@@ -876,6 +980,70 @@ fn create_writer(
     Err(ScanError::Resource(
         "snapshot creation collision retry limit reached".into(),
     ))
+}
+
+fn finish_snapshot(
+    writer: tidemark_store::writer::SnapshotWriter,
+    meta: &tidemark_core::snapshot::SnapshotMeta,
+) -> Result<PathBuf, ScanError> {
+    writer.finish(meta).map_err(|e| match e {
+        tidemark_store::StoreError::Io(ref io)
+            if io.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            ScanError::PublicationCollision
+        }
+        _ => ScanError::Store(e),
+    })
+}
+
+// Linux reports process high-water RSS in KiB. This includes other work in the process.
+fn observed_peak_rss() -> Option<u64> {
+    use std::io::Read;
+    let file = std::fs::File::open("/proc/self/status").ok()?;
+    let mut status = String::new();
+    file.take(65_536).read_to_string(&mut status).ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("VmHWM:")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(1024)
+    })
+}
+
+/// Record direct-mode directory samples, preserving the first sample within each second.
+/// The host scan lock must be held by the caller so the collision check is serialized.
+pub fn record_dir_series(
+    state: &std::path::Path,
+    root: &RawPath,
+    id: &str,
+    ts: i64,
+    rows: &[DirRow],
+) -> Result<(), ScanError> {
+    if rows.len() > 20_000 {
+        return Err(ScanError::Resource(
+            "directory series row limit exceeded".into(),
+        ));
+    }
+    let series = tidemark_store::timeseries::TimeSeries::open(&state.join("timeseries.db"), true)?;
+    // The frozen series key has second precision. Preserve the first observation
+    // at a given second when multiple serialized scans finish within that second.
+    let mut fresh = Vec::with_capacity(rows.len());
+    for row in rows {
+        if series.query_dir_series(root, &row.path, ts, ts)?.is_empty() {
+            fresh.push(row.clone());
+        }
+    }
+    if fresh.len() != rows.len() {
+        tracing::warn!(
+            scan_id = id,
+            timestamp = ts,
+            omitted = rows.len() - fresh.len(),
+            "directory series already sampled this second; preserving earlier samples"
+        );
+    }
+    Ok(series.insert_dir_series(root, id, ts, &fresh)?)
 }
 
 #[cfg(test)]
@@ -1177,5 +1345,47 @@ mod tests {
         std::fs::write(&file, b"kept").unwrap();
         assert!(delete_snapshot(state.path(), &file).is_err());
         assert_eq!(std::fs::read(file).unwrap(), b"kept");
+    }
+    #[test]
+    fn finish_collision_preserves_existing_snapshot_and_removes_temporary_file() {
+        let fixture = test_support::materialize("[[entry]]\npath='file'\nkind='file'\nsize=8\n");
+        let state = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.general.state_dir = state.path().to_owned();
+        let req = ScanRequest {
+            root: RawPath::from_path(&fixture.root).unwrap(),
+            mode: ModeRequest::Walk,
+            throttle: Some("max".into()),
+            threads: Some(1),
+            exclude_extra: vec![],
+            keep_partial: false,
+            annotations: vec![],
+        };
+        let outcome = run_scan(
+            &cfg,
+            &req,
+            &Recorder::default(),
+            &AtomicBool::new(false),
+            &|_| {},
+        )
+        .unwrap();
+        let snapshot =
+            tidemark_store::reader::Snapshot::open(outcome.file.as_ref().unwrap()).unwrap();
+        let mut meta = snapshot.meta().clone();
+        meta.scan_id = tidemark_core::time::ScanId::new(meta.started_at + 1).unwrap();
+        let dir = outcome.file.as_ref().unwrap().parent().unwrap();
+        let writer = tidemark_store::writer::SnapshotWriter::create(dir, &meta).unwrap();
+        let existing = dir.join(format!("{}.db", meta.scan_id));
+        let temporary = dir.join(format!("{}.db.tmp", meta.scan_id));
+        std::fs::write(&existing, b"existing snapshot must survive").unwrap();
+        assert!(matches!(
+            finish_snapshot(writer, &meta),
+            Err(ScanError::PublicationCollision)
+        ));
+        assert_eq!(
+            std::fs::read(existing).unwrap(),
+            b"existing snapshot must survive"
+        );
+        assert!(!temporary.exists());
     }
 }

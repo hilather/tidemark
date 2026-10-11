@@ -88,7 +88,6 @@ fn names_smallest_bytes_missing_and_cancelled() {
 use std::os::unix::ffi::OsStringExt;
 
 #[test]
-#[ignore = "needs W2-A"]
 fn synthetic_bulk_equals_walk() {
     let mut tree = test_support::golden::link_semantics_basic();
     tree.now = 0;
@@ -118,6 +117,7 @@ fn synthetic_bulk_equals_walk() {
                 .collect(),
             skipped: dir.skipped.clone(),
             errors: dir.errors.clone(),
+            errors_total: dir.errors_total,
             races: 0,
         };
         bulk.add_skeleton(&ns);
@@ -245,8 +245,127 @@ fn preflight_refuses_ftype_without_io() {
             &geo,
             &NoopGate,
             &AtomicBool::new(false),
+            &|_| {},
             aggregator(root)
         ),
         Err(BulkError::Unsupported(_))
     ));
+}
+
+#[test]
+fn namespace_failure_is_redoable_and_cancellation_is_not() {
+    use std::os::fd::AsFd;
+    let dir = tempfile::tempdir().unwrap();
+    let fd = std::fs::File::open(dir.path()).unwrap();
+    let root = RawPath::from_path(&dir.path().join("missing")).unwrap();
+    let params = BulkParams {
+        walk: config(root.clone()),
+        batch: 4096,
+        threads: 2,
+    };
+    let geo = XfsGeometry {
+        blocksize: 4096,
+        agblocks: 1024,
+        agcount: 1,
+        inodesize: 512,
+        dirblocksize: 4096,
+        uuid: [0; 16],
+        v5: Some(true),
+        ftype: Some(true),
+        reflink: None,
+    };
+    let reports = std::sync::Mutex::new(Vec::new());
+    let observer = |p: &tidemark_scan::bulk::BulkProgress| reports.lock().unwrap().push(p.phase);
+    assert!(matches!(
+        run_bulk(
+            &params,
+            fd.as_fd(),
+            &geo,
+            &NoopGate,
+            &AtomicBool::new(false),
+            &observer,
+            aggregator(root.clone())
+        ),
+        Err(BulkError::BeforePhase2(_))
+    ));
+    let before_cancel = reports.lock().unwrap().len();
+    assert!(matches!(
+        run_bulk(
+            &params,
+            fd.as_fd(),
+            &geo,
+            &NoopGate,
+            &AtomicBool::new(true),
+            &observer,
+            aggregator(root)
+        ),
+        Err(BulkError::Cancelled)
+    ));
+    assert_eq!(reports.lock().unwrap().len(), before_cancel);
+}
+
+#[test]
+fn bulk_namespace_progress_reports_while_setup_is_blocked() {
+    use std::{
+        os::fd::AsFd,
+        sync::atomic::Ordering,
+        time::{Duration, Instant},
+    };
+    struct SlowGate(AtomicBool);
+    impl tidemark_core::scan::Gate for SlowGate {
+        fn acquire(&self, _: u32) {
+            if !self.0.swap(true, Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(2300));
+            }
+        }
+        fn current_rate(&self) -> f64 {
+            1.0
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fd = std::fs::File::open(dir.path()).unwrap();
+    let root = RawPath::from_path(&dir.path().join("missing")).unwrap();
+    let params = BulkParams {
+        walk: config(root.clone()),
+        batch: 4096,
+        threads: 1,
+    };
+    let geo = XfsGeometry {
+        blocksize: 4096,
+        agblocks: 1024,
+        agcount: 1,
+        inodesize: 512,
+        dirblocksize: 4096,
+        uuid: [0; 16],
+        v5: Some(true),
+        ftype: Some(true),
+        reflink: None,
+    };
+    let start = Instant::now();
+    let reports = std::sync::Mutex::new(Vec::new());
+    let observer = |p: &tidemark_scan::bulk::BulkProgress| {
+        reports
+            .lock()
+            .unwrap()
+            .push((start.elapsed(), p.phase, p.dirs))
+    };
+    assert!(matches!(
+        run_bulk(
+            &params,
+            fd.as_fd(),
+            &geo,
+            &SlowGate(AtomicBool::new(false)),
+            &AtomicBool::new(false),
+            &observer,
+            aggregator(root)
+        ),
+        Err(BulkError::BeforePhase2(_))
+    ));
+    let reports = reports.lock().unwrap();
+    assert!(!reports.is_empty());
+    assert!(reports
+        .windows(2)
+        .all(|pair| pair[1].0 - pair[0].0 >= Duration::from_secs(2)));
+    assert!(reports[0].0 >= Duration::from_secs(2));
+    assert_eq!((reports[0].1, reports[0].2), ("namespace", 0));
 }
