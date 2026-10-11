@@ -19,9 +19,43 @@ pub struct Args {
     pub interval: std::time::Duration,
 }
 
-/// Execute this command (implemented by its later owner).
-pub fn run(_args: &Args, _context: &crate::Context) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!("not implemented yet (W5-B)"))
+/// Measure direct growth with two passes, or report daemon unavailability.
+pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
+    use std::io::Write;
+    if !args.direct {
+        return Err(crate::CliError::Unavailable("daemon unavailable; use --direct".into()).into());
+    }
+    if args.interval.is_zero() {
+        return Err(crate::CliError::Configuration("interval must be positive".into()).into());
+    }
+    let mut scanner = super::phantom::scanner(context, args.mount.as_deref(), true)?;
+    let first = super::phantom::timestamp()?;
+    scanner.scan_once(first)?;
+    std::thread::sleep(args.interval);
+    scanner.scan_once(super::phantom::timestamp()?)?;
+    let rows = scanner.writers(None, args.window.unwrap_or(args.interval), 20);
+    let mut out = std::io::stdout().lock();
+    if context.json {
+        return crate::render::json("tidemark.writers.v1", rows, &mut out);
+    }
+    for r in rows {
+        writeln!(
+            out,
+            "{} {} {} {} {} +{} bytes ({} bytes allocated)",
+            r.mount,
+            r.pid,
+            tidemark_core::path::display_lossy_bytes(r.comm.as_bytes()),
+            tidemark_core::path::display_lossy_bytes(r.unit.as_deref().unwrap_or("?").as_bytes()),
+            tidemark_core::path::display_lossy_bytes(&r.path),
+            r.growth,
+            r.disk
+        )?;
+    }
+    writeln!(
+        out,
+        "Root provides full /proc coverage; other users see the readable subset."
+    )?;
+    Ok(())
 }
 
 fn parse_positive_duration(value: &str) -> Result<std::time::Duration, String> {

@@ -1,67 +1,358 @@
 //! Owned by: W5-B
-//! Cross-task interface stubs.
+//! Metadata-only phantom aggregation and bounded open-writer history.
 
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tidemark_core::{
-    live::{OpenWriter, PhantomSample, PhantomSummary, WriterSample},
+    live::{Attribution, OpenWriter, PhantomHolder, PhantomSample, PhantomSummary, WriterSample},
     path::RawPath,
     scan::DevId,
 };
-use tidemark_fs::attribution::AttributionCache;
-/// Reserved for W5-B.
+use tidemark_fs::{
+    attribution::AttributionCache,
+    procfs::{self, OpenFile},
+};
+
+const MAX_WRITERS: usize = 10_000;
+const HISTORY: usize = 60;
+const MAX_FDS: usize = 1_048_576;
+
+/// Devices and exclusions for a single shared procfs pass.
 pub struct ProcScannerOptions {
-    /// Contract field.
+    /// Watched mount paths and kernel devices.
     pub mounts: Vec<(RawPath, DevId)>,
-    /// Contract field.
+    /// Read fd flags and track writable descriptors.
     pub open_writers: bool,
-    /// Contract field.
+    /// Component-aware writer exclusions.
     pub exclude_prefixes: Vec<RawPath>,
 }
-/// Reserved for W5-B.
+/// Diagnostics for a completed pass.
 pub struct ProcScanResult {
-    /// Contract field.
+    /// Injected Unix timestamp.
     pub at: i64,
-    /// Contract field.
+    /// Regular-file descriptors returned by the source, before deduplication.
     pub fds_seen: u64,
-    /// Contract field.
+    /// Elapsed scan and aggregation time.
     pub duration: Duration,
 }
-/// Reserved for W5-B.
-pub struct ProcScanner;
+trait Source: Send {
+    fn scan(&mut self, devs: &[DevId], flags: bool) -> io::Result<Vec<OpenFile>>;
+    fn attribution(&self, pid: u32) -> Attribution;
+}
+struct ProcSource(Arc<AttributionCache>);
+impl Source for ProcSource {
+    fn scan(&mut self, devs: &[DevId], flags: bool) -> io::Result<Vec<OpenFile>> {
+        procfs::scan_open_files(devs, flags)
+    }
+    fn attribution(&self, pid: u32) -> Attribution {
+        self.0.lookup(pid)
+    }
+}
+struct Tracked {
+    row: WriterSample,
+    samples: VecDeque<(i64, u64, u64)>,
+    missed: u8,
+}
+fn delta(a: u64, b: u64) -> i64 {
+    (i128::from(a) - i128::from(b)).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+fn growth(t: &Tracked) -> i64 {
+    t.samples.front().map_or(0, |s| delta(t.row.disk, s.1))
+}
+/// One-pass phantom detector with at most 10,000 writer histories of 60 samples.
+/// Pending samples hold only the latest pass; callers should drain after each pass.
+pub struct ProcScanner {
+    cfg: ProcScannerOptions,
+    source: Box<dyn Source>,
+    phantom: Vec<PhantomSummary>,
+    tracked: BTreeMap<(u64, u64), Tracked>,
+    pending: (Vec<PhantomSample>, Vec<WriterSample>),
+    now: Option<i64>,
+}
 impl ProcScanner {
-    /// Reserved for W5-B.
+    /// Construct a real procfs scanner using the shared attribution cache.
     pub fn new(cfg: ProcScannerOptions, attribution: Arc<AttributionCache>) -> Self {
-        let _ = cfg;
-        let _ = attribution;
-        Self
+        Self {
+            cfg,
+            source: Box::new(ProcSource(attribution)),
+            phantom: Vec::new(),
+            tracked: BTreeMap::new(),
+            pending: (Vec::new(), Vec::new()),
+            now: None,
+        }
     }
-    /// Reserved for W5-B.
+    /// Scan once. Failed passes preserve the last successful state.
+    /// Timestamps must not decrease so that window baselines remain ordered.
     pub fn scan_once(&mut self, now: i64) -> io::Result<ProcScanResult> {
-        let _ = now;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "NotYetImplemented",
-        ))
+        if self.now.is_some_and(|last| now < last) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scan timestamps must not decrease",
+            ));
+        }
+        let started = Instant::now();
+        let devs: Vec<_> = self.cfg.mounts.iter().map(|m| m.1).collect();
+        let mut files = self.source.scan(&devs, self.cfg.open_writers)?;
+        if files.len() > MAX_FDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "proc descriptor cap exceeded",
+            ));
+        }
+        let fds_seen = files.len() as u64;
+        files.sort_unstable_by_key(|a| (a.dev, a.ino, a.pid, a.fd));
+        let mut summaries: Vec<_> = self
+            .cfg
+            .mounts
+            .iter()
+            .map(|(p, _)| PhantomSummary {
+                mount: p.display_lossy(),
+                total_bytes: 0,
+                files: 0,
+                holders: Vec::new(),
+            })
+            .collect();
+        let mut previous_phantom = None;
+        let mut previous_holder = None;
+        let mut seen_writers = BTreeMap::new();
+        // Attribution is fetched only for relevant descriptors, once per PID per pass.
+        let mut attrs = BTreeMap::new();
+        for file in files {
+            let Some(index) = self.cfg.mounts.iter().position(|m| m.1 == file.dev) else {
+                continue;
+            };
+            if !file.target.starts_with(b"/") {
+                continue;
+            }
+            let path = if file.nlink == 0 {
+                file.target
+                    .strip_suffix(b" (deleted)")
+                    .unwrap_or(&file.target)
+            } else {
+                &file.target
+            };
+            let key = (file.dev, file.ino);
+            let writable = self.cfg.open_writers
+                && file.flags.is_some_and(|f| matches!(f & 3, 1 | 2))
+                && !self
+                    .cfg
+                    .exclude_prefixes
+                    .iter()
+                    .any(|p| under(path, p.as_bytes()));
+            if file.nlink != 0 && !writable {
+                continue;
+            }
+            let attr = attrs
+                .entry(file.pid)
+                .or_insert_with(|| self.source.attribution(file.pid));
+            if file.nlink == 0 {
+                if previous_phantom != Some(key) {
+                    summaries[index].total_bytes =
+                        summaries[index].total_bytes.saturating_add(file.disk);
+                    summaries[index].files += 1;
+                    previous_phantom = Some(key);
+                }
+                let holder = (key, file.pid);
+                if previous_holder != Some(holder) {
+                    summaries[index].holders.push(PhantomHolder {
+                        pid: file.pid,
+                        comm: attr.comm.clone(),
+                        unit: attr.unit.clone(),
+                        path: path.to_vec(),
+                        dev: file.dev,
+                        ino: file.ino,
+                        bytes: file.disk,
+                    });
+                    previous_holder = Some(holder);
+                }
+            }
+            if writable && !seen_writers.contains_key(&key) {
+                seen_writers.insert(
+                    key,
+                    WriterSample {
+                        ts: now,
+                        mount: summaries[index].mount.clone(),
+                        pid: file.pid,
+                        comm: attr.comm.clone(),
+                        unit: attr.unit.clone(),
+                        path: path.to_vec(),
+                        dev: file.dev,
+                        ino: file.ino,
+                        size: file.size,
+                        disk: file.disk,
+                    },
+                );
+            }
+        }
+        for t in self.tracked.values_mut() {
+            t.missed = t.missed.saturating_add(1);
+        }
+        let mut candidates: Vec<_> = self
+            .tracked
+            .iter()
+            .filter(|(k, t)| t.missed < 2 || seen_writers.contains_key(k))
+            .map(|(k, t)| {
+                (
+                    *k,
+                    seen_writers.get(k).map_or_else(
+                        || growth(t),
+                        |r| t.samples.front().map_or(0, |s| delta(r.disk, s.1)),
+                    ),
+                )
+            })
+            .collect();
+        candidates.extend(
+            seen_writers
+                .keys()
+                .filter(|k| !self.tracked.contains_key(k))
+                .map(|k| (*k, 0)),
+        );
+        candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        candidates.truncate(MAX_WRITERS);
+        let keep: std::collections::BTreeSet<_> = candidates.into_iter().map(|c| c.0).collect();
+        self.tracked.retain(|k, _| keep.contains(k));
+        seen_writers.retain(|k, _| keep.contains(k));
+        for (key, row) in seen_writers {
+            let t = self.tracked.entry(key).or_insert_with(|| Tracked {
+                row: row.clone(),
+                samples: VecDeque::with_capacity(HISTORY),
+                missed: 0,
+            });
+            t.missed = 0;
+            t.row = row;
+            if t.samples.len() == HISTORY {
+                t.samples.pop_front();
+            }
+            t.samples.push_back((now, t.row.disk, t.row.size));
+        }
+        for summary in &mut summaries {
+            summary.holders.sort_unstable_by(|a, b| {
+                b.bytes
+                    .cmp(&a.bytes)
+                    .then(a.path.cmp(&b.path))
+                    .then((a.dev, a.ino, a.pid).cmp(&(b.dev, b.ino, b.pid)))
+            });
+        }
+        self.pending.0 = summaries
+            .iter()
+            .flat_map(|s| {
+                s.holders.iter().map(|h| PhantomSample {
+                    ts: now,
+                    mount: s.mount.clone(),
+                    pid: h.pid,
+                    comm: h.comm.clone(),
+                    unit: h.unit.clone(),
+                    path: h.path.clone(),
+                    dev: h.dev,
+                    ino: h.ino,
+                    bytes: h.bytes,
+                })
+            })
+            .collect();
+        self.pending.1 = self
+            .tracked
+            .values()
+            .filter(|t| t.missed == 0)
+            .map(|t| t.row.clone())
+            .collect();
+        self.phantom = summaries;
+        self.now = Some(now);
+        Ok(ProcScanResult {
+            at: now,
+            fds_seen,
+            duration: started.elapsed(),
+        })
     }
-    /// Reserved for W5-B.
+    /// Latest totals with each inode counted once and each process holder listed once.
     pub fn phantom(&self, mount: Option<&RawPath>) -> Vec<PhantomSummary> {
-        let _ = mount;
-        Vec::new()
+        self.phantom
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mount.is_none_or(|p| p == &self.cfg.mounts[*i].0))
+            .map(|(_, s)| s.clone())
+            .collect()
     }
-    /// Reserved for W5-B.
+    /// Positive allocated growth from the most recent sample at or before the window
+    /// boundary, falling back to the oldest retained sample for shorter histories.
     pub fn writers(
         &self,
         mount: Option<&RawPath>,
         window: Duration,
         limit: usize,
     ) -> Vec<OpenWriter> {
-        let _ = mount;
-        let _ = window;
-        let _ = limit;
-        Vec::new()
+        if window.is_zero() {
+            return Vec::new();
+        }
+        let Some(now) = self.now else {
+            return Vec::new();
+        };
+        let cutoff = now.saturating_sub(
+            i64::try_from(
+                window
+                    .as_secs()
+                    .saturating_add(u64::from(window.subsec_nanos() != 0)),
+            )
+            .unwrap_or(i64::MAX),
+        );
+        let mut rows = Vec::new();
+        for t in self.tracked.values().filter(|t| t.missed == 0) {
+            let r = &t.row;
+            if mount.is_some_and(|p| !self.cfg.mounts.iter().any(|(m, d)| m == p && *d == r.dev)) {
+                continue;
+            }
+            let Some(base) = t
+                .samples
+                .iter()
+                .rev()
+                .find(|s| s.0 <= cutoff)
+                .or_else(|| t.samples.front())
+            else {
+                continue;
+            };
+            let growth = delta(r.disk, base.1);
+            if growth <= 0 {
+                continue;
+            }
+            rows.push(OpenWriter {
+                mount: r.mount.clone(),
+                pid: r.pid,
+                comm: r.comm.clone(),
+                unit: r.unit.clone(),
+                path: r.path.clone(),
+                dev: r.dev,
+                ino: r.ino,
+                size: r.size,
+                disk: r.disk,
+                growth,
+                window_secs: window.as_secs(),
+            });
+        }
+        rows.sort_unstable_by(|a, b| {
+            b.growth
+                .cmp(&a.growth)
+                .then(a.path.cmp(&b.path))
+                .then((a.dev, a.ino, a.pid).cmp(&(b.dev, b.ino, b.pid)))
+        });
+        rows.truncate(limit);
+        rows
     }
-    /// Reserved for W5-B.
+    /// Drain the latest pass's persistence samples exactly once.
     pub fn take_samples(&mut self) -> (Vec<PhantomSample>, Vec<WriterSample>) {
-        (Vec::new(), Vec::new())
+        std::mem::take(&mut self.pending)
     }
 }
+fn under(path: &[u8], prefix: &[u8]) -> bool {
+    path == prefix
+        || prefix == b"/"
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|s| s.starts_with(b"/"))
+}
+
+#[cfg(test)]
+#[path = "../tests/w5b/unit.rs"]
+mod tests;
