@@ -513,10 +513,37 @@ fn interrupt_scan(keep_partial: bool) -> (std::process::Output, tempfile::TempDi
     if keep_partial {
         command.arg("--keep-partial");
     }
-    let child = command.spawn().unwrap();
+    let mut child = command.spawn().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let stderr_reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut bytes = Vec::new();
+        let mut line = Vec::new();
+        let mut reported = false;
+        while reader.read_until(b'\n', &mut line).unwrap() != 0 {
+            let text = String::from_utf8_lossy(&line);
+            if !reported && text.starts_with("walk: ") {
+                let dirs = text
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                if dirs > 0 {
+                    ready_tx.send(()).unwrap();
+                    reported = true;
+                }
+            }
+            bytes.extend_from_slice(&line);
+            line.clear();
+        }
+        bytes
+    });
     let pid = child.id();
     let mut guard = ChildGuard(Some(child));
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if let Ok(catalog) = tidemark_store::catalog::Catalog::open(state.path(), false) {
             if catalog
@@ -535,8 +562,10 @@ fn interrupt_scan(keep_partial: bool) -> (std::process::Output, tempfile::TempDi
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Let the walker publish the root record before stopping it.
-    std::thread::sleep(Duration::from_millis(400));
+    // Interrupt only after the collector has accepted at least one directory.
+    ready_rx
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .expect("scan never reported a collected directory");
     rustix::process::kill_process(
         rustix::process::Pid::from_raw(pid as i32).unwrap(),
         rustix::process::Signal::INT,
@@ -552,7 +581,30 @@ fn interrupt_scan(keep_partial: bool) -> (std::process::Output, tempfile::TempDi
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let output = guard.0.take().unwrap().wait_with_output().unwrap();
+    let mut output = guard.0.take().unwrap().wait_with_output().unwrap();
+    output.stderr = stderr_reader.join().unwrap();
+    eprintln!(
+        "interrupted keep_partial={keep_partial}: status={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let catalog = tidemark_store::catalog::Catalog::open(state.path(), false).unwrap();
+    for row in catalog.list(None).unwrap() {
+        eprintln!(
+            "catalog: id={} status={} file={:?} finished={:?}",
+            row.scan_id, row.status, row.file, row.finished_at
+        );
+    }
+    fn contents(path: &Path) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            eprintln!("state: {:?}", entry.path());
+            if entry.file_type().unwrap().is_dir() {
+                contents(&entry.path());
+            }
+        }
+    }
+    contents(state.path());
     (output, state)
 }
 #[test]

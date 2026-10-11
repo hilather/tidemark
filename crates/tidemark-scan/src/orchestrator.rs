@@ -1034,12 +1034,8 @@ fn recorded<T>(
             .load(std::sync::atomic::Ordering::Acquire)
     {
         let (now, duration) = finish();
-        entry.status = if matches!(result, Err(ScanError::Cancelled)) {
-            "cancelled"
-        } else {
-            "failed"
-        }
-        .into();
+        // Cancellation is a failed catalog lifecycle unless a partial was published.
+        entry.status = "failed".into();
         entry.finished_at = Some(now);
         entry.duration_ms = Some(duration);
         if let Err(cleanup) = recorder.scan_finished(entry) {
@@ -1121,7 +1117,15 @@ fn publication_status(
     keep: bool,
     cancel: &AtomicBool,
 ) -> Result<SnapshotStatus, ScanError> {
-    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+    // Atomically consume the interruption that selected a kept walk partial.
+    // Publication starts at this boundary: a later signal sets the flag again
+    // and finish_with must discard the candidate, including partial candidates.
+    let interrupted = if mode == ScanMode::Walk && keep {
+        cancel.swap(false, std::sync::atomic::Ordering::AcqRel)
+    } else {
+        cancel.load(std::sync::atomic::Ordering::Acquire)
+    };
+    if interrupted {
         if mode == ScanMode::Bulk || !keep {
             return Err(ScanError::Cancelled);
         }
@@ -1297,6 +1301,8 @@ mod tests {
             publication_status(SnapshotStatus::Complete, ScanMode::Walk, true, &cancel).unwrap(),
             SnapshotStatus::Partial
         );
+        assert!(!cancel.load(Ordering::Acquire));
+        cancel.store(true, Ordering::Release);
         assert!(matches!(
             publication_status(SnapshotStatus::Complete, ScanMode::Bulk, true, &cancel),
             Err(ScanError::Cancelled)
@@ -1496,7 +1502,7 @@ mod tests {
             assert_eq!(
                 *rec.0.lock().unwrap(),
                 if fail {
-                    vec!["start:running", "finish:cancelled"]
+                    vec!["start:running", "finish:failed"]
                 } else {
                     vec!["start:running", "finish:complete", "series"]
                 }
@@ -1737,7 +1743,10 @@ mod tests {
             };
             let dir = existing.parent().unwrap();
             let writer = tidemark_store::writer::SnapshotWriter::create(dir, &meta).unwrap();
-            let cancel = AtomicBool::new(false);
+            let cancel = AtomicBool::new(keep_partial);
+            meta.status =
+                publication_status(meta.status, ScanMode::Walk, keep_partial, &cancel).unwrap();
+            assert!(!cancel.load(Ordering::Acquire));
             let checks = Cell::new(0);
             let recorder = Recorder::default();
             let catalog_dir = tempfile::tempdir().unwrap();
@@ -1761,16 +1770,16 @@ mod tests {
             );
             assert!(matches!(result, Err(ScanError::Cancelled)));
             assert_eq!(checks.get(), 2);
-            assert_eq!(e.status, "cancelled");
+            assert_eq!(e.status, "failed");
             let stored = catalog.get(&e.scan_id).unwrap().unwrap();
-            assert_eq!(stored.status, "cancelled");
+            assert_eq!(stored.status, "failed");
             assert_eq!(stored.finished_at, Some(102));
             assert!(stored.file.is_none());
             assert!(e.file.is_none());
             assert_eq!(e.finished_at, Some(102));
             assert_eq!(
                 *recorder.0.lock().unwrap(),
-                ["start:running", "finish:cancelled"]
+                ["start:running", "finish:failed"]
             );
             assert!(!dir.join(format!("{}.db", meta.scan_id)).exists());
             assert!(!dir.join(format!("{}.db.tmp", meta.scan_id)).exists());

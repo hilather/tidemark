@@ -29,10 +29,7 @@ impl ScanRecorder for Recorder {
         ts: i64,
         rows: &[DirRow],
     ) -> Result<(), ScanError> {
-        Ok(
-            tidemark_store::timeseries::TimeSeries::open(&self.0.join("timeseries.db"), true)?
-                .insert_dir_series(root, id, ts, rows)?,
-        )
+        tidemark_scan::orchestrator::record_dir_series(&self.0, root, id, ts, rows)
     }
 }
 fn request(path: &Path, mode: ModeRequest) -> ScanRequest {
