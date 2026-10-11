@@ -1,0 +1,8 @@
+---
+source: crates/tidemark-live/tests/w5d/main.rs
+expression: "render_now_text(&r, 100, false)"
+---
+tidemark now - db-01 - 1970-01-01 00:01:40 UTC
+/data used 950 B / 1000 B (95.0%)  7.03 KiB/h (15m)  full in ~50s (1h trend)
+  lvm n/a
+  deleted-but-open 0 B (0 files)

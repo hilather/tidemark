@@ -1,0 +1,15 @@
+---
+source: crates/tidemark-live/tests/w5d/main.rs
+expression: "render_now_text(&r, 60, false)"
+---
+tidemark now - db-01 - 1970-01-01 00:01:40 UTC
+/ used 500 B / 1000 B (50.0%)  0 B/h (15m)  not filling
+  lvm n/a
+  deleted-but-open 0 B (0 files)
+/data used 950 B / 1000 B (95.0%)  7.03 KiB/h (15m)  full in
+ ~50s (1h trend)
+  lvm n/a
+  deleted-but-open 0 B (0 files)
+degraded: daemon parts unavailable
+degraded: watcher /: unavailable
+degraded: watcher /data: unavailable
