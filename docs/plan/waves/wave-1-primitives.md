@@ -217,7 +217,7 @@ impl AdaptiveGate {
     pub fn stats(&self) -> GateStats;
     pub fn stop(&self);
 }
-pub struct GateStats { pub mean_rate: f64, pub min_rate: f64, pub throttled_ms: u64, pub decreases: u64, pub increases: u64 }
+pub use tidemark_core::scan::GateStats; // mean_rate/min_rate: f64; throttled_ms/decreases/increases: u64
 /// Pure controller step for unit tests: returns the new rate.
 pub fn controller_step(rate: f64, prev: &[DiskStat], cur: &[DiskStat], dt_ms: f64, p: &AdaptiveParams) -> f64;
 /// `profile` is a profile name: "gentle" | "normal" | any user-defined profile → AdaptiveGate;
@@ -285,6 +285,9 @@ impl AttributionCache {
 
 ```rust
 pub fn root_slug(root: &RawPath) -> String;   // '/' → '_', '_' → "%5F", bytes outside [A-Za-z0-9.-] → %XX; "/" → "_"
+
+// Readers and writers use checked SQLite integer conversions (05 §1/§3).
+// Refuse an existing scan id; callers retry with a fresh fallible ScanId. Never replace a snapshot.
 
 pub struct SnapshotWriter;
 impl SnapshotWriter {

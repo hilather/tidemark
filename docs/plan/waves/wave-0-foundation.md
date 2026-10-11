@@ -73,16 +73,18 @@
 | Module | Content |
 |--------|---------|
 | `path` | `RawName` (non-empty, no `/`) and `RawPath` (absolute, normalised, no trailing slash except `/`), backed by bytes. Methods: `from_path`, `as_path`, `join`, `parent`, `file_name`, `starts_with` (component-wise), `display_lossy` (escapes control chars and invalid UTF-8 as `\xNN`), `hash64` (xxh3, as `i64`), `to_json` (`{"path": …}` or `{"path_b64": …}`). Implements `Ord` by bytes. |
-| `units` | `ByteSize` (serde from `"1GiB"` or an integer), `fmt_bytes(u64)` (binary units, 3 significant digits: `1.23 GiB`, `611 GiB`), `parse_rate("50GiB/h") -> f64` (bytes/s), `fmt_rate`. |
-| `time` | `AGE_BOUNDS_SECS = [86_400, 604_800, 2_592_000, 7_776_000, 31_536_000]`, `age_bucket(scan_start, mtime) -> usize` (future mtime → 0), `ScanId::new(now)` (`YYYYMMDDTHHMMSSZ-<8 hex>`), `unix_now()`, humantime helpers. |
+| `units` | `ByteSize` (serde from `"1GiB"` or an integer), `fmt_bytes(u64)` (exact bytes below 1 KiB; otherwise binary units, 3 significant digits after rounding and unit promotion: `1.23 GiB`, `611 GiB`), `parse_rate("50GiB/h") -> Result<f64, CoreError>` (bytes/s), `fmt_rate`. |
+| `time` | `AGE_BOUNDS_SECS = [86_400, 604_800, 2_592_000, 7_776_000, 31_536_000]`, `age_bucket(scan_start, mtime) -> usize` (future mtime → 0), `ScanId::new(now: i64) -> Result<ScanId, CoreError>` (`YYYYMMDDTHHMMSSZ-<8 lowercase hex>`; errors outside the four-digit UTC-year range), `unix_now()`, humantime helpers. |
 | `scan` | Exactly the types in `04-scanner.md` §1, including `Gate` and `NoopGate`. Add `SnapshotStatus { Complete, Partial }` and `ScanMode { Walk, Bulk }`. |
-| `snapshot` | `SnapshotMeta` (every key in `05` §1, typed), `DirRow` (every `dirs` column), `FileRow`, `LinkSetRow`, `LinkInstanceRow`, `SkipRow`, `ErrorRow`, `AnnotationRow`, `SortKey`, `FileFilter`, `LinkFilter`, `FileHit` (row + full path), `LinkSetHit` (row + LCA path + instance count). |
+| `snapshot` | `SnapshotMeta` (every key in `05` §1, typed), `DirRow` (every `dirs` column), `FileRow`, `LinkSetRow`, `LinkInstanceRow`, `SkipRow`, `ErrorRow`, `AnnotationRow`, `SortKey`, `FileFilter`, `LinkFilter`, `FileHit` (row + optional full path), `LinkSetHit` (row + LCA path + instance count). |
 | `live` | Exactly the types in `07` §7a (field lists are normative), plus `NowReport`/`MountNow` from `07` §7. |
 | `dev` | `DevKind { Disk, Partition, Md { level }, Dm, Other }`, `BlockDevInfo { name, major, minor, kind, rotational: Option<bool>, scheduler: Option<String> }`, `DiskStat { read_ios, read_merges, read_sectors, read_ticks_ms, write_ios, write_merges, write_sectors, write_ticks_ms, in_flight, io_ticks_ms, time_in_queue_ms }` |
 | `config` | The full schema in `08` §3 as serde structs with `#[serde(deny_unknown_fields)]` and defaults matching the doc. Type names: `Config`, `GeneralConfig`, `RootConfig`, `ScanConfig`, `ThrottleConfig`, `ThrottleProfile`, `SamplerConfig`, `LvmConfig`, `WatchConfig`, `ProcscanConfig`, `PostgresConfig`, `MetricsConfig`, `AlertsConfig`, `AlertRule`, `RetentionConfig`, `SnapshotRetention`, `SampleRetention`. `Config::load(path)`; `Config::validate() -> Vec<ConfigIssue>` (paths absolute, windows parse, rule kinds valid; whether mounts exist is checked at runtime, not here). Unit tests round-trip the doc's example verbatim. |
 | `api` | `Request { v, id, method, params: serde_json::Value }`, `Response { v, id, ok, result?, error? }`, `ApiErrorCode`, and typed param/result structs for every method in `08` §2. |
-| `json` | `JsonDoc<T> { schema: &'static str, data: T }`, used by every `--json` output. |
+| `json` | `JsonDoc<T> { schema: Cow<'static, str>, data: T }`, used by every `--json` output. |
 | `error` | `CoreError` for config/parse errors (thiserror). |
+
+The exact helper signatures and contracts are frozen in `13-contract-decisions.md` SCR-004; snapshot widths/filters in SCR-001, API DTOs in `08` §2 and config defaults in `08` §3. `GateStats` is defined in core (`scan`) with the W1-D fields. Shared report DTO adapters encode all paths as mutually exclusive `path`/`path_b64`, including nested holders and directory hot entries; test whole envelopes. `JsonDoc` derives owned `Deserialize` without `#[serde(borrow)]`. CLI sort arguments use a wrapper with `Growth` (`08` §1.2), separate from snapshot `SortKey`.
 
 All structs derive `Debug, Clone` and, where sensible, `PartialEq` and `serde::{Serialize, Deserialize}`. Keep `tidemark-core` free of I/O, except `Config::load` reading one file.
 

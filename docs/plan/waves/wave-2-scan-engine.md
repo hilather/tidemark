@@ -85,12 +85,12 @@ pub struct AggSummary { pub dirs: u64, pub files: u64, pub inodes: u64, pub t_di
 
 Implement `03` §4 Steps A–F exactly:
 
-- **Storage:** a `Vec<Node>` indexed by `DirId`. `Node` holds `parent: u32` (`u32::MAX` for root), `depth: u16`, `name: Box<[u8]>`, own stats, union accumulators, charged/reclaim accumulators, age buckets, counters, `stamp: u64`, and children (`Vec<u32>`, filled in `prepare`). Keep `Node` lean; measure its size in a test and document it (target ≤ 200 bytes plus the name).
+- **Storage:** a `Vec<Node>` indexed by `DirId`. `Node` holds `parent: u32` (`u32::MAX` for root), `depth: u32` (matches core without truncation), `name: Box<[u8]>`, own stats, union accumulators, charged/reclaim accumulators, age buckets, counters, `stamp: u64`, and children (`Vec<u32>`, filled in `prepare`). Keep `Node` lean; measure its size in a test and document it (target ≤ 200 bytes plus the name).
 - **Walk mode** link sets: an `FxHashMap<Ino, LinkSetAcc>` built from `DirRecord.links`. In bulk mode, sets arrive complete via `add_link_set`, so no map is needed.
 - **Depth:** computed when the parent is known. Records can arrive child-before-parent in walk mode. Buffer orphans until the parent arrives, then compute depths in `prepare` with an iterative pass. Never recurse; trees can be very deep.
 - **Notable selection:** exactly `03` §4 Step G: deterministic order `(disk desc, final dir id, ino)`, representative = smallest `(final dir id, name)` instance. Selection runs after renumbering, so final ids are known. Workers' local heaps (W1-B) only pre-filter, and must admit ties at the boundary.
 - **projid (bulk mode only):** copy each directory's own project ID into `DirRow.projid` (NULL in walk mode). Nothing else uses it in v1 (`06-project-quotas-deferred.md`).
-- **Write:** iterative DFS over children sorted by name bytes. Assign preorder ids. Build each `path` incrementally in one reusable buffer. Compute `subtree_end`. Emit `DirRow`s in batches of 10,000, then the other row types, translating `DirId`s to final ids through a `Vec<u32>` map.
+- **Write:** iterative DFS over children sorted by name bytes. Assign preorder ids with checked bounds; assign zero-based notable-file `u32` ids with checked conversion (`max_notable <= u32::MAX`). Build each `path` incrementally in one reusable buffer. Compute `subtree_end`. Emit `DirRow`s in batches of 10,000, then the other row types, translating `DirId`s to final ids through a `Vec<u32>` map.
 - `degraded = errors > 0`.
 
 ### Tests
@@ -191,7 +191,7 @@ pub fn run_scan(cfg: &Config, req: &ScanRequest, recorder: &dyn ScanRecorder, ca
 3. **Host-wide scan lock:** take an exclusive `flock` on `state_dir/scan.lock` (non-blocking). If it's held, return `ScanError::Busy` (ADR-015). The daemon scheduler takes the same lock, so a CLI scan and a daemon scan can never overlap.
 4. **Space guard** (`05` §8). If refused, return `ScanError::NoSpace`.
 5. **Gate:** `gate_from_config(profile_name, &cfg.throttle, &leaves, sampler)` with `leaves = resolve_leaves(dev)` and `sampler` built from `read_disk_stats(&leaves)`.
-6. `ScanId::new`; `recorder.scan_started`.
+6. Fallible `ScanId::new(now)` (propagate invalid UTC-year errors; retry a collision with a fresh id, never replace an existing snapshot); `recorder.scan_started`.
 7. Choose the mode (`choose_mode`, `04` §7). On a bulk failure before phase 2 starts, fall back to walk and record why.
 8. Run walk (W1-B → W2-A on a collector thread) or bulk (W2-B). Report progress every 2 s.
 9. `prepared.annotate(…)` for every request annotation.
@@ -205,7 +205,7 @@ pub fn run_scan(cfg: &Config, req: &ScanRequest, recorder: &dyn ScanRecorder, ca
 - `snapshots list|show|prune [--dry-run]|rebuild-catalog`.
 - `top`: per `08` §1.4.
   - Columns SIZE, RECLAIM, SHARED (with `H`), FILES, NEWEST (optional `--wide`), and Δ24h when the catalog has a complete snapshot within ±6 h of now − 24 h (looked up per displayed path in the old snapshot).
-  - `--depth N` renders a tree; `--sort` and `--min-size` as in the spec.
+  - `--depth N` renders a tree; `--sort` and `--min-size` as in the spec. The CLI wrapper’s `Growth` case compares two snapshots (the selected snapshot and the older complete snapshot used for Δ24h), orders by descending signed disk-byte delta and breaks ties by raw path bytes; error if no older snapshot exists. It is not a single-snapshot `SortKey` variant.
   - `--live`: walk PATH now (walk mode, gate profile `gentle`, into `VecSink`) and show live values next to the snapshot values with deltas, without writing a snapshot.
 - `files`: largest files under PATH with path, size, mtime and nlink, plus `(shared)` for link-set representatives.
 - `render/tree.rs`: tree layout with Unicode glyphs (ASCII fallback when `LANG` is not UTF-8), built on W0-B's `render/table.rs` and `render/size.rs`.

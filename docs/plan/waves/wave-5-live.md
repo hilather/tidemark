@@ -243,7 +243,7 @@ pub fn render_now_text(r: &NowReport, width: usize, color: bool) -> String;
 ### Details
 
 - Rule kinds and semantics exactly as `07` §6.1–6.2: `for` / `resolve_for` hysteresis per `(rule, subject)`, and re-notify while firing. Path globs (`hot_dir_growth`) and VG/pool patterns (`thin_pool_pct`) use `globset`. Threshold strings are parsed with `tidemark_core::units` (`"50GiB/h"`).
-- **Default rules** (`07` §6.4) come from a function `default_rules(cfg)`, which the config layer merges with user rules: a user rule with the same `name` overrides.
+- **Default rules** (`07` §6.4) come from pure `tidemark_core::config::default_rules(cfg)`, wrapped or re-exported by W5-D. The config layer merges them with user rules: a user rule with the same `name` overrides. Follow `07` §6.4 for stable names, scheduled-root stale defaults and collector availability, and `08` §3 for required fields and numeric bytes/s thresholds.
 - `render_now_text` reproduces the layout in `07` §7, wrapping to `width`. With `color = false`, output is plain ASCII-safe (apart from the user's path bytes, which are rendered lossily).
 
 ### Tests

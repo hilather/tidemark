@@ -57,7 +57,7 @@ CREATE TABLE dirs (
 );
 
 CREATE TABLE files (                    -- notable single-link files, plus one representative per notable link set
-  id       INTEGER PRIMARY KEY,
+  id       INTEGER PRIMARY KEY,          -- zero-based notable-file row identifier (u32)
   dir_id   INTEGER NOT NULL,              -- representative: the link instance with the smallest (dir_id, name)
   name     BLOB,                        -- NULL if bulk-mode name resolution lost a race
   ino      INTEGER NOT NULL,
@@ -104,12 +104,20 @@ Notes:
 - Raw bytes everywhere (`BLOB`). Never store lossy UTF-8.
 - Expected size: about 150–250 bytes per directory row, plus files and links. Two million directories with half a million link sets should be in the low single-digit GB range at most. W7-B measures it; `link_instances` can be disabled with `scan.link_instances = "none"`.
 
+### Rust row and metadata contracts (SCR-001)
+
+Directory ids/depth, direct entry/error counts, link counts and project ids are `u32`; inode/device ids, sizes and subtree counters are `u64`; Unix seconds/path hashes are `i64`; errno is `i32`. SQL nullability maps to `Option`. `files.id` is a zero-based `u32` notable-file row identifier, with checked assignment and `1 <= max_notable <= u32::MAX`. `DirRow.name` is `Vec<u8>` (root stores its full path); other names are `RawName`, paths `RawPath`. `LinkInstanceRow.name` is `None` for bulk snapshots by design, resolved live on demand.
+
+`SnapshotMeta` has every required key above in documented order: schema_version/threads `u32`; counts/sizes/devices `u64`; timestamps `i64`; scan_id `ScanId`; root `RawPath`; mode `ScanMode`; status `SnapshotStatus`; degraded `bool`; exclude `Vec<String>`; link_instances `LinkInstances`; other descriptive scalars `String` (fs_uuid empty if unknown). `phase_ms` is deterministic `BTreeMap<String, u64>`. `gate_stats` is `tidemark_core::scan::GateStats { mean_rate: f64, min_rate: f64, throttled_ms: u64, decreases: u64, increases: u64 }`.
+
+All SQLite readers/writers use checked integer conversions: reject negative unsigned values, out-of-range widths and `u64` values not representable by SQLite's signed integer; never wrap or truncate.
+
 ## 2. Write path (`SnapshotWriter`, W1-E)
 
 1. Create `<scan_id>.db.tmp` (mode 0600, owner root:root; retained after rename to `.db`). Set `PRAGMA page_size=32768` before creating any table, then `journal_mode=OFF`, `synchronous=OFF`, `locking_mode=EXCLUSIVE`, `temp_store=MEMORY`, `cache_size=-262144` (256 MiB).
 2. Create tables **without** secondary indexes.
 3. Insert rows with prepared statements in large transactions (about 50,000 rows each). `dirs` rows arrive in ascending `id` order (preorder).
-4. `finish()`: create indexes, run `ANALYZE`, write the final `meta`, close, `fsync` the file, `rename` to `<scan_id>.db`, then `fsync` the directory.
+4. `finish()`: create indexes, run `ANALYZE`, write the final `meta`, close, `fsync` the file, publish without replacement to `<scan_id>.db` (refuse an existing id and retry with a fresh `ScanId`), then `fsync` the directory.
 5. On error or drop without `finish()`, delete the `.tmp`.
 
 Durability during the build is pointless (a crash discards the scan), so the expensive journaling settings are off. Durability of the finished file comes from the final `fsync` and rename.
@@ -137,6 +145,8 @@ impl Snapshot {
 }
 pub enum SortKey { Disk, Apparent, Reclaimable, Charged, Files, Inodes, Newest, Name }
 ```
+
+`FileFilter { min_size: Option<u64>, older_than: Option<Duration>, newer_than: Option<Duration> }` measures ages relative to snapshot `started_at`. `LinkFilter { incomplete: bool, boundary: Vec<String>, boundary_depth: Option<u32> }` rejects simultaneous boundary globs and boundary depth. `FileHit { row: FileRow, path: Option<RawPath> }` preserves unresolved bulk-race paths as `None`; render them honestly. `LinkSetHit { row: LinkSetRow, lca_path: RawPath, instance_count: u64 }` counts stored instance rows, not discovered `row.found` (especially with `link_instances=none`). Readers enforce the checked conversions in §1. `SortKey` stays single-snapshot; CLI growth sorting uses two snapshots (`08` §1.2).
 
 ## 4. Catalog
 
@@ -227,10 +237,10 @@ CREATE TABLE hot_minutes (mount TEXT NOT NULL, scope TEXT NOT NULL, key BLOB NOT
   events INTEGER NOT NULL, files INTEGER NOT NULL, bytes_delta INTEGER NOT NULL, lossy INTEGER NOT NULL,
   PRIMARY KEY (mount, scope, key, ts)) WITHOUT ROWID;              -- scope: dir|unit|comm; top-K per minute only
 
-CREATE TABLE phantom_samples (ts INTEGER NOT NULL, mount TEXT NOT NULL, pid INTEGER NOT NULL, comm TEXT, unit TEXT,
-  path BLOB, dev INTEGER NOT NULL, ino INTEGER NOT NULL, bytes INTEGER NOT NULL);
-CREATE TABLE writer_samples  (ts INTEGER NOT NULL, mount TEXT NOT NULL, pid INTEGER NOT NULL, comm TEXT, unit TEXT,
-  path BLOB, dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, disk INTEGER NOT NULL);
+CREATE TABLE phantom_samples (ts INTEGER NOT NULL, mount TEXT NOT NULL, pid INTEGER NOT NULL, comm TEXT NOT NULL, unit TEXT,
+  path BLOB NOT NULL, dev INTEGER NOT NULL, ino INTEGER NOT NULL, bytes INTEGER NOT NULL);
+CREATE TABLE writer_samples  (ts INTEGER NOT NULL, mount TEXT NOT NULL, pid INTEGER NOT NULL, comm TEXT NOT NULL, unit TEXT,
+  path BLOB NOT NULL, dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, disk INTEGER NOT NULL);
 CREATE INDEX phantom_ts ON phantom_samples(ts);
 CREATE INDEX writer_ts  ON writer_samples(ts);
 
@@ -240,7 +250,7 @@ CREATE TABLE pg_samples (kind TEXT NOT NULL, name TEXT NOT NULL, res INTEGER NOT
 -- kind: database | relation | wal_dir | slot_retained | temp_bytes_total | archiver_failed_total | dead_tuples
 
 CREATE TABLE alerts (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, rule TEXT NOT NULL, subject TEXT NOT NULL,
-  state TEXT NOT NULL, value REAL, message TEXT NOT NULL);         -- state: firing|resolved
+  state TEXT NOT NULL, value REAL, message TEXT NOT NULL);         -- state: firing|resolved|renotify
 ```
 
 ### 6.1 Retention and downsampling (`compact()`, hourly)

@@ -179,7 +179,7 @@ Every query sets `application_name=tidemark` and a statement timeout. Failures b
 | `pg_wal_bytes` / `pg_slot_retained` | above | WAL dir > above / any slot retains > above |
 | `pg_archiver_failing` | window | `failed_count` increased within window |
 | `scan_stale` | root, older_than | No complete scan within older_than |
-| `watch_lossy` | mount, overflows, window | Overflows > N in window |
+| `watch_lossy` | mount, above (overflow count), window | Overflows > N in window |
 | `state_space` | (internal) | Space guard refused a snapshot |
 
 ### 6.2 Semantics
@@ -187,6 +187,8 @@ Every query sets `application_name=tidemark` and a statement timeout. Failures b
 - Each rule has `for` (condition must hold continuously before firing; default 5 m) and `resolve_for` (must be false continuously before resolving; default 10 m).
 - State is per `(rule, subject)`, for example `(time_to_full, /data)` or `(thin_pool_pct, vg00/pool0)`.
 - Re-notify every `renotify` (default 4 h) while firing.
+
+Numeric `hot_dir_growth.above` must be finite and nonnegative and means bytes/s; equivalent rate strings evaluate identically. Rules whose collector/input is disabled or unavailable remain visible in effective config but do not fire. Thin-pool rules evaluate only tracked thin LVs.
 
 ### 6.3 Delivery
 
@@ -207,6 +209,8 @@ Shipped enabled; thresholds editable:
 - `scan_stale` with `older_than = "auto"`: 2 × the effective cadence, where a windowed schedule counts as at least 24 h (so a `00:00–06:00` window doesn't fire every afternoon)
 - `watch_lossy > 10` per 15 m
 - `thin_pool_pct`: data > 80% or metadata > 80% (only when a tracked LV is thin)
+
+Pure `tidemark_core::config::default_rules(cfg)` owns generation; W5-D wraps/re-exports it. Filesystem and phantom defaults expand over `sampler.mounts`, watcher defaults over `watch.mounts`. Generate one `scan_stale` rule per configured root with schedule other than `off`; explicit stale rules may monitor manually scanned roots. Base names are `fs_used_pct`, `fs_full_soon`, `phantom_bytes`, `watch_lossy`, `pg_slot_retained`, `pg_archiver_failing`, `scan_stale`, `thin_pool_pct`. Mount/root-scoped names are unsuffixed only for the exact `/data` subject; all others append `:<mount>` or `:<root>`, independent of list order. The suffix preserves UTF-8 bytes: retain `/` and ASCII `[A-Za-z0-9._-]`, percent-encode every other byte as uppercase `%XX` (including `%` and `:`). This escape choice settles S3's unspecified format. Same-name user rules override defaults; duplicate user names remain for validation. Generation/merge is idempotent; defaults use 5m/10m firing/resolution unless listed otherwise above.
 
 ## 7. The `now` view (FR-18)
 
@@ -249,7 +253,7 @@ last scan /data           2026-10-10 02:30 (11h ago, bulk, 9m14s) · /  03:30 (1
 
 ## 7a. Core live types (contract for `tidemark-core::live`)
 
-These field lists are normative for W0-B. Paths are raw bytes (`Vec<u8>`), rendered lossily.
+These field lists are normative for W0-B. Path fields are raw bytes (`Vec<u8>`); human display uses escaping, JSON report DTOs use `path`/`path_b64` (`08` §1.1). Explicit `mount: String` and `ScanStatus.root: String` override this general byte-path rule: tracked mounts/roots come from UTF-8 TOML, so these strings are exact config paths. Arbitrary non-UTF-8 scan request roots use the API DTO; for the String-only status root use `RawPath::display_lossy()` byte escaping, not replacement characters. This display string is not a round-trip request encoding.
 
 ```rust
 pub struct FsSample      { pub ts: i64, pub mount: String, pub size: u64, pub used: u64, pub avail: u64,

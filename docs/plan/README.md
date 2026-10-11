@@ -62,6 +62,7 @@ Nothing boot-critical is touched, so a bad deploy can't affect the reboot itself
 | [`10-agent-playbook.md`](10-agent-playbook.md) | How to run the waves: roles, worktrees, ownership, reviews, gates |
 | [`11-rollout-runbook.md`](11-rollout-runbook.md) | Pilot via hotfix deploy → tuning → fleet rollout, with abort criteria and rollback |
 | [`12-decisions-and-risks.md`](12-decisions-and-risks.md) | ADRs and risk register |
+| [`13-contract-decisions.md`](13-contract-decisions.md) | Decided W0-B1 contracts (SCR-001–004 and review findings) |
 | [`waves/`](waves/) | **Wave 0–7 implementation plans**: per task, owned paths, interfaces, steps, tests, acceptance criteria |
 | [`agents/`](agents/) | `AGENTS.md` for the repo root, prompt templates (implementer, reviewer, gate, coordinator, SCR), handoff template |
 
