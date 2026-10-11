@@ -309,7 +309,7 @@ impl TimeSeries {
         )?;
         let desired = resolution(from, to).max(available.unwrap_or(0));
         // Prefer the requested tier when present, retaining newer finer samples.
-        let sql="SELECT ts,mount,size,used,avail,inodes,inodes_used FROM fs_samples a WHERE mount=? AND ts BETWEEN ? AND ? AND (res<=? OR NOT EXISTS (SELECT 1 FROM fs_samples f WHERE f.mount=a.mount AND f.res<a.res AND a.ts=(CASE a.res WHEN 1 THEN f.ts-((f.ts%300+300)%300) ELSE f.ts-((f.ts%3600+3600)%3600) END))) AND NOT EXISTS (SELECT 1 FROM fs_samples b WHERE b.mount=a.mount AND b.res>a.res AND b.res<=? AND b.ts BETWEEN ? AND ? AND b.ts=(CASE b.res WHEN 1 THEN (a.ts-((a.ts%300+300)%300)) ELSE (a.ts-((a.ts%3600+3600)%3600)) END)) ORDER BY ts";
+        let sql = FS_QUERY;
         let mut stmt = self.conn.prepare(sql)?;
         let result = stmt
             .query_map(params![mount, from, to, desired, desired, from, to], |r| {
@@ -343,7 +343,7 @@ impl TimeSeries {
         )?;
         let desired = resolution(from, to).max(available.unwrap_or(0));
         // Prefer the requested tier when present, retaining newer finer samples.
-        let sql="SELECT ts,vg,lv,lv_size,vg_free,data_pct,meta_pct FROM lvm_samples a WHERE vg=? AND lv=? AND ts BETWEEN ? AND ? AND (res<=? OR NOT EXISTS (SELECT 1 FROM lvm_samples f WHERE f.vg=a.vg AND f.lv=a.lv AND f.res<a.res AND a.ts=(CASE a.res WHEN 1 THEN f.ts-((f.ts%300+300)%300) ELSE f.ts-((f.ts%3600+3600)%3600) END))) AND NOT EXISTS (SELECT 1 FROM lvm_samples b WHERE b.vg=a.vg AND b.lv=a.lv AND b.res>a.res AND b.res<=? AND b.ts BETWEEN ? AND ? AND b.ts=(CASE b.res WHEN 1 THEN (a.ts-((a.ts%300+300)%300)) ELSE (a.ts-((a.ts%3600+3600)%3600)) END)) ORDER BY ts";
+        let sql = LVM_QUERY;
         let mut stmt = self.conn.prepare(sql)?;
         let result = stmt
             .query_map(params![vg, lv, from, to, desired, desired, from, to], |r| {
@@ -373,7 +373,7 @@ impl TimeSeries {
         let available:Option<i64>=self.conn.query_row("SELECT MIN(res) FROM pg_samples WHERE kind=? AND (? IS NULL OR name=?) AND ts BETWEEN ? AND ?",params![kind,name,name,from,to],|r|r.get(0))?;
         let desired = resolution(from, to).max(available.unwrap_or(0));
         // Prefer the requested tier when present, retaining newer finer samples.
-        let sql="SELECT ts,kind,name,value FROM pg_samples a WHERE kind=? AND (? IS NULL OR name=?) AND ts BETWEEN ? AND ? AND (res<=? OR NOT EXISTS (SELECT 1 FROM pg_samples f WHERE f.kind=a.kind AND f.name=a.name AND f.res<a.res AND a.ts=(CASE a.res WHEN 1 THEN f.ts-((f.ts%300+300)%300) ELSE f.ts-((f.ts%3600+3600)%3600) END))) AND NOT EXISTS (SELECT 1 FROM pg_samples b WHERE b.kind=a.kind AND b.name=a.name AND b.res>a.res AND b.res<=? AND b.ts BETWEEN ? AND ? AND b.ts=(CASE b.res WHEN 1 THEN (a.ts-((a.ts%300+300)%300)) ELSE (a.ts-((a.ts%3600+3600)%3600)) END)) ORDER BY ts,name";
+        let sql = PG_QUERY;
         let mut stmt = self.conn.prepare(sql)?;
         let result = stmt
             .query_map(
@@ -487,5 +487,50 @@ impl TimeSeries {
         }
         tx.commit()?;
         Ok(stats)
+    }
+}
+
+const FS_QUERY: &str = "SELECT ts,mount,size,used,avail,inodes,inodes_used FROM fs_samples a WHERE mount=? AND ts BETWEEN ? AND ? AND (a.res<=? OR (a.res=1 AND NOT EXISTS (SELECT 1 FROM fs_samples f WHERE f.mount=a.mount AND f.res=0 AND f.ts>=a.ts AND f.ts<a.ts+300)) OR (a.res=2 AND NOT EXISTS (SELECT 1 FROM fs_samples f WHERE f.mount=a.mount AND f.res=0 AND f.ts>=a.ts AND f.ts<a.ts+3600) AND NOT EXISTS (SELECT 1 FROM fs_samples f WHERE f.mount=a.mount AND f.res=1 AND f.ts>=a.ts AND f.ts<a.ts+3600))) AND NOT EXISTS (SELECT 1 FROM fs_samples b WHERE b.mount=a.mount AND b.res=1 AND a.res<1 AND 1<=?5 AND b.ts=(a.ts-((a.ts%300+300)%300)) AND b.ts BETWEEN ?6 AND ?7) AND NOT EXISTS (SELECT 1 FROM fs_samples b WHERE b.mount=a.mount AND b.res=2 AND a.res<2 AND 2<=?5 AND b.ts=(a.ts-((a.ts%3600+3600)%3600)) AND b.ts BETWEEN ?6 AND ?7) ORDER BY ts";
+
+const LVM_QUERY: &str = "SELECT ts,vg,lv,lv_size,vg_free,data_pct,meta_pct FROM lvm_samples a WHERE vg=? AND lv=? AND ts BETWEEN ? AND ? AND (a.res<=? OR (a.res=1 AND NOT EXISTS (SELECT 1 FROM lvm_samples f WHERE f.vg=a.vg AND f.lv=a.lv AND f.res=0 AND f.ts>=a.ts AND f.ts<a.ts+300)) OR (a.res=2 AND NOT EXISTS (SELECT 1 FROM lvm_samples f WHERE f.vg=a.vg AND f.lv=a.lv AND f.res=0 AND f.ts>=a.ts AND f.ts<a.ts+3600) AND NOT EXISTS (SELECT 1 FROM lvm_samples f WHERE f.vg=a.vg AND f.lv=a.lv AND f.res=1 AND f.ts>=a.ts AND f.ts<a.ts+3600))) AND NOT EXISTS (SELECT 1 FROM lvm_samples b WHERE b.vg=a.vg AND b.lv=a.lv AND b.res=1 AND a.res<1 AND 1<=?6 AND b.ts=(a.ts-((a.ts%300+300)%300)) AND b.ts BETWEEN ?7 AND ?8) AND NOT EXISTS (SELECT 1 FROM lvm_samples b WHERE b.vg=a.vg AND b.lv=a.lv AND b.res=2 AND a.res<2 AND 2<=?6 AND b.ts=(a.ts-((a.ts%3600+3600)%3600)) AND b.ts BETWEEN ?7 AND ?8) ORDER BY ts";
+
+const PG_QUERY: &str = "SELECT ts,kind,name,value FROM pg_samples a WHERE kind=? AND (? IS NULL OR name=?) AND ts BETWEEN ? AND ? AND (a.res<=? OR (a.res=1 AND NOT EXISTS (SELECT 1 FROM pg_samples f WHERE f.kind=a.kind AND f.name=a.name AND f.res=0 AND f.ts>=a.ts AND f.ts<a.ts+300)) OR (a.res=2 AND NOT EXISTS (SELECT 1 FROM pg_samples f WHERE f.kind=a.kind AND f.name=a.name AND f.res=0 AND f.ts>=a.ts AND f.ts<a.ts+3600) AND NOT EXISTS (SELECT 1 FROM pg_samples f WHERE f.kind=a.kind AND f.name=a.name AND f.res=1 AND f.ts>=a.ts AND f.ts<a.ts+3600))) AND NOT EXISTS (SELECT 1 FROM pg_samples b WHERE b.kind=a.kind AND b.name=a.name AND b.res=1 AND a.res<1 AND 1<=?7 AND b.ts=(a.ts-((a.ts%300+300)%300)) AND b.ts BETWEEN ?8 AND ?9) AND NOT EXISTS (SELECT 1 FROM pg_samples b WHERE b.kind=a.kind AND b.name=a.name AND b.res=2 AND a.res<2 AND 2<=?7 AND b.ts=(a.ts-((a.ts%3600+3600)%3600)) AND b.ts BETWEEN ?8 AND ?9) ORDER BY ts,name";
+
+#[cfg(test)]
+mod query_plan_tests {
+    use super::*;
+
+    #[test]
+    fn tier_checks_seek_timestamp_primary_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TimeSeries::open(&tmp.path().join("timeseries.db"), true).unwrap();
+        for sql in [FS_QUERY, LVM_QUERY, PG_QUERY] {
+            let mut statement = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let count = statement.parameter_count();
+            let params = vec![rusqlite::types::Value::Integer(0); count];
+            let details = statement
+                .query_map(rusqlite::params_from_iter(params), |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let searches: Vec<_> = details
+                .iter()
+                .filter(|s| s.contains("SEARCH f ") || s.contains("SEARCH b "))
+                .collect();
+            assert_eq!(searches.len(), 5, "{details:?}");
+            for detail in searches {
+                assert!(
+                    detail.contains("PRIMARY KEY")
+                        && detail.contains("res=?")
+                        && detail.contains("ts"),
+                    "{detail}"
+                );
+            }
+        }
     }
 }

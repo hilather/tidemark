@@ -483,7 +483,7 @@ fn retention_utc_days_dst_and_iso_weeks_per_root() {
             now
         )
         .len(),
-        7
+        5
     );
     let dst_now = ts("2026-03-09T00:30:00Z");
     let dst = vec![
@@ -1021,4 +1021,291 @@ fn state_usage_skips_same_device_bind_mount() {
     assert!(
         matches!(result.unwrap(),SpaceVerdict::Refuse{reason} if reason.contains("free-space floor"))
     );
+}
+
+#[test]
+fn retention_preserves_newest_with_expired_windows_for_each_root() {
+    let entries = vec![
+        entry("a", b"/a", 0, "complete"),
+        entry("b", b"/b", 1, "complete"),
+        entry("older", b"/b", 0, "complete"),
+    ];
+    for policy in [
+        SnapshotRetention {
+            recent: 0,
+            daily: 14,
+            weekly: 8,
+        },
+        SnapshotRetention {
+            recent: 0,
+            daily: 0,
+            weekly: 0,
+        },
+    ] {
+        assert_eq!(
+            tidemark_store::retention::retention_plan(&entries, &policy, 100 * 86400),
+            vec!["older"]
+        );
+    }
+}
+
+#[test]
+fn glob_boundaries_match_raw_bytes_and_nested_regions() {
+    let (_tmp, file) = write_fixture(3);
+    let check = |patterns: &[&str], expected| {
+        let snapshot = Snapshot::open(&file).unwrap();
+        let filter = LinkFilter {
+            boundary: patterns.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot.link_sets_under(0, &filter, 10).unwrap().len(),
+            expected
+        );
+    };
+    check(&["/data/*/*"], 1); // invalid UTF-8 root component matches as bytes
+    check(&["/missing/*"], 0);
+    check(&["/data/�/*"], 0); // replacement characters must not match invalid bytes
+    check(&["/data/*"], 0); // both instances share the same region
+    check(&["/data/*", "/data/*/00000001"], 1); // nested region and parent
+    check(&["/data/*/*", "/data/*/00000001"], 1); // overlapping globs
+    check(&["/data/*/00000001"], 1); // matched versus outside
+    let snapshot = Snapshot::open(&file).unwrap();
+    assert!(snapshot
+        .link_sets_under(
+            0,
+            &LinkFilter {
+                boundary: vec!["[".into()],
+                ..Default::default()
+            },
+            10
+        )
+        .is_err());
+    assert!(snapshot
+        .link_sets_under(
+            0,
+            &LinkFilter {
+                boundary: vec!["*".into()],
+                boundary_depth: Some(1),
+                ..Default::default()
+            },
+            10
+        )
+        .is_err());
+    assert!(snapshot
+        .link_sets_under(
+            0,
+            &LinkFilter {
+                boundary: vec!["/data/*/*".into()],
+                ..Default::default()
+            },
+            0
+        )
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn recover_corrupt_catalog_preserves_database_and_sidecars() {
+    let state = tempfile::tempdir().unwrap();
+    let snapshots = state.path().join("snapshots").join(root_slug(&meta().root));
+    let mut writer = SnapshotWriter::create(&snapshots, &meta()).unwrap();
+    let mut root = dir(0);
+    root.subtree_end = 0;
+    writer.put_dirs(&[root]).unwrap();
+    writer.finish(&meta()).unwrap();
+    for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
+        std::fs::write(state.path().join(name), name.as_bytes()).unwrap();
+    }
+    assert!(Catalog::open(state.path(), true).is_err());
+    assert_eq!(
+        std::fs::read(state.path().join("timeseries.db")).unwrap(),
+        b"timeseries.db"
+    );
+    // SQLite may remove invalid sidecars during an ordinary open; install them
+    // after the nondestructive database-open assertion to test explicit recovery.
+    for name in ["timeseries.db-wal", "timeseries.db-shm"] {
+        std::fs::write(state.path().join(name), name.as_bytes()).unwrap();
+    }
+    let catalog = tidemark_store::catalog::recover_catalog(state.path()).unwrap();
+    assert_eq!(catalog.list(None).unwrap().len(), 1);
+    assert_eq!(catalog.recovery_files().len(), 3);
+    for file in catalog.recovery_files() {
+        assert_eq!(
+            std::fs::read(file).unwrap(),
+            file.file_name().unwrap().as_encoded_bytes()
+        );
+    }
+    drop(catalog);
+    let second = tidemark_store::catalog::recover_catalog(state.path()).unwrap();
+    assert!(second.recovery_files()[0]
+        .parent()
+        .unwrap()
+        .ends_with("timeseries-recovery-1"));
+}
+
+#[test]
+fn space_floor_does_not_round_down_large_sizes() {
+    let mut policy = RetentionConfig {
+        min_free_pct: 100.0,
+        ..Default::default()
+    };
+    policy.max_state_size.0 = u64::MAX;
+    assert!(matches!(
+        space_check_with(
+            || Ok(FsTotals {
+                size: (1 << 62) + 512,
+                avail: 1 << 62
+            }),
+            0,
+            0,
+            &policy
+        ),
+        SpaceVerdict::Refuse { .. }
+    ));
+    policy.min_free_pct = 12.5;
+    assert!(matches!(
+        space_check_with(
+            || Ok(FsTotals {
+                size: (1 << 62) + 1,
+                avail: 1 << 59
+            }),
+            0,
+            0,
+            &policy
+        ),
+        SpaceVerdict::Refuse { .. }
+    ));
+}
+
+#[test]
+fn retained_400_day_history_returns_all_tiers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("timeseries.db");
+    let store = TimeSeries::open(&db, true).unwrap();
+    let mut sql = Connection::open(&db).unwrap();
+    let tx = sql.transaction().unwrap();
+    let mut expected = Vec::new();
+    for (res, start, count, step) in [
+        (2, 0, 8760, 3600),
+        (1, 365 * 86400, 9504, 300),
+        (0, 398 * 86400, 5760, 30),
+    ] {
+        for index in 0..count {
+            let ts = start + index * step;
+            expected.push(ts);
+            tx.execute(
+                "INSERT INTO fs_samples VALUES ('/data',?,?,100,10,90,100,10)",
+                rusqlite::params![res, ts],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO lvm_samples VALUES ('vg','lv',?,?,100,10,NULL,NULL)",
+                rusqlite::params![res, ts],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO pg_samples VALUES ('database','db',?,?,10)",
+                rusqlite::params![res, ts],
+            )
+            .unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    assert_eq!(expected.len(), 24024);
+    assert_eq!(
+        store
+            .query_fs("/data", 0, 400 * 86400)
+            .unwrap()
+            .iter()
+            .map(|r| r.ts)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        store
+            .query_lvm("vg", "lv", 0, 400 * 86400)
+            .unwrap()
+            .iter()
+            .map(|r| r.ts)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        store
+            .query_pg("database", Some("db"), 0, 400 * 86400)
+            .unwrap()
+            .iter()
+            .map(|r| r.ts)
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn overlapping_sample_tiers_preserve_selection_for_all_query_families() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("timeseries.db");
+    let store = TimeSeries::open(&db, true).unwrap();
+    let sql = Connection::open(db).unwrap();
+    for (res, ts) in [
+        (0, 20),
+        (0, 400),
+        (1, 0),
+        (1, 300),
+        (1, 600),
+        (2, 0),
+        (2, 3600),
+    ] {
+        sql.execute(
+            "INSERT INTO fs_samples VALUES ('/data',?,?,100,10,90,100,10)",
+            rusqlite::params![res, ts],
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO lvm_samples VALUES ('vg','lv',?,?,100,10,NULL,NULL)",
+            rusqlite::params![res, ts],
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO pg_samples VALUES ('database','db',?,?,10)",
+            rusqlite::params![res, ts],
+        )
+        .unwrap();
+    }
+    for (to, expected) in [
+        (4000, vec![20, 400, 600, 3600]),
+        (3 * 86400, vec![0, 300, 600, 3600]),
+        (40 * 86400, vec![0, 3600]),
+    ] {
+        assert_eq!(
+            store
+                .query_fs("/data", 0, to)
+                .unwrap()
+                .iter()
+                .map(|r| r.ts)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            store
+                .query_lvm("vg", "lv", 0, to)
+                .unwrap()
+                .iter()
+                .map(|r| r.ts)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for name in [Some("db"), None] {
+            assert_eq!(
+                store
+                    .query_pg("database", name, 0, to)
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.ts)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
 }

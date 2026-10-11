@@ -41,7 +41,7 @@ pub fn retention_plan(entries: &[ScanEntry], policy: &SnapshotRetention, now: i6
             let weekly = week <= this_week
                 && usize::try_from(this_week.saturating_sub(week)).is_ok_and(|n| n < policy.weekly)
                 && weeks.insert(week);
-            if i >= policy.recent && !daily && !weekly {
+            if i != 0 && i >= policy.recent && !daily && !weekly {
                 deleted.push(e.scan_id.clone());
             }
         }
