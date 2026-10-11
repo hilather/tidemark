@@ -363,7 +363,7 @@ fn holes_errors_races_and_annotations() {
     assert_eq!(summary.races, 4);
     assert_eq!(summary.errors, 2);
     assert!(summary.degraded);
-    p.annotate(&root, "pg.db", "example");
+    p.annotate(&root, "app.label", "example");
     p.annotate(
         &RawPath::new(b"/missing".to_vec()).unwrap(),
         "ignored",
@@ -561,6 +561,7 @@ fn scan_disk(root: &std::path::Path) -> VecSink {
         scan_start: 0,
         getdents_buf: 32768,
         io_idle: false,
+        max_record_bytes: 64 * 1024 * 1024,
     };
     let (tx, rx) = crossbeam_channel::bounded(4);
     let mut agg = Aggregator::new(config(root, 0));
