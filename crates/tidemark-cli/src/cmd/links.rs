@@ -115,7 +115,8 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 if paths.len() == 1_000_000 {
                     return Err(anyhow::anyhow!("instance path cap reached"));
                 }
-                let dir = snap.dir(instance.dir_id)?.path;
+                let directory = snap.dir(instance.dir_id)?;
+                let dir = directory.path;
                 if let Some(name) = instance.name {
                     push_path(
                         &mut paths,
@@ -125,7 +126,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                         "snapshot",
                     )?;
                 } else {
-                    match tidemark_fs::walk::read_dir_entries(&dir, gate.as_ref()) {
+                    match tidemark_fs::walk::read_dir_entries_checked(
+                        &snap.meta().root,
+                        snap.meta().fs_dev,
+                        &dir,
+                        Some(directory.ino),
+                        gate.as_ref(),
+                    ) {
                         Ok(entries) => {
                             let mut found = false;
                             for (name, ino, _) in entries {
@@ -147,7 +154,15 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                                 push_path(&mut paths, &mut path_bytes, instance.ino, dir, "gone")?;
                             }
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::NotFound
+                                    | std::io::ErrorKind::CrossesDevices
+                                    | std::io::ErrorKind::NotADirectory
+                            ) || e.raw_os_error()
+                                == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
+                        {
                             push_path(&mut paths, &mut path_bytes, instance.ino, dir, "gone")?
                         }
                         Err(e) => return Err(e.into()),

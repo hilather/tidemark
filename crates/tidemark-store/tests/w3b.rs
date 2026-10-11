@@ -334,3 +334,46 @@ fn million_set_report_timing() {
         "elapsed {elapsed:?}"
     );
 }
+
+#[test]
+fn streamed_selection_matches_reader_order_and_subtree_scope() {
+    let (_tmp, snap) = fixture();
+    for under in [b"/r".as_slice(), b"/r/c", b"/r/b"] {
+        let under = path(under);
+        let root = snap.dir_by_path(&under).unwrap().unwrap();
+        for top in [0, 1, 2, 10] {
+            let report = link_report(&snap, &under, Some(&RegionSpec::Depth(1)), top).unwrap();
+            let expected = snap
+                .link_sets_under(root.id, &LinkFilter::default(), top)
+                .unwrap();
+            assert_eq!(
+                report
+                    .largest_sets
+                    .iter()
+                    .map(|h| (h.row.ino, &h.lca_path, h.instance_count))
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|h| (h.row.ino, &h.lca_path, h.instance_count))
+                    .collect::<Vec<_>>()
+            );
+            let regions = Regions::build(&snap, &under, &RegionSpec::Depth(1)).unwrap();
+            let (crossing, totals) = crossing_sets(&snap, &regions, top).unwrap();
+            let expected = snap
+                .link_sets_under(
+                    root.id,
+                    &LinkFilter {
+                        boundary_depth: Some(1),
+                        ..Default::default()
+                    },
+                    top,
+                )
+                .unwrap();
+            assert_eq!(
+                crossing.iter().map(|h| h.ino).collect::<Vec<_>>(),
+                expected.iter().map(|h| h.row.ino).collect::<Vec<_>>()
+            );
+            assert_eq!(totals.sets, report.totals.crossing.sets);
+        }
+    }
+}

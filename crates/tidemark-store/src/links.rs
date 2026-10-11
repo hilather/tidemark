@@ -5,7 +5,7 @@ use crate::{reader::Snapshot, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
 use tidemark_core::{
     path::RawPath,
-    snapshot::{LinkFilter, LinkSetHit, SortKey},
+    snapshot::{LinkFilter, LinkSetHit},
 };
 
 const CAP: usize = 1_000_000;
@@ -47,7 +47,6 @@ struct Interval {
 pub struct Regions {
     intervals: Vec<Interval>,
     under: RawPath,
-    filter: LinkFilter,
 }
 impl Regions {
     /// Build preorder intervals with precomputed nearest containing parents.
@@ -82,21 +81,30 @@ impl Regions {
         let globs = builder
             .build()
             .map_err(|e| StoreError::Invalid(e.to_string()))?;
-        let mut rows = snap.subtree_dirs(root.id, u32::MAX, SortKey::Name, CAP + 1)?;
-        rows.sort_unstable_by_key(|r| r.id);
-        let selected = rows
-            .into_iter()
-            .filter(|r| match spec {
-                RegionSpec::Depth(d) => u64::from(r.depth) == u64::from(root.depth) + u64::from(*d),
+        let mut stmt = snap.conn().prepare(
+            "SELECT id,subtree_end,path,depth FROM dirs WHERE id BETWEEN ?1 AND ?2 ORDER BY id",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![root.id, root.subtree_end])?;
+        let mut selected = Vec::new();
+        while let Some(row) = rows.next()? {
+            let depth: u32 = row.get(3)?;
+            let bytes: Vec<u8> = row.get(2)?;
+            let matches = match spec {
+                RegionSpec::Depth(d) => u64::from(depth) == u64::from(root.depth) + u64::from(*d),
                 RegionSpec::Globs(_) => {
-                    globs.is_match_candidate(&globset::Candidate::from_bytes(r.path.as_bytes()))
+                    globs.is_match_candidate(&globset::Candidate::from_bytes(&bytes))
                 }
-            })
-            .map(|r| (r.id, r.subtree_end, r.path));
+            };
+            if matches {
+                if selected.len() == CAP {
+                    return Err(StoreError::Invalid("region cap reached".into()));
+                }
+                selected.push((row.get(0)?, row.get(1)?, RawPath::new(bytes)?));
+            }
+        }
         Ok(Self {
-            intervals: intervals(selected),
+            intervals: intervals(selected.into_iter()),
             under: under.clone(),
-            filter,
         })
     }
     /// Find the deepest region containing a preorder directory id.
@@ -163,9 +171,7 @@ pub struct CrossingTotals {
     /// Bytes in incomplete crossing sets.
     pub incomplete_disk: u64,
 }
-/// Find crossings, using the reader's byte-boundary selection contract.
-/// Result and intermediate row vectors are bounded by the reader's million-row cap.
-/// The pending SCR-001 requests a streaming reader hook to remove these vectors.
+/// Find crossings from inode-ordered streamed rows, retaining only bounded results.
 ///
 /// ```no_run
 /// # fn main() -> Result<(), tidemark_store::StoreError> {
@@ -188,19 +194,20 @@ pub fn crossing_sets(
     let root = snap
         .dir_by_path(&regions.under)?
         .ok_or_else(|| StoreError::Invalid("report root absent".into()))?;
-    let hits = snap.link_sets_under(root.id, &regions.filter, CAP + 1)?;
     let mut totals = CrossingTotals::default();
     let mut out = Vec::new();
     let mut sample_count = 0usize;
-    for hit in hits {
-        let mut samples = BTreeMap::new();
-        for instance in snap.link_instances(hit.row.ino)? {
+    let mut samples = BTreeMap::new();
+    stream_sets(snap, root.id, root.subtree_end, |hit, dirs| {
+        samples.clear();
+        for &dir_id in dirs {
             samples
-                .entry(regions.region_of(instance.dir_id))
-                .or_insert(instance.dir_id);
+                .entry(regions.region_of(dir_id))
+                .and_modify(|id: &mut u32| *id = (*id).min(dir_id))
+                .or_insert(dir_id);
         }
         if samples.len() < 2 {
-            continue;
+            return Ok(());
         }
         totals.sets += 1;
         totals.disk = add(totals.disk, hit.row.disk)?;
@@ -208,24 +215,114 @@ pub fn crossing_sets(
             totals.incomplete_sets += 1;
             totals.incomplete_disk = add(totals.incomplete_disk, hit.row.disk)?;
         }
-        if out.len() < limit {
+        if limit > 0
+            && (out.len() < limit
+                || out
+                    .last()
+                    .is_some_and(|last: &(u64, RawPath, CrossingSet)| {
+                        order(
+                            hit.row.disk,
+                            &hit.lca_path,
+                            hit.row.ino,
+                            last.0,
+                            &last.1,
+                            last.2.ino,
+                        )
+                        .is_lt()
+                    }))
+        {
             sample_count += samples.len();
             if sample_count > CAP {
                 return Err(StoreError::Invalid("crossing sample cap reached".into()));
             }
-            let (rs, ds) = samples.into_iter().unzip();
-            out.push(CrossingSet {
-                ino: hit.row.ino,
-                disk: hit.row.disk,
-                nlink: hit.row.nlink,
-                found: hit.row.found,
-                regions: rs,
-                sample_dirs: ds,
+            let (rs, ds) = samples.iter().map(|(&r, &d)| (r, d)).unzip();
+            out.push((
+                hit.row.disk,
+                hit.lca_path.clone(),
+                CrossingSet {
+                    ino: hit.row.ino,
+                    disk: hit.row.disk,
+                    nlink: hit.row.nlink,
+                    found: hit.row.found,
+                    regions: rs,
+                    sample_dirs: ds,
+                },
+            ));
+            out.sort_unstable_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.ino.cmp(&b.2.ino))
             });
+            if out.len() > limit {
+                if let Some(removed) = out.pop() {
+                    sample_count -= removed.2.regions.len();
+                }
+            }
         }
-    }
+        Ok(())
+    })?;
+    let out = out.into_iter().map(|(_, _, set)| set).collect();
     Ok((out, totals))
 }
+fn order(
+    disk: u64,
+    path: &RawPath,
+    ino: u64,
+    other_disk: u64,
+    other_path: &RawPath,
+    other_ino: u64,
+) -> std::cmp::Ordering {
+    other_disk
+        .cmp(&disk)
+        .then_with(|| path.cmp(other_path))
+        .then_with(|| ino.cmp(&other_ino))
+}
+// One reusable flat directory-id buffer; no names or global instance collection.
+fn stream_sets(
+    snap: &Snapshot,
+    start: u32,
+    end: u32,
+    mut visit: impl FnMut(&LinkSetHit, &[u32]) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    // Two ordered cursors avoid both a global sort and an index lookup per inode.
+    // The primary-key scan remains outermost for byte-path tie ordering at the limit.
+    let mut sets_stmt = snap.conn().prepare(
+        "SELECT l.*,d.path FROM link_sets l NOT INDEXED CROSS JOIN dirs d ON d.id=l.lca_dir_id \
+         WHERE l.lca_dir_id BETWEEN ?1 AND ?2 ORDER BY l.ino",
+    )?;
+    let mut instances_stmt = snap
+        .conn()
+        .prepare("SELECT ino,dir_id FROM link_instances ORDER BY ino")?;
+    let mut sets = sets_stmt.query(rusqlite::params![start, end])?;
+    let mut instances = instances_stmt.query([])?;
+    let mut instance = instances.next()?;
+    let mut dirs = Vec::new();
+    while let Some(row) = sets.next()? {
+        let mut hit = LinkSetHit {
+            row: crate::reader::link_row(row)?,
+            lca_path: RawPath::new(row.get::<_, Vec<u8>>(8)?)?,
+            instance_count: 0,
+        };
+        dirs.clear();
+        while let Some(i) = instance {
+            let ino = crate::error::read_u64(i, 0)?;
+            if ino > hit.row.ino {
+                break;
+            }
+            if ino == hit.row.ino {
+                if dirs.len() == CAP {
+                    return Err(StoreError::Invalid("per-set instance cap reached".into()));
+                }
+                dirs.push(i.get::<_, u32>(1)?);
+            }
+            instance = instances.next()?;
+        }
+        hit.instance_count = dirs.len() as u64;
+        visit(&hit, &dirs)?;
+    }
+    Ok(())
+}
+
 /// Link-set totals for the charged subtree.
 #[derive(Debug, Default)]
 pub struct LinkTotals {
@@ -273,7 +370,7 @@ fn add(a: u64, b: u64) -> Result<u64, StoreError> {
     a.checked_add(b)
         .ok_or_else(|| StoreError::Integer("link report sum".into()))
 }
-/// Build a report; all link instances are fetched one set at a time, never globally.
+/// Build a report from two inode-ordered cursors with a reusable per-set directory buffer.
 /// Pair aggregation is capped at one million distinct pairs and fails explicitly above it.
 pub fn link_report(
     snap: &Snapshot,
@@ -288,14 +385,40 @@ pub fn link_report(
         .dir_by_path(under)?
         .ok_or_else(|| StoreError::Invalid("report root absent".into()))?;
     require_instances(snap)?;
-    let hits = snap.link_sets_under(root.id, &LinkFilter::default(), CAP + 1)?;
+    let mut largest_sets = Vec::new();
     let regions = spec.map(|s| Regions::build(snap, under, s)).transpose()?;
     let mut totals = LinkTotals::default();
     let mut pinned: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
     let mut pairs: BTreeMap<(Option<RegionId>, Option<RegionId>), (u64, u64)> = BTreeMap::new();
     let mut crossing = Vec::new();
     let mut sample_count = 0usize;
-    for hit in &hits {
+    let mut samples = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    stream_sets(snap, root.id, root.subtree_end, |hit, dirs| {
+        if top > 0
+            && (largest_sets.len() < top
+                || largest_sets.last().is_some_and(|last: &LinkSetHit| {
+                    order(
+                        hit.row.disk,
+                        &hit.lca_path,
+                        hit.row.ino,
+                        last.row.disk,
+                        &last.lca_path,
+                        last.row.ino,
+                    )
+                    .is_lt()
+                }))
+        {
+            largest_sets.push(hit.clone());
+            largest_sets.sort_unstable_by(|a, b| {
+                b.row
+                    .disk
+                    .cmp(&a.row.disk)
+                    .then_with(|| a.lca_path.cmp(&b.lca_path))
+                    .then_with(|| a.row.ino.cmp(&b.row.ino))
+            });
+            largest_sets.truncate(top);
+        }
         totals.sets += 1;
         totals.instances = add(totals.instances, u64::from(hit.row.found))?;
         totals.disk = add(totals.disk, hit.row.disk)?;
@@ -304,14 +427,17 @@ pub fn link_report(
             totals.incomplete_sets += 1;
             totals.incomplete_disk = add(totals.incomplete_disk, hit.row.disk)?;
         }
-        let mut visited = BTreeSet::new();
-        let mut samples = BTreeMap::new();
-        for i in snap.link_instances(hit.row.ino)? {
+        visited.clear();
+        samples.clear();
+        for &dir_id in dirs {
             if incomplete {
-                let mut cursor = Some(i.dir_id);
+                let mut cursor = Some(dir_id);
                 while let Some(id) = cursor {
                     if id < root.id || id > root.subtree_end || !visited.insert(id) {
                         break;
+                    }
+                    if visited.len() > CAP {
+                        return Err(StoreError::Invalid("per-set ancestor cap".into()));
                     }
                     let entry = pinned.entry(id).or_default();
                     entry.0 = add(entry.0, hit.row.disk)?;
@@ -323,7 +449,10 @@ pub fn link_report(
                 }
             }
             if let Some(r) = &regions {
-                samples.entry(r.region_of(i.dir_id)).or_insert(i.dir_id);
+                samples
+                    .entry(r.region_of(dir_id))
+                    .and_modify(|id: &mut u32| *id = (*id).min(dir_id))
+                    .or_insert(dir_id);
             }
         }
         if samples.len() > 1 {
@@ -345,23 +474,54 @@ pub fn link_report(
                     }
                 }
             }
-            if crossing.len() < top {
+            if top > 0
+                && (crossing.len() < top
+                    || crossing
+                        .last()
+                        .is_some_and(|last: &(RawPath, CrossingSet)| {
+                            order(
+                                hit.row.disk,
+                                &hit.lca_path,
+                                hit.row.ino,
+                                last.1.disk,
+                                &last.0,
+                                last.1.ino,
+                            )
+                            .is_lt()
+                        }))
+            {
                 sample_count += samples.len();
                 if sample_count > CAP {
                     return Err(StoreError::Invalid("crossing sample cap reached".into()));
                 }
-                let (rs, ds) = samples.into_iter().unzip();
-                crossing.push(CrossingSet {
-                    ino: hit.row.ino,
-                    disk: hit.row.disk,
-                    nlink: hit.row.nlink,
-                    found: hit.row.found,
-                    regions: rs,
-                    sample_dirs: ds,
+                let (rs, ds) = samples.iter().map(|(&r, &d)| (r, d)).unzip();
+                crossing.push((
+                    hit.lca_path.clone(),
+                    CrossingSet {
+                        ino: hit.row.ino,
+                        disk: hit.row.disk,
+                        nlink: hit.row.nlink,
+                        found: hit.row.found,
+                        regions: rs,
+                        sample_dirs: ds,
+                    },
+                ));
+                crossing.sort_unstable_by(|a, b| {
+                    b.1.disk
+                        .cmp(&a.1.disk)
+                        .then_with(|| a.0.cmp(&b.0))
+                        .then_with(|| a.1.ino.cmp(&b.1.ino))
                 });
+                if crossing.len() > top {
+                    if let Some(removed) = crossing.pop() {
+                        sample_count -= removed.1.regions.len();
+                    }
+                }
             }
         }
-    }
+        Ok(())
+    })?;
+    let crossing = crossing.into_iter().map(|(_, set)| set).collect();
     let mut incomplete_top_dirs = pinned
         .into_iter()
         .map(|(id, (bytes, sets))| Ok((snap.dir(id)?.path, bytes, sets)))
@@ -386,15 +546,20 @@ pub fn link_report(
             .then_with(|| a.b.cmp(&b.b))
     });
     region_pairs.truncate(top);
-    let mut most_shared_dirs: Vec<_> = snap
-        .subtree_dirs(root.id, u32::MAX, SortKey::Name, CAP + 1)?
-        .into_iter()
-        .map(|d| (d.path, d.t_disk.saturating_sub(d.t_reclaimable), d.t_disk))
-        .filter(|d| d.1 > 0)
-        .collect();
-    most_shared_dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    most_shared_dirs.truncate(top);
-    let largest_sets = hits.into_iter().take(top).collect();
+    let mut stmt = snap.conn().prepare("SELECT path,t_disk-t_reclaimable,t_disk FROM dirs WHERE id BETWEEN ?1 AND ?2 AND t_disk>t_reclaimable ORDER BY t_disk-t_reclaimable DESC,path LIMIT ?3")?;
+    let mut rows = stmt.query(rusqlite::params![
+        root.id,
+        root.subtree_end,
+        crate::error::sql_limit(top)?
+    ])?;
+    let mut most_shared_dirs = Vec::new();
+    while let Some(row) = rows.next()? {
+        most_shared_dirs.push((
+            RawPath::new(row.get::<_, Vec<u8>>(0)?)?,
+            crate::error::read_u64(row, 1)?,
+            crate::error::read_u64(row, 2)?,
+        ));
+    }
     Ok(LinkReport {
         totals,
         crossing,
@@ -423,7 +588,7 @@ mod tests {
             }
             tree(&mut rows,6,&mut 0);
             let chosen:Vec<_>=rows.into_iter().enumerate().filter(|(i,_)| selected[*i%selected.len()]).map(|(_,r)|r).collect();
-            let r=Regions { intervals:intervals(chosen.into_iter()),under:RawPath::new(b"/r".to_vec()).unwrap(),filter:LinkFilter::default() };
+            let r=Regions { intervals:intervals(chosen.into_iter()),under:RawPath::new(b"/r".to_vec()).unwrap() };
             let expected=r.intervals.iter().enumerate().filter(|(_,r)|r.start<=point && point<=r.end).max_by_key(|(_,r)|r.start).map(|(i,_)|RegionId(i));
             prop_assert_eq!(r.region_of(point),expected);
         }
