@@ -17,6 +17,8 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     if args.purge_state && !args.yes {
         return Err(crate::CliError::Precondition("--purge-state requires --yes".into()).into());
     }
+    crate::deploy::state_guard(&context.config.general.state_dir, Some(&context.config))
+        .map_err(|e| crate::CliError::Precondition(e.to_string()))?;
     match crate::deploy::unstage(
         &context.config.general.state_dir,
         args.purge_state,

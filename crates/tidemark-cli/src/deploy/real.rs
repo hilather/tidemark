@@ -51,26 +51,18 @@ impl Env for RealEnv {
         &self.installed_config
     }
     fn atomic_write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
-        super::atomic_write_owned(path, bytes, rustix::process::geteuid().is_root())
+        super::atomic_write_owned(path, bytes, true)
+    }
+    fn state_write(
+        &self,
+        parent: &std::os::fd::OwnedFd,
+        name: &std::ffi::OsStr,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        super::files::write_at(parent, name, bytes, true)
     }
     fn private_dir(&self, path: &Path) -> io::Result<()> {
-        super::private_dir(path)?;
-        if rustix::process::geteuid().is_root() {
-            let fd = rustix::fs::open(
-                path,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )?;
-            rustix::fs::fchown(
-                fd,
-                Some(rustix::process::Uid::ROOT),
-                Some(rustix::process::Gid::ROOT),
-            )?;
-        }
-        Ok(())
+        super::files::private_dir(path, true)
     }
     fn now(&self) -> i64 {
         self.now
@@ -91,7 +83,23 @@ impl Env for RealEnv {
                 .parent()
                 .ok_or_else(|| io::Error::other("config path has no parent"))?,
         )?;
-        ensure_writable(&cfg.general.state_dir)
+        ensure_writable(&cfg.general.state_dir)?;
+        match super::files::directory(&cfg.general.state_dir, false) {
+            Ok(fd) => {
+                // Unmarked existing directories cannot be chmod/chowned by deployment.
+                if super::files::read(&cfg.general.state_dir.join(super::MARKER)).is_err() {
+                    let stat = rustix::fs::fstat(&fd)?;
+                    if stat.st_uid != 0 || stat.st_gid != 0 || stat.st_mode & 0o777 != 0o700 {
+                        return Err(io::Error::other(
+                            "existing unmarked state_dir must already be 0700 root:root",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
     fn local_directory(&self, path: &Path) -> io::Result<()> {
         if !std::fs::metadata(path)?.is_dir() {
@@ -102,19 +110,7 @@ impl Env for RealEnv {
         let mounts = mount::read_mountinfo()?;
         let entry = mount::mount_for_path(&mounts, &raw)
             .ok_or_else(|| io::Error::other("mount not found"))?;
-        // Fail closed for unknown and pseudo filesystems rather than guessing local semantics.
-        if [
-            "xfs", "ext2", "ext3", "ext4", "btrfs", "tmpfs", "zfs", "f2fs", "jfs", "reiserfs",
-        ]
-        .contains(&entry.fs_type.as_str())
-        {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "not a supported local filesystem: {}",
-                entry.fs_type
-            )))
-        }
+        local_filesystem(&entry.fs_type)
     }
     fn mount_point(&self, path: &Path) -> io::Result<()> {
         let canonical = std::fs::canonicalize(path)?;
@@ -205,5 +201,37 @@ impl ApiPing for SocketPing {
             )
             .map(|_| ())
             .map_err(io::Error::other)
+    }
+}
+
+fn local_filesystem(kind: &str) -> io::Result<()> {
+    if [
+        "xfs", "ext2", "ext3", "ext4", "btrfs", "tmpfs", "zfs", "f2fs", "jfs", "reiserfs",
+    ]
+    .contains(&kind)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "not a supported local filesystem: {kind}"
+        )))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn accepted_local_filesystems_and_unknown_types() {
+        for kind in [
+            "xfs", "ext2", "ext3", "ext4", "btrfs", "tmpfs", "zfs", "f2fs", "jfs", "reiserfs",
+        ] {
+            assert!(local_filesystem(kind).is_ok());
+        }
+        for kind in ["nfs", "cifs", "overlay", "fuse", "unknown"] {
+            assert!(local_filesystem(kind)
+                .unwrap_err()
+                .to_string()
+                .contains(kind));
+        }
     }
 }

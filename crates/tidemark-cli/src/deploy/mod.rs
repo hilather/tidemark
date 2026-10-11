@@ -4,8 +4,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
-    io::{self, Read, Write},
+    io::{self},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -14,7 +13,7 @@ use tidemark_core::config::Config;
 const UNIT: &str = "tidemarkd";
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 /// State ownership marker, created only after successful staging.
-pub const MARKER: &str = ".tidemark-state.json";
+const MARKER: &str = ".tidemark-state.json";
 /// Outcome of one pre-flight check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,6 +137,15 @@ pub trait Env {
     fn atomic_write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         atomic_write(path, bytes)
     }
+    /// Publish under an already verified state directory handle.
+    fn state_write(
+        &self,
+        parent: &std::os::fd::OwnedFd,
+        name: &std::ffi::OsStr,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        files::write_at(parent, name, bytes, false)
+    }
     /// Create a private state directory, rejecting symlink ancestors.
     fn private_dir(&self, path: &Path) -> io::Result<()> {
         private_dir(path)
@@ -254,7 +262,7 @@ fn preflight_with_skips(cfg: &Config, env: &dyn Env, skips: &[String]) -> Vec<Ch
         }
     };
     vec![
-        outcome("installation", false, env.installation(cfg)),
+        outcome("installation", false, state_guard(&cfg.general.state_dir, Some(cfg)).and_then(|()| files::inspect(env.config_path())).and_then(|()| env.installation(cfg))),
         check("config", if issues.is_empty() { CheckStatus::Pass } else { CheckStatus::Fail }, if issues.is_empty() { "valid".into() } else { issues.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ") }),
         outcome("roots", false, all_paths(cfg.roots.iter().map(|root| &root.path), |path| env.local_directory(path))),
         outcome("mounts", false, all_paths(cfg.sampler.mounts.iter().chain(&cfg.watch.mounts), |path| env.mount_point(path))),
@@ -284,6 +292,15 @@ pub fn stage(
         ));
     }
     let (cfg, bytes) = env.source(cfg_path)?;
+    state_guard(&cfg.general.state_dir, Some(&cfg))
+        .and_then(|()| files::inspect(env.config_path()))
+        .map_err(|e| {
+            DeployError::Preflight(vec![check(
+                "installation",
+                CheckStatus::Fail,
+                e.to_string(),
+            )])
+        })?;
     let mut checks = preflight_with_skips(&cfg, env, &opts.skip_check);
     if checks
         .iter()
@@ -296,11 +313,13 @@ pub fn stage(
     let record_path = cfg.general.state_dir.join("deploy/staged.json");
     let old_record = optional_read(env, &record_path)?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
-    if old_config.as_deref() == Some(bytes.as_slice()) {
+    let enabled = sys.is_enabled(UNIT)?;
+    let active = sys.is_active(UNIT)?;
+    if enabled && (!opts.start_now || active) && old_config.as_deref() == Some(bytes.as_slice()) {
         if let Some(mut old) = old_record
             .as_ref()
             .and_then(|data| serde_json::from_slice::<StagedRecord>(data).ok())
-            .filter(|old| old.config_sha256 == hash)
+            .filter(|old| old.config_sha256 == hash && old.start_now == opts.start_now)
         {
             if let Some(info) = old.checks.iter_mut().find(|item| item.name == "previous") {
                 info.detail = "already staged; identical installed config, no changes".into();
@@ -314,8 +333,6 @@ pub fn stage(
             return Ok(old);
         }
     }
-    let enabled = sys.is_enabled(UNIT)?;
-    let active = sys.is_active(UNIT)?;
     checks.push(check(
         "previous",
         CheckStatus::Pass,
@@ -348,7 +365,8 @@ pub fn stage(
         return Err(DeployError::Guard("config backup already exists".into()));
     }
     env.private_dir(&cfg.general.state_dir)?;
-    env.private_dir(&cfg.general.state_dir.join("deploy"))?;
+    let state_fd = files::directory(&cfg.general.state_dir, false)?;
+    let deploy_fd = files::directory_at(&state_fd, std::ffi::OsStr::new("deploy"), true)?;
     let result = (|| -> Result<(), DeployError> {
         if differing {
             if let Some(old) = &old_config {
@@ -360,18 +378,31 @@ pub fn stage(
         if opts.start_now {
             sys.restart(UNIT)?;
         }
-        env.atomic_write(&marker_path, &marker_bytes)?;
-        env.atomic_write(&record_path, &record_bytes)?;
+        env.state_write(&state_fd, std::ffi::OsStr::new(MARKER), &marker_bytes)?;
+        env.state_write(
+            &deploy_fd,
+            std::ffi::OsStr::new("staged.json"),
+            &record_bytes,
+        )?;
         Ok(())
     })();
     if let Err(error) = result {
         let mut failures = Vec::new();
-        for (path, old) in [
-            (installed, old_config.as_deref()),
-            (&record_path, old_record.as_deref()),
-            (&marker_path, old_marker.as_deref()),
+        if let Err(e) = restore(env, installed, old_config.as_deref()) {
+            failures.push(e.to_string());
+        }
+        for (fd, name, old) in [
+            (&deploy_fd, "staged.json", old_record.as_deref()),
+            (&state_fd, MARKER, old_marker.as_deref()),
         ] {
-            if let Err(e) = restore(env, path, old) {
+            let result = match old {
+                Some(bytes) => env.state_write(fd, std::ffi::OsStr::new(name), bytes),
+                None => match rustix::fs::unlinkat(fd, name, rustix::fs::AtFlags::empty()) {
+                    Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+                    Err(e) => Err(e.into()),
+                },
+            };
+            if let Err(e) = result {
                 failures.push(e.to_string());
             }
         }
@@ -380,30 +411,35 @@ pub fn stage(
                 failures.push(e.to_string());
             }
         }
-        let rollback_service = (|| -> io::Result<()> {
-            if !enabled {
-                sys.disable_now(UNIT)?;
-                if active {
-                    sys.restart(UNIT)?;
-                }
-            } else if opts.start_now {
-                if active {
-                    sys.restart(UNIT)?;
-                } else {
-                    sys.disable_now(UNIT)?;
-                    sys.enable(UNIT)?;
-                }
+        if !enabled || (!active && opts.start_now) {
+            if let Err(e) = sys.disable_now(UNIT) {
+                failures.push(e.to_string());
             }
-            Ok(())
-        })();
-        if let Err(e) = rollback_service {
-            failures.push(e.to_string());
         }
-        if failures.is_empty() {
-            return Err(error);
+        if enabled {
+            if let Err(e) = sys.enable(UNIT) {
+                failures.push(e.to_string());
+            }
+        }
+        if active && (opts.start_now || !enabled) {
+            if let Err(e) = sys.restart(UNIT) {
+                failures.push(e.to_string());
+            }
+        }
+        for (label, desired, observed) in [
+            ("enabled", enabled, sys.is_enabled(UNIT)),
+            ("active", active, sys.is_active(UNIT)),
+        ] {
+            match observed {
+                Ok(value) if value == desired => {}
+                Ok(value) => failures.push(format!(
+                    "service compensation {label}={value}, expected {desired}"
+                )),
+                Err(e) => failures.push(e.to_string()),
+            }
         }
         return Err(DeployError::Io(io::Error::other(format!(
-            "{error}; rollback failures: {}",
+            "{error}; compensation failures: {}; re-run deploy stage or deploy unstage",
             failures.join("; ")
         ))));
     }
@@ -430,6 +466,7 @@ pub fn verify(
     sys: &dyn Systemctl,
     api: &dyn ApiPing,
 ) -> Result<VerifyResult, DeployError> {
+    state_guard(state_dir, None)?;
     let started = Instant::now();
     loop {
         let result = verify_once(state_dir, sys, api);
@@ -555,71 +592,59 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
     }
 }
 fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(MAX_RECORD_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "deployment file exceeds 1 MiB",
-        ));
-    }
-    Ok(bytes)
+    files::read(path)
 }
 fn read_json(path: &Path) -> io::Result<serde_json::Value> {
     serde_json::from_slice(&read_bytes(path)?).map_err(io::Error::other)
 }
 fn remove_if_exists(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        result => result,
-    }
+    files::remove(path)
 }
 fn private_dir(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    reject_symlink_ancestors(path)?;
-    fs::create_dir_all(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    files::private_dir(path, false)
 }
 fn reject_symlink_ancestors(path: &Path) -> io::Result<()> {
-    for ancestor in path.ancestors() {
-        match fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(io::Error::other("deployment path contains a symlink"))
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+    match files::directory(path, false) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            files::validate_state(path, std::iter::empty::<&Path>())
         }
+        Err(_) => files::inspect(path),
     }
-    Ok(())
 }
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     atomic_write_owned(path, bytes, false)
 }
 fn atomic_write_owned(path: &Path, bytes: &[u8], root_owner: bool) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("file has no parent"))?;
-    reject_symlink_ancestors(parent)?;
-    fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
-    if root_owner {
-        rustix::fs::fchown(
-            temporary.as_file(),
-            Some(rustix::process::Uid::ROOT),
-            Some(rustix::process::Gid::ROOT),
-        )?;
+    files::write(path, bytes, root_owner)
+}
+mod files;
+pub(crate) fn state_guard(path: &Path, cfg: Option<&Config>) -> io::Result<()> {
+    files::validate_state(
+        path,
+        cfg.into_iter().flat_map(|c| {
+            c.roots
+                .iter()
+                .map(|r| &r.path)
+                .chain(c.sampler.mounts.iter())
+                .chain(c.watch.mounts.iter())
+        }),
+    )?;
+    files::validate_state(&path.join("deploy"), std::iter::empty::<&Path>())?;
+    match files::read(&path.join(MARKER)) {
+        Ok(bytes) => {
+            let marker: Marker = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            if marker.format != "tidemark-state-v1" || marker.state_dir.as_path() != path {
+                return Err(io::Error::other("state marker path mismatch"));
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|e| e.error)?;
-    fs::File::open(parent)?.sync_all()
+    for name in [MARKER, "deploy/staged.json", "deploy/firstboot.json"] {
+        files::inspect(&path.join(name))?;
+    }
+    Ok(())
 }
 #[derive(Serialize, Deserialize)]
 struct Marker {
@@ -634,10 +659,17 @@ pub fn unstage(
     purge_state: bool,
     sys: &dyn Systemctl,
 ) -> Result<(), DeployError> {
+    state_guard(state_dir, None).map_err(|e| DeployError::Guard(e.to_string()))?;
+    files::validate_marker_roots(state_dir).map_err(|e| DeployError::Guard(e.to_string()))?;
     let guarded = if purge_state {
         Some(purge_guard(state_dir)?)
     } else {
         None
+    };
+    let deploy = match files::directory(&state_dir.join("deploy"), false) {
+        Ok(fd) => Some(fd),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
     };
     sys.disable_now(UNIT)?;
     if sys.is_active(UNIT)? {
@@ -648,8 +680,12 @@ pub fn unstage(
     if let Some((parent, name, root)) = guarded {
         purge_directory(parent, name, root)?;
     } else {
-        reject_symlink_ancestors(state_dir)?;
-        remove_if_exists(&state_dir.join("deploy/staged.json"))?;
+        if let Some(fd) = deploy {
+            match rustix::fs::unlinkat(&fd, "staged.json", rustix::fs::AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                Err(e) => return Err(io::Error::from(e).into()),
+            }
+        }
     }
     Ok(())
 }
@@ -736,3 +772,5 @@ mod real;
 pub use real::{RealEnv, SocketPing};
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+use std::fs;

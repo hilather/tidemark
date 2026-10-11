@@ -14,6 +14,7 @@ struct FakeSystemctl {
     active: Cell<bool>,
     fail_enable: Cell<bool>,
     refuse_stop: Cell<bool>,
+    fail_restart: Cell<bool>,
 }
 impl Systemctl for FakeSystemctl {
     fn is_enabled(&self, _: &str) -> io::Result<bool> {
@@ -24,7 +25,7 @@ impl Systemctl for FakeSystemctl {
     }
     fn enable(&self, _: &str) -> io::Result<()> {
         self.calls.borrow_mut().push("enable".into());
-        if self.fail_enable.get() {
+        if self.fail_enable.replace(false) {
             Err(io::Error::other("injected enable failure"))
         } else {
             self.enabled.set(true);
@@ -41,6 +42,9 @@ impl Systemctl for FakeSystemctl {
     }
     fn restart(&self, _: &str) -> io::Result<()> {
         self.calls.borrow_mut().push("restart".into());
+        if self.fail_restart.replace(false) {
+            return Err(io::Error::other("injected restart failure"));
+        }
         self.active.set(true);
         Ok(())
     }
@@ -51,8 +55,27 @@ struct FakeEnv {
     now: i64,
     capacity: (u64, u64),
     fail_record: Cell<bool>,
+    fail_name: RefCell<Option<String>>,
+    fail_restore: Cell<bool>,
+    mutations: Cell<usize>,
 }
 impl FakeEnv {
+    fn write_probe(&self, name: &std::ffi::OsStr, bytes: &[u8]) -> io::Result<()> {
+        self.mutations.set(self.mutations.get() + 1);
+        if self.fail_restore.get() && name == "tidemark.toml" && bytes == b"original" {
+            return Err(io::Error::other("injected compensation failure"));
+        }
+        if self
+            .fail_name
+            .borrow()
+            .as_deref()
+            .is_some_and(|n| name == n)
+        {
+            self.fail_name.borrow_mut().take();
+            return Err(io::Error::other("injected file failure"));
+        }
+        Ok(())
+    }
     fn probe(&self, name: &str) -> io::Result<()> {
         if self.failures.contains(&name) {
             Err(io::Error::other(format!("injected {name}")))
@@ -90,7 +113,20 @@ impl Env for FakeEnv {
     fn lvm(&self, _: &Config) -> io::Result<()> {
         self.probe("lvm")
     }
+    fn state_write(
+        &self,
+        parent: &std::os::fd::OwnedFd,
+        name: &std::ffi::OsStr,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        self.write_probe(name, bytes)?;
+        if name == "staged.json" && self.fail_record.replace(false) {
+            return Err(io::Error::other("injected record write failure"));
+        }
+        files::write_at(parent, name, bytes, false)
+    }
     fn atomic_write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.write_probe(path.file_name().unwrap(), bytes)?;
         if path.file_name().is_some_and(|name| name == "staged.json")
             && self.fail_record.replace(false)
         {
@@ -118,6 +154,9 @@ impl Fixture {
             now: 100,
             capacity: (4 << 30, 10 << 30),
             fail_record: Cell::new(false),
+            fail_name: RefCell::new(None),
+            fail_restore: Cell::new(false),
+            mutations: Cell::new(0),
         };
         Self {
             _dir: dir,
@@ -633,4 +672,257 @@ fn subprocess_wait_is_bounded_without_systemctl() {
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn unsafe_state_values_never_mutate() {
+    let f = Fixture::new();
+    let roots = Config::default().roots;
+    let mut values: Vec<PathBuf> = [
+        "/",
+        "relative",
+        "/tmp/../danger",
+        "/etc",
+        "/usr",
+        "/var",
+        "/var/lib",
+        "/run",
+        "/home",
+        "/root",
+        "/boot",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/tmp",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    values.extend(roots.into_iter().map(|r| r.path));
+    let linked = f._dir.path().join("linked");
+    symlink(f._dir.path(), &linked).unwrap();
+    values.push(linked.join("state"));
+    for value in values {
+        fs::write(&f.source, format!("[general]\nstate_dir = {:?}\n", value)).unwrap();
+        assert!(
+            matches!(
+                stage(&f.source, &StageOptions::default(), &f.sys, &f.env),
+                Err(DeployError::Preflight(_))
+            ),
+            "{value:?}"
+        );
+        assert!(unstage(&value, false, &f.sys).is_err(), "{value:?}");
+        assert!(f.sys.calls.borrow().is_empty());
+        assert!(!f.env.installed.exists());
+        assert_eq!(f.env.mutations.get(), 0);
+        assert!(!f.state.exists());
+    }
+}
+
+#[test]
+fn state_symlinks_refused_before_service_for_all_operations() {
+    for name in [
+        "deploy",
+        MARKER,
+        "deploy/staged.json",
+        "deploy/firstboot.json",
+    ] {
+        for purge in [false, true] {
+            let f = Fixture::new();
+            f.stage();
+            f.sys.calls.borrow_mut().clear();
+            let outside = f._dir.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("staged.json"), b"outside").unwrap();
+            let target = f.state.join(name);
+            if target.is_dir() {
+                fs::remove_dir_all(&target).unwrap();
+            } else if target.exists() {
+                fs::remove_file(&target).unwrap();
+            }
+            symlink(
+                if name == "deploy" {
+                    outside.clone()
+                } else {
+                    outside.join("staged.json")
+                },
+                &target,
+            )
+            .unwrap();
+            assert!(unstage(&f.state, purge, &f.sys).is_err());
+            assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+            assert!(verify(&f.state, Duration::ZERO, &f.sys, &Ping(true)).is_err());
+            assert!(f.sys.calls.borrow().is_empty());
+            assert_eq!(fs::read(outside.join("staged.json")).unwrap(), b"outside");
+        }
+    }
+}
+
+#[test]
+fn installed_symlink_blocks_identical_and_differing_config() {
+    for identical in [false, true] {
+        let f = Fixture::new();
+        f.stage();
+        f.sys.calls.borrow_mut().clear();
+        let outside = f._dir.path().join("outside.toml");
+        let bytes = if identical {
+            fs::read(&f.source).unwrap()
+        } else {
+            b"outside".to_vec()
+        };
+        fs::write(&outside, &bytes).unwrap();
+        fs::remove_file(&f.env.installed).unwrap();
+        symlink(&outside, &f.env.installed).unwrap();
+        assert!(matches!(
+            stage(&f.source, &StageOptions::default(), &f.sys, &f.env),
+            Err(DeployError::Preflight(_))
+        ));
+        assert_eq!(fs::read(&outside).unwrap(), bytes);
+        assert!(f.sys.calls.borrow().is_empty());
+        assert!(!f
+            .env
+            .installed
+            .with_file_name("tidemark.toml.100.bak")
+            .exists());
+    }
+}
+
+#[test]
+fn identical_restage_honors_start_and_repairs_enablement() {
+    let f = Fixture::new();
+    f.stage();
+    assert!(!f.sys.active.get());
+    let record = stage(
+        &f.source,
+        &StageOptions {
+            start_now: true,
+            ..Default::default()
+        },
+        &f.sys,
+        &f.env,
+    )
+    .unwrap();
+    assert!(record.start_now);
+    assert!(f.sys.active.get());
+    f.sys.enabled.set(false);
+    stage(&f.source, &StageOptions::default(), &f.sys, &f.env).unwrap();
+    assert!(f.sys.enabled.get());
+}
+
+#[test]
+fn state_cannot_contain_tracked_root() {
+    let f = Fixture::new();
+    fs::write(
+        &f.source,
+        format!(
+            "[general]\nstate_dir = {:?}\n[[roots]]\npath = {:?}\n",
+            f.state,
+            f.state.join("tracked")
+        ),
+    )
+    .unwrap();
+    assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+    assert!(f.sys.calls.borrow().is_empty());
+    assert!(!f.state.exists());
+}
+
+#[test]
+fn every_publication_and_service_failure_compensates_previous_state() {
+    for point in [
+        "tidemark.toml.100.bak",
+        "tidemark.toml",
+        MARKER,
+        "staged.json",
+        "enable",
+        "restart",
+    ] {
+        for (enabled, active) in [(false, false), (false, true), (true, false), (true, true)] {
+            let f = Fixture::new();
+            fs::create_dir_all(f.env.installed.parent().unwrap()).unwrap();
+            fs::write(&f.env.installed, b"original").unwrap();
+            f.sys.enabled.set(enabled);
+            f.sys.active.set(active);
+            match point {
+                "enable" => f.sys.fail_enable.set(true),
+                "restart" => f.sys.fail_restart.set(true),
+                name => *f.env.fail_name.borrow_mut() = Some(name.into()),
+            }
+            // An enable failure is consumed once so compensation itself can succeed.
+            let error = stage(
+                &f.source,
+                &StageOptions {
+                    start_now: true,
+                    ..Default::default()
+                },
+                &f.sys,
+                &f.env,
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("re-run deploy stage or deploy unstage"));
+            assert_eq!(fs::read(&f.env.installed).unwrap(), b"original", "{point}");
+            assert_eq!(f.sys.enabled.get(), enabled, "{point}");
+            assert_eq!(f.sys.active.get(), active, "{point}");
+            assert!(!f.state.join("deploy/staged.json").exists());
+        }
+    }
+}
+#[test]
+fn compensation_errors_are_reported_with_original_failure() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.env.installed.parent().unwrap()).unwrap();
+    fs::write(&f.env.installed, b"original").unwrap();
+    f.env.fail_record.set(true);
+    f.env.fail_restore.set(true);
+    let message = stage(&f.source, &StageOptions::default(), &f.sys, &f.env)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("injected record write failure"));
+    assert!(message.contains("injected compensation failure"));
+    assert!(message.contains("re-run deploy stage or deploy unstage"));
+}
+#[test]
+fn existing_unmarked_directory_permissions_are_untouched() {
+    let f = Fixture::new();
+    fs::create_dir(&f.state).unwrap();
+    fs::set_permissions(&f.state, fs::Permissions::from_mode(0o750)).unwrap();
+    f.stage();
+    assert_eq!(
+        fs::metadata(&f.state).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+}
+
+#[test]
+fn previous_staged_and_marker_bytes_survive_publication_failure() {
+    let f = Fixture::new();
+    f.stage();
+    let old_config = fs::read(&f.env.installed).unwrap();
+    let old_record = fs::read(f.state.join("deploy/staged.json")).unwrap();
+    let old_marker = fs::read(f.state.join(MARKER)).unwrap();
+    let mut source = fs::read(&f.source).unwrap();
+    source.extend_from_slice(b"# replacement\n");
+    fs::write(&f.source, source).unwrap();
+    f.env.fail_record.set(true);
+    assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+    assert_eq!(fs::read(&f.env.installed).unwrap(), old_config);
+    assert_eq!(
+        fs::read(f.state.join("deploy/staged.json")).unwrap(),
+        old_record
+    );
+    assert_eq!(fs::read(f.state.join(MARKER)).unwrap(), old_marker);
+}
+#[test]
+fn service_compensation_failure_is_reported_and_verified() {
+    let f = Fixture::new();
+    f.sys.active.set(true);
+    f.sys.fail_restart.set(true);
+    f.env.fail_record.set(true);
+    let message = stage(&f.source, &StageOptions::default(), &f.sys, &f.env)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("injected record write failure"));
+    assert!(message.contains("injected restart failure"));
+    assert!(message.contains("service compensation active=false, expected true"));
 }

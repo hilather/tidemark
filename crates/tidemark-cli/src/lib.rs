@@ -20,6 +20,8 @@ pub mod render;
 pub struct Context {
     /// Loaded and validated configuration.
     pub config: Config,
+    /// Installed configuration destination from global -c.
+    pub config_path: std::path::PathBuf,
     /// Emit schema-wrapped machine output.
     pub json: bool,
     /// Whether terminal color is enabled.
@@ -93,13 +95,19 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
             args,
             &Context {
                 config: Config::default(),
+                config_path: cli.config.clone(),
                 json: cli.json,
                 color: false,
             },
         )
         .map_err(command_error);
     }
-    let mut config = load_config(&cli.config)?;
+    let staging = matches!(&cli.command, cli::Command::Deploy(args) if matches!(&args.command, cmd::deploy::Command::Stage(_)));
+    let mut config = if staging {
+        Config::default()
+    } else {
+        load_config(&cli.config)?
+    };
     if let Some(path) = cli.state_dir {
         config.general.state_dir = path;
     }
@@ -137,6 +145,7 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
     cli.command
         .run(&Context {
             config,
+            config_path: cli.config.clone(),
             json: cli.json,
             color,
         })

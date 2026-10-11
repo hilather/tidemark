@@ -11,7 +11,7 @@ use std::{
 use tidemark_core::api::{ApiError, Request, Response};
 
 /// Maximum request or response size, including its newline (1 MiB).
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// A persistent connection; calls are sequential and use monotonically increasing ids.
 pub struct Client {
     stream: BufReader<UnixStream>,
