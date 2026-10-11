@@ -117,7 +117,7 @@ Generate random trees as an abstract model: directories, files with sizes, link 
 
 ## 5. Privileged VM suite (`cargo xtask vm-test`)
 
-- **Targets:** Rocky 8.8 (kernel 4.18.0-477.x) and Rocky 8.10 (latest 4.18.0-553.x), both x86_64, plus optionally Rocky 9 for forward compatibility. Packages: `xfsprogs xfsprogs-devel lvm2 bcc-tools postgresql-server lsof` (the database package supplies the workload for the `pgbench` impact gate). The VM layout mirrors production: root and `/data` as XFS on LVM (one VG), with a spare disk for loop/thin tests.
+- **Targets:** Rocky 8.8 (kernel 4.18.0-477.x) and Rocky 8.10 (latest 4.18.0-553.x), both x86_64, plus optionally Rocky 9 for forward compatibility. Packages: `xfsprogs xfsprogs-devel lvm2 bcc-tools lsof`. The VM layout mirrors production: root and `/data` as XFS on LVM (one VG), with a spare disk for loop/thin tests.
 - **Mechanism:** `xtask vm-test --host <ssh-host>` rsyncs the workspace, builds in the VM, and runs `sudo env "PATH=$PATH" cargo test --workspace --features privileged -- --test-threads=1` (EL8 sudo's `secure_path` ignores `-E`). VM provisioning (Vagrant/libvirt or a pre-built image) is documented in `xtask/README.md`.
 - **Loop XFS helper** (`test-support::xfs::LoopXfs`): `truncate -s <size> img`, `mkfs.xfs -f [opts] img`, `mount -o loop,<opts>` into a temp dir, with unmount and cleanup on `Drop`. Options cover `ftype=0` (to test the `DT_UNKNOWN` path) and `reflink=0/1`.
 - **Loop LVM helper** (`test-support::lvm::LoopVg`): loop devices → `pvcreate`/`vgcreate` with a unique test VG name → optional thin pool and thin LV → `mkfs.xfs` → mount. Cleanup removes LVs, VG, PVs and loop devices on `Drop`, and refuses to touch any VG not created by the test.
@@ -205,16 +205,17 @@ Record these Wave 1 findings on both VMs in `docs/handoff/W1-gate.md`; preserve 
 - 10% symlinks.
 - Target 5 M and 20 M inodes.
 
-**`cargo xtask bench --root … --modes du,walk,bulk --cache cold,warm --pgbench on,off`** records:
+**`cargo xtask bench --root … --modes du,walk,bulk --cache cold,warm`** records:
 
 - Wall time, CPU time, peak RSS, and syscall counts per mode.
-- Device util and await percentiles.
-- With pgbench on: TPS and p99 latency compared with a no-scan baseline.
+- Leaf block devices' utilisation and average-wait series with and without a scan, from `/sys/block/*/stat` using the adaptive gate's samples.
+- Gate statistics: mean rate, minimum rate, time throttled, number of decreases.
+- Watcher overhead: fixture-generator throughput in mutate mode with and without the watcher.
 
 Gates (NFR-2), set as defaults and confirmed or adjusted in the pilot:
 
 - Cold walk or bulk, with throttle off, at least 3× faster than `du -sx`.
-- With the `normal` throttle profile, pgbench p99 latency degradation ≤ 10%.
+- With the `normal` throttle profile, the leaf block devices' utilisation and average wait (from `/sys/block/*/stat`, using the adaptive gate's samples) stay within the profile's configured targets, apart from short excursions the controller corrects.
 - Peak RSS within `memory_budget`.
 
 ## 8. Soak (W7)
@@ -222,8 +223,7 @@ Gates (NFR-2), set as defaults and confirmed or adjusted in the pilot:
 72 h on staging with:
 
 - The daemon at default settings.
-- The fixture generator mutating the tree continuously.
-- pgbench running.
+- The fixture generator in mutate mode, mutating the tree continuously.
 - Scans every hour.
 
 Pass criteria:

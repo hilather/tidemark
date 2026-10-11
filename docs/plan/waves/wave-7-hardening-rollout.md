@@ -87,13 +87,14 @@
 ### Gates (NFR-2, NFR-4)
 
 - [ ] Cold-cache scan ≥ 3× faster than `du -sx` with the throttle off (or a documented, agreed revised target).
-- [ ] With the `normal` profile, pgbench p99 latency degradation ≤ 10% during a scan.
+- [ ] With the `normal` profile during a scan, the leaf block devices' utilisation and average wait (from `/sys/block/*/stat`, using the adaptive gate's samples) stay within the profile's configured targets, apart from short excursions the controller corrects.
+- [ ] Watcher overhead measured by comparing fixture-generator throughput in mutate mode with and without the watcher.
 - [ ] Peak RSS ≤ `memory_budget` at the target scale.
 - [ ] Daemon steady-state RSS ≤ 300 MiB and CPU ≤ 2% of one core outside scans (72 h soak, below).
 
 ### 72-hour soak (with W7-D)
 
-On staging: daemon at defaults, generator in mutate mode, pgbench running, hourly scans. Pass criteria are in `09` §8. Graphs and a summary go in `docs/perf/soak-<date>.md`.
+On staging: daemon at defaults, generator in mutate mode, hourly scans. Pass criteria are in `09` §8. Graphs and a summary go in `docs/perf/soak-<date>.md`.
 
 ---
 

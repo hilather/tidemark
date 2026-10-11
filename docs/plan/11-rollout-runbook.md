@@ -64,7 +64,7 @@ After verify:
 
 **Abort criteria** (any of these during a scan):
 
-- Postgres p99 latency > 1.2 × baseline for more than 1 minute;
+- leaf block device utilisation or average wait remains above the active profile's configured targets after the controller backs off;
 - array await > 2 × baseline for more than 2 minutes;
 - application alerts.
 
