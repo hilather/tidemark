@@ -138,6 +138,8 @@ SCR-008 (`13`, Wave 2) approves only these two `errors_total` additions to core.
 
 ### 2.2 Per-directory procedure
 
+`WalkConfig.max_record_bytes: u64` bounds each retained directory record (0 disables the bound only for explicit fixtures). Exceeding it returns `WalkError::Limit(String)` naming the directory, entry count and bound; no record is truncated. Charge before allocation for links, skips, sampled errors, namespace children and candidates, including vector growth, names/paths, padding and candidate heaps. See §7 for the orchestrator formula.
+
 ```
 gate.acquire(COST_OPEN_GETDENTS)
 fd = openat(AT_FDCWD, path, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_NOATIME)
@@ -239,9 +241,16 @@ Inodes that changed between phase 1 and phase 2 make the snapshot fuzzy. That is
 
 ### 3.3 Phase 3 — names for notable files
 
-After aggregation, the global top-N and over-threshold files are known by `(DirId, ino)` but have no names. Group them by directory. For each directory, `open` + `getdents64` and pick the wanted inode numbers. This touches at most `max_notable` directories and is throttled.
+After aggregation, the global top-N and over-threshold files are known by `(DirId, ino)` but have no names. Group them by directory. For each directory, use the checked helper below and pick the wanted inode numbers. This touches at most `max_notable` directories and is throttled.
 
 **Hard-link instance names are not resolved in bulk mode.** `link_instances.name` stays `NULL`, and reports resolve names lazily by reading the live directory (`links --show-paths`). This is labelled "live" in output, because the directory may have changed since the snapshot.
+
+```rust
+pub fn read_dir_entries_checked(root: &RawPath, dev: DevId, path: &RawPath,
+    expect_ino: Option<Ino>, gate: &dyn Gate) -> io::Result<Vec<(RawName, Ino, FileKind)>>;
+```
+
+`tidemark_fs::walk::read_dir_entries_checked` opens each component relative to no-follow directory handles with O_NOATIME (EPERM fallback). Gated descriptor statx checks device and available mount ID against the opened root before enumeration, and the final inode against the expected phase-1 identity. Outside-root paths and identity/device/mount mismatches return `io::ErrorKind::CrossesDevices`; other open errors retain their I/O error. Without kernel mount IDs, a same-device bind preserving the expected inode cannot be detected. Bulk phase 3 and `links --show-paths` use this helper, never the unchecked read. Bulk failures leave names unresolved and count races; links render missing/replaced directories as `(gone)` and propagate other I/O failures. Apply original excludes and skipped-mount paths before choosing an alias.
 
 ## 4. Things both modes must do identically
 
@@ -370,20 +379,22 @@ Choose **bulk** if all of the following hold, otherwise choose **walk** and log 
    bytes      ≈ dents × 12 + dirs × 320 + 64 MiB
    ```
 
-`scan.memory_budget` is admission control by estimate for mode choice and queue sizing, not a hard allocation guarantee. No new `WalkConfig` budget field is added. The service cgroup memory limit supplies the hard bound. The orchestrator logs its working-set estimate and observed process peak RSS after publication, series and retention work; process VmHWM includes earlier or concurrent work and is not an isolated scan measurement.
+`WalkConfig.max_record_bytes: u64` bounds each retained directory record (0 disables the bound only for explicit fixtures). Exceeding it returns `WalkError::Limit(String)` naming the directory, entry count and bound; no record is truncated. Charge before allocation for links, skips, sampled errors, namespace children and candidates, including vector growth, names/paths, padding and candidate heaps.
 
-The walk-mode base estimate is `dirs × 320 + link_entries × 72 + 64 MiB`; add candidate storage below. The orchestrator sizes the walker output channel from the scan memory budget.
+Let `Q = scan.memory_budget / 4` and `T = threads`. Refuse before starting if `Q < T * 16 MiB`. Compute `C = clamp(floor(Q / 16 MiB) - T, 1, 64)` and `max_record_bytes = floor(Q / (T + C))`. Capacity reaches 1 before the record bound drops below 16 MiB. Admission also checks aggregator estimates and worker buffers/heaps against the remaining budget using wide arithmetic, including bulk-to-walk fallback. Bulk's namespace channel has capacity 2, so bulk admission refuses derived `C < 2`. CLI live walks use the same derived record bound. This replaces D3: aggregate storage remains estimated, while records are explicitly bounded; the service cgroup supplies the hard whole-process limit.
 
-For top-N candidate storage, let `T = threads`, `C = output channel capacity`, `N = top_files`, `L = maximum allocated name bytes` and `B = bytes per candidate` (measured layout plus name storage and allocation/capacity overhead, at least `size_of::<NotableFile>() + L`). The walker holds at most `(T + C) * N * B + T * N * size_of::<u64>()` bytes of top-N candidates and worker cutoff heaps. Record headers, links, skipped entries, errors, traversal tasks and buffers are additional memory. If over-threshold candidates are separate, add `(T + C) * H * B` for their documented exact per-directory cap `H`; if exact bounded retention cannot be implemented, W1-B must file its G3 SCR rather than silently truncate.
+Notable candidates are bounded during ingestion in both modes. Let D be candidate-bearing directories and M=`max_notable`: retain fewer than M rows above the cutoff and at most D*M at the cutoff, plus one transient insertion; below-threshold ties tighten to D*min(`top_files`, M). After final directory numbering, lazily drain into a selection capped at M in `(disk desc, final directory id asc, inode asc)` order. This is exact but does not promise O(M) memory independent of D.
 
-W2-C assigns a share `M_queue` of the scan memory budget to queued records and chooses `C` so that `C * top_files * B <= M_queue`, i.e. `C <= floor(M_queue / (top_files * B))` for nonzero `top_files`. Include any separate threshold class and other record storage in the queued-record estimate, and reserve the producer term `T * N * B`, heaps and other scan state separately. Zero `top_files` contributes no top-N storage; channel capacity remains bounded for other record fields. If the budget cannot fit a usable channel plus producer state, refuse with an explicit resource error; do not rely on cgroup OOM as backpressure.
+The fixed fallback directory limit is `MAX_DIRS = 16_000_000`; exceeding it returns `AggError::Capacity`. Node payload is 232 bytes, sparse `Option<Box<Node>>` slots 8 bytes, or 240 bytes per populated directory before names, children, allocator overhead and vector slack. The 200-byte target was not reached. Linked scans additionally need temporary 32-byte union/stamp scratch slots plus numbering vectors; this ceiling is not a guarantee of fitting the configured budget.
 
-An explicit `--mode bulk` without v5 fails with exit code 5 and a message naming missing v5 bulkstat; it does not fall back to v1 metadata.
+Bulk worker admission reserves at most 32 MiB of the existing 64 MiB overhead estimate: `workers * (64 + batch * (192 + size_of::<BulkInode>()) + 2 * message_bytes + 2 MiB stack) + 3 * message_bytes`, with workers=min(threads, agcount). Each message reserves 4,096 joined layouts plus 1 MiB spilled directory IDs. Join batches flush at 65,536 namespace references; reject larger single-inode groups before spill allocation. Phase-1 identity storage remains capped at one million directories; duplicate directory identities fail with `DirectoryIdentityRace { ino, races }` before dispatch. These W2-B-fix bounds are admission estimates, not isolated RSS guarantees.
+
+The walk-mode base estimate remains `dirs × 320 + link_entries × 72 + 64 MiB`, plus candidate storage. Log the working-set estimate and process peak RSS after publication, series and retention; VmHWM includes earlier/concurrent work and is not isolated scan RSS. Explicit bulk without v5 fails with exit code 5 and a missing-v5 diagnostic; never fall back to v1 metadata.
 
 ## 8. Cancellation, failures and partial snapshots
 
 - SIGINT/SIGTERM or an API `scan.cancel` sets an `AtomicBool`. Workers stop taking tasks, finish their current directory and exit.
-- A cancelled or failed scan deletes its `.db.tmp`, unless walk mode is running and `--keep-partial` is given, in which case the snapshot is written with `meta.status = partial` and is never chosen as "latest" by default.
+- A cancelled or failed scan deletes its `.db.tmp`; walk `--keep-partial` may retain valid collected records after cancellation, I/O or resource-limit failure with status partial (never default latest). Worker panic/disconnection fails closed. Cancellation observed during finish_with discards every unpublished candidate, including partial output (05 §2, 13 R2-4).
 - Bulk cancellation returns `BulkError::Cancelled` and produces no snapshot; `--keep-partial` applies only to walk mode.
 - A scan whose error count is > 0 is `status = complete` with `meta.degraded = true`. Reports show this.
 

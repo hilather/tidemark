@@ -122,12 +122,14 @@ On staging: daemon at defaults, generator in mutate mode, hourly scans. Pass cri
   - The root daemon and its capability set.
   - Root-only CLI/API access, sudo guidance, and root-owned file and directory modes (ADR-018).
   - Sensitivity of path names in snapshots and metrics.
-  - Data sent in webhooks (paths in alert messages; config `alerts.redact_paths` was considered, and a decision is recorded).
+  - Data sent in webhooks (escaped paths/subjects and documented fields; no separate v1 redaction key or rule, 13 R2-10).
   - The read-only guarantee (no metadata, mount or LVM writes) and the `xtask ci` forbidden-call check.
-  - `deploy stage`/`unstage` safety (all-or-nothing staging; purge guard).
+  - `deploy stage`/`unstage` safety (pre-flight failures change nothing; later failures attempt compensation; unsafe-state refusal and no-follow handles; purge guard, 13 R2-7).
   - The SELinux posture (`unconfined_service_t`, and a possible future policy module).
   - Supply chain (`cargo-deny`, pinned toolchain, reproducible container build).
 - **Dependency review:** `cargo deny check` clean; an explanation for each crate with `unsafe` in its dependency tree that touches our data paths.
+
+Review the implemented contracts in `13` R2-1–10: record/resource refusals, checked live name reads, removed-path diff, publication cancellation, foreground-only event drains, PID reuse and not-evaluable alerts. Corruption fault tests must call recover_catalog only after reported corruption with connections closed; healthy startup is non-destructive.
 
 ### Acceptance
 

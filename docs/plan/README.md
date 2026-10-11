@@ -31,7 +31,7 @@ Two commands do most of the work during an incident:
 
 ```bash
 dnf install -y ./tidemark-<ver>-1.el8.x86_64.rpm
-tidemark deploy stage --from ./tidemark.toml     # pre-flight checks; all-or-nothing; enables the service
+tidemark deploy stage --from ./tidemark.toml     # pre-flight checks; runtime failures attempt compensation; enables the service
 # … hotfix reboot …
 tidemark deploy verify --wait 5m                   # pipeline pass/fail from the first-boot health report
 ```
