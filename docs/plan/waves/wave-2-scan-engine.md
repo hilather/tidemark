@@ -128,6 +128,8 @@ pub fn run_bulk(p: &BulkParams, mount_fd: BorrowedFd<'_>, geo: &XfsGeometry, gat
 
 ### Implementation notes
 
+- **v5 only:** `tidemark_sys::xfs::bulkstat` uses v5 metadata only; `Unsupported` means bulk mode is unavailable, never permission to use v1 records.
+
 - **Phase 1:** run `walk()` with `stat_entries = false` on a scoped thread. The collector thread consumes `WalkOutput::Ns`, calls `agg.add_skeleton(&ns)`, and appends `DentRef`s: 12 bytes each (`[u32; 3]` or `#[repr(C, packed(4))]`, read by copy only), one per child plus one self-reference per directory with the high bit of `slot` set.
 - **Sort:** `rayon` `par_sort_unstable_by_key` on `ino`.
 - **Phase 2:**
@@ -169,7 +171,7 @@ pub struct Progress { pub phase: &'static str, pub dirs: u64, pub entries: u64, 
 pub struct ScanOutcome { pub scan_id: String, pub file: Option<PathBuf>, pub status: SnapshotStatus,
                          pub degraded: bool, pub mode: ScanMode, pub mode_reason: String,
                          pub summary: AggSummary, pub duration: Duration }
-pub struct ModeFacts { pub is_xfs: bool, pub bulkstat_v1: bool, pub cap_sys_admin: bool, pub ftype: Option<bool>,
+pub struct ModeFacts { pub is_xfs: bool, pub bulkstat_v5: bool, pub cap_sys_admin: bool, pub ftype: Option<bool>,
                        pub root_is_mountpoint: bool, pub prev_root_inodes: Option<u64>, pub fs_used_inodes: u64,
                        pub dirs_estimate: u64 }
 pub fn choose_mode(f: &ModeFacts, req: &ModeRequest, memory_budget: u64) -> (ScanMode, String);   // pure
@@ -190,9 +192,9 @@ pub fn run_scan(cfg: &Config, req: &ScanRequest, recorder: &dyn ScanRecorder, ca
 2. Look up the root's `[[roots]]` config, or defaults when scanning an unconfigured path.
 3. **Host-wide scan lock:** take an exclusive `flock` on `state_dir/scan.lock` (non-blocking). If it's held, return `ScanError::Busy` (ADR-015). The daemon scheduler takes the same lock, so a CLI scan and a daemon scan can never overlap.
 4. **Space guard** (`05` §8). If refused, return `ScanError::NoSpace`.
-5. **Gate:** `gate_from_config(profile_name, &cfg.throttle, &leaves, sampler)` with `leaves = resolve_leaves(dev)` and `sampler` built from `read_disk_stats(&leaves)`.
+5. **Gate:** `gate_from_config(profile_name, &cfg.throttle, &leaves, sampler)` with `leaves = resolve_leaves(dev)` (empty on unavailable discovery) and a bounded sampler built from ordered, all-or-error `read_disk_stats(&leaves)`.
 6. Fallible `ScanId::new(now)` (propagate invalid UTC-year errors; retry a collision with a fresh id, never replace an existing snapshot); `recorder.scan_started`.
-7. Choose the mode (`choose_mode`, `04` §7). On a bulk failure before phase 2 starts, fall back to walk and record why.
+7. Choose the mode (`choose_mode`, `04` §7): auto requires v5. Explicit `--mode bulk` without v5 fails with exit code 5 and a reason naming missing v5 bulkstat. Auto may fall back to walk on a bulk failure before phase 2 starts and records why.
 8. Run walk (W1-B → W2-A on a collector thread) or bulk (W2-B). Report progress every 2 s.
 9. `prepared.annotate(…)` for every request annotation.
 10. `SnapshotWriter::create` → `prepared.write(&mut WriterSink)` → `finish(meta)`. Fill `meta` per `05` §1, including phase timings and gate stats.
@@ -202,7 +204,7 @@ pub fn run_scan(cfg: &Config, req: &ScanRequest, recorder: &dyn ScanRecorder, ca
 ### CLI
 
 - `scan` (direct mode; uses a `DirectRecorder` that writes `timeseries.db`, valid only while the daemon is not running): text progress on stderr (single updating line on a TTY; one line per 10 s otherwise). Final summary: mode and reason, duration, dirs/files, `t_disk`, reclaimable, link sets (incomplete), errors, races, snapshot path. `--json` prints `ScanOutcome`. **W6-A adds the daemon branch:** when `tidemarkd` is up, `scan` calls `scan.start` and follows `scan.status`, and `--cancel` calls `scan.cancel`.
-- `snapshots list|show|prune [--dry-run]|rebuild-catalog`.
+- `snapshots list|show|prune [--dry-run]|rebuild-catalog`. Direct catalog opens stay non-destructive; only reported corruption triggers `catalog::recover_catalog`, with all connections closed and writers stopped. Log preserved recovery file names (`05` §4). A healthy or missing catalog uses ordinary open/rebuild.
 - `top`: per `08` §1.4.
   - Columns SIZE, RECLAIM, SHARED (with `H`), FILES, NEWEST (optional `--wide`), and Δ24h when the catalog has a complete snapshot within ±6 h of now − 24 h (looked up per displayed path in the old snapshot).
   - `--depth N` renders a tree; `--sort` and `--min-size` as in the spec. The CLI wrapper’s `Growth` case compares two snapshots (the selected snapshot and the older complete snapshot used for Δ24h), orders by descending signed disk-byte delta and breaks ties by raw path bytes; error if no older snapshot exists. It is not a single-snapshot `SortKey` variant.

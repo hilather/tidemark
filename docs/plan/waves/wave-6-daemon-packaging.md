@@ -48,8 +48,8 @@ tidemarkd/src/
 - **Startup order:**
   1. Config.
   2. State dir (create, check permissions).
-  3. `TimeSeries::open` + migrate.
-  4. Catalog.
+  3. Open shared storage (`TimeSeries::open` / `Catalog::open`) and migrate. Only a reported corrupt open triggers `tidemark_store::catalog::recover_catalog(state_dir)`: stop writers and close all catalog/sample connections first. Preserve DB and sidecars, rebuild from valid snapshots, and log every recovery file name (`Catalog::recovery_files`, `05` §4).
+  4. Catalog and time-series connections on the healthy or recovered database.
   5. Namespace check (the watcher is disabled with a loud error if it fails; the daemon still runs).
   6. Services.
   7. API socket: remove a stale socket, bind, set mode `0600`, owner `root:root`.

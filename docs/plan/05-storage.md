@@ -146,12 +146,13 @@ impl Snapshot {
 pub enum SortKey { Disk, Apparent, Reclaimable, Charged, Files, Inodes, Newest, Name }
 ```
 
-`FileFilter { min_size: Option<u64>, older_than: Option<Duration>, newer_than: Option<Duration> }` measures ages relative to snapshot `started_at`. `LinkFilter { incomplete: bool, boundary: Vec<String>, boundary_depth: Option<u32> }` rejects simultaneous boundary globs and boundary depth. `FileHit { row: FileRow, path: Option<RawPath> }` preserves unresolved bulk-race paths as `None`; render them honestly. `LinkSetHit { row: LinkSetRow, lca_path: RawPath, instance_count: u64 }` counts stored instance rows, not discovered `row.found` (especially with `link_instances=none`). Readers enforce the checked conversions in §1. `SortKey` stays single-snapshot; CLI growth sorting uses two snapshots (`08` §1.2).
+`FileFilter { min_size: Option<u64>, older_than: Option<Duration>, newer_than: Option<Duration> }` measures ages relative to snapshot `started_at`. `LinkFilter { incomplete: bool, boundary: Vec<String>, boundary_depth: Option<u32> }` rejects simultaneous boundary globs and boundary depth. Boundary globs match complete raw directory path bytes, with `*` confined to a component. A matching directory defines a subtree region; the deepest matching ancestor wins, and unmatched instances share an outside region. Select sets crossing distinct regions. Region storage and pattern count use the existing 1,000,000-row cap; exceeding it errors rather than truncates (W1-E fix). `FileHit { row: FileRow, path: Option<RawPath> }` preserves unresolved bulk-race paths as `None`; render them honestly. `LinkSetHit { row: LinkSetRow, lca_path: RawPath, instance_count: u64 }` counts stored instance rows, not discovered `row.found` (especially with `link_instances=none`). Readers enforce the checked conversions in §1. `SortKey` stays single-snapshot; CLI growth sorting uses two snapshots (`08` §1.2).
 
 ## 4. Catalog
 
 - **Source of truth:** the `scans` table in `timeseries.db` (§6).
-- **Fallback:** if `timeseries.db` is missing or corrupt, `tidemark snapshots rebuild-catalog` lists `snapshots/*/*.db` and reads each file's `meta`.
+- **Rebuild:** when the database is missing or healthy, `tidemark snapshots rebuild-catalog` opens it normally and rebuilds from valid `snapshots/*/*.db` metadata.
+- **Corruption recovery:** `Catalog::open` remains non-destructive. After an open reports corruption, callers stop writers and close all catalog/sample connections, then call `tidemark_store::catalog::recover_catalog(state_dir)` to preserve the database and WAL/SHM sidecars by rename, create a fresh database and rebuild the catalog from valid snapshot files. The daemon at startup and `snapshots rebuild-catalog` use this path only on reported corruption and log the preserved paths. Per `docs/handoff/W1-E-fix.md`, preservation uses an exclusively created private `timeseries-recovery-N` directory inside `state_dir`, with at most 10,000 namespace attempts and directory syncs; no artifacts are deleted. `Catalog::recovery_files() -> &[PathBuf]` reports the preserved paths. Historical samples are unavailable in the new database but remain in those artifacts.
 - **"Latest"** is the newest `status = complete` snapshot for that root. Partial snapshots must be selected explicitly.
 
 ## 5. Diff and explain (W3-A)
@@ -276,6 +277,8 @@ daily  = 14     # plus the newest snapshot of each of the last 14 days
 weekly = 8      # plus the newest snapshot of each of the last 8 ISO weeks
 ```
 
+Retention always keeps each root's newest complete snapshot, even with `recent = 0`, expired calendar windows or an all-zero policy.
+
 Partial and failed snapshots are deleted after 24 h. `tidemark snapshots prune --dry-run` shows what would go.
 
 ## 8. Space guard (NFR-7)
@@ -283,8 +286,8 @@ Partial and failed snapshots are deleted after 24 h. `tidemark snapshots prune -
 Before starting a scan, the daemon and CLI check the state filesystem:
 
 - `estimate = previous snapshot size × 1.25`, or `dirs_estimate × 300 B` if there is no previous snapshot.
-- If `state_dir` usage plus the estimate would exceed `max_state_size`, or free space would drop below the floor, **first prune**: delete the oldest snapshots that aren't in the `recent` set (largest root first) until the scan fits. Only if it still doesn't fit, refuse to start and raise alert `state_space`. The floor is `max(min_free_pct × size, 2 GiB)`.
-- Pruning never deletes the `recent` set; it logs every deletion.
+- If `state_dir` usage plus the estimate would exceed `max_state_size`, or free space would drop below the floor, **first prune**: delete the oldest snapshots that aren't in the `recent` set or each root's protected newest complete snapshot (largest root first) until the scan fits. Only if it still doesn't fit, refuse to start and raise alert `state_space`. The floor is `max(min_free_pct × size, 2 GiB)`.
+- Pruning never deletes the `recent` set or a root's newest complete snapshot; it logs every deletion.
 - During the scan, the writer re-checks free space every 100,000 rows and aborts cleanly if the floor is crossed.
 
 ## 9. Schema evolution

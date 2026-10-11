@@ -106,10 +106,10 @@ L = likelihood, I = impact (H/M/L).
 | R1 | *(removed: project quotas deferred, ADR-007)* | — | — | — | — |
 | R2 | Scans degrade Postgres or app latency on RAID 5 | M | H | Adaptive throttle; windows; `gentle` profile in pilot; one scan at a time; pgbench gate | `04` §6, W1-D, W7-B, P3 |
 | R3 | Scans cause atime write storms | L | H | `O_NOATIME` on every directory open; `noatime_no_writes` test | W1-B |
-| R4 | Misleading numbers with hard links lead to wrong deletions | M | H | Normative spec; oracle, property and golden tests; reclaimable column; `H` markers | `03`, W2-A |
+| R4 | Misleading numbers with hard links lead to wrong deletions | M | H | Normative spec; oracle, property and golden tests; reclaimable column; `H` markers; v5-only bulk metadata (32-bit nlink), never truncated v1 link counts | `03`, W2-A |
 | R5 | Watcher silently blind (namespace, bind mounts, overflow) | M | M | Namespace guard; install E2E test; probe warnings; lossy/overflow metrics and alert | W5-A, W6-C |
 | R6 | Memory blow-up on very large trees | M | M | Memory estimates; budget-driven mode choice; cgroup memory limit; scale tests; spill join if needed | `04` §7, W2, W7-B |
-| R7 | EL8 kernel behaviour differs from upstream (bulkstat units, v5, fanotify FID) | M | M | Runtime probes; VM tests on 8.8 and 8.10; explicit validation tests | W1-C, W5-A |
+| R7 | EL8 kernel behaviour differs from upstream (bulkstat units, v5, fanotify FID) | M | M | EL8 5.0.0 headers lack v5; module inspection found v5 handlers in 477.27.1.el8_8 and 553.172.1.el8_10, not runtime ioctl evidence. Hand-transcribed ABI pinned to gcc layouts (`04` §5.1); runtime probes and units tests on both VMs remain gates | W1-C, W5-A |
 | R8 | Tidemark's own state fills the disk or adds random writes to RAID 5 | L | M | Space guard; retention; state dir on another device; excluded from scans and watch | `05` §8, W1-E |
 | R11 | Postgres collector adds load or locks | L | L–M | Statement and lock timeouts; read-only session; low frequency; per-DB sequential | W5-C |
 | R12 | Path names exposed through metrics or webhooks | M | M | Root-only file and API permissions (ADR-018); loopback-only HTTP; cardinality caps; redaction decision in `security.md` | W6-B, W7-C |

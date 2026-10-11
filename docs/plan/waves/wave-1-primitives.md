@@ -24,9 +24,10 @@
 
 ```rust
 // tidemark-fs::mount
+pub enum MountRoot { Path(RawPath), Object(Vec<u8>) }
 pub struct MountInfo {
     pub id: u32, pub parent: u32, pub major: u32, pub minor: u32, pub dev: DevId,
-    pub root: RawPath, pub mount_point: RawPath,
+    pub root: MountRoot, pub mount_point: RawPath,
     pub mount_opts: Vec<String>, pub fs_type: String, pub source: String, pub super_opts: Vec<String>,
 }
 pub fn parse_mountinfo(bytes: &[u8]) -> Result<Vec<MountInfo>, ParseError>;   // pure; fuzzed in W7-C
@@ -51,6 +52,10 @@ pub fn probe(cfg: &Config, extra_roots: &[RawPath]) -> ProbeReport;            /
 ### Details
 
 - **mountinfo parsing:** fields per proc(5). Optional fields end at `-`. Decode octal escapes (`\040` space, `\011` tab, `\012` newline, `\134` backslash) into raw bytes. `dev = makedev(major, minor)` (use `libc::makedev`).
+- Kernel-object roots such as `net:[4026533000]` are retained as `MountRoot::Object` and still define mount boundaries. Malformed lines are reported and skipped; well-formed records are returned.
+- Canonicalize user paths with realpath before constructing `RawPath`; never lexically normalize first. Unresolved paths produce unknown facts with reasons, never another mount's facts. Escape every displayed mount field like `RawPath::display_lossy`, including valid UTF-8.
+- `read_disk_stats` preserves leaf input order and returns one sample per leaf or fails as a whole.
+
 - **`resolve_leaves`:** start at `/sys/dev/block/<maj>:<min>`. If it has a `partition` file, step to the parent directory (the whole disk). If `slaves/` is non-empty (dm, md), recurse into each slave. Leaves are devices with no slaves. Record `queue/rotational`, the active scheduler (the bracketed entry in `queue/scheduler`), and for md, `md/level`. Hardware RAID LUNs appear as a single `sdX` leaf.
 - **Probe contents** (each field optional, plus a short `why` for unknowns):
   - **Host:** OS release (`/etc/os-release`, `/etc/rocky-release`), kernel (`uname -r`), whether this is the latest Rocky minor (8.10 for EL8; warn on anything older), cgroup version (`statfs("/sys/fs/cgroup").f_type`), CPUs, memory, effective capabilities (`CapEff` from `/proc/self/status`), mount-namespace equality (`/proc/self/ns/mnt` vs `/proc/1/ns/mnt`), `/sys/kernel/btf/vmlinux` present, `bcc-tools` installed.
@@ -115,7 +120,7 @@ pub fn read_dir_entries(dir: &RawPath, gate: &dyn Gate) -> io::Result<Vec<(RawNa
 - `getdents64` via `rustix::fs::Dir` (or `rustix::fs::RawDir` with a caller-provided buffer of `getdents_buf` bytes). Use `statx` via `rustix::fs::statx` with `AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT`.
 - **Paths longer than `PATH_MAX`:** when `openat(AT_FDCWD, path)` returns `ENAMETOOLONG`, fall back to component-wise `openat` from the root with `O_NOFOLLOW` at each step. Test with depth 200.
 - **`DT_UNKNOWN`:** classify with `statx` (mode only). The `ftype=0` loop-XFS test covers it.
-- **Notable files:** worker-local `BinaryHeap<Reverse<(u64, …)>>` of size `top_files`; emit entries with `disk ≥ big_file_threshold` or admitted to the heap.
+- **Notable files:** Workers emit every candidate that could win global top-N under `(disk desc, final directory id asc, inode asc)`, including all ties at the worker's size cutoff. The heap holds at most `top_files` sizes (configuration cap 200,000), with no worker-wide tie collection. Per `docs/handoff/W1-B-fix.md`, ties live in the current `DirRecord`, capped by the existing 1,000,000 direct-entry limit: exceeding it returns `WalkError::Limit("million-entry directory cap")` and aborts the scan, never silently truncates candidates. At most `threads` producer records and `out.capacity()` queued records are retained (validated bounds 64 and 1,024), giving at most `(threads + out.capacity()) * 1,000,000` notable candidates plus `threads * top_files` heap size values. Consumer retention is the consumer's responsibility; this large finite ceiling is not a measured worst-case RSS guarantee.
 - **Backpressure:** `out` is a bounded channel (capacity 1,024 records). Workers block when the consumer is slow.
 - **Cancellation:** check `cancel` before each directory; return `Err(WalkError::Cancelled)` after draining in-flight workers.
 - **No `unsafe`.** `rustix` gives safe wrappers.
@@ -123,7 +128,7 @@ pub fn read_dir_entries(dir: &RawPath, gate: &dyn Gate) -> io::Result<Vec<(RawNa
 ### Tests
 
 - Unit and integration (unprivileged, `test-support` fixtures):
-  - `link_semantics_basic`: the exact `DirRecord`s (own stats, link refs, entries).
+  - `link_semantics_basic`: `DirRecord`s with measured filesystem sizes (own stats, link refs, entries).
   - `symlink_loops` terminates; symlinks are counted as files and never followed.
   - `nonutf8` names round-trip byte-exact.
   - Exclude globs skip both directories and files, recorded as `Skip(Excluded)`.
@@ -138,7 +143,7 @@ pub fn read_dir_entries(dir: &RawPath, gate: &dyn Gate) -> io::Result<Vec<(RawNa
 
 ### Acceptance
 
-- [ ] All tests pass; the walk of `link_semantics_basic` matches the expected records exactly.
+- [ ] All tests pass; the walk of `link_semantics_basic` matches records derived from measured metadata.
 - [ ] Peak open fds ≤ `threads + 8` during a walk (asserted in a test by sampling `/proc/self/fd`).
 - [ ] A `cargo clippy` run with `-D warnings` is clean, and the module has no `unsafe`.
 
@@ -171,13 +176,19 @@ pub fn bulkstat(fd: BorrowedFd<'_>, start: u64, end: u64, batch: usize) -> Bulks
 
 ### Implementation notes
 
-- **Bindings:** run `bindgen` once on a Rocky 8 VM against `<xfs/xfs_fs.h>` (xfsprogs-devel) for the structs, and hand-define the ioctl numbers (`04` §5.1), with an allow-list of exactly the needed items. Commit as `src/gen/bindings.rs` with a header noting the source package versions and the command used. Add `size_of`/`align_of`/`offset_of` tests for `xfs_fsop_bulkreq`, `xfs_bstat`, `xfs_bstime` and the geometry structs.
+- **Bindings:** hand-transcribed with layout tests and measured provenance as `04` §5.1.
+- **v5 only:** use `XFS_IOC_BULKSTAT` with 32-bit link counts; legacy v1 is probe-only. Missing v5 returns `Unsupported`.
+
+The EL8 userspace header (`xfsprogs-devel-5.0.0-12.el8`, `/usr/include/xfs/xfs_fs.h`) lacks the v5 structures and `XFS_IOC_BULKSTAT`. Module-binary inspection of `xfs.ko` in `kernel-core-4.18.0-477.27.1.el8_8` (Rocky 8.8) and kernel 4.18.0-553.172.1.el8_10 (Rocky 8.10) found `xfs_ioc_bulkstat`, `xfs_bulk_ireq_setup` and `xfs_bulkstat_to_bstat`. This establishes handler presence, not successful ioctl execution; runtime probes on both VMs remain a Wave 1 gate item.
+
+Bindings are hand-transcribed, not bindgen output, and pinned by layout tests to sizes and offsets measured with `gcc`: `xfs_bstat` 136 bytes, `xfs_bstime` 16, `xfs_fsop_bulkreq` 32, `xfs_fsop_geom` 112 from the EL8 header; `xfs_bulkstat` 192, `xfs_bulk_ireq` 64 and `XFS_IOC_BULKSTAT` `0x8040587f` measured against `xfsprogs-devel-6.4.0-7.el9` (same kernel ABI).
+
 - **Units:**
-  - `disk_bytes` is derived from `bs_blocks` in **one function** (`fn bulk_disk_bytes(bs: &xfs_bstat, blocksize: u32) -> u64`) with the privileged validation test `bulkstat_blocks_match_statx`.
+  - `disk_bytes` is derived from `bs_blocks` in **one function** (`fn bulk_disk_bytes(bs: &xfs_bulkstat, blocksize: u32) -> u64`) with the privileged validation test `bulkstat_blocks_match_statx`.
   - `mtime` combines `tv_sec` with sign handling.
-- **Iteration semantics:** v1 returns inodes `> *lastip`. Start at `start.saturating_sub(1)` (`start = 0` for AG 0). Stop when an inode ≥ `end` appears (truncate that batch) or `ocount == 0`.
+- **Iteration semantics:** v5 inclusive start, per-AG flag and returned cursor; stop at exclusive `end` or an empty batch (`04` §5.2).
 - **Errors:** `EPERM` (no `CAP_SYS_ADMIN`) maps to a typed `io::Error` that callers translate into "bulk mode unavailable".
-- **Every `unsafe` block** gets a `// SAFETY:` comment explaining buffer sizes and lifetimes. Buffers are `Vec<MaybeUninit<xfs_bstat>>` sized by `batch`.
+- **Every `unsafe` block** gets a `// SAFETY:` comment explaining buffer sizes and lifetimes. Buffers are `Vec<MaybeUninit<xfs_bulkstat>>` sized by `batch`.
 
 ### Tests (mostly privileged, on loop XFS)
 
@@ -190,7 +201,7 @@ pub fn bulkstat(fd: BorrowedFd<'_>, start: u64, end: u64, batch: usize) -> Bulks
 ### Acceptance
 
 - [ ] All privileged tests pass on Rocky 8.8 **and** 8.10 VMs; results are in the handoff note.
-- [ ] `bulkstat_probe` correctly reports v5 availability on each VM (record the finding: it tells us whether EL8 backported v5 bulkstat).
+- [ ] `bulkstat_probe` confirms v5 at runtime on both VMs: module inspection found the handlers on Rocky 8.8 and 8.10 (`04` §5.1), but is not an ioctl test.
 - [ ] No `unsafe` outside `tidemark-sys`; every `unsafe` block is commented.
 
 ---
@@ -255,7 +266,10 @@ impl AttributionCache {
 
 ### Details
 
-- **Token bucket:** `acquire(cost)` blocks (sleeping, not spinning) until tokens are available. Burst = 0.25 s of tokens. Thread-safe and low-contention: use an atomic "next allowed time" (nanoseconds) with a CAS loop; sleep on `parking_lot` only when ahead.
+- **Token bucket and sampler:** The caller resolves leaves with `blockdev::resolve_leaves`; unavailable discovery means an empty slice and the configured minimum gate rate. `StatSampler` and `read_disk_stats` return exactly one sample per leaf in input order and fail the whole sample if any device cannot be read. Samplers finish within one interval. Signatures stay unchanged; `controller_step` is counter-only, so callers mask utilisation (`io_ticks_ms = 0`) for non-rotational, unknown or multi-queue devices. `FixedGate::new` is private.
+
+The token bucket accounts for outstanding token debt: elapsed earnings use the previous rate before a rate change, and waiting acquisitions recheck their targets at the new rate. Per `docs/handoff/W1-D-fix.md`, cumulative issued/earned tokens use constant-size mutex/condition-variable state, with no waiter queue; surplus is capped to 0.25 seconds at the current rate.
+
 - **Controller:** exactly `04` §6.2. AIMD, worst leaf device. `util = Δio_ticks / Δt_ms × 100`; `await = Δ(read_ticks + write_ticks) / max(1, Δ(read_ios + write_ios))`. If the sampler errors, keep the current rate and log once.
 - **Attribution cache:** keyed by `(pid, starttime)`, LRU of `capacity` (default 16,384), TTL refresh. A unit is the last cgroup path component ending in `.service`, `.scope` or `.slice`; user sessions map to `user-<uid>`.
 
@@ -318,7 +332,11 @@ impl Catalog {
     pub fn record_start(&self, e: &ScanEntry) -> Result<(), StoreError>;
     pub fn record_finish(&self, e: &ScanEntry) -> Result<(), StoreError>;
     pub fn rebuild_from_files(&self) -> Result<usize, StoreError>;
+    pub fn recovery_files(&self) -> &[PathBuf];
 }
+
+// tidemark_store::catalog; explicit corruption recovery, all connections closed
+pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError>;
 
 pub struct TimeSeries;     // timeseries.db; WAL; migrations
 impl TimeSeries {
@@ -351,8 +369,10 @@ pub fn space_check_with(statvfs: impl Fn() -> io::Result<FsTotals>, used_by_stat
 - Writer PRAGMAs and the finish sequence exactly as `05` §2. The file is created `0600 root:root` (umask-independent: `fchmod` after create).
 - Reader opens `file:<path>?immutable=1&mode=ro` (rusqlite `OpenFlags::SQLITE_OPEN_URI | SQLITE_OPEN_READ_ONLY`).
 - Query methods use the subtree range technique (`05` §1). `children` sorts in SQL by the requested key, with `name` as tie-break for determinism.
+- Catalog recovery and raw-byte boundary glob regions follow `05` §3–4 and W1-E fix notes; ordinary opens are non-destructive.
+
 - Time-series schema and compaction exactly `05` §6. Migrations are numbered Rust functions; v1 is the initial schema.
-- `retention_plan` implements recent / daily / weekly (ISO week) keep rules. Partial and failed entries older than 24 h are always deleted. Pure and table-tested.
+- `retention_plan` always protects each root's newest complete snapshot, then implements recent / daily / weekly (ISO week) keep rules. Partial and failed entries older than 24 h are always deleted. Pure and table-tested.
 
 ### Tests
 
@@ -376,6 +396,6 @@ pub fn space_check_with(statvfs: impl Fn() -> io::Result<FsTotals>, used_by_stat
 
 - [ ] All five branches approved and merged in order; `cargo xtask ci` green.
 - [ ] Privileged suite green on Rocky 8.8 and 8.10 VMs (W1-A, W1-B, W1-C, W1-D privileged tests).
-- [ ] Recorded findings: v5 bulkstat present? `bs_blocks` unit confirmed? Default scheduler on the VM's virtual disks? Captured in `docs/handoff/W1-gate.md`.
+- [ ] Recorded findings: module inspection found v5 handlers on Rocky 8.8 and 8.10; confirm v5 bulkstat with runtime probes on both VMs. `bs_blocks` unit confirmed? Default scheduler on the VM's virtual disks? Captured in `docs/handoff/W1-gate.md`.
 - [ ] Gate review agent finds no duplicated helpers across `tidemark-fs` modules and confirms no `unsafe` outside `tidemark-sys`.
 - [ ] Tag `wave-1-done`.
