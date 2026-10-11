@@ -48,7 +48,11 @@ pub fn write(report: &Report, json: bool, output: &mut impl Write) -> anyhow::Re
             )?,
             None => writeln!(
                 output,
-                "  ? other mounts: unknown (mount table unavailable)"
+                "  ? other mounts: unknown ({})",
+                root.facts
+                    .get("mount_point")
+                    .and_then(|f| f.why.as_deref())
+                    .unwrap_or("mount table unavailable")
             )?,
         }
     }
