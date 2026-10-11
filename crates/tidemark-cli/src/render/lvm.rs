@@ -6,40 +6,40 @@ use tidemark_core::{api::VgInfo, live::LvmNow, path::display_lossy_bytes};
 use tidemark_fs::lvm::LvInfo;
 /// Current LVM context for tracked filesystems.
 #[derive(Serialize)]
-pub struct Report {
+pub(crate) struct Report {
     /// ok or n/a when LVM is disabled, absent or unmapped.
-    pub status: String,
+    pub(crate) status: String,
     /// Unix sampling timestamp.
-    pub sampled_at: i64,
+    pub(crate) sampled_at: i64,
     /// Tracked mounted logical volumes.
-    pub tracked: Vec<TrackedLv>,
+    pub(crate) tracked: Vec<TrackedLv>,
     /// Relevant volume groups.
-    pub vgs: Vec<VgInfo>,
+    pub(crate) vgs: Vec<VgInfo>,
     /// Other volumes in those groups.
-    pub other_lvs: Vec<LvInfo>,
+    pub(crate) other_lvs: Vec<LvInfo>,
 }
 /// A mapped mount and its current metadata.
 #[derive(Serialize)]
-pub struct TrackedLv {
+pub(crate) struct TrackedLv {
     /// Byte-preserving path/path_b64 object.
-    pub mount: serde_json::Value,
+    pub(crate) mount: serde_json::Value,
     /// Terminal-safe mount label.
     #[serde(skip)]
-    pub mount_display: String,
+    pub(crate) mount_display: String,
     /// Current LV, VG and pool state.
-    pub current: LvmNow,
+    pub(crate) current: LvmNow,
     /// LVM segment type.
-    pub segtype: String,
+    pub(crate) segtype: String,
     /// Optional history-derived slopes.
-    pub trend: Option<Trend>,
+    pub(crate) trend: Option<Trend>,
 }
 /// Least-squares slopes over available samples in the last 24 hours.
 #[derive(Serialize)]
-pub struct Trend {
+pub(crate) struct Trend {
     /// Pool data percentage points per day, requiring three samples.
-    pub data_pp_per_day: Option<f64>,
+    pub(crate) data_pp_per_day: Option<f64>,
     /// Pool metadata percentage points per day, requiring three samples.
-    pub meta_pp_per_day: Option<f64>,
+    pub(crate) meta_pp_per_day: Option<f64>,
 }
 fn display(s: &str) -> String {
     display_lossy_bytes(s.as_bytes())
@@ -48,7 +48,7 @@ fn display(s: &str) -> String {
         .to_owned()
 }
 /// Render a report to the supplied writer.
-pub fn write(report: &Report, json: bool, output: &mut impl Write) -> anyhow::Result<()> {
+pub(crate) fn write(report: &Report, json: bool, output: &mut impl Write) -> anyhow::Result<()> {
     if json {
         return super::json("tidemark.lvm.v1", report, output);
     }

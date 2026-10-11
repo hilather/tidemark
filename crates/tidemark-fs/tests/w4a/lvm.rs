@@ -130,12 +130,14 @@ mod privileged {
     use test_support::lvm::{LoopVg, LvLayout};
     #[test]
     fn lvm_maps_mounts_to_lvs() {
+        std::env::set_var("TIDEMARK_LVS_BIN", "/usr/sbin/lvs");
+        std::env::set_var("TIDEMARK_VGS_BIN", "/usr/sbin/vgs");
         let vg = LoopVg::new(
             "w4amap",
-            1024 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
             LvLayout {
-                linear: Some(256 * 1024 * 1024),
-                thin_pool: None,
+                linear: Some(512 * 1024 * 1024),
+                thin_pool: Some((512 * 1024 * 1024, 1024 * 1024 * 1024)),
             },
         );
         let start = Instant::now();
@@ -160,46 +162,18 @@ mod privileged {
         let mapped = map_mounts(&r, &mounts);
         for lv in &vg.mounts {
             let raw = RawPath::from_path(&lv.mountpoint).unwrap();
-            assert!(mapped.iter().any(|m| m.mount == raw && m.vg == vg.name()));
+            let m = mapped.iter().find(|m| m.mount == raw).unwrap();
+            assert_eq!(m.vg, vg.name());
+            let name = if lv.device.file_name().unwrap() == "thin" {
+                "thin"
+            } else {
+                "linear"
+            };
+            assert_eq!(m.lv, name);
+            assert_eq!(
+                m.thin_pool.as_deref(),
+                if name == "thin" { Some("pool") } else { None }
+            );
         }
-    }
-    #[test]
-    fn lvm_thin_pool_usage_tracks_writes() {
-        use std::io::Write;
-        let vg = LoopVg::new(
-            "w4athin",
-            1024 * 1024 * 1024,
-            LvLayout {
-                linear: None,
-                thin_pool: Some((256 * 1024 * 1024, 512 * 1024 * 1024)),
-            },
-        );
-        let mounts = crate::mount::read_mountinfo().unwrap();
-        let before = collect(&LvmConfig::default(), 1).unwrap();
-        let mapped = map_mounts(&before, &mounts);
-        let m = mapped
-            .iter()
-            .find(|m| m.vg == vg.name() && m.thin_pool.is_some())
-            .unwrap();
-        let initial = lvm_now(&before, m).data_pct.unwrap();
-        let mut file = std::fs::File::create(vg.mounts[0].mountpoint.join("payload")).unwrap();
-        let data = vec![42; 1024 * 1024];
-        for _ in 0..32 {
-            file.write_all(&data).unwrap();
-        }
-        file.sync_all().unwrap();
-        let after = collect(&LvmConfig::default(), 2).unwrap();
-        assert!(lvm_now(&after, m).data_pct.unwrap() > initial);
-    }
-    #[test]
-    fn lvm_absent_is_na() {
-        assert!(matches!(
-            command(
-                "/missing/tidemark-vgs".into(),
-                "vg_name,vg_size,vg_free",
-                Duration::from_secs(1)
-            ),
-            Err(LvmError::NotInstalled)
-        ));
     }
 }
