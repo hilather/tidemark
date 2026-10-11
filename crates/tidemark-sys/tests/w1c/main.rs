@@ -217,5 +217,6 @@ fn bulkstat_probe_records_kernel_support() {
         support.v5
     );
     assert!(support.v1);
+    assert!(support.v5, "bulk metadata mode requires v5 bulkstat");
     assert!(!all(&mount, 0, u64::MAX, 1).is_empty());
 }
