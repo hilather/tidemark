@@ -42,6 +42,7 @@ fn config(root: RawPath) -> WalkConfig {
         scan_start: 0,
         getdents_buf: 256 * 1024,
         io_idle: false,
+        max_record_bytes: 0,
     }
 }
 #[test]
@@ -64,6 +65,8 @@ fn names_smallest_bytes_missing_and_cancelled() {
         .ino();
     let path = RawPath::from_path(dir.path()).unwrap();
     let missing_path = path.join(&RawName::new("gone".as_bytes()).unwrap());
+    let cfg = config(path.clone());
+    let identities = root_identity(&path);
     let (names, missing) = names::resolve(
         vec![
             (path.clone(), ino),
@@ -71,6 +74,8 @@ fn names_smallest_bytes_missing_and_cancelled() {
             (path.clone(), u64::MAX),
             (missing_path, ino),
         ],
+        &cfg,
+        &identities,
         &NoopGate,
         &AtomicBool::new(false),
     )
@@ -81,7 +86,13 @@ fn names_smallest_bytes_missing_and_cancelled() {
         vec![(path.clone(), ino, RawName::new(b"a").unwrap())]
     );
     assert!(matches!(
-        names::resolve(vec![(path, ino)], &NoopGate, &AtomicBool::new(true)),
+        names::resolve(
+            vec![(path, ino)],
+            &cfg,
+            &identities,
+            &NoopGate,
+            &AtomicBool::new(true)
+        ),
         Err(BulkError::Cancelled)
     ));
 }
@@ -368,4 +379,215 @@ fn bulk_namespace_progress_reports_while_setup_is_blocked() {
         .all(|pair| pair[1].0 - pair[0].0 >= Duration::from_secs(2)));
     assert!(reports[0].0 >= Duration::from_secs(2));
     assert_eq!((reports[0].1, reports[0].2), ("namespace", 0));
+}
+
+fn root_identity(path: &RawPath) -> Vec<names::Identity> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path.as_path()).unwrap();
+    vec![names::Identity {
+        id: DirId(0),
+        parent: None,
+        name: None,
+        ino: m.ino(),
+        dev: m.dev(),
+    }]
+}
+#[test]
+fn names_exclude_smallest_alias() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a"), []).unwrap();
+    std::fs::hard_link(dir.path().join("a"), dir.path().join("z")).unwrap();
+    let path = RawPath::from_path(dir.path()).unwrap();
+    let ino = std::fs::metadata(dir.path().join("z")).unwrap().ino();
+    let mut cfg = config(path.clone());
+    cfg.exclude = globset::GlobSetBuilder::new()
+        .add(globset::Glob::new("**/a").unwrap())
+        .build()
+        .unwrap();
+    let (resolved, missing) = names::resolve(
+        vec![(path.clone(), ino)],
+        &cfg,
+        &root_identity(&path),
+        &NoopGate,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(missing, 0);
+    assert_eq!(resolved[0].2.as_bytes(), b"z");
+}
+
+#[test]
+fn excluded_alias_namespace_bulk_equals_walk() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a"), []).unwrap();
+    std::fs::hard_link(dir.path().join("a"), dir.path().join("z")).unwrap();
+    let root = RawPath::from_path(dir.path()).unwrap();
+    let mut cfg = config(root.clone());
+    cfg.exclude = globset::GlobSetBuilder::new()
+        .add(globset::Glob::new("**/a").unwrap())
+        .build()
+        .unwrap();
+    let collect = |cfg: &WalkConfig| {
+        let cancel = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (tx, rx) = crossbeam_channel::bounded(2);
+            let h = scope.spawn(|| tidemark_fs::walk::walk(cfg, &NoopGate, &cancel, tx));
+            let records: Vec<_> = rx.iter().collect();
+            h.join().unwrap().unwrap();
+            records
+        })
+    };
+    let mut walk = aggregator(root.clone());
+    for r in collect(&cfg) {
+        if let tidemark_core::scan::WalkOutput::Dir(r) = r {
+            walk.add_dir_record(r);
+        }
+    }
+    let mut expected = VecSink::default();
+    walk.prepare().unwrap().write(&mut expected).unwrap();
+    cfg.stat_entries = false;
+    let mut bulk = aggregator(root.clone());
+    let mut dents = Vec::new();
+    let mut identities = Vec::new();
+    for r in collect(&cfg) {
+        if let tidemark_core::scan::WalkOutput::Ns(r) = r {
+            join::append_namespace(&mut dents, &r).unwrap();
+            identities.push(names::Identity::from_ns(&r));
+            bulk.add_skeleton(&r);
+        }
+    }
+    let mut inodes: Vec<_> = [dir.path().to_path_buf(), dir.path().join("z")]
+        .iter()
+        .map(|p| {
+            let m = std::fs::symlink_metadata(p).unwrap();
+            tidemark_sys::xfs::BulkInode {
+                ino: m.ino(),
+                mode: m.mode(),
+                nlink: m.nlink() as u32,
+                uid: m.uid(),
+                gid: m.gid(),
+                size: m.len(),
+                disk_bytes: m.blocks() * 512,
+                mtime: m.mtime(),
+                projid: 0,
+                xflags: 0,
+            }
+        })
+        .collect();
+    inodes.sort_unstable_by_key(|i| i.ino);
+    dents.sort_unstable_by_key(|d| d.ino());
+    join::stream(
+        &dents,
+        std::iter::once(Ok(inodes)),
+        &NoopGate,
+        1,
+        &AtomicBool::new(false),
+        |b| {
+            for item in b.items {
+                item.dispatch(&mut bulk);
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    let mut prepared = bulk.prepare().unwrap();
+    names::sort_identities(&mut identities);
+    let (resolved, missing) = names::resolve(
+        prepared.needs_names(),
+        &cfg,
+        &identities,
+        &NoopGate,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(missing, 0);
+    prepared.set_names(resolved);
+    let mut actual = VecSink::default();
+    prepared.write(&mut actual).unwrap();
+    compare(&mut expected, &mut actual);
+}
+#[test]
+fn cancellation_during_namespace_setup_is_normalized() {
+    use std::os::fd::AsFd;
+    use std::sync::atomic::Ordering;
+    struct CancelGate<'a>(&'a AtomicBool);
+    impl tidemark_core::scan::Gate for CancelGate<'_> {
+        fn acquire(&self, _: u32) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+        fn current_rate(&self) -> f64 {
+            0.0
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = RawPath::from_path(dir.path()).unwrap();
+    let fd = std::fs::File::open(dir.path()).unwrap();
+    let cancel = AtomicBool::new(false);
+    let params = BulkParams {
+        walk: config(root.clone()),
+        batch: 4096,
+        threads: 2,
+    };
+    let geo = XfsGeometry {
+        blocksize: 4096,
+        agblocks: 1024,
+        agcount: 1,
+        inodesize: 512,
+        dirblocksize: 4096,
+        uuid: [0; 16],
+        v5: Some(true),
+        ftype: Some(true),
+        reflink: None,
+    };
+    assert!(matches!(
+        run_bulk(
+            &params,
+            fd.as_fd(),
+            &geo,
+            &CancelGate(&cancel),
+            &cancel,
+            &|_| {},
+            aggregator(root)
+        ),
+        Err(BulkError::Cancelled)
+    ));
+}
+
+#[test]
+fn replaced_directory_names_remain_unresolved() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let child = dir.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(child.join("file"), []).unwrap();
+    let root = RawPath::from_path(dir.path()).unwrap();
+    let path = RawPath::from_path(&child).unwrap();
+    let m = std::fs::metadata(&child).unwrap();
+    let ino = std::fs::metadata(child.join("file")).unwrap().ino();
+    let mut identities = root_identity(&root);
+    identities.push(names::Identity {
+        id: DirId(1),
+        parent: Some(DirId(0)),
+        name: Some(RawName::new(b"child").unwrap()),
+        ino: m.ino(),
+        dev: m.dev(),
+    });
+    names::sort_identities(&mut identities);
+    // Preserve the original file inode to expose a false name match if the
+    // replacement directory's descriptor were not checked.
+    std::fs::rename(&child, dir.path().join("old")).unwrap();
+    std::fs::create_dir(&child).unwrap();
+    std::fs::hard_link(dir.path().join("old/file"), child.join("alias")).unwrap();
+    let (resolved, missing) = names::resolve(
+        vec![(path, ino)],
+        &config(root),
+        &identities,
+        &NoopGate,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(resolved.is_empty());
+    assert_eq!(missing, 1);
 }

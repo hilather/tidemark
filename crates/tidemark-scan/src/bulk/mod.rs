@@ -21,6 +21,7 @@ pub struct BulkParams {
     /// Maximum v5 inodes per batch, 1..=65,536.
     pub batch: usize,
     /// AG workers and sorting threads, 1..=64; AG workers are capped at agcount.
+    /// Worker/batch buffers must fit a 32 MiB share of the estimate overhead.
     pub threads: usize,
 }
 /// Bounded-cadence observation of the current bulk phase.
@@ -94,6 +95,7 @@ pub fn run_bulk(
             "invalid batch, thread count or geometry".into(),
         ));
     }
+    validate_worker_memory(p.batch, p.threads.min(geo.agcount as usize))?;
     // A local configuration forces namespace mode without altering caller settings.
     let cfg = WalkConfig {
         root: p.walk.root.clone(),
@@ -106,6 +108,7 @@ pub fn run_bulk(
         scan_start: p.walk.scan_start,
         getdents_buf: p.walk.getdents_buf,
         io_idle: p.walk.io_idle,
+        max_record_bytes: p.walk.max_record_bytes,
     };
     let mut stats = BulkStats::default();
     let mut namespace_errors = 0;
@@ -115,6 +118,7 @@ pub fn run_bulk(
     };
     let mut last_progress = Instant::now();
     let mut dents = Vec::new();
+    let mut identities = Vec::new();
     let start = Instant::now();
     std::thread::scope(|scope| -> Result<(), BulkError> {
         let (tx, rx) = crossbeam_channel::bounded(2);
@@ -140,6 +144,11 @@ pub fn run_bulk(
                         observation.entries += u64::from(ns.entries);
                         observation.errors += u64::from(ns.errors_total);
                         stats.races += u64::from(ns.races);
+                        if identities.try_reserve(1).is_err() {
+                            failure = Some(BulkError::Limit("identity allocation"));
+                            continue;
+                        }
+                        identities.push(names::Identity::from_ns(&ns));
                         agg.add_skeleton(&ns);
                     }
                     Err(e) => failure = Some(e),
@@ -170,7 +179,7 @@ pub fn run_bulk(
     stats.phase_ms[0] = millis(start);
     let start = Instant::now();
     let sort_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(p.threads)
+        .num_threads(p.threads.min(geo.agcount as usize))
         .build()
         .map_err(|_| BulkError::BeforePhase2("sort worker creation failed".into()))?;
     observe_operation(
@@ -184,6 +193,9 @@ pub fn run_bulk(
     )
     .map_err(before_phase2)?;
     drop(sort_pool);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(BulkError::Cancelled);
+    }
     let (last_start, last_end) = tidemark_sys::xfs::ag_ino_range(geo, geo.agcount - 1);
     if last_start >= last_end || dents.last().is_some_and(|d| d.ino() >= last_end) {
         return Err(BulkError::BeforePhase2("inode outside geometry".into()));
@@ -275,15 +287,17 @@ pub fn run_bulk(
     let start = Instant::now();
     observation.phase = "names";
     report_due(&observation, progress, &mut last_progress);
+    names::sort_identities(&mut identities);
     let needed = prepared.needs_names();
     let (resolved, missing) = observe_operation(
-        || names::resolve(needed, gate, cancel),
+        || names::resolve(needed, &cfg, &identities, gate, cancel),
         &observation,
         progress,
         &mut last_progress,
     )?;
     stats.names_resolved = resolved.len() as u64;
     stats.names_missing = missing;
+    stats.races += missing;
     prepared.set_names(resolved);
     stats.phase_ms[2] = millis(start);
     Ok((prepared, stats))
@@ -351,6 +365,14 @@ pub enum BulkError {
     /// A documented resource or representation bound was exceeded.
     #[error("bulk limit: {0}")]
     Limit(&'static str),
+    /// Duplicate phase-one directory identities; no attributes are dispatched.
+    #[error("directory inode {ino} observed more than once ({races} raced references)")]
+    DirectoryIdentityRace {
+        /// Repeated directory inode.
+        ino: u64,
+        /// Number of conflicting namespace self-references.
+        races: u64,
+    },
     /// Metadata I/O failed.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -370,5 +392,48 @@ fn before_phase2(error: BulkError) -> BulkError {
         BulkError::Cancelled | BulkError::Walk(WalkError::Cancelled) => BulkError::Cancelled,
         BulkError::Unsupported(_) => error,
         _ => BulkError::BeforePhase2(error.to_string()),
+    }
+}
+
+// Reserve half the fixed 64 MiB allowance for other pipeline overhead. Include
+// retained v5 request buffers, decoded source batches, producer messages, two
+// queued messages and the collector's current message. Link spill allocations
+// are capped separately by the message reference limit.
+fn worker_memory(batch: usize, workers: usize) -> u64 {
+    // Up to two reference groups over the flush threshold, u32 directory ids,
+    // and up to 2x SmallVec capacity growth: at most 1 MiB spilled ids/message.
+    let message = (join::MESSAGE_ITEMS * std::mem::size_of::<join::Joined>()) as u64 + 1024 * 1024;
+    let per_worker = 64
+        + batch as u64 * (192 + std::mem::size_of::<tidemark_sys::xfs::BulkInode>() as u64)
+        + 2 * message
+        + 2 * 1024 * 1024; // thread stack plus replacement message
+    per_worker
+        .saturating_mul(workers as u64)
+        .saturating_add(3 * message)
+}
+fn validate_worker_memory(batch: usize, workers: usize) -> Result<(), BulkError> {
+    if worker_memory(batch, workers) > 32 * 1024 * 1024 {
+        return Err(BulkError::BeforePhase2(
+            "worker/batch buffers exceed 32 MiB overhead share".into(),
+        ));
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    #[test]
+    fn worker_memory_boundary() {
+        assert!(validate_worker_memory(4096, 2).is_ok());
+        assert!(validate_worker_memory(65536, 64).is_err());
+        let max = (1..=65536)
+            .take_while(|&b| validate_worker_memory(b, 4).is_ok())
+            .last()
+            .unwrap();
+        assert!(validate_worker_memory(max, 4).is_ok());
+        if max < 65536 {
+            assert!(validate_worker_memory(max + 1, 4).is_err());
+        }
+        assert!(worker_memory(65536, 64) >= 805_310_464);
     }
 }

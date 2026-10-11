@@ -13,7 +13,9 @@ use tidemark_sys::xfs::BulkInode;
 const SELF: u32 = 1 << 31;
 // Explicit cap for this API, which has no memory_budget parameter.
 const MAX_DENTS: usize = 256 * 1024 * 1024 / 12;
-const MESSAGE_ITEMS: usize = 4096;
+pub(super) const MESSAGE_ITEMS: usize = 4096;
+// Spill storage is bounded independently of the number of inode groups.
+const MESSAGE_REFS: usize = 65_536;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DentRef([u32; 3]);
@@ -113,6 +115,7 @@ impl Joined {
 pub(super) struct Batch {
     pub(super) streamed: u64,
     pub(super) items: Vec<Joined>,
+    refs: usize,
 }
 fn kind(mode: u32) -> FileKind {
     match mode & 0o170000 {
@@ -122,7 +125,17 @@ fn kind(mode: u32) -> FileKind {
         _ => FileKind::Other,
     }
 }
-fn matched(dents: &[DentRef], inode: Option<BulkInode>) -> Joined {
+fn matched(dents: &[DentRef], inode: Option<BulkInode>) -> Result<Joined, BulkError> {
+    if dents.len() > MESSAGE_REFS {
+        return Err(BulkError::Limit("65,536 namespace references per inode"));
+    }
+    let races = dents.iter().filter(|d| d.directory()).count();
+    if races > 1 {
+        return Err(BulkError::DirectoryIdentityRace {
+            ino: dents[0].ino(),
+            races: races as u64,
+        });
+    }
     let attrs = inode.map(|i| InodeAttrs {
         ino: i.ino,
         kind: kind(i.mode),
@@ -155,9 +168,9 @@ fn matched(dents: &[DentRef], inode: Option<BulkInode>) -> Joined {
     }) {
         // Multiple phase-1 names cannot all be live links of a single-link phase-2 inode.
         // Dropping these stale references avoids double charging an inode.
-        joined.races.extend(joined.dirs.drain(..));
+        joined.races.extend(std::mem::take(&mut joined.dirs));
     }
-    joined
+    Ok(joined)
 }
 
 /// Reject cross-AG records: disjoint ranges make global duplicates impossible.
@@ -191,6 +204,7 @@ pub(super) fn stream(
     let mut previous = None;
     let mut batch = Batch {
         streamed: 0,
+        refs: 0,
         items: Vec::with_capacity(MESSAGE_ITEMS),
     };
     loop {
@@ -198,6 +212,9 @@ pub(super) fn stream(
             return Err(BulkError::Cancelled);
         }
         gate.acquire(cost.saturating_add(u32::from(previous.is_none())));
+        if cancel.load(Ordering::Relaxed) {
+            return Err(BulkError::Cancelled);
+        }
         let Some(inodes) = source.next() else {
             break;
         };
@@ -209,6 +226,9 @@ pub(super) fn stream(
             }
         })?;
         for inode in inodes {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(BulkError::Cancelled);
+            }
             // Each AG owns a disjoint range. Duplicates/order violations indicate a broken source.
             if previous.is_some_and(|ino| inode.ino <= ino) {
                 return Err(BulkError::Limit("duplicate or unordered bulk inode"));
@@ -217,22 +237,25 @@ pub(super) fn stream(
             batch.streamed += 1;
             while pos < dents.len() && dents[pos].ino() < inode.ino {
                 let end = pos + dents[pos..].partition_point(|d| d.ino() == dents[pos].ino());
-                batch.items.push(matched(&dents[pos..end], None));
+                batch.refs += end - pos;
+                batch.items.push(matched(&dents[pos..end], None)?);
                 pos = end;
-                flush(&mut batch, &mut emit)?;
+                flush(&mut batch, cancel, &mut emit)?;
             }
             if pos < dents.len() && dents[pos].ino() == inode.ino {
                 let end = pos + dents[pos..].partition_point(|d| d.ino() == inode.ino);
-                batch.items.push(matched(&dents[pos..end], Some(inode)));
+                batch.refs += end - pos;
+                batch.items.push(matched(&dents[pos..end], Some(inode))?);
                 pos = end;
             }
-            flush(&mut batch, &mut emit)?;
+            flush(&mut batch, cancel, &mut emit)?;
             // Bound even messages consisting entirely of out-of-root inodes.
             if batch.streamed >= MESSAGE_ITEMS as u64 {
                 emit(std::mem::replace(
                     &mut batch,
                     Batch {
                         streamed: 0,
+                        refs: 0,
                         items: Vec::with_capacity(MESSAGE_ITEMS),
                     },
                 ))?;
@@ -240,25 +263,40 @@ pub(super) fn stream(
         }
     }
     while pos < dents.len() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(BulkError::Cancelled);
+        }
         let end = pos + dents[pos..].partition_point(|d| d.ino() == dents[pos].ino());
-        batch.items.push(matched(&dents[pos..end], None));
+        batch.refs += end - pos;
+        batch.items.push(matched(&dents[pos..end], None)?);
         pos = end;
-        flush(&mut batch, &mut emit)?;
+        flush(&mut batch, cancel, &mut emit)?;
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(BulkError::Cancelled);
     }
     if batch.streamed > 0 || !batch.items.is_empty() {
         emit(batch)?;
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(BulkError::Cancelled);
     }
     Ok(())
 }
 fn flush(
     batch: &mut Batch,
+    cancel: &AtomicBool,
     emit: &mut impl FnMut(Batch) -> Result<(), BulkError>,
 ) -> Result<(), BulkError> {
-    if batch.items.len() >= MESSAGE_ITEMS {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(BulkError::Cancelled);
+    }
+    if batch.items.len() >= MESSAGE_ITEMS || batch.refs >= MESSAGE_REFS {
         emit(std::mem::replace(
             batch,
             Batch {
                 streamed: 0,
+                refs: 0,
                 items: Vec::with_capacity(MESSAGE_ITEMS),
             },
         ))?;
@@ -271,6 +309,57 @@ fn flush(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+    #[test]
+    fn duplicate_directory_identity_is_a_counted_fatal_race() {
+        let mut calls = 0;
+        let result = stream(
+            &[dent(42, 1, true), dent(42, 2, true)],
+            std::iter::once(Ok(vec![inode(42, 0o040000, 2)])),
+            &tidemark_core::scan::NoopGate,
+            1,
+            &AtomicBool::new(false),
+            |_| {
+                calls += 1;
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(BulkError::DirectoryIdentityRace { ino: 42, races: 2 })
+        ));
+        assert_eq!(calls, 0);
+    }
+    #[test]
+    fn reference_spill_cap_is_checked_before_allocation() {
+        let dents = vec![dent(42, 0, false); MESSAGE_REFS + 1];
+        assert!(matches!(
+            matched(&dents, Some(inode(42, 0o100000, u32::MAX))),
+            Err(BulkError::Limit(_))
+        ));
+        assert!(matched(&dents[..MESSAGE_REFS], Some(inode(42, 0o100000, u32::MAX))).is_ok());
+    }
+    #[test]
+    fn cancellation_between_gap_and_tail_batches() {
+        for source in [vec![], vec![inode(20000, 0o100000, 1)]] {
+            let dents: Vec<_> = (1..12002).map(|ino| dent(ino, 0, false)).collect();
+            let cancel = AtomicBool::new(false);
+            let mut calls = 0;
+            let result = stream(
+                &dents,
+                std::iter::once(Ok(source)),
+                &tidemark_core::scan::NoopGate,
+                1,
+                &cancel,
+                |_| {
+                    calls += 1;
+                    cancel.store(true, Ordering::Relaxed);
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Err(BulkError::Cancelled)));
+            assert_eq!(calls, 1);
+        }
+    }
     #[derive(Default)]
     struct Recorder {
         directory: Vec<(DirId, InodeAttrs)>,
@@ -389,12 +478,13 @@ mod tests {
         let j = matched(
             &[dent(1, 0, false), dent(1, 1, false)],
             Some(inode(1, 0o100000, 1)),
-        );
+        )
+        .unwrap();
         let mut r = Recorder::default();
         j.dispatch(&mut r);
         assert!(r.single.is_empty());
         assert_eq!(r.races, [DirId(0), DirId(1)]);
-        let j = matched(&[dent(1, 0, false)], Some(inode(1, 0o100000, 0)));
+        let j = matched(&[dent(1, 0, false)], Some(inode(1, 0o100000, 0))).unwrap();
         j.dispatch(&mut r);
         assert!(r.single.is_empty());
     }
