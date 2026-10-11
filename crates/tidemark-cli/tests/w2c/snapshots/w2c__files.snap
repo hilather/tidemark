@@ -1,0 +1,7 @@
+---
+source: crates/tidemark-cli/tests/w2c/main.rs
+expression: "String::from_utf8(buf).unwrap()"
+---
+PATH                     SIZE      MTIME  NLINK
+/fixture/a\xFF (shared)  1.00 KiB  100    2
+[unresolved inode 13]    512 B     101    1

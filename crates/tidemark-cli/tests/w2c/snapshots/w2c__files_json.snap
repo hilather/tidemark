@@ -1,0 +1,37 @@
+---
+source: crates/tidemark-cli/tests/w2c/main.rs
+expression: doc
+---
+{
+  "data": [
+    {
+      "path_b64": "L2ZpeHR1cmUvYf8=",
+      "row": {
+        "apparent": 8192,
+        "dir_id": 0,
+        "disk": 1024,
+        "id": 0,
+        "ino": 12,
+        "mtime": 100,
+        "name": [
+          97,
+          255
+        ],
+        "nlink": 2
+      }
+    },
+    {
+      "row": {
+        "apparent": 512,
+        "dir_id": 0,
+        "disk": 512,
+        "id": 1,
+        "ino": 13,
+        "mtime": 101,
+        "name": null,
+        "nlink": 1
+      }
+    }
+  ],
+  "schema": "tidemark.files.v1"
+}

@@ -1,0 +1,9 @@
+---
+source: crates/tidemark-cli/tests/w2c/main.rs
+expression: "String::from_utf8(buf).unwrap()"
+---
+PATH               SIZE      RECLAIM   SHARED      FILES  NEWEST  INODES  APPARENT  DELTA24h   LIVE      DELTA LIVE
+/fixture           4.00 KiB  2.00 KiB  H 2.00 KiB  1      100     1       4.00 KiB  +1.00 KiB  5.00 KiB  +1.00 KiB
+|- /fixture/a\xFF  2.00 KiB  1.00 KiB  H 1.00 KiB  1      100     1       2.00 KiB  -1.00 KiB  1.00 KiB  -1.00 KiB
+`- /fixture/z      1.00 KiB  512 B     H 512 B     1      100     1       1.00 KiB  0          unknown   unknown
+H = hard links shared outside this directory (see tidemark links)
