@@ -833,3 +833,55 @@ fn uncapped_directory_errors_survive_walk_and_namespace_sampling() {
         assert_eq!((a.errors, a.t_errors), (b.errors, b.t_errors));
     }
 }
+
+#[test]
+fn error_order_below_at_and_above_cap_preserves_record_order() {
+    for cap in [3, 6, 10] {
+        let mut records = vec![record(0, None), record(2, Some(0)), record(1, Some(0))];
+        for r in &mut records {
+            for suffix in ["z", "a"] {
+                r.errors.push(ScanErrorRec {
+                    path: RawPath::new(format!("/r/{}/{suffix}", r.id.0).into_bytes()).unwrap(),
+                    op: ErrOp::Statx,
+                    errno: 5,
+                });
+            }
+            r.errors_total = 2;
+        }
+        let mut cfg = config(RawPath::new(b"/r".to_vec()).unwrap(), 0);
+        cfg.max_stored_errors = cap;
+        let forward = collect(records.clone(), cfg);
+        records.reverse();
+        let mut cfg = config(RawPath::new(b"/r".to_vec()).unwrap(), 0);
+        cfg.max_stored_errors = cap;
+        let reverse = collect(records, cfg);
+        assert_sink(&forward, &reverse);
+        assert!(forward
+            .errors
+            .windows(2)
+            .all(|p| p[0].dir_id <= p[1].dir_id));
+        if cap == 10 {
+            assert!(forward
+                .errors
+                .chunks(2)
+                .all(|r| r[0].path.as_bytes().ends_with(b"z")
+                    && r[1].path.as_bytes().ends_with(b"a")));
+        }
+    }
+}
+
+#[test]
+fn directory_limit_and_five_million_discovery_id() {
+    let mut agg = Aggregator::new(config(RawPath::new(b"/r".to_vec()).unwrap(), 0));
+    agg.add_dir_record(record(0, None));
+    agg.add_dir_record(record(5_000_000, Some(0)));
+    assert_eq!(agg.prepare().unwrap().summary().dirs, 2);
+    let mut agg = Aggregator::new(config(RawPath::new(b"/r".to_vec()).unwrap(), 0));
+    agg.add_dir_record(record(0, None));
+    agg.add_dir_record(record(15_999_999, Some(0)));
+    assert_eq!(agg.prepare().unwrap().summary().dirs, 2);
+    let mut agg = Aggregator::new(config(RawPath::new(b"/r".to_vec()).unwrap(), 0));
+    agg.add_dir_record(record(0, None));
+    agg.add_dir_record(record(16_000_000, Some(0)));
+    assert!(matches!(agg.prepare(), Err(AggError::Capacity)));
+}

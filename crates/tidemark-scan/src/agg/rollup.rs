@@ -83,7 +83,7 @@ pub(super) fn prepare(mut agg: Aggregator) -> Result<Prepared, AggError> {
     }
     let mut sets: Vec<_> = agg.links.into_values().collect();
     sets.append(&mut agg.bulk_links);
-    let (links, instances) =
+    let (links, instances, unions) =
         linkset::resolve(&mut agg.nodes, sets, &ids, &agg.cfg, &mut agg.candidates)?;
     let mut ends = ids.clone();
     for &id in order.iter().rev() {
@@ -100,7 +100,6 @@ pub(super) fn prepare(mut agg: Aggregator) -> Result<Prepared, AggError> {
             add(&mut pt.reclaim, t.reclaim)?;
             add(&mut pt.files, t.files)?;
             add(&mut pt.inodes, t.inodes)?;
-            add(&mut pt.dirs, t.dirs)?;
             add(&mut pt.errors, t.errors)?;
             for (a, b) in pt.age.iter_mut().zip(t.age) {
                 add(a, b)?;
@@ -109,14 +108,19 @@ pub(super) fn prepare(mut agg: Aggregator) -> Result<Prepared, AggError> {
             pt.max_entries = pt.max_entries.max(t.max_entries);
         }
     }
-    for n in agg.nodes.iter_mut().flatten() {
-        add(&mut n.totals.disk, n.union[0])?;
-        add(&mut n.totals.apparent, n.union[1])?;
-        add(&mut n.totals.inodes, n.union[2])?;
+    for (id, slot) in agg.nodes.iter_mut().enumerate() {
+        let Some(n) = slot else {
+            continue;
+        };
+        let union = unions.get(id).copied().unwrap_or_default();
+        add(&mut n.totals.disk, union[0])?;
+        add(&mut n.totals.apparent, union[1])?;
+        add(&mut n.totals.inodes, union[2])?;
         debug_assert!(n.totals.reclaim <= n.totals.charged && n.totals.reclaim <= n.totals.disk);
         debug_assert_eq!(n.totals.age.iter().sum::<u64>(), n.totals.charged);
     }
-    let files = notable::select(agg.candidates, &ids, &agg.cfg)?;
+    drop(unions);
+    let files = agg.candidates.select(&ids, &agg.cfg)?;
     for s in &mut agg.skipped {
         s.dir_id = *ids
             .get(s.dir_id as usize)
@@ -128,13 +132,15 @@ pub(super) fn prepare(mut agg: Aggregator) -> Result<Prepared, AggError> {
             .cmp(&b.dir_id)
             .then(a.name.as_bytes().cmp(b.name.as_bytes()))
     });
-    for e in &mut agg.errors {
+    for (_, e) in &mut agg.errors {
         e.dir_id = e.dir_id.map(|id| ids[id as usize]);
     }
+    // Stable sort preserves the order of details within each directory record.
+    agg.errors.sort_by_key(|(ordinal, e)| (e.dir_id, *ordinal));
     let root = &agg.nodes[0].as_ref().ok_or(AggError::Tree)?.totals;
     debug_assert_eq!(root.disk, root.charged);
     let summary = AggSummary {
-        dirs: root.dirs,
+        dirs: order.len() as u64,
         files: root.files,
         inodes: root.inodes,
         t_disk: root.disk,
@@ -158,7 +164,7 @@ pub(super) fn prepare(mut agg: Aggregator) -> Result<Prepared, AggError> {
         links,
         instances,
         skipped: agg.skipped,
-        errors: agg.errors,
+        errors: agg.errors.into_iter().map(|(_, e)| e).collect(),
         annotations: Vec::new(),
         summary,
         namespace_errors: None,
