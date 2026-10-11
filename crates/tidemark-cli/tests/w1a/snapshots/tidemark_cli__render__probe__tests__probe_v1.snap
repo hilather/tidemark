@@ -1,0 +1,48 @@
+---
+source: crates/tidemark-cli/src/render/../../tests/w1a/render.rs
+expression: value
+---
+{
+  "data": {
+    "host": {
+      "facts": {
+        "kernel": {
+          "value": "4.18.0-test",
+          "why": null
+        }
+      }
+    },
+    "postgres": {
+      "reachable": {
+        "value": null,
+        "why": "NotYetImplemented"
+      }
+    },
+    "recommendations": [],
+    "roots": [
+      {
+        "facts": {
+          "fanotify_available": {
+            "value": null,
+            "why": "NotYetImplemented"
+          },
+          "lvm": {
+            "value": "n/a",
+            "why": "awaits W4-A"
+          }
+        },
+        "leaves": null,
+        "mount_point": null,
+        "other_mounts": [
+          {
+            "path": "/bind"
+          }
+        ],
+        "root": {
+          "path_b64": "L2RhdGEv/w=="
+        }
+      }
+    ]
+  },
+  "schema": "tidemark.probe.v1"
+}

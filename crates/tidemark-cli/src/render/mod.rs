@@ -22,3 +22,5 @@ pub fn json<T: serde::Serialize>(
     output.write_all(b"\n")?;
     Ok(())
 }
+/// Host and filesystem capability probe output.
+pub mod probe;

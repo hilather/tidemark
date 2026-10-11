@@ -1,0 +1,2 @@
+29 1 253:0 / / rw,relatime shared:1 - xfs /dev/mapper/rl-root rw,seclabel,attr2,inode64,noquota
+30 29 253:1 / /data rw,noatime shared:2 - xfs /dev/mapper/vg_data-lv_data rw,seclabel,attr2,inode64
