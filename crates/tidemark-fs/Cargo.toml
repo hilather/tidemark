@@ -1,0 +1,12 @@
+[package]
+name = "tidemark-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+privileged = []
+
+[lints]
+workspace = true

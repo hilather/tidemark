@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+privileged = []
+
+[dependencies]
+anyhow.workspace = true
+proc-macro2.workspace = true
+syn.workspace = true
+
+[lints]
+workspace = true

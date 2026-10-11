@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tidemark-core",
+    "crates/tidemark-sys",
+    "crates/tidemark-fs",
+    "crates/tidemark-scan",
+    "crates/tidemark-store",
+    "crates/tidemark-live",
+    "crates/tidemark-pg",
+    "crates/tidemark-cli",
+    "crates/tidemarkd",
+    "crates/test-support",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.98.0"
+
+[workspace.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
+libc = "0.2"
+rusqlite = { version = "0.38", features = ["bundled"] }
+crossbeam-deque = "0.8"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+crossterm = "0.29"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+humantime-serde = "1"
+bytesize = "2"
+serde_json = "1"
+postgres = "0.19"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+tiny_http = "0.12"
+sd-notify = "0.4"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rustc-hash = "2"
+tempfile = "3"
+assert_cmd = "2"
+insta = "1"
+proptest = "1"
+cargo-fuzz = "0.13"
+cargo-generate-rpm = "0.20"
+globset = "0.4"
+smallvec = "1"
+thiserror = "2"
+anyhow = "1"
+clap_complete = "4"
+clap_mangen = "0.2"
+proc-macro2 = "1"
+syn = { version = "2", features = ["full", "visit"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+panic = "unwind"
