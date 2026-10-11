@@ -9,6 +9,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use std::os::unix::ffi::OsStrExt;
 use std::{
     fs::{self, OpenOptions},
+    io::Read,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
 };
@@ -30,6 +31,9 @@ pub struct CompactStats {
 }
 pub(crate) fn open_connection(path: &Path, rw: bool) -> Result<Connection, StoreError> {
     let existing = path.try_exists()?;
+    if existing {
+        preflight_header(path)?;
+    }
     if rw && !existing {
         let file = OpenOptions::new()
             .write(true)
@@ -87,6 +91,28 @@ pub(crate) fn open_connection(path: &Path, rw: bool) -> Result<Connection, Store
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     }
     Ok(conn)
+}
+// Inspect only our own state file before SQLite can mutate its sidecars.
+fn preflight_header(path: &Path) -> Result<(), StoreError> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0; 16];
+    let mut len = 0;
+    while len < header.len() {
+        match file.read(&mut header[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if len != 0 && (len != header.len() || &header != b"SQLite format 3\0") {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+            Some("invalid timeseries database header".into()),
+        )
+        .into());
+    }
+    Ok(())
 }
 fn migration_v1(conn: &Connection) -> Result<(), StoreError> {
     let tx = conn.unchecked_transaction()?;
