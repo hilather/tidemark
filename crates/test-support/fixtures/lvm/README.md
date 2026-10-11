@@ -1,0 +1,1 @@
+Synthetic lvmreport fixtures, written by hand; all field values are strings. Cover linear, thin pool and thin LV, snapshot, inactive and empty fields, bracketed hidden LV names, and hyphenated VG/device-mapper names. Real EL8 VM captures remain an unmet acceptance input: pending VM. No reporting tools were run on the development host.

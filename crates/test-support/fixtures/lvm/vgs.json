@@ -1,0 +1,13 @@
+{
+  "report": [
+    {
+      "vg": [
+        {
+          "vg_name": "vg-with-hyphens",
+          "vg_size": "8589934592",
+          "vg_free": "4294967296"
+        }
+      ]
+    }
+  ]
+}

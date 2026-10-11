@@ -1,0 +1,86 @@
+{
+  "report": [
+    {
+      "lv": [
+        {
+          "vg_name": "vg-with-hyphens",
+          "lv_name": "root",
+          "lv_attr": "-wi-a-----",
+          "segtype": "linear",
+          "lv_size": "1073741824",
+          "data_percent": "",
+          "metadata_percent": "",
+          "pool_lv": "",
+          "lv_dm_path": "/dev/mapper/vg--with--hyphens-root",
+          "lv_kernel_major": "253",
+          "lv_kernel_minor": "0"
+        },
+        {
+          "vg_name": "vg-with-hyphens",
+          "lv_name": "data",
+          "lv_attr": "Vwi-a-tz--",
+          "segtype": "thin",
+          "lv_size": "1073741824",
+          "data_percent": "99.9",
+          "metadata_percent": "",
+          "pool_lv": "pool",
+          "lv_dm_path": "/dev/mapper/vg--with--hyphens-data",
+          "lv_kernel_major": "253",
+          "lv_kernel_minor": "1"
+        },
+        {
+          "vg_name": "vg-with-hyphens",
+          "lv_name": "pool",
+          "lv_attr": "twi-a-tz--",
+          "segtype": "thin-pool",
+          "lv_size": "1073741824",
+          "data_percent": "25.50",
+          "metadata_percent": "3.25",
+          "pool_lv": "",
+          "lv_dm_path": "/dev/mapper/vg--with--hyphens-pool",
+          "lv_kernel_major": "253",
+          "lv_kernel_minor": "2"
+        },
+        {
+          "vg_name": "vg-with-hyphens",
+          "lv_name": "snap",
+          "lv_attr": "swi-a-s---",
+          "segtype": "snapshot",
+          "lv_size": "1073741824",
+          "data_percent": "",
+          "metadata_percent": "",
+          "pool_lv": "",
+          "lv_dm_path": "/dev/mapper/vg--with--hyphens-snap",
+          "lv_kernel_major": "253",
+          "lv_kernel_minor": "3"
+        },
+        {
+          "vg_name": "vg-with-hyphens",
+          "lv_name": "[pool_tdata]",
+          "lv_attr": "-wi-a-----",
+          "segtype": "linear",
+          "lv_size": "1073741824",
+          "data_percent": "",
+          "metadata_percent": "",
+          "pool_lv": "",
+          "lv_dm_path": "",
+          "lv_kernel_major": "-1",
+          "lv_kernel_minor": "-1"
+        },
+        {
+          "vg_name": "vg-with-hyphens",
+          "lv_name": "inactive",
+          "lv_attr": "-wi-a-----",
+          "segtype": "linear",
+          "lv_size": "1073741824",
+          "data_percent": "",
+          "metadata_percent": "",
+          "pool_lv": "",
+          "lv_dm_path": "",
+          "lv_kernel_major": "",
+          "lv_kernel_minor": "-1"
+        }
+      ]
+    }
+  ]
+}

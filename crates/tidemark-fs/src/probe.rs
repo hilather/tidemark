@@ -254,6 +254,8 @@ fn presence(path: &str) -> Fact {
 pub fn probe(cfg: &Config, extra_roots: &[RawPath]) -> ProbeReport {
     let host = host_facts();
     let mounts = mount::read_mountinfo();
+    // W4-A LVM section: collect once for all roots; probe does not expose a timestamp.
+    let lvm_report = std::cell::OnceCell::new();
     let mut roots = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let configured = cfg.roots.iter().map(|r| r.path.clone());
@@ -441,13 +443,41 @@ pub fn probe(cfg: &Config, extra_roots: &[RawPath]) -> ProbeReport {
             continue;
         }
         capacity_facts(&mut report);
-        report.facts.insert(
-            "lvm".into(),
-            Fact {
-                value: Some("n/a".into()),
-                why: Some("LVM discovery awaits W4-A".into()),
-            },
-        );
+        // W4-A LVM section: failures remain advisory and do not affect other probe facts.
+        let fact = match lvm_report.get_or_init(|| crate::lvm::collect(&cfg.lvm, 0)) {
+            Ok(_) if mounts.is_err() => Fact::unknown("mount table unavailable for LVM mapping"),
+            Ok(lvm) => {
+                let mapped = mounts.as_ref().ok().and_then(|mounts| {
+                    mount::mount_for_path(mounts, &report.root).and_then(|mount| {
+                        crate::lvm::map_mounts(lvm, std::slice::from_ref(mount))
+                            .into_iter()
+                            .next()
+                    })
+                });
+                match mapped {
+                    Some(mapped) => {
+                        let current = crate::lvm::lvm_now(lvm, &mapped);
+                        Fact::known(format!(
+                            "LV {}/{}; thin pool {}; VG free {} bytes",
+                            tidemark_core::path::display_lossy_bytes(current.vg.as_bytes()),
+                            tidemark_core::path::display_lossy_bytes(current.lv.as_bytes()),
+                            current
+                                .thin_pool
+                                .as_deref()
+                                .map(|p| tidemark_core::path::display_lossy_bytes(p.as_bytes()))
+                                .unwrap_or_else(|| "n/a".into()),
+                            current.vg_free
+                        ))
+                    }
+                    None => Fact::known("n/a"),
+                }
+            }
+            Err(crate::lvm::LvmError::NotInstalled | crate::lvm::LvmError::Disabled) => {
+                Fact::known("n/a")
+            }
+            Err(e) => Fact::unknown(e),
+        };
+        report.facts.insert("lvm".into(), fact);
         roots.push(report);
     }
     let mut report = ProbeReport {
