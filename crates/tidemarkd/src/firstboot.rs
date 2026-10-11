@@ -51,24 +51,14 @@ pub struct FirstbootReport {
 }
 /// Cross-task contract reserved for the owning task.
 pub fn needs_report(state_dir: &Path, config_sha256: &str) -> bool {
-    if !state_dir.join("deploy/staged.json").is_file() {
+    if files::read(&state_dir.join("deploy/staged.json")).is_err() {
         return false;
     }
     read_report(&state_dir.join("deploy/firstboot.json"))
         .map_or(true, |report| report.config_sha256 != config_sha256)
 }
 fn read_report(path: &Path) -> io::Result<FirstbootReport> {
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > 1024 * 1024 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "report exceeds 1 MiB",
-        ));
-    }
+    let bytes = files::read(path)?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 /// Build the report using the supplied logical clock and Linux boot timestamp.
@@ -115,64 +105,32 @@ fn build_with_boot(inputs: &FirstbootInputs, now: i64, booted_at: i64) -> Firstb
 }
 /// Publish a private report atomically and sync both the file and its parent.
 pub fn write(state_dir: &Path, r: &FirstbootReport) -> io::Result<()> {
-    use std::{
-        io::Write,
-        os::unix::fs::{OpenOptionsExt, PermissionsExt},
-        sync::atomic::{AtomicU64, Ordering},
-    };
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let dir = state_dir.join("deploy");
-    for ancestor in dir.ancestors() {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(io::Error::other("firstboot path contains a symlink"))
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+    files::validate_state(state_dir, std::iter::empty::<&Path>())?;
+    files::validate_marker_roots(state_dir)?;
+    files::validate_state(&state_dir.join("deploy"), std::iter::empty::<&Path>())?;
+    for name in [
+        ".tidemark-state.json",
+        "deploy/staged.json",
+        "deploy/firstboot.json",
+    ] {
+        files::inspect(&state_dir.join(name))?;
     }
-    std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    let temporary = dir.join(format!(
-        ".firstboot.{}.{}.tmp",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        if rustix::process::geteuid().is_root() {
-            rustix::fs::fchown(
-                &file,
-                Some(rustix::process::Uid::ROOT),
-                Some(rustix::process::Gid::ROOT),
-            )?;
-        }
-        let bytes = serde_json::to_vec(r).map_err(io::Error::other)?;
-        if bytes.len() >= 1024 * 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "report exceeds 1 MiB",
-            ));
-        }
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, dir.join("firstboot.json"))?;
-        std::fs::File::open(&dir)?.sync_all()
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+    let mut bytes = serde_json::to_vec(r).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    if bytes.len() > 1024 * 1024 {
+        return Err(io::Error::other("report exceeds 1 MiB"));
     }
-    result?;
+    files::write(
+        &state_dir.join("deploy/firstboot.json"),
+        &bytes,
+        rustix::process::geteuid().is_root(),
+    )?;
     tracing::info!(healthy = r.healthy, version = %r.version, config_sha256 = %r.config_sha256, "Tidemark first-boot report published");
     Ok(())
 }
+#[path = "../../tidemark-cli/src/deploy/files.rs"]
+#[allow(dead_code)]
+mod files;
 
 #[cfg(test)]
 mod tests {
@@ -294,5 +252,59 @@ mod tests {
         );
         std::fs::write(dir.path().join("deploy/staged.json"), b"{}").unwrap();
         assert!(!needs_report(dir.path(), "abc"));
+    }
+    #[test]
+    fn unsafe_state_and_record_symlinks_are_refused() {
+        let report = build_with_boot(&inputs(), 20, 5);
+        for path in [
+            "/",
+            "relative",
+            "/tmp/../danger",
+            "/etc",
+            "/usr",
+            "/var",
+            "/var/lib",
+            "/run",
+            "/home",
+            "/root",
+            "/boot",
+            "/dev",
+            "/proc",
+            "/sys",
+            "/tmp",
+        ] {
+            assert!(write(Path::new(path), &report).is_err());
+        }
+        for name in [
+            "deploy",
+            ".tidemark-state.json",
+            "deploy/staged.json",
+            "deploy/firstboot.json",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path().join("state");
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(state.join("deploy")).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("firstboot.json"), b"outside").unwrap();
+            let link = state.join(name);
+            if link.is_dir() {
+                std::fs::remove_dir(&link).unwrap();
+            }
+            std::os::unix::fs::symlink(
+                if name == "deploy" {
+                    outside.clone()
+                } else {
+                    outside.join("firstboot.json")
+                },
+                link,
+            )
+            .unwrap();
+            assert!(write(&state, &report).is_err());
+            assert_eq!(
+                std::fs::read(outside.join("firstboot.json")).unwrap(),
+                b"outside"
+            );
+        }
     }
 }

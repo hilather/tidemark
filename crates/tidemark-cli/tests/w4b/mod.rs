@@ -68,3 +68,22 @@ fn missing_purge_marker_is_precondition_exit_five_without_service_calls() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("state marker"));
     assert_eq!(std::fs::read(state.join("keep")).unwrap(), b"untouched");
 }
+
+#[test]
+fn valid_source_bypasses_invalid_installed_config_and_exits_five_for_unsafe_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let installed = dir.path().join("installed.toml");
+    let source = dir.path().join("source.toml");
+    std::fs::write(&installed, "invalid TOML").unwrap();
+    std::fs::write(&source, "[general]\nstate_dir = '/'\n").unwrap();
+    let output = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("tidemark"))
+        .arg("-c")
+        .arg(&installed)
+        .args(["deploy", "stage", "--from"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("unsafe state_dir"));
+    assert_eq!(std::fs::read(&installed).unwrap(), b"invalid TOML");
+}
