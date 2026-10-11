@@ -159,7 +159,7 @@ fn million_directory_export_rss_below_64_mib() {
     assert!(delta < 64 * 1024 * 1024);
 }
 #[test]
-fn notable_cap_fails_before_writing_and_io_errors_propagate() {
+fn notable_files_above_old_cap_stream_and_io_errors_propagate() {
     use tidemark_core::{
         path::{RawName, RawPath},
         snapshot::FileRow,
@@ -193,11 +193,23 @@ fn notable_cap_fails_before_writing_and_io_errors_propagate() {
         utf8_lossy: true,
         max_depth: None,
     };
-    assert!(export_ncdu(&snap, &root, &mut out, &opts)
-        .unwrap_err()
-        .to_string()
-        .contains("4096"));
-    assert!(out.is_empty());
+    let original = std::fs::read(&file).unwrap();
+    let stats = export_ncdu(&snap, &root, &mut out, &opts).unwrap();
+    assert_eq!(stats.files, 4097);
+    assert_eq!(stats.disk_bytes, 4097);
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(sum(&json[3]), 4097);
+    let entries = json[3].as_array().unwrap();
+    let names: Vec<_> = entries[1..entries.len() - 1]
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 4097);
+    assert!(names
+        .windows(2)
+        .all(|pair| pair[0].as_bytes() < pair[1].as_bytes()));
+    assert_eq!(entries.last().unwrap()["name"], "[other files: 0]");
+    assert_eq!(std::fs::read(&file).unwrap(), original);
     let absent = RawPath::new(b"/absent".to_vec()).unwrap();
     assert!(export_ncdu(&snap, &absent, &mut out, &opts).is_err());
     let small = tempfile::tempdir().unwrap();

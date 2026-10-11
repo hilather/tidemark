@@ -50,10 +50,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         max_depth,
     };
     if let Some(output) = output {
-        let mut file = create_output(output, &context.config.general.state_dir)?;
-        let mut out = std::io::BufWriter::new(&mut file);
-        tidemark_store::export_ncdu(&snap, &path, &mut out, &opts)?;
-        out.flush()?;
+        let (mut file, target) = create_output(output, &context.config.general.state_dir)?;
+        {
+            let mut out = std::io::BufWriter::new(file.as_file_mut());
+            tidemark_store::export_ncdu(&snap, &path, &mut out, &opts)?;
+            out.flush()?;
+        }
+        publish_output(&file, &target)?;
     } else {
         let mut out = std::io::BufWriter::new(std::io::stdout().lock());
         tidemark_store::export_ncdu(&snap, &path, &mut out, &opts)?;
@@ -64,8 +67,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
 fn create_output(
     output: &std::path::Path,
     state: &std::path::Path,
-) -> anyhow::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
+) -> anyhow::Result<(tempfile::NamedTempFile, std::path::PathBuf)> {
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -81,11 +83,57 @@ fn create_output(
             crate::CliError::Precondition("refusing export inside state_dir".into()).into(),
         );
     }
-    // Exclusive creation refuses symlinks, hard links and all existing files,
-    // including snapshots located outside the configured state directory.
-    Ok(std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(target)?)
+    match std::fs::symlink_metadata(&target) {
+        Ok(_) => return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // NamedTempFile creates a private 0600 file in this same directory. A crash
+    // can leave its conspicuous temporary name, never an incomplete target.
+    let file = tempfile::Builder::new()
+        .prefix(".tidemark-export-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    Ok((file, target))
+}
+
+fn publish_output(file: &tempfile::NamedTempFile, target: &std::path::Path) -> anyhow::Result<()> {
+    file.as_file().sync_all()?;
+    // NOREPLACE preserves refusal to overwrite if a destination appears during
+    // export. The temporary file is removed on error/drop.
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        file.path(),
+        rustix::fs::CWD,
+        target,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn staging_is_private_and_publication_never_replaces_a_racing_target() {
+        use super::{create_output, publish_output};
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let target = temp.path().join("export.json");
+        let (mut file, target) = create_output(&target, &state).unwrap();
+        let staging = file.path().to_owned();
+        file.write_all(b"partial").unwrap();
+        assert!(!target.exists());
+        assert_eq!(
+            file.as_file().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::write(&target, b"racing destination").unwrap();
+        assert!(publish_output(&file, &target).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"racing destination");
+        drop(file);
+        assert!(!staging.exists());
+    }
 }
