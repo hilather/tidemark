@@ -6,14 +6,22 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-privileged = []
+privileged = ["test-support/privileged"]
 
 [lints]
 workspace = true
 
 [dependencies]
-tidemark-core = { path = "../tidemark-core" }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-journald.workspace = true
+rustix.workspace = true
+
+tidemark-core.workspace = true
 clap.workspace = true
 
 [dev-dependencies]
+test-support.workspace = true
+
 tempfile.workspace = true

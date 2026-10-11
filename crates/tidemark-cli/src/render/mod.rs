@@ -29,3 +29,24 @@ pub mod probe;
 pub mod scan_progress;
 /// Tree rendering.
 pub mod tree;
+
+/// diff report rendering.
+pub mod diff;
+
+/// links report rendering.
+pub mod links;
+
+/// symlinks report rendering.
+pub mod symlinks;
+
+/// export report rendering.
+pub mod export;
+
+/// wide report rendering.
+pub mod wide;
+
+/// lvm report rendering.
+pub mod lvm;
+
+/// deploy report rendering.
+pub mod deploy;

@@ -62,3 +62,8 @@ fn test_meta() -> tidemark_core::snapshot::SnapshotMeta {
         gate_stats: tidemark_core::scan::GateStats::default(),
     }
 }
+
+/// Streaming ncdu export.
+pub use export_ncdu::{export_ncdu, ExportStats, NcduOptions};
+/// Snapshot reader used by query interfaces.
+pub use reader::Snapshot;
