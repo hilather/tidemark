@@ -214,7 +214,7 @@ pub fn run_scan(cfg: &Config, req: &ScanRequest, recorder: &dyn ScanRecorder, ca
 
 - `choose_mode` truth table: every condition in `04` §7, with reasons.
 - End-to-end (unprivileged): `tidemark scan <fixture>` then `top` / `files` / `snapshots` produce `insta` snapshots, with timestamps redacted.
-- **Oracle:** after scanning each mandatory fixture in walk mode, `top --depth 99 --json` values equal `du -sxB1` / `--apparent-size` and `find` counts for every directory.
+- **Oracle:** after scanning each mandatory fixture in walk mode, `top --depth 99 --json` values equal `du -sxB1` / `--apparent-size` and `find` counts for every directory, with apparent-size oracle normalization as specified in `09-testing.md` §3.
 - Cancellation: SIGINT during a scan leaves no `.db` and a catalog row with `status = failed` (or `partial` with `--keep-partial`).
 - The space-guard refusal path (injected) leaves no partial files.
 - Privileged: `auto` chooses bulk on a loop XFS mount root and walk on a small subdirectory; reasons are recorded in `meta`.

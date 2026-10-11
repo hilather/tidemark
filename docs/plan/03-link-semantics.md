@@ -35,7 +35,7 @@ Directory inodes contribute their own `disk`/`apparent` (directory blocks; small
 | Column | Name in CLI | Definition | Additive across siblings? |
 |--------|-------------|------------|---------------------------|
 | `t_disk` | SIZE | Σ `disk(i)` over **distinct** inodes with at least one link in T(d), plus Σ disk of directory inodes in T(d). Equals `du -sxB1 d`. | No |
-| `t_apparent` | APPARENT | Same as `t_disk` using `apparent`. Equals `du -sxB1 --apparent-size d`. | No |
+| `t_apparent` | APPARENT | Same as `t_disk` using `apparent`. Equals `du -sxB1 --apparent-size d` after the oracle normalization below (`09` §3). | No |
 | `t_charged` | CHARGED | Every inode is charged to exactly one directory: its single directory if `found(i) = 1`, otherwise `LCA(i)`. `t_charged(d)` = Σ charged to directories in T(d) + directory inodes in T(d). | **Yes** |
 | `t_reclaimable` | RECLAIM | Like `t_charged`, but only inodes with `complete(i)`. "What deleting T(d) would free", ignoring open file handles and reflink-shared extents. | Yes |
 | `shared` | SHARED | `t_disk − t_reclaimable`. Bytes visible in T(d) but kept alive by links elsewhere. | — |
@@ -46,6 +46,8 @@ Directory inodes contribute their own `disk`/`apparent` (directory blocks; small
 | `newest_mtime` | NEWEST | max mtime over the directory inodes in T(d) and every non-directory inode with at least one link in T(d). Computed as a rolled-up max, so a link set's mtime counts in every directory that holds one of its links. | — |
 | `max_entries` | WIDEST | max direct-entry count of any directory in T(d) | — |
 | `t_errors` | ERR | Errors encountered in T(d) (permission, I/O). Values for *d* may be incomplete if > 0. | Yes |
+
+**Apparent-size oracle:** the definition includes directory `st_size` (§2) unchanged. GNU coreutils 8.30 (Rocky Linux 8) counts directory sizes in apparent mode, so direct equality holds on the target. Coreutils 9.2 and later count only regular files and symbolic links; their output differs by the subtree's directory sizes (and any other non-regular, non-symlink inode with non-zero `st_size`). Tests probe the local `du` with an empty directory, never branch on a version string, and when it omits directory sizes add those measured apparent sizes to the `du` figure before comparing, counting distinct inodes consistently with the metric. `t_disk` is compared directly with `du -sxB1` on every version. See `09-testing.md` §3.
 
 **Invariants** (checked by property tests and asserted in debug builds):
 

@@ -89,13 +89,17 @@ Shared fixtures live in `test-support/fixtures/*.toml`. Mandatory ones:
 | Oracle | Command | Compared with |
 |--------|---------|---------------|
 | Disk usage | `du -sxB1 <dir>` | `t_disk` for every directory in the fixture (GNU du counts each hard-linked inode once per invocation) |
-| Apparent | `du -sxB1 --apparent-size <dir>` | `t_apparent` |
+| Apparent | `du -sxB1 --apparent-size <dir>` | `t_apparent` after normalization below |
 | Entry counts | `find <dir> -xdev -not -type d -printf . \| wc -c` (robust to newlines in names) | `t_files` |
 | Directory counts | `find <dir> -xdev -type d -printf . \| wc -c`, minus mount-point directories and excluded paths, which Tidemark skips | `t_dirs` |
 | Distinct inodes | `find <dir> -xdev -not -type d -printf '%i\n' \| sort -u \| wc -l` | `t_inodes` |
 | LVM | `lvs --units b --nosuffix -o lv_size,data_percent,metadata_percent`, `vgs -o vg_free` (plain text) | LVM collector values |
 | Filesystem totals | `df -B1 --output=size,used,avail` | Sampler values |
 | Bulk vs walk | Walk-mode snapshot | Bulk-mode snapshot: all `dirs` columns except `projid` must be equal |
+
+`t_disk` is compared directly with `du -sxB1` on every version. The normative `t_apparent` includes directory `st_size` (`03` §2–3). GNU coreutils 8.30, shipped with Rocky Linux 8, counts directory sizes in apparent mode, so equality holds directly on the target. Coreutils 9.2 and later count only regular files and symbolic links in apparent mode.
+
+For apparent-size comparisons, probe the local `du -sxB1 --apparent-size` with an empty directory and compare its output with the measured directory `st_size` to learn whether it counts directory sizes. When it does not, normalize by adding the measured `st_size` of every directory in the compared subtree (including its root), and of any other non-regular, non-symlink inode with non-zero `st_size`, to the `du` figure before comparing with `t_apparent`. Count distinct inodes and use the same subtree boundaries as the metric. The probe decides; never branch on a version string.
 
 Oracle helpers live in `test-support::oracle` and return parsed numbers. Tests skip with a clear message if `du`/`find` are not GNU.
 
