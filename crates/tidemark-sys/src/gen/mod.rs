@@ -1,2 +1,3 @@
 //! Owned by: W1-C
-//! Generated XFS binding layouts.
+//! Private XFS ABI bindings.
+pub(crate) mod bindings;
