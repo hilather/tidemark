@@ -1,4 +1,4 @@
-//! Owned by: W1-D
+//! Owned by: W1-gate-fix-throttle
 //! Thread-safe metadata token buckets and an interruptible AIMD controller.
 
 use parking_lot::{Condvar, Mutex};
@@ -43,19 +43,55 @@ struct Bucket {
     wake: Condvar,
     blocked_ns: AtomicU64,
 }
-// Constant-size accounting: issued - earned is outstanding token debt.
-// Each caller keeps its own FIFO target, so no waiter collection is needed.
+// Exact nano-token reservations. Rebase only after every target has retired.
+// Admission pauses before overflow, so outstanding targets never change.
+const UNIT: u128 = 1_000_000_000;
+const RESERVATION_LIMIT: u128 = u128::MAX - (u32::MAX as u128 * UNIT);
 struct TokenState {
     last: Instant,
     rate: f64,
-    issued: f64,
-    earned: f64,
+    issued: u128,
+    earned: u128,
+    remainder: u128,
+    waiters: usize,
 }
 impl TokenState {
+    fn rate_nanos(&self) -> u128 {
+        (self.rate * UNIT as f64).floor() as u128
+    }
+    fn burst(&self) -> u128 {
+        self.rate_nanos() / 4
+    }
     fn account(&mut self, now: Instant) {
-        self.earned = (self.earned + self.rate * now.duration_since(self.last).as_secs_f64())
-            .min(self.issued + self.rate * 0.25);
+        let cap = self.issued + self.burst();
+        let elapsed = now.duration_since(self.last).as_nanos();
+        let rate = self.rate_nanos();
+        // Split before multiplication: the subsecond product is bounded by
+        // 1e9 * (u32::MAX * 1e9), and retains fractional nano-token credit.
+        let fraction = (elapsed % UNIT) * rate + self.remainder;
+        let credit = (elapsed / UNIT)
+            .checked_mul(rate)
+            .and_then(|n| n.checked_add(fraction / UNIT));
+        let available = cap - self.earned;
+        if let Some(credit) = credit {
+            self.earned += credit.min(available);
+            self.remainder = if credit >= available {
+                0
+            } else {
+                fraction % UNIT
+            };
+        } else {
+            // The final credit itself exceeds u128, hence fills any bucket.
+            self.earned = cap;
+            self.remainder = 0;
+        }
         self.last = now;
+    }
+    fn rebase(&mut self) {
+        if self.waiters == 0 {
+            self.earned = self.earned.saturating_sub(self.issued);
+            self.issued = 0;
+        }
     }
 }
 impl Bucket {
@@ -64,8 +100,10 @@ impl Bucket {
             state: Mutex::new(TokenState {
                 last: Instant::now(),
                 rate,
-                issued: 0.0,
-                earned: rate * 0.25,
+                issued: 0,
+                earned: (rate * UNIT as f64).floor() as u128 / 4,
+                remainder: 0,
+                waiters: 0,
             }),
             wake: Condvar::new(),
             blocked_ns: AtomicU64::new(0),
@@ -79,7 +117,7 @@ impl Bucket {
         // Earn tokens at the old rate up to the transition, never retroactively.
         state.account(Instant::now());
         state.rate = rate;
-        state.earned = state.earned.min(state.issued + rate * 0.25);
+        state.earned = state.earned.min(state.issued + state.burst());
         self.wake.notify_all();
     }
     fn acquire(&self, cost: u32) {
@@ -89,22 +127,42 @@ impl Bucket {
         let before = Instant::now();
         let mut state = self.state.lock();
         state.account(Instant::now());
-        state.issued += f64::from(cost);
-        let target = state.issued;
+        let cost = u128::from(cost) * UNIT;
         let mut blocked = false;
         loop {
-            state.account(Instant::now());
-            let debt = target - state.earned;
-            if debt <= 0.0 {
+            state.rebase();
+            if state.issued <= RESERVATION_LIMIT - cost && state.waiters < usize::MAX {
                 break;
             }
             blocked = true;
-            let wait = Duration::from_secs_f64((debt / state.rate).min(u32::MAX as f64));
+            self.wake.wait(&mut state);
+            state.account(Instant::now());
+        }
+        state.issued += cost;
+        state.waiters += 1;
+        let target = state.issued;
+        loop {
+            state.account(Instant::now());
+            let debt = target.saturating_sub(state.earned);
+            if debt == 0 {
+                break;
+            }
+            blocked = true;
+            let wait = Duration::from_secs_f64(
+                (debt as f64 / UNIT as f64 / state.rate).min(u32::MAX as f64),
+            );
             self.wake.wait_for(&mut state, wait);
         }
+        state.waiters -= 1;
+        state.rebase();
+        self.wake.notify_all();
         if blocked {
-            self.blocked_ns
-                .fetch_add(nanos(before.elapsed()), Ordering::Relaxed);
+            let elapsed = nanos(before.elapsed());
+            let _ = self
+                .blocked_ns
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_add(elapsed))
+                });
         }
     }
 }
@@ -208,10 +266,10 @@ impl AdaptiveGate {
                             let mut metrics = worker.metrics.lock();
                             metrics.account(now);
                             if next < rate {
-                                metrics.stats.decreases += 1;
+                                metrics.stats.decreases = metrics.stats.decreases.saturating_add(1);
                             }
                             if next > rate {
-                                metrics.stats.increases += 1;
+                                metrics.stats.increases = metrics.stats.increases.saturating_add(1);
                             }
                             metrics.stats.min_rate = metrics.stats.min_rate.min(next);
                             metrics.rate = next;
@@ -339,6 +397,57 @@ pub fn controller_step(
     }
 }
 
+enum ScanGateKind {
+    Adaptive(Arc<AdaptiveGate>),
+    Fixed(Arc<FixedGate>),
+    Max,
+}
+/// Owns scan throttling statistics and controller shutdown.
+/// For profile `max`, statistics rates of zero mean "unthrottled".
+pub struct ScanGate {
+    kind: ScanGateKind,
+}
+impl ScanGate {
+    /// The gate to pass to the walker and the bulk pipeline.
+    pub fn gate(&self) -> Arc<dyn Gate> {
+        match &self.kind {
+            ScanGateKind::Adaptive(gate) => gate.clone(),
+            ScanGateKind::Fixed(gate) => gate.clone(),
+            ScanGateKind::Max => Arc::new(NoopGate),
+        }
+    }
+    /// Statistics so far.
+    pub fn stats(&self) -> GateStats {
+        match &self.kind {
+            ScanGateKind::Adaptive(gate) => gate.stats(),
+            ScanGateKind::Fixed(gate) => GateStats {
+                mean_rate: gate.current_rate(),
+                min_rate: gate.current_rate(),
+                throttled_ms: gate.bucket.blocked_ns.load(Ordering::Relaxed) / 1_000_000,
+                ..GateStats::default()
+            },
+            ScanGateKind::Max => GateStats::default(),
+        }
+    }
+    /// Stop the controller thread (joined within one interval) and return the final statistics.
+    /// Waiting acquisitions continue at the last rate. Join assumes the sampler
+    /// satisfies its documented one-interval completion bound.
+    pub fn stop(self) -> GateStats {
+        self.stop_controller();
+        self.stats()
+    }
+    fn stop_controller(&self) {
+        if let ScanGateKind::Adaptive(gate) = &self.kind {
+            gate.stop();
+        }
+    }
+}
+impl Drop for ScanGate {
+    fn drop(&mut self) {
+        self.stop_controller();
+    }
+}
+
 /// Select a configured adaptive profile, conservative fixed fallback, or max.
 /// No leaves (including unresolved W1-A discovery) use the configured minimum.
 pub fn gate_from_config(
@@ -346,9 +455,11 @@ pub fn gate_from_config(
     cfg: &ThrottleConfig,
     leaves: &[BlockDevInfo],
     sampler: StatSampler,
-) -> Result<Arc<dyn Gate>, ConfigIssue> {
+) -> Result<ScanGate, ConfigIssue> {
     if profile == "max" {
-        return Ok(Arc::new(NoopGate));
+        return Ok(ScanGate {
+            kind: ScanGateKind::Max,
+        });
     }
     let issue = |message: &str| ConfigIssue {
         field: "throttle".into(),
@@ -373,7 +484,9 @@ pub fn gate_from_config(
     }
     if leaves.is_empty() {
         tracing::warn!("no leaf devices known; using minimum fixed metadata rate");
-        return Ok(Arc::new(FixedGate::new(f64::from(cfg.min_ops_per_sec))));
+        return Ok(ScanGate {
+            kind: ScanGateKind::Fixed(Arc::new(FixedGate::new(f64::from(cfg.min_ops_per_sec)))),
+        });
     }
     // %util is trustworthy only on known rotational, single-queue leaves.
     // Missing mq directories on legacy devices mean a single queue; unknown
@@ -406,40 +519,141 @@ pub fn gate_from_config(
         }
         Ok(stats)
     });
-    Ok(AdaptiveGate::start(
-        AdaptiveParams {
-            max_ops: cfg.max_ops_per_sec,
-            min_ops: cfg.min_ops_per_sec,
-            max_util_pct: params.max_util_pct,
-            target_latency_ms: params.target_latency_ms,
-            interval: cfg.sample_interval,
-        },
-        masked,
-    ))
+    Ok(ScanGate {
+        kind: ScanGateKind::Adaptive(AdaptiveGate::start(
+            AdaptiveParams {
+                max_ops: cfg.max_ops_per_sec,
+                min_ops: cfg.min_ops_per_sec,
+                max_util_pct: params.max_util_pct,
+                target_latency_ms: params.target_latency_ms,
+                interval: cfg.sample_interval,
+            },
+            masked,
+        )),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn exact_reservations_near_float_limit_and_integer_limit() {
+        for seed in [(1_u128 << 53) * UNIT, RESERVATION_LIMIT] {
+            let bucket = Arc::new(Bucket::new(100.0));
+            {
+                let mut state = bucket.state.lock();
+                state.issued = seed;
+                state.earned = seed;
+            }
+            let start = Instant::now();
+            for _ in 0..4 {
+                bucket.acquire(1);
+            }
+            assert!(start.elapsed() >= Duration::from_millis(35));
+            assert!(bucket.blocked_ns.load(Ordering::Relaxed) >= 35_000_000);
+        }
+    }
+
+    #[test]
+    fn exact_reservations_preserve_outstanding_targets() {
+        for seed in [(1_u128 << 53) * UNIT, RESERVATION_LIMIT] {
+            let bucket = Arc::new(Bucket::new(100.0));
+            {
+                let mut state = bucket.state.lock();
+                state.issued = seed;
+                state.earned = seed - 10 * UNIT;
+                state.waiters = 1; // A real outstanding target is retained below.
+            }
+            let clone = bucket.clone();
+            let worker = thread::spawn(move || clone.acquire(1));
+            thread::sleep(Duration::from_millis(30));
+            assert!(!worker.is_finished());
+            {
+                let mut state = bucket.state.lock();
+                state.account(Instant::now());
+                assert_eq!(
+                    state.issued,
+                    if seed == RESERVATION_LIMIT {
+                        seed
+                    } else {
+                        seed + UNIT
+                    }
+                );
+                assert!(state.earned < seed);
+                // Retire the seeded waiter only after its exact target is paid.
+                state.account(Instant::now() + Duration::from_millis(100));
+                assert!(state.earned >= seed);
+                state.waiters -= 1;
+                bucket.wake.notify_all();
+                // Restore the real clock after injecting credit.
+                state.last = Instant::now();
+            }
+            worker.join().unwrap();
+            let state = bucket.state.lock();
+            assert_eq!(state.waiters, 0);
+            assert!(state.earned <= state.issued + state.burst());
+        }
+    }
+
+    #[test]
+    fn large_elapsed_credit_does_not_overflow_or_fill_unpaid_debt() {
+        let start = Instant::now();
+        let mut state = TokenState {
+            last: start,
+            rate: f64::from(u32::MAX),
+            issued: RESERVATION_LIMIT,
+            earned: 0,
+            remainder: 0,
+            waiters: 1,
+        };
+        let seconds = 1_000_000_000_000_u64;
+        let expected = u128::from(seconds) * state.rate_nanos();
+        state.account(start + Duration::from_secs(seconds));
+        assert_eq!(state.earned, expected);
+        assert!(state.earned < state.issued);
+    }
+
+    #[test]
+    fn fractional_nanotokens_survive_accounting_and_rebasing() {
+        let start = Instant::now();
+        let mut state = TokenState {
+            last: start,
+            rate: 1.5,
+            issued: UNIT,
+            earned: UNIT,
+            remainder: 0,
+            waiters: 0,
+        };
+        state.account(start + Duration::from_nanos(1));
+        assert_eq!(state.earned, UNIT + 1);
+        assert_eq!(state.remainder, UNIT / 2);
+        state.rebase();
+        state.account(start + Duration::from_nanos(2));
+        assert_eq!(state.earned, 3);
+        assert_eq!(state.remainder, 0);
+    }
+
+    #[test]
     fn time_weighted_debt_and_burst() {
         let start = Instant::now();
         let mut state = TokenState {
             last: start,
             rate: 1000.0,
-            issued: 1000.0,
-            earned: 250.0,
+            issued: 1000 * UNIT,
+            earned: 250 * UNIT,
+            remainder: 0,
+            waiters: 1,
         };
         state.account(start + Duration::from_millis(100));
         state.rate = 1.0;
         state.account(start + Duration::from_millis(800));
-        assert!((state.earned - 350.7).abs() < 1e-9);
+        assert_eq!(state.earned, 350_700_000_000);
         assert!(state.earned < state.issued);
         state.rate = 1000.0;
         state.account(start + Duration::from_millis(1500));
-        assert!((state.earned - 1050.7).abs() < 1e-9);
+        assert_eq!(state.earned, 1_050_700_000_000);
         state.account(start + Duration::from_secs(100));
-        assert_eq!(state.earned, state.issued + 250.0);
+        assert_eq!(state.earned, state.issued + 250 * UNIT);
     }
 
     // Real wait/notification tests allow 2 units for floating point and scheduling.

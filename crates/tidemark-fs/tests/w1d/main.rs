@@ -210,6 +210,7 @@ fn config_profiles_and_fallback() {
     assert!(
         gate_from_config("max", &cfg, &[], Box::new(|| panic!("max must not sample")))
             .unwrap()
+            .gate()
             .current_rate()
             .is_infinite()
     );
@@ -221,6 +222,7 @@ fn config_profiles_and_fallback() {
             Box::new(|| panic!("fallback must not sample"))
         )
         .unwrap()
+        .gate()
         .current_rate(),
         f64::from(cfg.min_ops_per_sec)
     );
@@ -367,6 +369,103 @@ fn nonrotational_util_is_ignored_by_config_gate() {
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
-    assert_eq!(gate.current_rate(), f64::from(cfg.max_ops_per_sec));
+    assert_eq!(gate.gate().current_rate(), f64::from(cfg.max_ops_per_sec));
     drop(gate);
+}
+
+#[test]
+fn factory_final_statistics_and_waiters_after_stop() {
+    use tidemark_core::{
+        config::ThrottleConfig,
+        dev::{BlockDevInfo, DevKind},
+    };
+    let cfg = ThrottleConfig {
+        min_ops_per_sec: 100,
+        max_ops_per_sec: 100,
+        sample_interval: Duration::from_millis(10),
+        ..Default::default()
+    };
+    for leaves in [
+        vec![],
+        vec![BlockDevInfo {
+            name: "synthetic".into(),
+            major: 0,
+            minor: 0,
+            kind: DevKind::Disk,
+            rotational: Some(false),
+            scheduler: None,
+        }],
+    ] {
+        let handle = gate_from_config(
+            "normal",
+            &cfg,
+            &leaves,
+            Box::new(|| Ok(vec![DiskStat::default()])),
+        )
+        .unwrap();
+        let gate = handle.gate();
+        gate.acquire(25);
+        let worker = std::thread::spawn(move || gate.acquire(10));
+        std::thread::sleep(Duration::from_millis(20));
+        let stats = handle.stop();
+        assert!((stats.mean_rate - 100.0).abs() < 1e-9);
+        assert_eq!(stats.min_rate, 100.0);
+        worker.join().unwrap();
+        // Final blocked time is measured after completed acquisitions.
+        let handle = gate_from_config(
+            "normal",
+            &cfg,
+            &leaves,
+            Box::new(|| Ok(vec![DiskStat::default()])),
+        )
+        .unwrap();
+        handle.gate().acquire(30);
+        assert!(handle.stats().throttled_ms >= 40);
+        let stats = handle.stop();
+        assert!(stats.throttled_ms >= 40);
+        assert_eq!(stats.decreases, 0);
+        assert_eq!(stats.increases, 0);
+    }
+    let handle = gate_from_config("max", &cfg, &[], Box::new(|| panic!("no sampling"))).unwrap();
+    handle.gate().acquire(u32::MAX);
+    let stats = handle.stop();
+    assert_eq!(stats.mean_rate, 0.0);
+    assert_eq!(stats.min_rate, 0.0);
+    assert_eq!(stats.throttled_ms, 0);
+    assert_eq!(stats.decreases, 0);
+    assert_eq!(stats.increases, 0);
+}
+
+#[test]
+fn factory_drop_stops_controller_with_retained_gate() {
+    let samples = Arc::new(AtomicU64::new(0));
+    let counter = samples.clone();
+    let cfg = tidemark_core::config::ThrottleConfig {
+        sample_interval: Duration::from_millis(5),
+        ..Default::default()
+    };
+    let leaf = tidemark_core::dev::BlockDevInfo {
+        name: "synthetic".into(),
+        major: 0,
+        minor: 0,
+        kind: tidemark_core::dev::DevKind::Disk,
+        rotational: Some(false),
+        scheduler: None,
+    };
+    let handle = gate_from_config(
+        "normal",
+        &cfg,
+        &[leaf],
+        Box::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![DiskStat::default()])
+        }),
+    )
+    .unwrap();
+    let gate = handle.gate();
+    drop(handle);
+    let before = samples.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(samples.load(Ordering::Relaxed), before);
+    gate.acquire(1);
 }
