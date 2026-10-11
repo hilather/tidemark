@@ -10,7 +10,14 @@ impl Source for Fake {
     fn scan(&mut self, _: &[DevId], flags: bool) -> io::Result<Vec<OpenFile>> {
         assert!(flags);
         self.start += 1;
-        self.passes.pop_front().unwrap()
+        self.passes.pop_front().unwrap().map(|mut files| {
+            for file in &mut files {
+                if file.starttime == 0 {
+                    file.starttime = self.start;
+                }
+            }
+            files
+        })
     }
     fn attribution(&self, pid: u32) -> Attribution {
         Attribution {
@@ -25,6 +32,7 @@ impl Source for Fake {
 fn file(ino: u64, pid: u32, disk: u64) -> OpenFile {
     OpenFile {
         pid,
+        starttime: 0,
         fd: 3,
         target: b"/data/log (deleted)".to_vec(),
         dev: 1,
@@ -143,7 +151,7 @@ fn ring_cap_eviction_and_twenty_thousand_fds() {
     assert_eq!(s.tracked.len(), MAX_WRITERS);
     s.scan_once(1).unwrap();
     assert!(s.tracked.contains_key(&(1, 9999)));
-    assert!(!s.tracked.contains_key(&(1, 10_000)));
+    assert!(s.tracked.contains_key(&(1, 10_000)));
     for i in 2..65 {
         s.scan_once(i).unwrap();
     }
@@ -167,6 +175,7 @@ fn irregular_window_baseline_sort_limits_and_subsecond() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].ino, 2);
     assert_eq!(rows[0].growth, 2560);
+    assert_eq!(rows[0].window_secs, 20);
     assert!(s
         .writers(
             Some(&RawPath::new(b"/other".to_vec()).unwrap()),
@@ -176,5 +185,60 @@ fn irregular_window_baseline_sort_limits_and_subsecond() {
         .is_empty());
     assert!(s.writers(None, Duration::from_secs(30), 0).is_empty());
     s.scan_once(30).unwrap();
-    assert_eq!(s.writers(None, Duration::from_millis(1), 1)[0].growth, 3072);
+    let rows = s.writers(None, Duration::from_millis(1), 1);
+    assert_eq!(rows[0].growth, 3072);
+    assert_eq!(rows[0].window_secs, 20);
+}
+
+#[test]
+fn admission_reaches_initially_excluded_grower() {
+    let passes = (0..8)
+        .map(|pass| {
+            Ok((0..20_000)
+                .map(|i| file(i, 1, if i == 19_999 { 512 + pass * 512 } else { 512 }))
+                .collect())
+        })
+        .collect();
+    let mut s = scanner(passes);
+    let mut found = false;
+    let mut evictions = 0;
+    for at in 0..8 {
+        let result = s.scan_once(at).unwrap();
+        assert!(result.writers_full);
+        evictions += result.writer_evictions;
+        assert!(s.tracked.len() <= MAX_WRITERS);
+        assert!(s.tracked.values().all(|t| t.samples.len() <= HISTORY));
+        found |= s
+            .writers(None, Duration::from_secs(300), 20)
+            .iter()
+            .any(|r| r.ino == 19_999);
+    }
+    assert!(found);
+    assert!(evictions > 0);
+}
+#[test]
+fn short_history_and_repeated_seconds() {
+    let mut s = scanner(vec![
+        Ok(vec![file(1, 1, 512)]),
+        Ok(vec![file(1, 1, 1024)]),
+        Ok(vec![file(1, 1, 2048)]),
+    ]);
+    s.scan_once(0).unwrap();
+    s.scan_once(0).unwrap();
+    assert!(s.writers(None, Duration::from_millis(500), 1).is_empty());
+    s.scan_once(10).unwrap();
+    let row = &s.writers(None, Duration::from_secs(3600), 1)[0];
+    assert_eq!(row.growth, 1536);
+    assert_eq!(row.window_secs, 10);
+}
+#[test]
+fn enumeration_identity_mismatch_is_unknown() {
+    let mut old = file(1, 1, 512);
+    old.starttime = 99;
+    let mut s = scanner(vec![Ok(vec![old])]);
+    s.scan_once(0).unwrap();
+    let row = &s.phantom(None)[0].holders[0];
+    assert_eq!(row.comm, "?");
+    assert_eq!(row.unit, None);
+    assert_eq!(s.take_samples().1[0].comm, "?");
 }
