@@ -251,20 +251,6 @@ impl TimeSeries {
         tx.commit()?;
         Ok(())
     }
-    /// Append pg_samples rows atomically with checked integer values.
-    pub fn insert_pg(&self, rows: &[PgSample]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO pg_samples (ts,res,kind,name,value) VALUES (?,?,?,?,?)",
-            )?;
-            for r in rows {
-                stmt.execute(params![r.ts, 0, &r.kind, &r.name, r.value])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
     /// Record at most 20,000 supplied series rows, largest disk usage first.
     ///
     /// The caller selects rows through its configured series_depth.
@@ -388,36 +374,6 @@ impl TimeSeries {
         crate::error::check_result_bound(&result)?;
         Ok(result)
     }
-    /// Query pg_samples in timestamp order at a resolution selected by range length.
-    pub fn query_pg(
-        &self,
-        kind: &str,
-        name: Option<&str>,
-        from: i64,
-        to: i64,
-    ) -> Result<Vec<PgSample>, StoreError> {
-        let available:Option<i64>=self.conn.query_row("SELECT MIN(res) FROM pg_samples WHERE kind=? AND (? IS NULL OR name=?) AND ts BETWEEN ? AND ?",params![kind,name,name,from,to],|r|r.get(0))?;
-        let desired = resolution(from, to).max(available.unwrap_or(0));
-        // Prefer the requested tier when present, retaining newer finer samples.
-        let sql = PG_QUERY;
-        let mut stmt = self.conn.prepare(sql)?;
-        let result = stmt
-            .query_map(
-                params![kind, name, name, from, to, desired, desired, from, to],
-                |r| {
-                    Ok(PgSample {
-                        ts: r.get(0)?,
-                        kind: r.get(1)?,
-                        name: r.get(2)?,
-                        value: r.get(3)?,
-                    })
-                },
-            )?
-            .take(crate::error::MAX_QUERY_ROWS + 1)
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        crate::error::check_result_bound(&result)?;
-        Ok(result)
-    }
     /// Query retained hot-minute records, greatest event count first.
     pub fn query_hot(
         &self,
@@ -493,13 +449,6 @@ impl TimeSeries {
         stats.inserted+=u64::try_from(tx.execute("INSERT OR IGNORE INTO lvm_samples (vg,lv,res,ts,lv_size,vg_free,data_pct,meta_pct) SELECT a.vg,a.lv,1,a.ts-((a.ts%300+300)%300),a.lv_size,a.vg_free,a.data_pct,a.meta_pct FROM lvm_samples a WHERE a.res=0 AND a.ts<? AND NOT EXISTS (SELECT 1 FROM lvm_samples b WHERE b.vg=a.vg AND b.lv=a.lv AND b.res=0 AND b.ts<? AND b.ts>a.ts AND b.ts<a.ts-((a.ts%300+300)%300)+300 AND b.ts-((b.ts%300+300)%300)=a.ts-((a.ts%300+300)%300))",params![raw,raw])?).map_err(|_|StoreError::Integer("row count".into()))?;
         stats.inserted+=u64::try_from(tx.execute("INSERT OR IGNORE INTO lvm_samples (vg,lv,res,ts,lv_size,vg_free,data_pct,meta_pct) SELECT a.vg,a.lv,2,a.ts-((a.ts%3600+3600)%3600),a.lv_size,a.vg_free,a.data_pct,a.meta_pct FROM lvm_samples a WHERE a.res=1 AND a.ts<? AND NOT EXISTS (SELECT 1 FROM lvm_samples b WHERE b.vg=a.vg AND b.lv=a.lv AND b.res=1 AND b.ts<? AND b.ts>a.ts AND b.ts<a.ts-((a.ts%3600+3600)%3600)+3600 AND b.ts-((b.ts%3600+3600)%3600)=a.ts-((a.ts%3600+3600)%3600))",params![five,five])?).map_err(|_|StoreError::Integer("row count".into()))?;
         stats.deleted+=u64::try_from(tx.execute("DELETE FROM lvm_samples WHERE (res=0 AND ts<?) OR (res=1 AND ts<?) OR (res=2 AND ts<?)",params![raw,five,hour])?).map_err(|_|StoreError::Integer("row count".into()))?;
-        stats.inserted+=u64::try_from(tx.execute("INSERT OR IGNORE INTO pg_samples (kind,name,res,ts,value) SELECT a.kind,a.name,1,a.ts-((a.ts%300+300)%300),a.value FROM pg_samples a WHERE a.res=0 AND a.ts<? AND NOT EXISTS (SELECT 1 FROM pg_samples b WHERE b.kind=a.kind AND b.name=a.name AND b.res=0 AND b.ts<? AND b.ts>a.ts AND b.ts<a.ts-((a.ts%300+300)%300)+300 AND b.ts-((b.ts%300+300)%300)=a.ts-((a.ts%300+300)%300))",params![raw,raw])?).map_err(|_|StoreError::Integer("row count".into()))?;
-        stats.inserted+=u64::try_from(tx.execute("INSERT OR IGNORE INTO pg_samples (kind,name,res,ts,value) SELECT a.kind,a.name,2,a.ts-((a.ts%3600+3600)%3600),a.value FROM pg_samples a WHERE a.res=1 AND a.ts<? AND NOT EXISTS (SELECT 1 FROM pg_samples b WHERE b.kind=a.kind AND b.name=a.name AND b.res=1 AND b.ts<? AND b.ts>a.ts AND b.ts<a.ts-((a.ts%3600+3600)%3600)+3600 AND b.ts-((b.ts%3600+3600)%3600)=a.ts-((a.ts%3600+3600)%3600))",params![five,five])?).map_err(|_|StoreError::Integer("row count".into()))?;
-        stats.deleted += u64::try_from(tx.execute(
-            "DELETE FROM pg_samples WHERE (res=0 AND ts<?) OR (res=1 AND ts<?) OR (res=2 AND ts<?)",
-            params![raw, five, hour],
-        )?)
-        .map_err(|_| StoreError::Integer("row count".into()))?;
         for (table, cut) in [
             ("hot_minutes", hot),
             ("phantom_samples", hot),
@@ -520,8 +469,6 @@ const FS_QUERY: &str = "SELECT ts,mount,size,used,avail,inodes,inodes_used FROM 
 
 const LVM_QUERY: &str = "SELECT ts,vg,lv,lv_size,vg_free,data_pct,meta_pct FROM lvm_samples a WHERE vg=? AND lv=? AND ts BETWEEN ? AND ? AND (a.res<=? OR (a.res=1 AND NOT EXISTS (SELECT 1 FROM lvm_samples f WHERE f.vg=a.vg AND f.lv=a.lv AND f.res=0 AND f.ts>=a.ts AND f.ts<a.ts+300)) OR (a.res=2 AND NOT EXISTS (SELECT 1 FROM lvm_samples f WHERE f.vg=a.vg AND f.lv=a.lv AND f.res=0 AND f.ts>=a.ts AND f.ts<a.ts+3600) AND NOT EXISTS (SELECT 1 FROM lvm_samples f WHERE f.vg=a.vg AND f.lv=a.lv AND f.res=1 AND f.ts>=a.ts AND f.ts<a.ts+3600))) AND NOT EXISTS (SELECT 1 FROM lvm_samples b WHERE b.vg=a.vg AND b.lv=a.lv AND b.res=1 AND a.res<1 AND 1<=?6 AND b.ts=(a.ts-((a.ts%300+300)%300)) AND b.ts BETWEEN ?7 AND ?8) AND NOT EXISTS (SELECT 1 FROM lvm_samples b WHERE b.vg=a.vg AND b.lv=a.lv AND b.res=2 AND a.res<2 AND 2<=?6 AND b.ts=(a.ts-((a.ts%3600+3600)%3600)) AND b.ts BETWEEN ?7 AND ?8) ORDER BY ts";
 
-const PG_QUERY: &str = "SELECT ts,kind,name,value FROM pg_samples a WHERE kind=? AND (? IS NULL OR name=?) AND ts BETWEEN ? AND ? AND (a.res<=? OR (a.res=1 AND NOT EXISTS (SELECT 1 FROM pg_samples f WHERE f.kind=a.kind AND f.name=a.name AND f.res=0 AND f.ts>=a.ts AND f.ts<a.ts+300)) OR (a.res=2 AND NOT EXISTS (SELECT 1 FROM pg_samples f WHERE f.kind=a.kind AND f.name=a.name AND f.res=0 AND f.ts>=a.ts AND f.ts<a.ts+3600) AND NOT EXISTS (SELECT 1 FROM pg_samples f WHERE f.kind=a.kind AND f.name=a.name AND f.res=1 AND f.ts>=a.ts AND f.ts<a.ts+3600))) AND NOT EXISTS (SELECT 1 FROM pg_samples b WHERE b.kind=a.kind AND b.name=a.name AND b.res=1 AND a.res<1 AND 1<=?7 AND b.ts=(a.ts-((a.ts%300+300)%300)) AND b.ts BETWEEN ?8 AND ?9) AND NOT EXISTS (SELECT 1 FROM pg_samples b WHERE b.kind=a.kind AND b.name=a.name AND b.res=2 AND a.res<2 AND 2<=?7 AND b.ts=(a.ts-((a.ts%3600+3600)%3600)) AND b.ts BETWEEN ?8 AND ?9) ORDER BY ts,name";
-
 #[cfg(test)]
 mod query_plan_tests {
     use super::*;
@@ -530,7 +477,7 @@ mod query_plan_tests {
     fn tier_checks_seek_timestamp_primary_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let store = TimeSeries::open(&tmp.path().join("timeseries.db"), true).unwrap();
-        for sql in [FS_QUERY, LVM_QUERY, PG_QUERY] {
+        for sql in [FS_QUERY, LVM_QUERY] {
             let mut statement = store
                 .conn
                 .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))

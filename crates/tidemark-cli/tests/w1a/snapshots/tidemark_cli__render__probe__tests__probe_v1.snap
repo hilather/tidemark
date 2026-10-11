@@ -12,12 +12,6 @@ expression: value
         }
       }
     },
-    "postgres": {
-      "reachable": {
-        "value": null,
-        "why": "NotYetImplemented"
-      }
-    },
     "recommendations": [],
     "roots": [
       {

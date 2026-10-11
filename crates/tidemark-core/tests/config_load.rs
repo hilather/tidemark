@@ -88,3 +88,24 @@ fn partial_profile_override_preserves_named_defaults() {
     assert_eq!(config.throttle.profiles["gentle"].max_util_pct, 40.0);
     assert_eq!(config.throttle.profiles["normal"].max_util_pct, 70.0);
 }
+
+#[test]
+fn removed_database_table_is_an_unknown_key() {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(b"[postgres]\nenabled = true\n").unwrap();
+    let error = Config::load(file.path()).unwrap_err().to_string();
+    assert!(error.contains("unknown field `postgres`"), "{error}");
+}
+
+#[test]
+fn example_matches_interface_contract_byte_for_byte() {
+    let document = include_str!("../../../docs/plan/08-interfaces.md");
+    let example = document
+        .split_once("```toml\n")
+        .unwrap()
+        .1
+        .split_once("```")
+        .unwrap()
+        .0;
+    assert_eq!(include_str!("example.toml"), example);
+}

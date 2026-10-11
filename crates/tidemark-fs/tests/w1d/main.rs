@@ -24,7 +24,7 @@ fn params() -> AdaptiveParams {
 fn parser_samples() {
     assert_eq!(
         parse_cgroup_unit(include_str!("data/cgroup-v1.txt")),
-        Some("postgresql.service".into())
+        Some("database.service".into())
     );
     assert_eq!(
         parse_cgroup_unit(include_str!("data/cgroup-v2.txt")),

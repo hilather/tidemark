@@ -21,8 +21,6 @@ pub mod links;
 pub mod lvm;
 /// now command.
 pub mod now;
-/// pg command.
-pub mod pg;
 /// phantom command.
 pub mod phantom;
 /// probe command.

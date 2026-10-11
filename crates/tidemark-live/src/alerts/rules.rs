@@ -97,17 +97,6 @@ impl Rule {
             ThinPoolPct | VgFreeLow => !i.lvm.is_empty(),
             PhantomBytes => i.phantom.iter().any(|p| mount(&p.mount)),
             DirGrowth => i.dir_growth.iter().any(|d| root(&d.root)),
-            PgWalBytes => i.pg.is_some_and(|p| {
-                p.unreachable_since.is_none() && p.sampled_at.is_some() && p.wal_dir_bytes.is_some()
-            }),
-            PgSlotRetained => i.pg.is_some_and(|p| {
-                p.unreachable_since.is_none()
-                    && p.sampled_at.is_some()
-                    && p.slots.iter().all(|s| s.retained_bytes.is_some())
-            }),
-            PgArchiverFailing => {
-                i.pg.is_some_and(|p| p.unreachable_since.is_none() && p.sampled_at.is_some())
-            }
             ScanStale => self.age.is_some() && i.scans.iter().any(|s| root(&s.root)),
             WatchLossy => {
                 self.window == 900.0 && i.watch_overflows_15m.iter().any(|(m, _)| mount(m))
@@ -212,38 +201,6 @@ impl Rule {
                     );
                 }
             }
-            PgWalBytes | PgSlotRetained | PgArchiverFailing => {
-                if let Some(pg) =
-                    i.pg.filter(|p| p.unreachable_since.is_none() && p.sampled_at.is_some())
-                {
-                    match self.cfg.kind {
-                        PgWalBytes => {
-                            if let Some(v) = pg.wal_dir_bytes {
-                                emit("postgres".into(), v as f64, v as f64 > self.above);
-                            }
-                        }
-                        PgSlotRetained => {
-                            for slot in &pg.slots {
-                                if let Some(v) = slot.retained_bytes {
-                                    emit(slot.name.clone(), v as f64, v as f64 > self.above);
-                                }
-                            }
-                        }
-                        _ => {
-                            let condition = pg.archiver_failing
-                                && pg.archiver_last_failed.is_some_and(|ts| {
-                                    ts <= now
-                                        && (i128::from(now) - i128::from(ts)) as f64 <= self.window
-                                });
-                            emit(
-                                "postgres".into(),
-                                if condition { 1.0 } else { 0.0 },
-                                condition,
-                            );
-                        }
-                    }
-                }
-            }
             ScanStale => {
                 for s in i
                     .scans
@@ -327,24 +284,6 @@ mod tests {
                 lossy: false,
             }],
         )];
-        let pg = PgNow {
-            sampled_at: Some(100),
-            unreachable_since: None,
-            server_version_num: Some(160000),
-            databases: vec![],
-            wal_dir_bytes: Some(100),
-            slots: vec![PgSlot {
-                name: "slot".into(),
-                slot_type: "physical".into(),
-                active: false,
-                retained_bytes: Some(100),
-                wal_status: None,
-            }],
-            archiver_failing: true,
-            archiver_last_failed: Some(99),
-            temp_bytes_rate: None,
-            top_relations: vec![],
-        };
         let scans = [ScanStatus {
             root: "/data".into(),
             running: None,
@@ -364,7 +303,6 @@ mod tests {
             lvm: &lvm,
             phantom: &phantom,
             hot_dirs_window: &hot,
-            pg: Some(&pg),
             scans: &scans,
             dir_growth: &growth,
             watch_overflows_15m: &overflows,
@@ -379,9 +317,6 @@ mod tests {
             VgFreeLow,
             DirGrowth,
             PhantomBytes,
-            PgWalBytes,
-            PgSlotRetained,
-            PgArchiverFailing,
             ScanStale,
             WatchLossy,
         ] {
@@ -420,13 +355,10 @@ mod tests {
                     cfg.depth = Some(1);
                     cfg.above = Some(AlertThreshold::Number(99.0));
                 }
-                PhantomBytes | PgWalBytes | PgSlotRetained => {
+                PhantomBytes => {
                     cfg.above = Some(AlertThreshold::Text("99B".into()));
-                    if kind == PhantomBytes {
-                        cfg.mount = Some("/data".into());
-                    }
+                    cfg.mount = Some("/data".into());
                 }
-                PgArchiverFailing => cfg.window = Some("30m".into()),
                 ScanStale => {
                     cfg.root = Some("/data".into());
                     cfg.older_than = Some("1h".into());
@@ -441,82 +373,6 @@ mod tests {
                 super::super::AlertEngine::new(&[cfg], Duration::from_secs(1)).unwrap();
             assert_eq!(engine.evaluate(100, &i).len(), 1, "{kind:?}");
         }
-        let cfg = AlertRule {
-            name: "wal".into(),
-            kind: PgWalBytes,
-            above: Some(AlertThreshold::Number(1.0)),
-            for_: Duration::ZERO,
-            ..Default::default()
-        };
-        let mut engine = super::super::AlertEngine::new(&[cfg], Duration::from_secs(1)).unwrap();
-        let mut unreachable = pg.clone();
-        unreachable.unreachable_since = Some(90);
-        let mut i = i;
-        i.pg = Some(&unreachable);
-        assert!(engine.evaluate(100, &i).is_empty());
-        i.pg = None;
-        assert!(engine.evaluate(101, &i).is_empty());
-    }
-}
-
-#[cfg(test)]
-mod missing_subject_tests {
-    use super::*;
-    use std::time::Duration;
-    use tidemark_core::live::*;
-    #[test]
-    fn vanished_slot_resolves_but_unreachable_does_not() {
-        let rule = AlertRule {
-            name: "slot".into(),
-            kind: AlertKind::PgSlotRetained,
-            above: Some(AlertThreshold::Number(1.0)),
-            for_: Duration::ZERO,
-            resolve_for: Duration::from_secs(5),
-            ..Default::default()
-        };
-        let mut engine = super::super::AlertEngine::new(&[rule], Duration::from_secs(20)).unwrap();
-        let mut pg = PgNow {
-            sampled_at: Some(0),
-            unreachable_since: None,
-            server_version_num: None,
-            databases: vec![],
-            wal_dir_bytes: None,
-            slots: vec![PgSlot {
-                name: "replica".into(),
-                slot_type: "physical".into(),
-                active: false,
-                retained_bytes: Some(10),
-                wal_status: None,
-            }],
-            archiver_failing: false,
-            archiver_last_failed: None,
-            temp_bytes_rate: None,
-            top_relations: vec![],
-        };
-        fn input(pg: &PgNow) -> AlertInputs<'_> {
-            AlertInputs {
-                mounts: &[],
-                lvm: &[],
-                phantom: &[],
-                hot_dirs_window: &[],
-                pg: Some(pg),
-                scans: &[],
-                dir_growth: &[],
-                watch_overflows_15m: &[],
-                state_space_refused: false,
-            }
-        }
-        assert_eq!(engine.evaluate(0, &input(&pg)).len(), 1);
-        pg.slots.clear();
-        pg.unreachable_since = Some(1);
-        assert!(engine.evaluate(1, &input(&pg)).is_empty());
-        assert!(engine.evaluate(100, &input(&pg)).is_empty());
-        pg.unreachable_since = None;
-        assert!(engine.evaluate(101, &input(&pg)).is_empty());
-        assert_eq!(
-            engine.evaluate(106, &input(&pg))[0].state,
-            AlertState::Resolved
-        );
     }
 }
 
@@ -556,7 +412,6 @@ mod window_tests {
                 lvm: &[],
                 phantom: &[],
                 hot_dirs_window: hot,
-                pg: None,
                 scans: &[],
                 dir_growth: &[],
                 watch_overflows_15m: &[],

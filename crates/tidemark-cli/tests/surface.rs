@@ -78,7 +78,6 @@ fn complete_command_and_flag_tree() {
         ("lvm", vec!["mount"]),
         ("phantom", vec!["mount", "direct"]),
         ("writers", vec!["mount", "window", "direct", "interval"]),
-        ("pg", vec!["relations", "db"]),
         ("alerts", vec!["all"]),
         ("deploy", vec![]),
         ("watch", vec!["mount", "events"]),

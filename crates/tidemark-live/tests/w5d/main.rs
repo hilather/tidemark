@@ -1,7 +1,6 @@
 //! Owned by: W5-D
 //! Snapshot fixtures for complete and degraded live reports.
 use std::time::Duration;
-use tidemark_core::live::PgNow;
 use tidemark_live::{
     now::{build_now, render_now_text, NowInputs},
     rates::MountRates,
@@ -23,7 +22,6 @@ fn mount(name: &str, filling: bool) -> MountRates {
 }
 fn report(
     mounts: &[MountRates],
-    pg: Option<&PgNow>,
     modes: &[(String, String, u32)],
     degraded: &[String],
 ) -> tidemark_core::live::NowReport {
@@ -36,7 +34,6 @@ fn report(
             writers_5m: &[],
             phantom: &[],
             open_writers: &[],
-            pg,
             alerts: &[],
             scans: &[],
             watch_modes: modes,
@@ -49,7 +46,6 @@ fn report(
 fn healthy() {
     let r = report(
         &[mount("/data", false)],
-        None,
         &[("/data".into(), "dfid-name/filesystem".into(), 0)],
         &[],
     );
@@ -92,7 +88,6 @@ fn healthy() {
 fn filling() {
     let r = report(
         &[mount("/data", true)],
-        None,
         &[("/data".into(), "dfid-name/mount".into(), 0)],
         &[],
     );
@@ -100,21 +95,8 @@ fn filling() {
 }
 #[test]
 fn degraded() {
-    let pg = PgNow {
-        sampled_at: Some(50),
-        unreachable_since: Some(60),
-        server_version_num: None,
-        databases: vec![],
-        wal_dir_bytes: None,
-        slots: vec![],
-        archiver_failing: false,
-        archiver_last_failed: None,
-        temp_bytes_rate: None,
-        top_relations: vec![],
-    };
     let r = report(
         &[mount("/data", true)],
-        Some(&pg),
         &[("/data".into(), "fd/mount".into(), 2)],
         &["procscan: unavailable".into()],
     );
@@ -124,7 +106,6 @@ fn degraded() {
 fn multi_mount() {
     let r = report(
         &[mount("/data", true), mount("/", false)],
-        None,
         &[],
         &["daemon parts unavailable".into()],
     );
@@ -133,7 +114,7 @@ fn multi_mount() {
 }
 #[test]
 fn narrow_and_controls() {
-    let mut r = report(&[], None, &[], &[]);
+    let mut r = report(&[], &[], &[]);
     r.host = "a\n\x1b".into();
     let text = render_now_text(&r, 1, false);
     assert!(!text.contains('\x1b'));

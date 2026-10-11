@@ -3,7 +3,7 @@
 
 use crate::rates::MountRates;
 use tidemark_core::live::{
-    AlertSummary, HotEntry, LvmNow, NowReport, OpenWriter, PgNow, PhantomSummary, ScanStatus,
+    AlertSummary, HotEntry, LvmNow, NowReport, OpenWriter, PhantomSummary, ScanStatus,
 };
 
 /// Borrowed collector inputs for an injected-time report.
@@ -22,8 +22,6 @@ pub struct NowInputs<'a> {
     pub phantom: &'a [PhantomSummary],
     /// Contract field.
     pub open_writers: &'a [(String, Vec<OpenWriter>)],
-    /// Contract field.
-    pub pg: Option<&'a PgNow>,
     /// Contract field.
     pub alerts: &'a [AlertSummary],
     /// Contract field.
@@ -95,9 +93,6 @@ pub fn build_now(i: &NowInputs, now: i64) -> NowReport {
             ));
         }
     }
-    if let Some(ts) = i.pg.and_then(|p| p.unreachable_since) {
-        degraded.push(format!("pg: unreachable since {ts}"));
-    }
     degraded.sort();
     degraded.dedup();
     let mut scans = i.scans.to_vec();
@@ -108,7 +103,6 @@ pub fn build_now(i: &NowInputs, now: i64) -> NowReport {
         generated_at: now,
         host: i.host.into(),
         mounts,
-        pg: i.pg.cloned(),
         alerts_firing: alerts,
         scans,
         degraded,
@@ -223,25 +217,6 @@ pub fn render_now_text(r: &NowReport, width: usize, color: bool) -> String {
                 bytes_display(&w.path),
                 w.growth,
                 w.window_secs
-            ));
-        }
-    }
-    if let Some(p) = &r.pg {
-        lines.push(format!(
-            "postgres WAL {}  archiver {}",
-            p.wal_dir_bytes
-                .map(fmt_bytes)
-                .unwrap_or_else(|| "unknown".into()),
-            if p.archiver_failing { "failing" } else { "ok" }
-        ));
-        for s in &p.slots {
-            lines.push(format!(
-                "  slot {} retains {} ({})",
-                escape(&s.name),
-                s.retained_bytes
-                    .map(fmt_bytes)
-                    .unwrap_or_else(|| "unknown".into()),
-                if s.active { "active" } else { "inactive" }
             ));
         }
     }

@@ -59,22 +59,13 @@ mounts           = ["/", "/data"]
 events           = ["close_write"]     # add "modify" only for short investigations
 hot_depth        = 6
 exclude_prefixes = []                  # state_dir is always excluded
-exclude_postgres = true                # skip PGDATA when [postgres] is enabled (collector covers it)
 lru_entries      = 200000
 
 [procscan]
 enabled          = true
 interval         = "60s"
 open_writers     = true
-exclude_prefixes = []                  # PGDATA base/ and global/ are added automatically when [postgres] is enabled
-
-[postgres]
-enabled            = false
-dsn                = "host=/var/run/postgresql user=tidemark dbname=postgres application_name=tidemark"
-interval           = "5m"
-relations_interval = "1h"
-top_relations      = 20
-statement_timeout  = "30s"
+exclude_prefixes = []
 
 [metrics]
 textfile              = "/var/lib/node_exporter/textfile_collector/tidemark.prom"   # "" = disabled

@@ -3,14 +3,12 @@
 use serde::Serialize;
 use std::io::Write;
 use tidemark_fs::probe::{Fact, ProbeReport};
-/// CLI-composed report, including the PostgreSQL section.
+/// CLI-composed report.
 #[derive(Debug, Serialize)]
 pub struct Report {
     /// Host, roots and recommendations collected by tidemark-fs.
     #[serde(flatten)]
     pub filesystem: ProbeReport,
-    /// PostgreSQL facts; unavailable implementations remain unknown.
-    pub postgres: std::collections::BTreeMap<String, Fact>,
 }
 /// Render all sections to a caller-provided writer.
 pub fn write(report: &Report, json: bool, output: &mut impl Write) -> anyhow::Result<()> {
@@ -56,8 +54,6 @@ pub fn write(report: &Report, json: bool, output: &mut impl Write) -> anyhow::Re
             )?,
         }
     }
-    writeln!(output, "\nPostgreSQL")?;
-    facts(&report.postgres, output)?;
     writeln!(output, "\nRecommendations")?;
     if report.filesystem.recommendations.is_empty() {
         writeln!(output, "  ✓ none from known facts")?;

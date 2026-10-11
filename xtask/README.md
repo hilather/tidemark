@@ -21,7 +21,7 @@ not whole-program alias or data-flow analysis.
 
 Use Rocky Linux **8.8 and 8.10**, x86_64, with XFS root and `/data` on LVM,
 a spare disk and enough free space for loop images. Install `xfsprogs
-xfsprogs-devel lvm2 bcc-tools postgresql-server lsof`, plus `mdadm`, `rsync`, SSH,
+xfsprogs-devel lvm2 bcc-tools lsof`, plus `mdadm`, `rsync`, SSH,
 a C compiler/linker and rustup with the pinned toolchain from
 `rust-toolchain.toml`. The local machine needs `ssh` and `rsync`. Configure
 an SSH alias and a test user with passwordless sudo. These tests create mounts,
