@@ -1,0 +1,13 @@
+---
+source: crates/tidemark-cli/tests/w3a/reports.rs
+expression: "String::from_utf8(out).unwrap()"
+---
+Notice: comparison snapshot actual age: 2h
+Target removed: /fixture
+CLASS  DELTA  PATH
+✗  −2.00 KiB  /fixture
+✗  −1.00 KiB    /fixture/a\xFF
+Explanation: /fixture −2.00 KiB
+└─ /fixture/a\xFF −1.00 KiB (50%)
+Change is spread across 0 subdirectories; top 0:
+Own charged bytes: −1.00 KiB
