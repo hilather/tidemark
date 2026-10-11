@@ -132,7 +132,7 @@ Here `rolled_single_*` covers inodes whose found count is 1, which includes `nli
 | **XFS speculative preallocation** | Files being appended can briefly show extra allocated blocks beyond EOF. That is real allocated space at that moment. Document it; don't correct for it. |
 | **Reflinked files** (`cp --reflink`) | Separate inodes that share extents. `t_disk` overstates physical usage, as `du` does. Exact detection needs per-file FIEMAP (`FIEMAP_EXTENT_SHARED`), which is out of scope for v1. The probe reports whether reflink is enabled so operators know this caveat applies. |
 | **Deleted-but-open files** | Not in any directory, so invisible to scans. Covered by the live layer (`07-live-monitoring.md` §4.1); they still count in `df`/`statvfs` totals. This is the usual cause of a `df` vs `du` mismatch. |
-| **Postgres data directory** | Scanned like any other tree (few, large files). Annotated with `pg.*` labels by the collector. Its sizes in a snapshot are a moment-in-time view. |
+| **Postgres data directory** | Scanned like any other tree (few, large files). Its sizes in a snapshot are a moment-in-time view. |
 | **Non-UTF-8 names** | Stored and compared as raw bytes (`RawName`/`RawPath`). Displayed with lossy conversion plus an escape marker; JSON output uses `"path_b64"` when not valid UTF-8. |
 
 ## 6. Worked example (golden test `link_semantics_basic`)

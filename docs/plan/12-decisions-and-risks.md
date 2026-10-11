@@ -36,7 +36,7 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 
 **ADR-005 — No async runtime.**
 - *Decision:* `std::thread` plus `crossbeam` channels. The daemon's concurrency is a dozen long-lived loops.
-- *Consequences:* simpler code for agents to write and review; blocking syscalls are natural. Note: the sync `postgres` crate runs a small internal tokio runtime per client. That is acceptable, since it is confined to the `pg` thread.
+- *Consequences:* simpler code for agents to write and review; blocking syscalls are natural.
 
 **ADR-006 — Metrics through the node_exporter textfile collector by default.**
 - *Decision:* textfile is the default; an optional HTTP listener binds to loopback only.
@@ -95,6 +95,11 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 - *Decision:* no `tidemark` group. All installed Tidemark files are `root:root`: the API socket, config, snapshots and their `.db.tmp` files are `0600`; state and runtime directories are `0700`. Access control is by ownership, file modes and socket peer uid: every API method accepts uid 0 or the daemon's own effective uid; other peers receive `forbidden`. In production the daemon is root, so only root is accepted. Neither the CLI nor the daemon has a uid gate. Remove the socket-group configuration key and group creation from packaging; no group-specific service setting or account-definition file is shipped.
 - *Consequences:* operators use `sudo`; one less packaging step and no group membership to manage. A non-root command that cannot read the root-only config, state directory, snapshot or socket retains the exit code for that failure and adds the hint: `Tidemark's files are root-only; run this command with sudo.` No new exit code is added; exit code 5 retains its precondition-failure meaning. Unprivileged tests keep working with their own temporary config, state directory and socket. Non-root daemon and scan runs use the existing degraded mode (readable-subset walk mode, no watcher or procscan of other users).
 
+**ADR-019 — No PostgreSQL tracking in v1.**
+- *Context:* owner decision on 2026-10-11: keep disk-usage intelligence simple; database-specific tracking may return later as an add-on.
+- *Decision:* remove the collector and `tidemark-pg`, `tidemark pg`, probe integration, `[postgres]` and PostgreSQL-only keys, `pg.pass`, the three alert kinds and defaults, core types/fields/API, sample table/store functions, service thread, first-boot component, metrics, deploy checks and workspace `postgres` dependency. `[postgres]` is rejected as unknown. The reference design and former wave tasks live in `14-postgres-deferred.md`.
+- *Consequences:* no migration because nothing has been released. Generic annotations and path exclusions remain. A PostgreSQL data directory is scanned normally. Adaptive throttling, scan windows, one scan at a time, `O_NOATIME`, R2 and the `pgbench` performance gate remain to protect the shared-disk workload. R11 no longer applies; ADR-005 needs no client-runtime exception.
+
 ---
 
 ## Risk register
@@ -111,7 +116,7 @@ L = likelihood, I = impact (H/M/L).
 | R6 | Memory blow-up on very large trees | M | M | Memory estimates; budget-driven mode choice; cgroup memory limit; scale tests; spill join if needed | `04` §7, W2, W7-B |
 | R7 | EL8 kernel behaviour differs from upstream (bulkstat units, v5, fanotify FID) | M | M | EL8 5.0.0 headers lack v5; module inspection found v5 handlers in 477.27.1.el8_8 and 553.172.1.el8_10, not runtime ioctl evidence. Hand-transcribed ABI pinned to gcc layouts (`04` §5.1); runtime probes and units tests on both VMs remain gates | W1-C, W5-A |
 | R8 | Tidemark's own state fills the disk or adds random writes to RAID 5 | L | M | Space guard; retention; state dir on another device; excluded from scans and watch | `05` §8, W1-E |
-| R11 | Postgres collector adds load or locks | L | L–M | Statement and lock timeouts; read-only session; low frequency; per-DB sequential | W5-C |
+| R11 | *(removed: collector deferred, ADR-019)* | — | — | — | — |
 | R12 | Path names exposed through metrics or webhooks | M | M | Root-only file and API permissions (ADR-018); loopback-only HTTP; cardinality caps; redaction decision in `security.md` | W6-B, W7-C |
 | R13 | Inconsistent or low-quality code from parallel agents | M | M | Frozen contracts; owned paths; independent reviewers; gate reviews | `10` |
 | R14 | Host on unsupported Rocky 8.8 | H | M | Probe warns; P0 recommends updating to 8.10 | P0 |

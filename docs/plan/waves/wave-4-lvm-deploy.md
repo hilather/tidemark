@@ -119,7 +119,7 @@ pub fn write(state_dir: &Path, r: &FirstbootReport) -> io::Result<()>; // atomic
     4. Write `deploy/staged.json`.
     5. Print a summary, including warnings such as "watcher will be disabled: fanotify unavailable".
   - **Idempotent:** re-running with the same config is a no-op that reports "already staged".
-- **`healthy` (first-boot report)** is true when the core components (`sampler`, `scheduler`, `api`, `tswriter`; canonical names in `08` §5) are `ok`. Non-core components may be `degraded`/`disabled`/`error`; they are listed but never block, so a host without LVM or Postgres verifies.
+- **`healthy` (first-boot report)** is true when the core components (`sampler`, `scheduler`, `api`, `tswriter`; canonical names in `08` §5) are `ok`. Non-core components may be `degraded`/`disabled`/`error`; they are listed but never block, so a host without LVM verifies.
 - **`deploy verify`:**
   1. The service must be active.
   2. `firstboot.json` must exist with `config_sha256` matching `staged.json`, and be `healthy`.

@@ -117,7 +117,7 @@ Generate random trees as an abstract model: directories, files with sizes, link 
 
 ## 5. Privileged VM suite (`cargo xtask vm-test`)
 
-- **Targets:** Rocky 8.8 (kernel 4.18.0-477.x) and Rocky 8.10 (latest 4.18.0-553.x), both x86_64, plus optionally Rocky 9 for forward compatibility. Packages: `xfsprogs xfsprogs-devel lvm2 bcc-tools postgresql-server lsof`. The VM layout mirrors production: root and `/data` as XFS on LVM (one VG), with a spare disk for loop/thin tests.
+- **Targets:** Rocky 8.8 (kernel 4.18.0-477.x) and Rocky 8.10 (latest 4.18.0-553.x), both x86_64, plus optionally Rocky 9 for forward compatibility. Packages: `xfsprogs xfsprogs-devel lvm2 bcc-tools postgresql-server lsof` (the database package supplies the workload for the `pgbench` impact gate). The VM layout mirrors production: root and `/data` as XFS on LVM (one VG), with a spare disk for loop/thin tests.
 - **Mechanism:** `xtask vm-test --host <ssh-host>` rsyncs the workspace, builds in the VM, and runs `sudo env "PATH=$PATH" cargo test --workspace --features privileged -- --test-threads=1` (EL8 sudo's `secure_path` ignores `-E`). VM provisioning (Vagrant/libvirt or a pre-built image) is documented in `xtask/README.md`.
 - **Loop XFS helper** (`test-support::xfs::LoopXfs`): `truncate -s <size> img`, `mkfs.xfs -f [opts] img`, `mount -o loop,<opts>` into a temp dir, with unmount and cleanup on `Drop`. Options cover `ftype=0` (to test the `DT_UNKNOWN` path) and `reflink=0/1`.
 - **Loop LVM helper** (`test-support::lvm::LoopVg`): loop devices → `pvcreate`/`vgcreate` with a unique test VG name → optional thin pool and thin LV → `mkfs.xfs` → mount. Cleanup removes LVs, VG, PVs and loop devices on `Drop`, and refuses to touch any VG not created by the test.
@@ -193,7 +193,6 @@ Record these Wave 1 findings on both VMs in `docs/handoff/W1-gate.md`; preserve 
 | Crash during snapshot write | `kill -9` at random points | No `.db` without a complete `meta`; `.tmp` cleaned on next start |
 | Crash during time-series compaction | `kill -9` | DB opens cleanly; compaction idempotent |
 | fanotify overflow | Generate 100,000 close-writes rapidly | `lossy` minute flagged; counter incremented; watcher keeps running |
-| Postgres down / slow | Stop the server; `pg_sleep` behind a lock | Back-off; statement timeout respected; `now` shows the degraded state |
 | Huge directory | 1,000,000 entries in one directory | Bounded memory per directory record; progress continues |
 
 ## 7. Performance and impact (W7-B)
@@ -249,6 +248,6 @@ Pass criteria:
 
 1. `tidemark probe`: review the output with the team.
 2. One walk-mode scan of a single large report subtree with the `gentle` profile at a quiet hour. Compare with `du -sxB1` on the same subtree (also run with `nice`). The numbers must match within the fuzziness of a live tree; investigate any gap above 0.5%.
-3. Watch Postgres latency and device await during the scan (`iostat -x 5`, pg monitoring). Record the result.
+3. Watch Postgres latency and device await during the scan (`iostat -x 5`, existing database monitoring). Record the result.
 4. Repeat with bulk mode on the full mount.
 5. Only then enable the daemon (see `11-rollout-runbook.md`).

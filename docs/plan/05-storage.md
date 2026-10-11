@@ -85,7 +85,7 @@ CREATE TABLE link_instances (
 
 CREATE TABLE skipped     (dir_id INTEGER NOT NULL, name BLOB NOT NULL, reason TEXT NOT NULL);   -- mount|other_fs|excluded
 CREATE TABLE errors      (dir_id INTEGER, path BLOB NOT NULL, op TEXT NOT NULL, errno INTEGER NOT NULL);
-CREATE TABLE annotations (dir_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL);  -- e.g. pg.database=app
+CREATE TABLE annotations (dir_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL);  -- generic key/value labels
 
 -- Created AFTER bulk load (see §2):
 CREATE UNIQUE INDEX dirs_path      ON dirs(path_hash, path);
@@ -246,11 +246,6 @@ CREATE TABLE writer_samples  (ts INTEGER NOT NULL, mount TEXT NOT NULL, pid INTE
 CREATE INDEX phantom_ts ON phantom_samples(ts);
 CREATE INDEX writer_ts  ON writer_samples(ts);
 
-CREATE TABLE pg_samples (kind TEXT NOT NULL, name TEXT NOT NULL, res INTEGER NOT NULL, ts INTEGER NOT NULL,
-  value INTEGER NOT NULL,
-  PRIMARY KEY (kind, name, res, ts)) WITHOUT ROWID;
--- kind: database | relation | wal_dir | slot_retained | temp_bytes_total | archiver_failed_total | dead_tuples
-
 CREATE TABLE alerts (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, rule TEXT NOT NULL, subject TEXT NOT NULL,
   state TEXT NOT NULL, value REAL, message TEXT NOT NULL);         -- state: firing|resolved|renotify
 ```
@@ -259,7 +254,7 @@ CREATE TABLE alerts (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, rule TEXT NOT 
 
 | Data | Raw | 5-min | 1-hour |
 |------|-----|-------|--------|
-| fs_samples, lvm_samples, pg_samples | 48 h | 35 d | 400 d |
+| fs_samples, lvm_samples | 48 h | 35 d | 400 d |
 | hot_minutes | 7 d | — | — |
 | phantom_samples, writer_samples | 7 d | — | — |
 | dir_series | one row per scan, kept 400 d | — | — |

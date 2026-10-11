@@ -10,7 +10,7 @@ Fast Mac and Windows disk tools are fast because they **don't walk the tree file
 | Persistent index (Spotlight) | An **immutable SQLite snapshot per scan**: per-directory aggregates, notable files, hard-link sets |
 | Change journal (FSEvents, USN journal) | **fanotify** (where writes land, and who writes them) plus 30-second free-space sampling |
 
-On top of that sit things the Mac tools don't need: hard-link-correct accounting, LVM and Postgres awareness, and throttling that keeps a RAID 5 array usable while scanning.
+On top of that sit things the Mac tools don't need: hard-link-correct accounting, LVM awareness, and throttling that keeps a RAID 5 array usable while scanning.
 
 **Tidemark is strictly read-only.** It changes no mounts, fstab entries, LVM, kernel parameters or file metadata. Installing it is just a package plus a service.
 
@@ -20,7 +20,7 @@ On top of that sit things the Mac tools don't need: hard-link-correct accounting
 |-------|---------|-----------|---------|------|
 | **L0 — Sampling** | "How full is each filesystem/volume, and how fast is it filling?" | `statvfs` per mount every 30 s; LVM (`lvs`/`vgs`) every 5 min | Seconds | Negligible |
 | **L1 — Index** | "Where exactly is the space? What grew since yesterday? What would deleting X free?" | Scheduled scans (walk or bulk) → snapshot DB | Minutes per scan; queries instant | Throttled metadata reads, in quiet windows |
-| **L2 — Live** | "Who is writing what, right now? What's hidden?" | fanotify watcher, `/proc` scanner, Postgres collector | ≤ 60 s | Low; bounded |
+| **L2 — Live** | "Who is writing what, right now? What's hidden?" | fanotify watcher, `/proc` scanner | ≤ 60 s | Low; bounded |
 
 Each layer works without the others. Without the daemon, snapshot queries still work from the CLI.
 
@@ -36,8 +36,8 @@ Each layer works without the others. Without the daemon, snapshot queries still 
   LVM (lvs/vgs JSON, 5m) ─────┼──▶ L0  LvmSampler ──────────────────┤                                              │
                               │                                     ├──▶ LiveState (per-minute rings) ──▶ RateEngine ──▶ AlertEngine ──▶ journald / webhook
   fanotify (mount marks ×2) ──┼──▶ L2  Watcher (/ and /data) ───────┤             │                                │
-  /proc/*/fd, fdinfo ─────────┼──▶ L2  ProcScanner (60s) ───────────┤             ├──▶ MetricsExporter ──▶ node_exporter textfile (+ optional HTTP)
-  PostgreSQL (unix socket) ───┼──▶ L2  PgCollector (5m / 1h) ───────┘             └──▶ ApiServer (unix socket, JSON lines) ◀── tidemark now/hot/lvm/...
+  /proc/*/fd, fdinfo ─────────┼──▶ L2  ProcScanner (60s) ───────────┘             ├──▶ MetricsExporter ──▶ node_exporter textfile (+ optional HTTP)
+                              │                                                   └──▶ ApiServer (unix socket, JSON lines) ◀── tidemark now/hot/lvm/...
                               │                                                                                    │
   dirs + inodes ──────────────┼──▶ L1  Scheduler ─▶ Scanner (walk | bulk) ─▶ Aggregator ─▶ SnapshotWriter          │
   (getdents64/statx/bulkstat) │                       ▲                                       │                     │
@@ -66,7 +66,6 @@ tidemark/
 │   ├── tidemark-scan/         # orchestrator, bulk pipeline, aggregator, link resolution
 │   ├── tidemark-store/        # SQLite snapshot writer/reader, catalog, diff, time series, retention
 │   ├── tidemark-live/         # fanotify watcher, proc scanner, rates, alerts, `now` model
-│   ├── tidemark-pg/           # Postgres collector
 │   ├── tidemark-cli/          # binary `tidemark` (commands, rendering, TUI, deploy)
 │   ├── tidemarkd/             # binary `tidemarkd` (services, scheduler, API, metrics, first-boot report)
 │   └── test-support/          # fixture DSL, oracles (du/find), loop-XFS and loop-LVM helpers
@@ -87,8 +86,7 @@ tidemark-sys   ◀── tidemark-fs, tidemark-scan (bulkstat), tidemark-live
 tidemark-fs    ◀── tidemark-scan, tidemark-live, tidemark-cli, tidemarkd
 tidemark-store ◀── tidemark-scan, tidemark-live, tidemark-cli, tidemarkd
 tidemark-scan  ◀── tidemark-cli, tidemarkd
-tidemark-live, tidemark-pg ◀── tidemark-cli, tidemarkd
-(tidemark-fs never depends on tidemark-pg; the CLI composes the probe's Postgres section.)
+tidemark-live ◀── tidemark-cli, tidemarkd
 test-support   ◀── dev-dependencies only
 ```
 
@@ -109,7 +107,6 @@ test-support   ◀── dev-dependencies only
 | `lvm` | Every 5 min: `lvs`/`vgs` JSON report → LiveState + timeseries |
 | `watcher-<mount>` | Blocking `read()` on the fanotify fd → resolve → aggregate into per-minute rings (one per tracked mount) |
 | `procscan` | Every 60 s: `/proc` walk → phantom and open-writer state |
-| `pg` | Every 5 min (relations hourly): Postgres queries |
 | `scheduler` | Starts scans in allowed windows; at most one scan at a time on the host |
 | `scan-*` | Walker/bulkstat workers + aggregator (spawned per scan) |
 | `ts-writer` | Single writer for timeseries.db; receives batched rows over a channel |
@@ -135,7 +132,6 @@ Shared state is `Arc<RwLock<LiveState>>` with small critical sections. Cross-thr
 
 ```
 /etc/tidemark/tidemark.toml          config (0600 root:root)
-/etc/tidemark/pg.pass                optional Postgres password file (0600 root:root)
 /var/lib/tidemark/                   state_dir (0700 root:root). On the root filesystem by default,
 │                                    which keeps Tidemark's own writes off /data. Excluded from scans and watches.
 ├── timeseries.db (+ -wal, -shm)     samples, scan catalog, dir series, alerts
@@ -176,7 +172,6 @@ Shared state is `Arc<RwLock<LiveState>>` with small critical sections. Cross-thr
 | Not XFS, or bulkstat unavailable | Walk mode. |
 | Scan memory estimate exceeds budget | Walk mode. |
 | Not on LVM, or `lvs` missing | LVM section shows "n/a"; everything else unaffected. |
-| Postgres unreachable | Collector backs off; `now` shows "pg: unreachable since …". |
 | Daemon down | CLI snapshot queries still work; live commands report "daemon unavailable" (exit 4); `phantom`/`lvm` fall back to direct mode. |
 | State filesystem low on space | Snapshots skipped (alert raised); time-series compaction; samples continue. |
 | fanotify queue overflow | Window marked `lossy`; counter metric; nothing else breaks. |
@@ -206,7 +201,6 @@ There are no fstab, LVM or kernel changes, so a failed deploy can't affect boot.
 - **Observability:** `tracing`, `tracing-subscriber`, `tracing-journald`.
 - **Config and serialisation:** `serde`, `toml`, `humantime-serde`, `bytesize`, `serde_json`. JSON is also used to parse LVM's `--reportformat json` output.
 - **Other crates:**
-  - `postgres` (sync client)
   - `ureq` for webhooks
   - `tiny_http` for the optional metrics listener
   - `sd-notify`

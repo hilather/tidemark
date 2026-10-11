@@ -58,7 +58,7 @@ impl Prepared {
     /// Bulk mode: notable files without names, as (directory path, ino).
     pub fn needs_names(&self) -> Vec<(RawPath, Ino)>;
     pub fn set_names(&mut self, names: Vec<(RawPath, Ino, RawName)>);
-    /// Labels from the Postgres collector etc.; paths not in the tree are ignored (counted).
+    /// Generic caller-provided labels; paths not in the tree are ignored (counted).
     pub fn annotate(&mut self, path: &RawPath, key: &str, value: &str);
     /// Stream all rows, dirs in preorder, children sorted by name bytes.
     pub fn write(self, sink: &mut dyn RowSink) -> Result<AggSummary, AggError>;

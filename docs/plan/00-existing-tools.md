@@ -5,7 +5,6 @@
 1. Instant per-tree totals maintained by the kernel.
 2. A historical index with hard-link-correct numbers, including "what would deleting this actually free".
 3. Live attribution of growth to directories, processes and systemd units.
-4. Postgres-internal breakdown (WAL, replication slots, relations).
 
 The recommendation is to build **Tidemark** (placeholder name) in Rust, borrowing proven ideas from the tools below. Use the stopgaps in §4 while it is being built.
 
@@ -19,7 +18,6 @@ The recommendation is to build **Tidemark** (placeholder name) in Rust, borrowin
 | R2 | Drill-down index with history and diffs ("what grew since yesterday") |
 | R3 | Hard-link-correct sizing, including reclaimable vs shared bytes |
 | R4 | Live "what is growing right now", attributed to process / systemd unit |
-| R5 | Postgres internals: WAL, replication-slot retention, relation sizes |
 | R6 | Low impact on a busy RAID 5 box: throttled, read-only, no Elasticsearch/MySQL on the host |
 | R7 | Runs on Rocky/RHEL 8 (kernel 4.18 with Red Hat backports) |
 
@@ -27,23 +25,23 @@ The recommendation is to build **Tidemark** (placeholder name) in Rust, borrowin
 
 Legend: ✓ meets · ◐ partial · ✗ no
 
-| Tool | R1 | R2 | R3 | R4 | R5 | R6 | R7 | Notes |
-|------|----|----|----|----|----|----|----|-------|
-| GNU `du`, ncdu, gdu, dua, dust, pdu | ✗ | ◐ | ◐ | ✗ | ✗ | ✓ | ✓ | One-shot scans, some parallel. They count each hard-linked inode once, like `du`, but have no "reclaimable" view. ncdu can export/import a JSON snapshot but has no history or diff. |
-| **duc** | ✗ | ◐ | ◐ | ✗ | ✗ | ✓ | ✓ | Keeps a database of accumulated directory sizes that you query instead of rescanning. Designed for hundreds of millions of files. It re-indexes periodically and has no live layer. |
-| **Robinhood Policy Engine** (cea-hpc) | ✗ | ✓ | ◐ | ✗ | ✗ | ✗ | ✓ | Replicates filesystem metadata into MySQL using parallel scans, with reports and policies. On plain POSIX filesystems it relies on periodic scans; its changelog reader is Lustre-only. Latest release 3.2.0 (Nov 2024). HPC-oriented and heavy for one server. |
-| **Diskover Community Edition** | ✗ | ✓ | ◐ | ✗ | ✗ | ✗ | ◐ | Python crawler with an Elasticsearch index and a PHP web app; strong search and analytics. Running Elasticsearch on the disk-heavy box competes for I/O and RAM. Crawls are periodic. v2.3.4 released Jan 2026. |
-| XFS project quotas (`xfs_quota`) | ✓ | ✗ | ◐ | ✗ | ✗ | ✓ | ✓ | Kernel-maintained per-tree block and inode totals, read instantly. Only covers the trees you define, with no drill-down. Has a serious hard-link caveat (see `06-project-quotas-deferred.md`; deferred from v1 for this reason). |
-| fatrace, `fsnotifywatch`, fsmon | ✗ | ✗ | ✗ | ◐ | ✗ | ✓ | ◐ | These produce fanotify event streams, not usage accounting. fsmon needs Linux 5.9+ fanotify FID mode, which is newer than the upstream 4.18 baseline. |
-| bcc-tools (`filetop`, `biosnoop`) | ✗ | ✗ | ✗ | ◐ | ✗ | ✓ | ✓ | Interactive eBPF diagnosis, supported on RHEL 8 x86_64. Excellent as a microscope; it isn't an accounting system. |
-| Prometheus node_exporter | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | Filesystem-level used/available only. |
-| Commercial storage-analytics platforms | ◐ | ✓ | ? | ? | ✗ | ? | ? | Not evaluated. They are typically aimed at multi-petabyte estates. |
+| Tool | R1 | R2 | R3 | R4 | R6 | R7 | Notes |
+|------|----|----|----|----|----|----|-------|
+| GNU `du`, ncdu, gdu, dua, dust, pdu | ✗ | ◐ | ◐ | ✗ | ✓ | ✓ | One-shot scans, some parallel. They count each hard-linked inode once, like `du`, but have no "reclaimable" view. ncdu can export/import a JSON snapshot but has no history or diff. |
+| **duc** | ✗ | ◐ | ◐ | ✗ | ✓ | ✓ | Keeps a database of accumulated directory sizes that you query instead of rescanning. Designed for hundreds of millions of files. It re-indexes periodically and has no live layer. |
+| **Robinhood Policy Engine** (cea-hpc) | ✗ | ✓ | ◐ | ✗ | ✗ | ✓ | Replicates filesystem metadata into MySQL using parallel scans, with reports and policies. On plain POSIX filesystems it relies on periodic scans; its changelog reader is Lustre-only. Latest release 3.2.0 (Nov 2024). HPC-oriented and heavy for one server. |
+| **Diskover Community Edition** | ✗ | ✓ | ◐ | ✗ | ✗ | ◐ | Python crawler with an Elasticsearch index and a PHP web app; strong search and analytics. Running Elasticsearch on the disk-heavy box competes for I/O and RAM. Crawls are periodic. v2.3.4 released Jan 2026. |
+| XFS project quotas (`xfs_quota`) | ✓ | ✗ | ◐ | ✗ | ✓ | ✓ | Kernel-maintained per-tree block and inode totals, read instantly. Only covers the trees you define, with no drill-down. Has a serious hard-link caveat (see `06-project-quotas-deferred.md`; deferred from v1 for this reason). |
+| fatrace, `fsnotifywatch`, fsmon | ✗ | ✗ | ✗ | ◐ | ✓ | ◐ | These produce fanotify event streams, not usage accounting. fsmon needs Linux 5.9+ fanotify FID mode, which is newer than the upstream 4.18 baseline. |
+| bcc-tools (`filetop`, `biosnoop`) | ✗ | ✗ | ✗ | ◐ | ✓ | ✓ | Interactive eBPF diagnosis, supported on RHEL 8 x86_64. Excellent as a microscope; it isn't an accounting system. |
+| Prometheus node_exporter | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | Filesystem-level used/available only. |
+| Commercial storage-analytics platforms | ◐ | ✓ | ? | ? | ? | ? | Not evaluated. They are typically aimed at multi-petabyte estates. |
 
 ### Conclusion
 
 > **Update after review:** instant per-tree totals (R1) were relaxed. Project quotas were deferred because of their hard-link side effects. Tidemark v1 covers R1 approximately: 30-second filesystem sampling plus live hot-directory attribution.
 
-No tool reaches R1–R5 together. The closest combination is xfs_quota plus duc plus bcc-tools plus hand-written Postgres queries. That is four tools, and none of them answers the hard-link question, "how much would deleting this free?".
+No tool reaches R1–R4 together. The closest combination is xfs_quota plus duc plus bcc-tools. That is three tools, and none of them answers the hard-link question, "how much would deleting this free?".
 
 ## 3. What Tidemark borrows
 
@@ -70,11 +68,6 @@ dnf install -y bcc-tools
 
 # Coarse top-level breakdown, gently
 nice -n 19 du -xh --max-depth=2 /data 2>/dev/null | sort -h | tail -25
-
-# Postgres: WAL on disk and WAL held back by replication slots (run as a superuser or pg_monitor member)
-psql -XAtc "select pg_size_pretty(sum(size)) from pg_ls_waldir()"
-psql -XAtc "select slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) from pg_replication_slots"
-psql -XAtc "select failed_count, last_failed_time from pg_stat_archiver"
 
 # If project quotas are already enabled on the filesystem
 xfs_quota -x -c 'report -pbih' /data

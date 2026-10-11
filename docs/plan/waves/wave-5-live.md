@@ -1,19 +1,19 @@
 # Wave 5 — Live monitoring components
 
-**Goal:** the L2 components as tested libraries with standalone CLI modes: the fanotify watcher, the `/proc` scanner (phantom files, open writers), the Postgres collector, and the rate/alert/`now` model. Wave 6 wires them into the daemon.
+**Goal:** the L2 components as tested libraries with standalone CLI modes: the fanotify watcher, the `/proc` scanner (phantom files, open writers), and the rate/alert/`now` model. Wave 6 wires them into the daemon.
 
-**Agents:** 4 in parallel. **Entry:** `wave-1-done`. Can run alongside Waves 2–4: the owned crates are disjoint.
+**Agents:** 3 in parallel. **Entry:** `wave-1-done`. Can run alongside Waves 2–4: the owned crates are disjoint.
 
 | Task | Title | Owned paths | Depends on |
 |------|-------|-------------|------------|
 | W5-A | fanotify FFI and watcher | `tidemark-sys/src/fanotify.rs`, `tidemark-live/src/watch/**`, `tidemark-cli/src/cmd/watch.rs` | W1-D (attribution) |
 | W5-B | Process scanner: phantom files and open writers | `tidemark-live/src/procscan.rs`, `tidemark-cli/src/cmd/{phantom,writers}.rs` | W1-D |
-| W5-C | Postgres collector | `tidemark-pg/**`, `tidemark-cli/src/cmd/pg.rs` | W0 |
+| W5-C | *(Deferred.)* | — | — |
 | W5-D | Rates, alert engine, `now` model and renderer | `tidemark-live/src/{rates,now}.rs`, `tidemark-live/src/alerts/**` | W0 |
 
-To keep the four tasks independent, **W5-D's inputs use only `tidemark-core::live` types plus its own rate types**. It never imports from W5-A/B/C. Wave 6 adapts component outputs into W5-D's input structs.
+To keep the three tasks independent, **W5-D's inputs use only `tidemark-core::live` types plus its own rate types**. It never imports from W5-A/B. Wave 6 adapts component outputs into W5-D's input structs.
 
-**Merge order:** W5-D → W5-B → W5-C → W5-A.
+**Merge order:** W5-D → W5-B → W5-A.
 
 ---
 
@@ -77,7 +77,7 @@ pub fn namespace_ok() -> io::Result<bool>;   // /proc/self/ns/mnt == /proc/1/ns/
   - Handle events per `07` §3.2 (fd mode) or §3.4 (FID modes). **Close every event fd** (the `OwnedFd` drop handles it).
   - Ignore our own PID.
 - **Rings:** `07` §3.3. 60 minute buckets, with three bounded maps per bucket and a `lossy` flag. A minute is "completed" when the wall clock passes its end. `drain_completed_minutes` hands each completed minute's top-K rows over exactly once.
-- **Two mounts by default** (`/` and `/data`): the daemon starts one `Watcher` per mount, each with its own fanotify group and thread. `exclude_prefixes` includes the Postgres data directory when `watch.exclude_postgres` is set (the daemon resolves it via the collector's `data_directory`).
+- **Two mounts by default** (`/` and `/data`): the daemon starts one `Watcher` per mount, each with its own fanotify group and thread. Exclusions come from the generic `watch.exclude_prefixes` setting.
 - **`start` refuses** (`WatchError::Namespace`) when `namespace_ok()` is false, and returns `WatchError::Unsupported` when fanotify isn't available.
 - **`cmd/watch.rs`:** foreground mode prints `HH:MM:SS  +12.3 MiB  /path  (comm pid, unit)` per event (rate-limited to 50 lines/s with a "… N more" summary), and a top-5 summary every minute. Its exit code is 5 when it can't run (namespace or permission).
 
@@ -139,60 +139,7 @@ impl ProcScanner {
 
 ---
 
-## W5-C — Postgres collector
-
-**Read first:** `07-live-monitoring.md` §5 (all), `08-interfaces.md` (`[postgres]`, `pg`).
-
-### Interface
-
-```rust
-pub struct PgProbe { pub reachable: bool, pub server_version_num: Option<u32>, pub in_recovery: Option<bool>,
-                     pub data_directory: Option<String>, pub missing_privileges: Vec<String>, pub error: Option<String> }
-pub fn probe_from_config(cfg: &PostgresConfig) -> Result<PgProbe, PgError>;
-
-/// Our own row type: every column as text (NULL → None), so fakes can build rows freely.
-/// (postgres::Row has no public constructor.) Queries cast to text in SQL where needed.
-pub type PgRow = Vec<Option<String>>;
-pub trait PgConn { fn query(&mut self, sql: &str, params: &[&str]) -> Result<Vec<PgRow>, PgError>; }
-pub trait PgConnector: Send { fn connect(&self, dbname: &str) -> Result<Box<dyn PgConn>, PgError>; }
-pub struct PgCollector;
-impl PgCollector {
-    pub fn new(cfg: PostgresConfig) -> Self;                                       // real connections (postgres crate)
-    pub fn with_connector(cfg: PostgresConfig, c: Box<dyn PgConnector>) -> Self;  // tests
-    pub fn collect_fast(&mut self, now: i64) -> Result<Vec<PgSample>, PgError>;  // 5-minute set
-    pub fn collect_relations(&mut self, now: i64) -> Result<Vec<PgSample>, PgError>; // hourly, per database
-    pub fn path_labels(&mut self) -> Result<Vec<(RawPath, String, String)>, PgError>; // pg.* annotations
-    pub fn latest(&self) -> Option<PgNow>;
-    pub fn backoff_until(&self) -> Option<i64>;
-}
-```
-
-### Details
-
-- Queries exactly as `07` §5.2, chosen by `server_version_num`:
-  - **< 100000:** unsupported; probe reports it.
-  - **< 130000:** no `wal_status`.
-  - **In recovery:** skip slot retention; report WAL dir only.
-- Every session: `SET application_name = 'tidemark'`, `SET statement_timeout = <cfg>`, `SET lock_timeout = '1s'`. Read-only: `SET default_transaction_read_only = on`.
-- **Back-off:** 1, 2, 4 … 30 minutes on connection or query failure. `latest()` keeps the last good values and adds `unreachable_since`.
-- **`path_labels`:** `data_directory` → `pg.data_directory=true`; `base/<oid>` → `pg.database=<name>`; `pg_wal` → `pg.wal=true`; tablespace locations → `pg.tablespace=<name>`.
-- **`missing_privileges` in probe:** test `pg_ls_waldir()`, `pg_database_size` on one database, and reading `data_directory`, and report which fail. The probe text then suggests `GRANT pg_monitor TO tidemark;`.
-- **CLI `pg`:** runs `collect_fast` (and `collect_relations` with `--relations`) once and prints:
-  - databases by size;
-  - WAL directory size;
-  - slots with retained bytes and active flag;
-  - archiver status;
-  - temp-bytes counters;
-  - top relations.
-
-### Tests
-
-- Unit: a fake connector returns canned rows for each version branch (PG 10, 12, 13, 16); back-off schedule; label mapping.
-- Integration (VM, or any box with Postgres binaries): `tests/support/pgtmp.rs` runs `initdb` into a temp dir as an unprivileged user, starts on a Unix socket in the temp dir, creates role `tidemark` with `pg_monitor`, creates a database and a table with data plus a physical replication slot → `collect_fast` reports database size > 0, `wal_dir` > 0, and slot retention ≥ 0. A role without `pg_monitor` → probe lists the missing privileges.
-
-### Acceptance
-
-- [ ] Works against PostgreSQL from the EL8 AppStream module streams installed on the VM (record the versions tested).
+## W5-C — *(Deferred.)*
 
 ---
 
@@ -215,7 +162,7 @@ pub struct DirGrowth { pub root: String, pub path: RawPath, pub depth: u32, pub 
 pub struct AlertInputs<'a> {
     pub mounts: &'a [MountRates], pub lvm: &'a [(String /*mount*/, LvmNow)], pub phantom: &'a [PhantomSummary],
     pub hot_dirs_window: &'a [(String /*mount*/, Vec<HotEntry>)],   // for hot_dir_growth (rule window)
-    pub pg: Option<&'a PgNow>, pub scans: &'a [ScanStatus], pub dir_growth: &'a [DirGrowth],
+    pub scans: &'a [ScanStatus], pub dir_growth: &'a [DirGrowth],
     pub watch_overflows_15m: &'a [(String, u64)], pub state_space_refused: bool,
 }
 pub struct AlertEngine;
@@ -233,7 +180,7 @@ pub struct NowInputs<'a> {
     pub host: &'a str, pub mounts: &'a [MountRates], pub lvm: &'a [(String /*mount*/, LvmNow)],
     pub hot_dirs_5m: &'a [(String /*mount*/, Vec<HotEntry>)], pub writers_5m: &'a [(String, Vec<HotEntry>)],
     pub phantom: &'a [PhantomSummary], pub open_writers: &'a [(String, Vec<OpenWriter>)],
-    pub pg: Option<&'a PgNow>, pub alerts: &'a [AlertSummary], pub scans: &'a [ScanStatus],
+    pub alerts: &'a [AlertSummary], pub scans: &'a [ScanStatus],
     pub watch_modes: &'a [(String, String, u32 /*lossy 15m*/)], pub degraded: &'a [String],
 }
 pub fn build_now(i: &NowInputs, now: i64) -> NowReport;
@@ -251,7 +198,7 @@ pub fn render_now_text(r: &NowReport, width: usize, color: bool) -> String;
 - `slope_bytes_per_sec` on linear, noisy, sawtooth and constant series; fewer than 3 samples gives `None`; `time_to_full` edge cases (zero, negative rate).
 - Alert state machine: table-driven timelines (condition flaps shorter than `for` never fire; resolve after `resolve_for`; re-notify cadence; multiple subjects independent).
 - Webhook: a local `tiny_http` test server receives the JSON body; timeouts and retries; queue overflow drops the oldest and counts it.
-- `render_now_text` `insta` snapshots for: healthy, filling, degraded (pg unreachable, watcher fd mode), and multi-mount.
+- `render_now_text` `insta` snapshots for: healthy, filling, degraded (watcher fd mode), and multi-mount.
 
 ### Acceptance
 
@@ -263,5 +210,4 @@ pub fn render_now_text(r: &NowReport, width: usize, color: bool) -> String;
 
 - [ ] Privileged suite green on both VMs; fanotify capability findings for 8.8 and 8.10 recorded in `docs/handoff/W5-gate.md`.
 - [ ] Manual check on a VM: run `tidemark watch` while a script writes files under two units (`systemd-run --unit=fake-report …`); attribution shows the unit names.
-- [ ] Postgres collector verified against the VM's Postgres.
 - [ ] Tag `wave-5-done`.

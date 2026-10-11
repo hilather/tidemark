@@ -1,6 +1,6 @@
 # 07 — Live monitoring (L0 sampling + L2)
 
-Goal: within about a minute of something starting to fill the disk, `tidemark now` names the filesystem and its growth rate, the hot directories, and the process or systemd unit doing it. It also shows hidden consumers (deleted-but-open files, Postgres WAL held by slots).
+Goal: within about a minute of something starting to fill the disk, `tidemark now` names the filesystem and its growth rate, the hot directories, and the process or systemd unit doing it. It also shows hidden consumers (deleted-but-open files).
 
 All live components run inside `tidemarkd` and write to `LiveState` (in memory) and `timeseries.db` (persisted).
 
@@ -25,7 +25,7 @@ LVM details:
 
 - **Rate** = least-squares slope of `(ts, used)` over a window. Windows are 5 min, 15 min and 1 h, and need at least 3 samples. A slope is robust to the sawtooth of temp files being created and deleted, unlike first-minus-last.
 - **Time-to-full** = `avail / rate` when `rate > 0`, otherwise "not filling". Shown from the 1 h window, with the 15 min value alongside.
-- The same functions apply to thin-pool usage, Postgres WAL, and `dir_series` (scan-to-scan growth).
+- The same functions apply to thin-pool usage and `dir_series` (scan-to-scan growth).
 
 ```rust
 pub fn slope_bytes_per_sec(samples: &[(i64 /*unix s*/, i64 /*bytes*/)]) -> Option<f64>;
@@ -73,7 +73,6 @@ Rules:
 
 - **Default mask is `FAN_CLOSE_WRITE` only.** `FAN_MODIFY` fires on every `write()`, opening an fd for us each time, which is too expensive for Postgres and log writers. Long-lived writers that never close are covered by the open-writer scanner (§4.2) and by the 30-second filesystem rates.
 - **Bounded queue.** Don't use `FAN_UNLIMITED_QUEUE`. On overflow, mark the minute `lossy` and increment `tidemark_watch_overflows_total`. Rates from L0 remain correct.
-- **PostgreSQL on `/data`:** when `[postgres]` is enabled, the watcher excludes the data directory by default (`watch.exclude_postgres = true`). Postgres growth is measured by the collector (§5) instead, which is more accurate and avoids event noise.
 - `dir_key(path)` is the parent directory, truncated to `watch.hot_depth` components below the mount (default 6) to bound cardinality. Keys are raw bytes.
 - The LRU of last-seen sizes holds 200,000 entries (about 10 MB). For a file **not** in the LRU, count its full size only if it is new: birth time (`statx` btime, which XFS v5 provides) or, failing that, ctime is after the watcher started and within the last 2 minutes. Otherwise count 0 and seed the LRU. `CLOSE_WRITE` fires even when nothing was written, and this rule avoids false spikes after restarts and evictions.
 - Mount-mark limitation: in fd mode, writes made through a *different* mount of the same filesystem (bind mounts, other mount namespaces) are not seen. The probe lists bind mounts of watched filesystems so operators know.
@@ -119,9 +118,9 @@ Output: total phantom bytes per mount, and the top holders as `pid, comm, unit, 
 
 For fds whose target is a regular file on a watched mount, read `/proc/<pid>/fdinfo/<n>` and parse `flags:` (octal). If `flags & O_ACCMODE ∈ {O_WRONLY, O_RDWR}`, track `(dev, ino) → (size, disk, path, pid, comm, unit)` across passes. "Growing" = `disk` increased since the previous pass. Report the top growers per window.
 
-This catches log files and long-running writers, including runaway Postgres temp files, that close-write events never see.
+This catches log files and long-running writers, including runaway database temp files, that close-write events never see.
 
-- Exclude prefixes from `procscan.exclude_prefixes` (default: PGDATA's `base/` and `global/`, which Postgres keeps open read-write constantly).
+- Exclude prefixes from `procscan.exclude_prefixes` (default: none).
 - Cost: one `readlink` + `stat` per fd and one small read per candidate. Expect well under a second for tens of thousands of fds. Ignore `ENOENT`/`ESRCH` from exiting processes.
 
 ### 4.3 Attribution helper (shared with the watcher)
@@ -134,38 +133,13 @@ This catches log files and long-running writers, including runaway Postgres temp
 
 Cache with a 60 s TTL, keyed by `(pid, starttime)` from `/proc/<pid>/stat` field 22, to survive PID reuse.
 
-## 5. Postgres collector (`tidemark-pg`, W5-C)
-
-### 5.1 Access
-
-```sql
-CREATE ROLE tidemark LOGIN;
-GRANT pg_monitor TO tidemark;      -- PG10+: read all stats/settings, pg_ls_waldir()
-```
-
-The daemon runs as root and connects over the Unix socket. Either:
-
-- **peer auth with an ident map** (`pg_ident.conf`: `tidemark  root  tidemark`; `pg_hba.conf`: `local all tidemark peer map=tidemark`), or
-- **a password file** at `/etc/tidemark/pg.pass` (0600), used via `passfile=` in the DSN.
-
-### 5.2 Queries (version-adaptive; probe `server_version_num` first)
-
-| Every | Query | Notes |
-|-------|-------|-------|
-| 5 min | `SELECT datname, pg_database_size(oid) FROM pg_database WHERE datallowconn AND NOT datistemplate` | `kind=database` |
-| 5 min | `SELECT COALESCE(sum(size),0) FROM pg_ls_waldir()` | `kind=wal_dir`; PG ≥ 10 |
-| 5 min | `SELECT slot_name, slot_type, active, pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) FROM pg_replication_slots` | `kind=slot_retained`; skip when `pg_is_in_recovery()`; add `wal_status` on PG ≥ 13 |
-| 5 min | `SELECT archived_count, failed_count, last_failed_time, last_archived_time FROM pg_stat_archiver` | `kind=archiver_failed_total`; a failing archiver makes WAL pile up |
-| 5 min | `SELECT datname, temp_bytes, temp_files FROM pg_stat_database WHERE datname IS NOT NULL` | `kind=temp_bytes_total` (cumulative counter, so take the rate) |
-| 1 h | Per database: `SELECT n.nspname, c.relname, c.relkind, pg_total_relation_size(c.oid) AS b FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','m') ORDER BY b DESC NULLS LAST LIMIT $top` | `kind=relation`, `name = <db>.<schema>.<relation>` (unique across databases; total size already includes TOAST and indexes, so TOAST tables aren't listed separately); one connection per database, sequential, with `statement_timeout = 30s` |
-| 1 h | Per database: `SELECT schemaname, relname, n_live_tup, n_dead_tup, last_autovacuum FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 20` | `kind=dead_tuples`, a bloat hint |
-| On start + daily | `SHOW data_directory`; `SELECT spcname, pg_tablespace_location(oid) FROM pg_tablespace`; `SELECT oid, datname FROM pg_database` | Path labels: annotate `<data_directory>`, `base/<oid>` → `pg.database=<name>`, tablespace dirs, `pg_wal` |
-
-Every query sets `application_name=tidemark` and a statement timeout. Failures back off 1, 2, 4 … up to 30 minutes, and the status shows "pg: unreachable since …".
+## 5. *(Deferred: PostgreSQL collector, see `14`.)*
 
 ## 6. Alert engine (`tidemark-live::alerts`, W5-D)
 
 ### 6.1 Rule kinds
+
+Nine configurable rule kinds remain; `state_space` is an internal alert.
 
 | Kind | Parameters | Fires when |
 |------|------------|-----------|
@@ -176,8 +150,6 @@ Every query sets `application_name=tidemark` and a statement timeout. Failures b
 | `vg_free_low` | vg, below | VG free space < below (informational: headroom for growing filesystems) |
 | `dir_growth` | root, depth, above | Between the last two snapshots, a directory at ≤ depth grew > above |
 | `phantom_bytes` | mount, above | Phantom total > above |
-| `pg_wal_bytes` / `pg_slot_retained` | above | WAL dir > above / any slot retains > above |
-| `pg_archiver_failing` | window | `failed_count` increased within window |
 | `scan_stale` | root, older_than | No complete scan within older_than |
 | `watch_lossy` | mount, above (overflow count), window | Overflows > N in window |
 | `state_space` | (internal) | Space guard refused a snapshot |
@@ -204,13 +176,11 @@ Shipped enabled; thresholds editable:
 - `fs_used_pct > 90%` for 5 m
 - `time_to_full < 12h` (1 h window) for 10 m
 - `phantom_bytes > 10 GiB` for 10 m
-- `pg_slot_retained > 50 GiB`
-- `pg_archiver_failing` (30 m window)
 - `scan_stale` with `older_than = "auto"`: 2 × the effective cadence, where a windowed schedule counts as at least 24 h (so a `00:00–06:00` window doesn't fire every afternoon)
 - `watch_lossy > 10` per 15 m
 - `thin_pool_pct`: data > 80% or metadata > 80% (only when a tracked LV is thin)
 
-Pure `tidemark_core::config::default_rules(cfg)` owns generation; W5-D wraps/re-exports it. Filesystem and phantom defaults expand over `sampler.mounts`, watcher defaults over `watch.mounts`. Generate one `scan_stale` rule per configured root with schedule other than `off`; explicit stale rules may monitor manually scanned roots. Base names are `fs_used_pct`, `fs_full_soon`, `phantom_bytes`, `watch_lossy`, `pg_slot_retained`, `pg_archiver_failing`, `scan_stale`, `thin_pool_pct`. Mount/root-scoped names are unsuffixed only for the exact `/data` subject; all others append `:<mount>` or `:<root>`, independent of list order. The suffix preserves UTF-8 bytes: retain `/` and ASCII `[A-Za-z0-9._-]`, percent-encode every other byte as uppercase `%XX` (including `%` and `:`). This escape choice settles S3's unspecified format. Same-name user rules override defaults; duplicate user names remain for validation. Generation/merge is idempotent; defaults use 5m/10m firing/resolution unless listed otherwise above.
+Pure `tidemark_core::config::default_rules(cfg)` owns generation; W5-D wraps/re-exports it. Filesystem and phantom defaults expand over `sampler.mounts`, watcher defaults over `watch.mounts`. Generate one `scan_stale` rule per configured root with schedule other than `off`; explicit stale rules may monitor manually scanned roots. Base names are `fs_used_pct`, `fs_full_soon`, `phantom_bytes`, `watch_lossy`, `scan_stale`, `thin_pool_pct`. Mount/root-scoped names are unsuffixed only for the exact `/data` subject; all others append `:<mount>` or `:<root>`, independent of list order. The suffix preserves UTF-8 bytes: retain `/` and ASCII `[A-Za-z0-9._-]`, percent-encode every other byte as uppercase `%XX` (including `%` and `:`). This escape choice settles S3's unspecified format. Same-name user rules override defaults; duplicate user names remain for validation. Generation/merge is idempotent; defaults use 5m/10m firing/resolution unless listed otherwise above.
 
 ## 7. The `now` view (FR-18)
 
@@ -220,10 +190,9 @@ The daemon builds a `NowReport` from `LiveState` in under 50 ms; the CLI renders
 pub struct NowReport {
     pub generated_at: i64, pub host: String,
     pub mounts: Vec<MountNow>,
-    pub pg: Option<PgNow>,
     pub alerts_firing: Vec<AlertSummary>,
     pub scans: Vec<ScanStatus>,          // last success per root, running scan progress
-    pub degraded: Vec<String>,           // e.g. "watcher: fd mode only", "pg: unreachable since …"
+    pub degraded: Vec<String>,           // e.g. "watcher: fd mode only"
 }
 pub struct MountNow {
     pub mount: String, pub size: u64, pub used: u64, pub avail: u64,
@@ -243,9 +212,8 @@ tidemark now — db-report-01 — 2026-10-10 14:02:11 EDT
   lvm                     vg00/data 3.64 TiB · thin pool vg00/pool0 data 81% meta 12% · VG free 0 B ⚠ thin_pool_pct
   hot dirs (5m)           /data/reports/acme/2026-10/raw   +2.6 GiB  14,212 files  reportgen.service
                           /data/reports/globex/daily       +310 MiB     402 files  etl-nightly.service
-  writers (5m)            reportgen.service +2.7 GiB · etl-nightly.service +0.3 GiB · postgresql.service +0.1 GiB
+  writers (5m)            reportgen.service +2.7 GiB · etl-nightly.service +0.3 GiB · app-api.service +0.1 GiB
   deleted-but-open        41.2 GiB — java (pid 4121, app-api.service) /data/logs/api.log
-postgres                  WAL 18.4 GiB · slot replica_b retains 12.9 GiB (inactive) · archiver ok
 /       used 31.2 GiB / 50.0 GiB (62.4%)   +0.1 GiB/h (15m)   not filling
   hot dirs (5m)           /var/log/journal  +42 MiB  systemd-journald.service
 last scan /data           2026-10-10 02:30 (11h ago, bulk, 9m14s) · /  03:30 (10h ago, walk, 48s) — run `tidemark diff --since 24h --explain`
@@ -277,13 +245,6 @@ pub struct OpenWriter    { pub mount: String, pub pid: u32, pub comm: String, pu
                            pub dev: u64, pub ino: u64, pub size: u64, pub disk: u64, pub growth: i64, pub window_secs: u64 }
 pub struct WriterSample  { pub ts: i64, pub mount: String, pub pid: u32, pub comm: String, pub unit: Option<String>,
                            pub path: Vec<u8>, pub dev: u64, pub ino: u64, pub size: u64, pub disk: u64 }
-pub struct PgSample      { pub ts: i64, pub kind: String /* 05 §6 kinds */, pub name: String, pub value: i64 }
-pub struct PgSlot        { pub name: String, pub slot_type: String, pub active: bool,
-                           pub retained_bytes: Option<u64>, pub wal_status: Option<String> }
-pub struct PgNow         { pub sampled_at: Option<i64>, pub unreachable_since: Option<i64>, pub server_version_num: Option<u32>,
-                           pub databases: Vec<(String, u64)>, pub wal_dir_bytes: Option<u64>, pub slots: Vec<PgSlot>,
-                           pub archiver_failing: bool, pub archiver_last_failed: Option<i64>,
-                           pub temp_bytes_rate: Option<f64>, pub top_relations: Vec<(String /* db.schema.rel */, u64)> }
 pub enum   AlertState    { Firing, Resolved, Renotify }
 pub struct AlertEvent    { pub ts: i64, pub rule: String, pub subject: String, pub state: AlertState,
                            pub value: Option<f64>, pub message: String }
@@ -304,5 +265,4 @@ There is no separate `Hot` or `Growth` type: hot lists use `HotEntry`, and scan-
 | Samplers | < 0.1% CPU | `statvfs` every 30 s; `lvs`/`vgs` every 5 min with a timeout |
 | Watcher | ≤ 1% of one core at 1,000 events/s | Close-write only; bounded queue; capped maps |
 | Procscan | < 1 s per pass | 60 s interval; skips non-matching devices early |
-| Postgres | Sub-second queries, except hourly relation sizes | Statement timeout; sequential per DB; back-off |
 | Memory | ≤ 300 MiB steady (NFR-4) | Fixed rings; capped LRUs and maps |
