@@ -39,7 +39,6 @@ Machine output uses `JsonDoc<T> { schema: Cow<'static, str>, data: T }`, with ow
 | `lvm` | LV/VG/thin-pool status and trend (FR-24) | `--mount M` | root |
 | `phantom` | Deleted-but-open files (FR-15) | `--mount`, `--direct` (scan `/proc` now) | root |
 | `writers` | Growing open files (FR-15) | `--mount`, `--window`, `--direct` (no daemon: two `/proc` passes), `--interval DUR` (10s, with `--direct`) | root |
-| `pg` | Postgres breakdown (FR-16) | `--relations`, `--db NAME` | root |
 | `alerts` | Active alerts; `--all` for history | | root |
 | `deploy stage` | Pre-flight checks, install config, enable the service for next boot (FR-25) | `--from FILE` (config to install; the global `-c` still names the installed path), `--start-now`, `--skip-check NAME…` (warning-level checks only) | root |
 | `deploy verify` | Post-reboot pass/fail for the pipeline (FR-25) | `--wait DUR` (poll until healthy or timeout); machine output via the global `--json` | root |
@@ -100,7 +99,6 @@ The `Δ24h` column appears when a snapshot about 24 h older exists.
 | `lvm` | `mount?` | `LvmResult { mounts: Vec<(mount, LvmNow)>, vgs: Vec<VgInfo>, sampled_at }` (`VgInfo` defined in core API, re-exported by W4-A `lvm`) |
 | `phantom` | `mount?` | `Vec<PhantomSummary>` (one per mount) |
 | `writers` | `mount?`, `window` (positive humantime duration) | `Vec<OpenWriter>` |
-| `pg` | `relations?`, `db?` | `Option<PgNow>` |
 | `alerts.active` / `alerts.history` | `limit?` | `Vec<AlertSummary>` / `Vec<AlertEvent>` |
 | `scan.start` | exactly one of `root`/`root_b64`, `mode?`, `throttle?` | `{scan_id}`, or error `busy` (another scan holds the host lock) |
 | `scan.status` | at most one of `root`/`root_b64` | `Vec<ScanStatus>` |
@@ -183,22 +181,13 @@ mounts           = ["/", "/data"]
 events           = ["close_write"]     # add "modify" only for short investigations
 hot_depth        = 6
 exclude_prefixes = []                  # state_dir is always excluded
-exclude_postgres = true                # skip PGDATA when [postgres] is enabled (collector covers it)
 lru_entries      = 200000
 
 [procscan]
 enabled          = true
 interval         = "60s"
 open_writers     = true
-exclude_prefixes = []                  # PGDATA base/ and global/ are added automatically when [postgres] is enabled
-
-[postgres]
-enabled            = false
-dsn                = "host=/var/run/postgresql user=tidemark dbname=postgres application_name=tidemark"
-interval           = "5m"
-relations_interval = "1h"
-top_relations      = 20
-statement_timeout  = "30s"
+exclude_prefixes = []
 
 [metrics]
 textfile              = "/var/lib/node_exporter/textfile_collector/tidemark.prom"   # "" = disabled
@@ -249,13 +238,13 @@ Require `1 <= scan.max_notable <= u32::MAX`, with checked zero-based file-id ass
 | Field | Type | Used by kinds |
 |-------|------|---------------|
 | `name` | string (unique) | all |
-| `kind` | enum | all: `fs_used_pct`, `time_to_full`, `hot_dir_growth`, `thin_pool_pct`, `vg_free_low`, `dir_growth`, `phantom_bytes`, `pg_wal_bytes`, `pg_slot_retained`, `pg_archiver_failing`, `scan_stale`, `watch_lossy` |
+| `kind` | enum | nine kinds: `fs_used_pct`, `time_to_full`, `hot_dir_growth`, `thin_pool_pct`, `vg_free_low`, `dir_growth`, `phantom_bytes`, `scan_stale`, `watch_lossy` |
 | `enabled` | bool (default true) | all |
 | `for`, `resolve_for` | duration (defaults 5m / 10m) | all |
 | `mount` | path | fs_used_pct, time_to_full, hot_dir_growth, phantom_bytes, watch_lossy |
-| `above` | number, size (`"10GiB"`) or rate (`"50GiB/h"`) | fs_used_pct (percent), hot_dir_growth (finite nonnegative number in bytes/s or rate string), dir_growth, phantom_bytes, pg_wal_bytes, pg_slot_retained (sizes), watch_lossy (count) |
+| `above` | number, size (`"10GiB"`) or rate (`"50GiB/h"`) | fs_used_pct (percent), hot_dir_growth (finite nonnegative number in bytes/s or rate string), dir_growth, phantom_bytes (sizes), watch_lossy (count) |
 | `below` | duration or size | time_to_full (duration), vg_free_low (size) |
-| `window` | duration | time_to_full, hot_dir_growth, pg_archiver_failing, watch_lossy |
+| `window` | duration | time_to_full, hot_dir_growth, watch_lossy |
 | `path` | glob | hot_dir_growth |
 | `vg`, `pool` | glob (default `*`) | thin_pool_pct (`vg`, `pool`), vg_free_low (`vg`) |
 | `data_above`, `meta_above` | percent | thin_pool_pct |
@@ -284,10 +273,6 @@ All metrics are written to the node_exporter textfile collector (atomic write-an
 | `tidemark_hot_bytes` | gauge | `mount`, `scope`, `key` (top 10, 5 m window) |
 | `tidemark_phantom_bytes` | gauge | `mount` |
 | `tidemark_open_writer_growth_bytes` | gauge | `mount`, `unit` (top 10) |
-| `tidemark_pg_database_bytes` | gauge | `database` |
-| `tidemark_pg_wal_dir_bytes` | gauge | — |
-| `tidemark_pg_slot_retained_bytes` | gauge | `slot` |
-| `tidemark_pg_archiver_failed_total` | counter | — |
 | `tidemark_scan_last_success_timestamp_seconds` | gauge | `root` |
 | `tidemark_scan_duration_seconds` | gauge | `root`, `mode` |
 | `tidemark_scan_errors` | gauge | `root` |
@@ -320,7 +305,6 @@ tidemark deploy verify --wait 5m                    # exit 0 = healthy; 6 = not 
 | fanotify available (`probe`), mount namespace OK | warning (watcher would be disabled) |
 | XFS + v5 bulkstat available on `/data` | warning (walk mode would be used) |
 | LVM visible (`lvs` succeeds) | warning |
-| Postgres reachable with `pg_monitor` (if enabled) | warning |
 | A previous version staged/running | info (config backed up, service restarted only with `--start-now`) |
 
 On success, `deploy stage`:
@@ -336,7 +320,7 @@ On success, `deploy stage`:
 | Component | Blocks `deploy verify` if not `ok`? |
 |-----------|--------------------------------------|
 | `sampler`, `scheduler`, `api`, `tswriter` | **yes** (the core) |
-| `lvm`, `watcher:<mount>`, `procscan`, `pg`, `alerts`, `metrics` | no: reported as `ok`/`degraded`/`disabled` with a reason. A host without LVM or Postgres still verifies. |
+| `lvm`, `watcher:<mount>`, `procscan`, `alerts`, `metrics` | no: reported as `ok`/`degraded`/`disabled` with a reason. A host without LVM still verifies. |
 
 **`deploy verify`** is healthy when all of these hold:
 
@@ -353,7 +337,7 @@ On success, `deploy stage`:
 [Unit]
 Description=Tidemark disk usage monitor
 Documentation=file:///usr/share/doc/tidemark/README.md
-After=local-fs.target network-online.target postgresql.service
+After=local-fs.target network-online.target
 Wants=network-online.target
 
 [Service]

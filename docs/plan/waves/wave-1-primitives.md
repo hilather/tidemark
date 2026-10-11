@@ -60,7 +60,7 @@ pub fn probe(cfg: &Config, extra_roots: &[RawPath]) -> ProbeReport;            /
 - **`resolve_leaves`:** start at `/sys/dev/block/<maj>:<min>`. If it has a `partition` file, step to the parent directory (the whole disk). If `slaves/` is non-empty (dm, md), recurse into each slave. Leaves are devices with no slaves. Record `queue/rotational`, the active scheduler (the bracketed entry in `queue/scheduler`), and for md, `md/level`. Hardware RAID LUNs appear as a single `sdX` leaf.
 - **Probe contents** (each field optional, plus a short `why` for unknowns):
   - **Host:** OS release (`/etc/os-release`, `/etc/rocky-release`), kernel (`uname -r`), whether this is the latest Rocky minor (8.10 for EL8; warn on anything older), cgroup version (`statfs("/sys/fs/cgroup").f_type`), CPUs, memory, effective capabilities (`CapEff` from `/proc/self/status`), mount-namespace equality (`/proc/self/ns/mnt` vs `/proc/1/ns/mnt`), `/sys/kernel/btf/vmlinux` present, `bcc-tools` installed.
-  - **Per root:** mount point, fs type, source device, options (atime mode: `relatime`/`noatime`/`strictatime`), `statvfs` totals, XFS geometry and features (calls `tidemark_sys::xfs::geometry`), bulkstat support (`bulkstat_probe`), LVM mapping (`tidemark_fs::lvm::collect`; stub until W4-A), leaf devices (resolved through dm/LVM and md) with scheduler/rotational/md level, other mounts of the same device (bind mounts), and fanotify capabilities (`tidemark_sys::fanotify::probe`; stub until W5-A). **Postgres is not probed here**: `tidemark-fs` must not depend on `tidemark-pg`. `cmd/probe.rs` appends a Postgres section by calling `tidemark_pg::probe_from_config` (stub until W5-C).
+  - **Per root:** mount point, fs type, source device, options (atime mode: `relatime`/`noatime`/`strictatime`), `statvfs` totals, XFS geometry and features (calls `tidemark_sys::xfs::geometry`), bulkstat support (`bulkstat_probe`), LVM mapping (`tidemark_fs::lvm::collect`; stub until W4-A), leaf devices (resolved through dm/LVM and md) with scheduler/rotational/md level, other mounts of the same device (bind mounts), and fanotify capabilities (`tidemark_sys::fanotify::probe`; stub until W5-A).
 - **Recommendations** (pure function over the facts, unit-tested):
   - Scheduler is not `bfq` → "ionice ineffective; Tidemark's throttle is used".
   - Not the latest minor release → recommend updating.
@@ -377,11 +377,9 @@ impl TimeSeries {
     pub fn insert_hot_minutes(&self, rows: &[HotMinute]) -> Result<(), StoreError>;
     pub fn insert_phantom(&self, rows: &[PhantomSample]) -> Result<(), StoreError>;
     pub fn insert_writers(&self, rows: &[WriterSample]) -> Result<(), StoreError>;
-    pub fn insert_pg(&self, s: &[PgSample]) -> Result<(), StoreError>;
     pub fn insert_alert(&self, a: &AlertEvent) -> Result<(), StoreError>;
     pub fn query_fs(&self, mount: &str, from: i64, to: i64) -> Result<Vec<FsSample>, StoreError>;      // picks resolution
     pub fn query_lvm(&self, vg: &str, lv: &str, from: i64, to: i64) -> Result<Vec<LvmSample>, StoreError>;
-    pub fn query_pg(&self, kind: &str, name: Option<&str>, from: i64, to: i64) -> Result<Vec<PgSample>, StoreError>;
     pub fn query_hot(&self, mount: &str, scope: &str, from: i64, to: i64, limit: usize) -> Result<Vec<HotMinute>, StoreError>;
     pub fn query_dir_series(&self, root: &RawPath, path: &RawPath, from: i64, to: i64) -> Result<Vec<(i64, u64)>, StoreError>;
     pub fn compact(&self, now: i64, policy: &SampleRetention) -> Result<CompactStats, StoreError>;

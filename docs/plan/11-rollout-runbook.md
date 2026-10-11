@@ -6,7 +6,7 @@ Tidemark is read-only and makes no fstab, LVM, kernel or file-metadata changes. 
 |-------|------|-----------------|------------------|
 | P0 | Preconditions and baseline | none | 1–2 days of observation |
 | P1 | Staging validation (Wave 7 gates) | none | done in W7 |
-| P2 | Preparation: config and Postgres role | Postgres monitoring role (optional) | 1 hour |
+| P2 | Preparation: config and monitoring | config and monitoring setup | 1 hour |
 | P3 | Pilot host: hotfix deploy → reboot → verify | RPM, config, enabled service | 1 hotfix cycle |
 | P4 | Pilot observation and tuning | config tweaks | 1 week |
 | P5 | Fleet rollout via the hotfix pipeline | same as P3, per host | per hotfix schedule |
@@ -24,7 +24,6 @@ Tidemark is read-only and makes no fstab, LVM, kernel or file-metadata changes. 
    - `df -h / /data ; df -i / /data`
    - `cat /proc/mdstat` (or the hardware RAID tool)
    - `lsblk -o NAME,TYPE,ROTA,SCHED,SIZE`
-   - Postgres data directory and version
 3. **Baseline load** across a full business day and a batch window: `iostat -x 5` (await and %util on the array's disks), Postgres latency (existing monitoring or `pg_stat_statements`), and application SLOs.
 4. Answer the open questions in `01-requirements.md` §2: Q1 (thin LVs), Q5 (quiet windows), Q6 (pipeline capabilities).
 
@@ -39,15 +38,7 @@ Tidemark is read-only and makes no fstab, LVM, kernel or file-metadata changes. 
    - the metrics textfile path.
 
    Keep the file in the hotfix repository. Validate it anywhere the RPM is installed: `tidemarkd --check-config --config tidemark.toml`.
-2. **Postgres (optional but recommended):** a DBA runs
-
-   ```sql
-   CREATE ROLE tidemark LOGIN;
-   GRANT pg_monitor TO tidemark;
-   ```
-
-   and adds peer mapping (`pg_ident.conf`: `tidemark root tidemark`; `pg_hba.conf`: `local all tidemark peer map=tidemark`), then reloads Postgres. Set `[postgres] enabled = true`. Without the role, `deploy stage` warns and the collector reports "unreachable"; nothing else is affected.
-3. **Monitoring:** load `packaging/prometheus/tidemark-alerts.yml` and the Grafana dashboard. Route Tidemark alerts to a **non-paging** channel for now.
+2. **Monitoring:** load `packaging/prometheus/tidemark-alerts.yml` and the Grafana dashboard. Route Tidemark alerts to a **non-paging** channel for now.
 
 ## P3 — Pilot host: hotfix deploy, reboot, verify
 
@@ -63,7 +54,7 @@ tidemark deploy verify --wait 5m                      # non-zero → see output;
 After verify:
 
 - `tidemark status` shows each component with its mode. Expected watcher mode on EL8: `fd/mount`.
-- `tidemark now` shows both filesystems, LVM and Postgres.
+- `tidemark now` shows both filesystems, LVM.
 - `tidemark hot --window 5m` during normal activity shows writing services.
 
 **First night:** both roots scan in their windows (`/data` in `bulk` if eligible, `/` in walk). Next morning:
@@ -103,7 +94,7 @@ Use the same steps as P3 in each host's next hotfix cycle, with the tuned config
 
 ## P6 — Steady state
 
-- Route `TidemarkTimeToFull`, `TidemarkThinPool`, `TidemarkPhantomBytes`, `TidemarkPgSlotRetention` and `TidemarkDown` to paging, and the rest to tickets. Link the runbooks from the alerts.
+- Route `TidemarkTimeToFull`, `TidemarkThinPool`, `TidemarkPhantomBytes` and `TidemarkDown` to paging, and the rest to tickets. Link the runbooks from the alerts.
 - 30-day review:
   - alert precision;
   - scan durations trend;

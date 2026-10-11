@@ -21,7 +21,7 @@ When a disk fills, operators need to know **immediately** where the space is, wh
 | Filesystems | Two XFS filesystems, `/` and `/data`. Both are v5 (`crc=1`, `ftype=1`), with reflink probably enabled (RHEL 8 `mkfs.xfs` default). | Check `xfs_info / ; xfs_info /data` |
 | Volume management | **LVM**: both filesystems are logical volumes, possibly in one volume group on the RAID 5 array. Thin provisioning unknown. | Check `lvs -o vg_name,lv_name,segtype,lv_size,data_percent,pool_lv; vgs` |
 | RAID | RAID 5, either Linux md or a hardware controller LUN | Unknown — the design handles both |
-| PostgreSQL | Data directory on `/data`; version unknown (assume ≥ 10); local Unix-socket access | Confirmed on `/data`; version to check |
+| PostgreSQL | Data directory on `/data`, sharing the disks with scans; scanned like any other directory | Confirmed on `/data` |
 | SELinux | Enforcing | Assumed |
 | cgroups | v1 (RHEL 8 default) | Assumed |
 | Scale | 5–50 M inodes on `/data`, 0.5–5 M directories, widest directories 10k–100k+ entries; `/` is much smaller | Estimate (`df -i`) |
@@ -39,7 +39,7 @@ When a disk fills, operators need to know **immediately** where the space is, wh
 | Q4 | Is there an existing Prometheus/Alertmanager/Grafana stack? | Metrics delivery | node_exporter textfile metrics |
 | Q5 | Which hours are quiet enough for the scheduled scans? | Scan windows | `/data` 00:00–06:00; `/` daily at 03:30 |
 | Q6 | What does the hotfix pipeline run (shell steps, Ansible, …) and can it run a post-reboot check? | Shape of `deploy stage` / `deploy verify` | Shell commands with clear exit codes |
-| Q7 | PostgreSQL version and replication/archiving setup | Collector query set | Probe the version; adapt queries |
+| Q7 | *(Deferred with FR-16.)* | — | — |
 
 ## 3. Goals
 
@@ -47,7 +47,7 @@ When a disk fills, operators need to know **immediately** where the space is, wh
 - **G2 — Full picture, gently.** A complete per-directory index of `/` and `/data`, built by a scanner that is several times faster than `du` and backs off when the array is busy.
 - **G3 — Truthful numbers with links.** Every directory gets a `du`-compatible size, a **reclaimable** size and a **shared** size. Symlinks are never followed.
 - **G4 — History.** Snapshots are kept, and "what grew between A and B" can be explained in one command.
-- **G5 — Hidden consumers.** Surface deleted-but-open files, growing open files, Postgres WAL/slot/temp/relation growth, and LVM thin-pool usage.
+- **G5 — Hidden consumers.** Surface deleted-but-open files, growing open files and LVM thin-pool usage.
 - **G6 — Early warning.** Growth-rate, time-to-full and thin-pool alerts, delivered through existing monitoring.
 - **G7 — Strictly read-only.** Tidemark never changes filesystem metadata, never reads file contents, and makes no changes to mounts, fstab, LVM or the kernel command line.
 - **G8 — Hands-off deployment.** Deployable by the hotfix pipeline, active after the next reboot, with a verifiable result.
@@ -63,11 +63,11 @@ When a disk fills, operators need to know **immediately** where the space is, wh
 
 ## 5. Functional requirements
 
-Wave files reference these IDs. FR-10 to FR-13 (project quotas) are **deferred** and kept unused so the numbering stays stable.
+Wave files reference these IDs. FR-10 to FR-13 (project quotas) and FR-16 (collector) are **deferred** and kept unused so the numbering stays stable.
 
 | ID | Requirement | Wave |
 |----|-------------|------|
-| FR-1 | **Probe**: report OS, kernel, cgroup version, per-mount filesystem facts (type, device, LVM LV/VG, mount options, XFS geometry, ftype, reflink), leaf block devices (through LVM and md) with scheduler and rotational flag, RAID level if md, fanotify capabilities, bulkstat availability, privileges, Postgres reachability. Human-readable text and JSON. | W1 |
+| FR-1 | **Probe**: report OS, kernel, cgroup version, per-mount filesystem facts (type, device, LVM LV/VG, mount options, XFS geometry, ftype, reflink), leaf block devices (through LVM and md) with scheduler and rotational flag, RAID level if md, fanotify capabilities, bulkstat availability, privileges. Human-readable text and JSON. | W1 |
 | FR-2 | **Walk-mode scan**: parallel `getdents64` + `statx` traversal of a root, one filesystem only, producing per-directory records. | W1/W2 |
 | FR-3 | **Bulk-mode scan** (XFS, root): namespace walk without per-file stat, joined with XFS bulkstat. Results identical to walk mode on a quiescent tree. | W2 |
 | FR-4 | **Link-correct metrics** per directory: `t_disk` (du-compatible), `t_apparent`, `t_charged` (additive), `t_reclaimable`, `shared`, `t_files`, `t_inodes`, `t_dirs`, age buckets, newest mtime, widest directory. Defined in `03-link-semantics.md`. | W2 |
@@ -79,10 +79,10 @@ Wave files reference these IDs. FR-10 to FR-13 (project quotas) are **deferred**
 | FR-10 … FR-13 | *(Deferred: project quotas.)* | — |
 | FR-14 | **Live write attribution**: fanotify watcher on `/` and `/data` (fd mode baseline, FID mode when available); per-minute hot directories, units and processes. | W5 |
 | FR-15 | **Hidden consumers**: deleted-but-open files and growing open-for-write files, attributed to process and unit. | W5 |
-| FR-16 | **Postgres collector**: database sizes, top relations, WAL directory size, slot retention, archiver failures, temp-file bytes; label PGDATA paths in `/data` snapshots. | W5 |
-| FR-17 | **Rates and alerts**: least-squares growth rates, time-to-full, thin-pool thresholds, rule engine with hysteresis, delivery to journald/webhook/metrics. | W5 |
-| FR-18 | **`now` view**: a one-screen live situation report in under 1 s. | W5/W6 |
-| FR-19 | **Daemon**: samplers, watcher, scan scheduler with windows, Unix-socket JSON API, self-protection. | W6 |
+| FR-16 | *(Deferred: PostgreSQL collector.)* | — |
+| FR-17 | **Rates and alerts**: least-squares growth rates, time-to-full, thin-pool thresholds, nine configurable rule kinds with hysteresis, delivery to journald/webhook/metrics. | W5 |
+| FR-18 | **`now` view**: a one-screen live report of filesystems, LVM, hot directories, writers, phantom files, alerts and scan status in under 1 s. | W5/W6 |
+| FR-19 | **Daemon**: filesystem/LVM samplers, watcher, process scanner, scan scheduler with windows, Unix-socket JSON API, self-protection. | W6 |
 | FR-20 | **Metrics**: node_exporter textfile (default) and optional localhost HTTP; cardinality caps. | W6 |
 | FR-21 | **TUI**: ncdu-style browser over snapshots, with diff overlay and on-demand live refresh of a subtree. Read-only. | W7 |
 | FR-22 | **ncdu export**: snapshot → ncdu JSON. | W3 |

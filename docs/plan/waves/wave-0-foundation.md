@@ -23,7 +23,7 @@
 ### Deliverables
 
 1. **Workspace `Cargo.toml`** with members:
-   `crates/tidemark-core`, `tidemark-sys`, `tidemark-fs`, `tidemark-scan`, `tidemark-store`, `tidemark-live`, `tidemark-pg`, `tidemark-cli`, `tidemarkd`, `test-support`, and `xtask`.
+   `crates/tidemark-core`, `tidemark-sys`, `tidemark-fs`, `tidemark-scan`, `tidemark-store`, `tidemark-live`, `tidemark-cli`, `tidemarkd`, `test-support`, and `xtask`.
    - `[workspace.package]`: version `0.1.0`, edition `2021`, license (team's choice), `rust-version` = pinned toolchain.
    - `[workspace.dependencies]` declares every third-party crate from `02-architecture.md` §11, plus `globset`, `smallvec`, `thiserror`, `anyhow`, `clap_complete` and `clap_mangen`, so member crates use `dep.workspace = true`.
    - `[workspace.lints]`: `rust.unsafe_code = "forbid"`, `clippy.all = "warn"`, `clippy.unwrap_used = "warn"`, `clippy.expect_used = "warn"`. Every crate uses `lints.workspace = true` **except `tidemark-sys`**, which has its own `[lints]` table (`unsafe_code = "deny"`, `unsafe_op_in_unsafe_fn = "deny"`, same clippy set) so its modules can `#[allow(unsafe_code)]`. A `forbid` can't be relaxed, and workspace lints can't be overridden per lint.
@@ -31,7 +31,7 @@
    - `[profile.release]`: `lto = "thin"`, `codegen-units = 1`, `debug = "line-tables-only"` (for useful backtraces and perf), `panic = "unwind"`.
 2. **`rust-toolchain.toml`** pinning the then-current stable Rust (record the version in the handoff), with `rustfmt` and `clippy` components.
 3. **Crate skeletons** with the module files listed in the table below. Every file compiles, and each starts with a doc comment `//! Owned by: W<task>` plus a one-line purpose. **`tidemark-cli` and `tidemarkd` are lib + bin crates** (`src/lib.rs` holds everything; `src/main.rs` is a thin `fn main`), so `tidemarkd::firstboot`, `tidemark_cli::client` and their parsers are reachable from tests and fuzz targets.
-   - **(Done in W0-B, after `tidemark-core` exists.)** Stub every public signature given in the wave files: `wave-1-primitives.md` (W1-A … W1-E), plus `tidemark_sys::fanotify::{probe, FanotifyCaps}` (W5-A), `tidemark_pg::{probe_from_config, PgProbe}` (W5-C), `tidemark_fs::lvm::{collect, LvmReport}` (W4-A) and `tidemark_live::rates::{slope_bytes_per_sec, time_to_full}` (W5-D). Cross-task calls then compile from day one. For W4-A, stub the **whole** `tidemark_fs::lvm` interface with final field lists, not just `collect`.
+   - **(Done in W0-B, after `tidemark-core` exists.)** Stub every public signature given in the wave files: `wave-1-primitives.md` (W1-A … W1-E), plus `tidemark_sys::fanotify::{probe, FanotifyCaps}` (W5-A), `tidemark_fs::lvm::{collect, LvmReport}` (W4-A) and `tidemark_live::rates::{slope_bytes_per_sec, time_to_full}` (W5-D). Cross-task calls then compile from day one. For W4-A, stub the **whole** `tidemark_fs::lvm` interface with final field lists, not just `collect`.
    - Tidemark is strictly read-only (ADR-008): no crate may contain code that changes file metadata, mounts, LVM or boot configuration. `xtask ci` scans the **non-test library and binary sources** (excluding `test-support/`, `xtask/`, `tests/`, `#[cfg(test)]` modules and string literals) for forbidden symbols: `FS_IOC_FSSETXATTR`, `Q_SETQUOTA`/`Q_XSETQLIM`, `libc::mount`/`umount`, and `Command::new` with an `lv*`/`vg*`/`pv*` command other than `lvs`/`vgs`. Any hit fails CI.
    - Stubs whose documented signatures can return an error return `Err(NotYetImplemented)` (an `io::ErrorKind::Unsupported` error, or the crate's error type with a `NotYetImplemented` variant), never `unimplemented!()`, so callers can treat them as "unknown". Error-free signatures (plain values, `Option`, references, constructors or unit) keep their exact signature and return inert placeholders: `None`, an empty collection, zero or a default value. The wave-file signature wins over this generic rule. Callers treat placeholders as "unknown", never real data, until the owning task replaces the body without changing the signature (SCR-005, `13`).
    - Later waves' internal modules may use `unimplemented!("W<task>")`.
@@ -52,9 +52,8 @@
 | tidemark-store | `writer.rs` `reader.rs` `catalog.rs` `timeseries.rs` `retention.rs` `space_guard.rs` (W1-E) · `diff.rs` (W3-A) · `links.rs` (W3-B) · `export_ncdu.rs` (W3-C) |
 | tidemark-scan | `agg/mod.rs` `agg/linkset.rs` `agg/lca.rs` `agg/rollup.rs` `agg/notable.rs` (W2-A) · `bulk/mod.rs` `bulk/join.rs` `bulk/names.rs` (W2-B) · `orchestrator.rs` `mode.rs` `progress.rs` (W2-C) |
 | tidemark-live | `watch/mod.rs` `watch/fdmode.rs` `watch/fidmode.rs` `watch/rings.rs` (W5-A) · `procscan.rs` (W5-B) · `rates.rs` `alerts/mod.rs` `alerts/rules.rs` `alerts/deliver.rs` `now.rs` (W5-D) |
-| tidemark-pg | `collector.rs` `queries.rs` `labels.rs` (W5-C) |
 | tidemark-cli | see W0-B |
-| tidemarkd | `main.rs`, `lib.rs` (W0-B stub → W6-A) · `firstboot.rs` (W4-B) · `api.rs` `state.rs` `scheduler.rs` `services/{sampler,lvm,watcher,procscan,pg,tswriter,alerts}.rs` (W6-A) · `metrics.rs` (W6-B) |
+| tidemarkd | `main.rs`, `lib.rs` (W0-B stub → W6-A) · `firstboot.rs` (W4-B) · `api.rs` `state.rs` `scheduler.rs` `services/{sampler,lvm,watcher,procscan,tswriter,alerts}.rs` (W6-A) · `metrics.rs` (W6-B) |
 
 ### Acceptance
 
@@ -79,7 +78,7 @@
 | `snapshot` | `SnapshotMeta` (every key in `05` §1, typed), `DirRow` (every `dirs` column), `FileRow`, `LinkSetRow`, `LinkInstanceRow`, `SkipRow`, `ErrorRow`, `AnnotationRow`, `SortKey`, `FileFilter`, `LinkFilter`, `FileHit` (row + optional full path), `LinkSetHit` (row + LCA path + instance count). |
 | `live` | Exactly the types in `07` §7a (field lists are normative), plus `NowReport`/`MountNow` from `07` §7. |
 | `dev` | `DevKind { Disk, Partition, Md { level }, Dm, Other }`, `BlockDevInfo { name, major, minor, kind, rotational: Option<bool>, scheduler: Option<String> }`, `DiskStat { read_ios, read_merges, read_sectors, read_ticks_ms, write_ios, write_merges, write_sectors, write_ticks_ms, in_flight, io_ticks_ms, time_in_queue_ms }` |
-| `config` | The full schema in `08` §3 as serde structs with `#[serde(deny_unknown_fields)]` and defaults matching the doc. Type names: `Config`, `GeneralConfig`, `RootConfig`, `ScanConfig`, `ThrottleConfig`, `ThrottleProfile`, `SamplerConfig`, `LvmConfig`, `WatchConfig`, `ProcscanConfig`, `PostgresConfig`, `MetricsConfig`, `AlertsConfig`, `AlertRule`, `RetentionConfig`, `SnapshotRetention`, `SampleRetention`. `Config::load(path)`; `Config::validate() -> Vec<ConfigIssue>` (paths absolute, windows parse, rule kinds valid; whether mounts exist is checked at runtime, not here). Unit tests round-trip the doc's example verbatim. |
+| `config` | The full schema in `08` §3 as serde structs with `#[serde(deny_unknown_fields)]` and defaults matching the doc. Type names: `Config`, `GeneralConfig`, `RootConfig`, `ScanConfig`, `ThrottleConfig`, `ThrottleProfile`, `SamplerConfig`, `LvmConfig`, `WatchConfig`, `ProcscanConfig`, `MetricsConfig`, `AlertsConfig`, `AlertRule`, `RetentionConfig`, `SnapshotRetention`, `SampleRetention`. `Config::load(path)`; `Config::validate() -> Vec<ConfigIssue>` (paths absolute, windows parse, rule kinds valid; whether mounts exist is checked at runtime, not here). Unit tests round-trip the doc's example verbatim. |
 | `api` | `Request { v, id, method, params: serde_json::Value }`, `Response { v, id, ok, result?, error? }`, `ApiErrorCode`, and typed param/result structs for every method in `08` §2. |
 | `json` | `JsonDoc<T> { schema: Cow<'static, str>, data: T }`, used by every `--json` output. |
 | `error` | `CoreError` for config/parse errors (thiserror). |
@@ -99,7 +98,7 @@ All structs derive `Debug, Clone` and, where sensible, `PartialEq` and `serde::{
 
 Create the stub signatures described in W0-A item 3 in their owners' files. Stubs follow the error-capable/error-free rules in W0-A item 3 (SCR-005, `13`); their types use the real `tidemark-core` types, so callers compile against final signatures.
 
-Owner map for the command files: `probe` W1-A · `scan` `snapshots` `top` `files` W2-C · `diff` W3-A · `links` `symlinks` W3-B · `export` `wide` W3-C · `lvm` W4-A · `deploy/*` W4-B · `watch` W5-A · `phantom` `writers` W5-B · `pg` W5-C · `now` `hot` `alerts` `status` W6-A · `tui` W7-A.
+Owner map for the command files: `probe` W1-A · `scan` `snapshots` `top` `files` W2-C · `diff` W3-A · `links` `symlinks` W3-B · `export` `wide` W3-C · `lvm` W4-A · `deploy/*` W4-B · `watch` W5-A · `phantom` `writers` W5-B · `now` `hot` `alerts` `status` W6-A · `tui` W7-A.
 
 ### Deliverables in `tidemarkd`
 

@@ -6,11 +6,11 @@
 
 | Task | Title | Owned paths | Depends on |
 |------|-------|-------------|------------|
-| W6-A | Daemon core, services, scheduler, API; CLI live commands | `tidemarkd/src/{main,api,state,scheduler}.rs`, `tidemarkd/src/services/**`, `tidemark-cli/src/cmd/{now,hot,alerts,status}.rs`, and the daemon-mode branches in `cmd/{scan,lvm,phantom,writers,pg}.rs` (see note) | W2–W5 |
+| W6-A | Daemon core, services, scheduler, API; CLI live commands | `tidemarkd/src/{main,api,state,scheduler}.rs`, `tidemarkd/src/services/**`, `tidemark-cli/src/cmd/{now,hot,alerts,status}.rs`, and the daemon-mode branches in `cmd/{scan,lvm,phantom,writers}.rs` (see note) | W2–W5 |
 | W6-B | Metrics exporter, dashboards, alert rules | `tidemarkd/src/metrics.rs`, `packaging/grafana/**`, `packaging/prometheus/**` | W6-A `state` API (skeleton first) |
 | W6-C | Packaging, systemd, RPM, install tests | `packaging/{systemd,tmpfiles.d,config}/**`, `packaging/rpm/**`, `xtask/src/rpm.rs`, `tests/install/**` | W6-A binary |
 
-**Note on shared CLI files:** `scan.rs` (W2-C), `lvm.rs` (W4-A), `phantom.rs`/`writers.rs` (W5-B) and `pg.rs` (W5-C) already exist. W6-A adds a "daemon first, direct fallback" branch at the top of each `run()` and **must not change their direct-mode code**. The reviewer checks the diff stays within that branch.
+**Note on shared CLI files:** `scan.rs` (W2-C), `lvm.rs` (W4-A) and `phantom.rs`/`writers.rs` (W5-B) already exist. W6-A adds a "daemon first, direct fallback" branch at the top of each `run()` and **must not change their direct-mode code**. The reviewer checks the diff stays within that branch.
 
 W6-A lands the `state` API skeleton (`LiveStateView` read methods) first, so W6-B can compile against it.
 
@@ -36,7 +36,6 @@ tidemarkd/src/
     lvm.rs         tidemark_fs::lvm::collect every lvm.interval → LiveState.lvm + ts-writer (timeout, back-off)
     watcher.rs     one tidemark_live::watch::Watcher per watch mount (/ and /data); minute drain → ts-writer
     procscan.rs    ProcScanner every procscan.interval
-    pg.rs          PgCollector fast/relations cadence; labels refreshed daily
     tswriter.rs    the single TimeSeries writer thread; batched inserts; hourly compact()
     alerts.rs      AlertEngine every 30 s; deliverers
 ```
@@ -56,7 +55,7 @@ tidemarkd/src/
   8. `READY=1`.
 - **`LiveState`:**
   - Per-mount rings of the last 2 h of raw fs samples (and the latest LVM report), so rates are computed from memory without DB reads.
-  - `Arc` handles to the watcher(s), procscan and pg collector.
+  - `Arc` handles to the watcher(s) and procscan.
   - The alert engine's active set.
   - Scan statuses.
   - Degraded reasons.
@@ -70,15 +69,14 @@ tidemarkd/src/
   - **Post-scan:**
     1. Compute `dir_growth` between the last two snapshots at depth ≤ `series_depth` (via `tidemark_store::diff`), feeding the `dir_growth` rule.
     2. Clear the watcher dirty set for that root.
-    3. Refresh labels from pg into the next scan's annotations.
-    4. Apply retention.
+    3. Apply retention.
 - **API:**
   - One thread per connection; max 32 concurrent connections.
   - 1 MiB request line limit; 10 s handler timeout.
   - `SO_PEERCRED` logged; every method accepts root or the daemon's own effective uid; other peers receive `forbidden`.
   - Methods and errors exactly as `08` §2.
 - **Self-protection:** `state_dir` is always added to watch and procscan excludes and to scan excludes. The space guard emits the `state_space` alert.
-- **Reload (SIGHUP / `config.reload`):** re-read config and validate. Apply changes to schedules, alert rules, thresholds, exclude lists and metrics settings live. Changes to mounts, the watch set or the Postgres DSN restart only the affected service. Invalid config keeps the old one and reports the issues.
+- **Reload (SIGHUP / `config.reload`):** re-read config and validate. Apply changes to schedules, alert rules, thresholds, exclude lists and metrics settings live. Changes to mounts or the watch set restart only the affected service. Invalid config keeps the old one and reports the issues.
 - **Shutdown:** stop the API, cancel the running scan (no partial snapshot kept), stop the watchers, flush the ts-writer, then exit within 10 s.
 - **First-boot report:** after startup, if `tidemarkd::firstboot::needs_report(state_dir, config_sha)` is true, the daemon builds `FirstbootInputs` once all components have reported (or after 2 minutes), then calls `build` + `write` (W4-B). Never more than once per staged config.
 - **Strictly read-only** (ADR-008): the daemon has no code path that changes file metadata, mounts or LVM.
@@ -89,14 +87,14 @@ tidemarkd/src/
 - `now`: renders `NowReport` via `render_now_text` (terminal width from `TIOCGWINSZ`, default 100). `--json` gives the raw report.
 - `hot`, `alerts`, `status`: tables. `status` shows versions, uptime, each component's state and mode, last error per component, scan schedule and next run.
 - **Daemon branches:**
-  - `lvm`, `pg`, `writers`: try the daemon first, otherwise fall back to direct mode with a one-line notice.
+  - `lvm`, `writers`: try the daemon first, otherwise fall back to direct mode with a one-line notice.
   - `scan`: if the daemon is up, `scan.start` + follow `scan.status` (and `--cancel` → `scan.cancel`); otherwise W2-C's direct mode.
   - `phantom`: same, but `--direct` forces direct mode.
 
 ### Tests
 
 - Unit: schedule/window parser and next-run computation (DST transitions, windows wrapping midnight); API framing (partial lines, oversize line, malformed JSON → `bad_request`); peer-uid check (root or the daemon's own uid accepted; others `forbidden`) for every method.
-- Integration (unprivileged): start the daemon with a temp config (watcher/LVM/pg disabled, walk-mode root on a fixture, socket in a temp dir) → `tidemark status`, `scan.start` via the CLI, `scan.status` until complete, then `now` renders.
+- Integration (unprivileged): start the daemon with a temp config (watcher/LVM disabled, walk-mode root on a fixture, socket in a temp dir) → `tidemark status`, `scan.start` via the CLI, `scan.status` until complete, then `now` renders.
 - Privileged `daemon_end_to_end` (`09` §5): start via `systemd-run` with the real unit's properties → write 50 MiB under a transient unit → within 60 s, `tidemark now` shows the hot directory and the unit; `tidemark now` shows both tracked mounts and, on a loop-LVM thin volume, the pool's data %.
 - Privileged `daemon_reload_and_shutdown`: SIGHUP with a changed alert rule is applied; an invalid config is rejected; SIGTERM mid-scan exits within 10 s with no `.db.tmp` left.
 
@@ -125,10 +123,9 @@ tidemarkd/src/
   - top-level directory sizes over time (from `tidemark_dir_used_bytes`);
   - top directories (table from `tidemark_dir_used_bytes`);
   - phantom bytes;
-  - Postgres WAL/slots;
   - scan freshness;
   - watcher health.
-- `packaging/prometheus/tidemark-alerts.yml`: `TidemarkTimeToFull`, `TidemarkThinPool`, `TidemarkPhantomBytes`, `TidemarkPgSlotRetention`, `TidemarkScanStale`, `TidemarkWatcherLossy`, `TidemarkDown` (absent `tidemark_up`), and `TidemarkAlertFiring` (pass-through of `tidemark_alert_firing`).
+- `packaging/prometheus/tidemark-alerts.yml`: `TidemarkTimeToFull`, `TidemarkThinPool`, `TidemarkPhantomBytes`, `TidemarkScanStale`, `TidemarkWatcherLossy`, `TidemarkDown` (absent `tidemark_up`), and `TidemarkAlertFiring` (pass-through of `tidemark_alert_firing`).
 
 ### Tests
 
@@ -152,7 +149,7 @@ tidemarkd/src/
 
 - `packaging/systemd/tidemarkd.service`: **exactly** `08` §6. Do not add mount-namespace options.
 - `packaging/tmpfiles.d/tidemark.conf`: `d /run/tidemark 0700 root root -`.
-- `packaging/config/tidemark.toml`: the `08` §3 example with explanatory comments. Postgres, webhook and HTTP metrics are disabled by default. Roots, sampler and watch mounts default to `/` and `/data` (matching the fleet layout); hosts without `/data` are caught by `deploy stage` pre-flight.
+- `packaging/config/tidemark.toml`: the `08` §3 example with explanatory comments. Webhook and HTTP metrics are disabled by default. Roots, sampler and watch mounts default to `/` and `/data` (matching the fleet layout); hosts without `/data` are caught by `deploy stage` pre-flight.
 - `xtask rpm [--container]`:
   - Build release binaries in a `rockylinux:8` container (podman, or docker if present). The toolchain is installed via rustup in the container image; cache it.
   - Then `cargo generate-rpm` with metadata in `packaging/rpm/rpm.toml`.
