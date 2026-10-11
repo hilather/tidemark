@@ -167,13 +167,14 @@ Notes:
 
 - **`O_NOATIME` matters on RAID 5.** `getdents` counts as a read access. Under `relatime`, the first scan touching a directory more than 24 h after its last access updates its atime: a metadata **write** per directory, which turns a read-only scan into millions of small random writes on parity RAID. Root (`CAP_FOWNER`) can always use `O_NOATIME`. `statx` never updates atime.
 - Only one directory fd per worker is open at a time, so fd usage is bounded by `threads + small constant`.
+- If the mount id, parent id, device and mount point can be decoded, retain the record as a boundary even when later fields are malformed: set those fields to empty and log the line with `tracing::warn!`. If any line’s mount point cannot be decoded, return `Err` for the whole table so callers fail closed. Valid nsfs records are unaffected. When mount discovery returns `Err` and the kernel reports no mount ids, the walker refuses to run.
 - `mount_points` is built once from `/proc/self/mountinfo`. It is the set of mount targets strictly under the root; mountinfo octal escapes such as `\040` must be decoded. It catches same-device bind mounts, which `st_dev` cannot.
-- Notable-file admission: emit if `disk ≥ big_file_threshold` or if the worker-local size min-heap of size `top_files` would admit it, including all ties at its cutoff. The aggregator keeps the global top-N plus everything at or above the threshold, capped at `max_notable` (default 200,000).
+- Notable-file admission: emit if `disk ≥ big_file_threshold` or if the worker-local size min-heap of size `top_files` would admit it, including cross-directory ties at its cutoff, subject to the exact per-directory top-N bound below. The aggregator keeps the global top-N plus everything at or above the threshold, capped at `max_notable` (default 200,000).
 - Each worker calls `ioprio_set(IOPRIO_CLASS_IDLE)` for itself (I/O priority is per thread) and the process runs at `nice 10`. These are best-effort only; see §6.
 
 The aggregator tolerates `DirId` holes: a `Gone` record removes that id from the tree and, for `OtherFs`, adds a `Skip` to the parent. On a quiescent tree no `Gone` records occur, so bulk/walk equality is unaffected.
 
-Workers emit every candidate that could win global top-N under `(disk desc, final directory id asc, inode asc)`, including all ties at the worker's size cutoff. The heap holds at most `top_files` sizes (configuration cap 200,000), with no worker-wide tie collection. Per `docs/handoff/W1-B-fix.md`, ties live in the current `DirRecord`, capped by the existing 1,000,000 direct-entry limit: exceeding it returns `WalkError::Limit("million-entry directory cap")` and aborts the scan, never silently truncates candidates. At most `threads` producer records and `out.capacity()` queued records are retained (validated bounds 64 and 1,024), giving at most `(threads + out.capacity()) * 1,000,000` notable candidates plus `threads * top_files` heap size values. Consumer retention is the consumer's responsibility; this large finite ceiling is not a measured worst-case RSS guarantee.
+A `DirRecord` carries at most `top_files` top-N candidates, chosen by `(disk desc, inode asc)` within that directory. This preserves every possible global top-N winner under `(disk desc, final directory id asc, inode asc)`; cross-directory ties at the worker cutoff are still emitted. A separate over-threshold class must have an exact per-directory bound for `03` §4 Step G, or W1-B writes `docs/handoff/scr-W1-B/SCR-001.md` with the trade-off and implements the safest bounded behaviour. See `13` G3 and `04` §7 for the byte budget; the million-entry cap is not a candidate memory budget.
 
 ### 2.3 Output ordering
 
@@ -247,17 +248,19 @@ The EL8 userspace header (`xfsprogs-devel-5.0.0-12.el8`, `/usr/include/xfs/xfs_f
 
 Bindings are hand-transcribed, not bindgen output, and pinned by layout tests to sizes and offsets measured with `gcc`: `xfs_bstat` 136 bytes, `xfs_bstime` 16, `xfs_fsop_bulkreq` 32, `xfs_fsop_geom` 112 from the EL8 header; `xfs_bulkstat` 192, `xfs_bulk_ireq` 64 and `XFS_IOC_BULKSTAT` `0x8040587f` measured against `xfsprogs-devel-6.4.0-7.el9` (same kernel ABI).
 
+Charge the `Gate` before every call to the bulkstat iterator, including terminal and error calls. Use a conservative per-batch cost, never the returned record count after I/O; the first charge also covers the geometry read. W2-C resolves leaf devices and constructs the gate; W2-B receives it.
+
 ### 5.2 Iteration ranges
 
 v5 starts inclusively at the requested inode, uses the per-AG request flag, advances from the returned cursor, and stops at the exclusive end or an empty batch. Never fall back to v1 records.
 
 ### 5.3 What bulkstat gives us for free
 
-v5 `bs_projectid` gives the project ID of every inode. v1 only records each directory's ID (`dirs.projid`, normally 0) so a future project-quota add-on (`06-project-quotas-deferred.md`) has the data; nothing in v1 depends on it.
+v5 `bs_projectid` gives the project ID of every inode. Tidemark records each directory’s ID (`dirs.projid`, normally 0) for a future project-quota add-on (`06-project-quotas-deferred.md`); the current product does not otherwise use it.
 
 ### 5.4 Units validation (mandatory test)
 
-`bs_blocks` is expected in filesystem blocks, not 512-byte units. **Do not trust that.** The privileged test `bulkstat_blocks_match_statx` picks 10,000 random inodes on a loop XFS image and asserts `bulk_disk_bytes(ino) == statx.blocks * 512` for each. The conversion constant lives in one function with this test next to it.
+`BulkInode.disk_bytes` is already in bytes and must not be multiplied again. The sys conversion from `bs_blocks` is validated against `statx.blocks * 512`; confirm the `bs_blocks` unit at runtime on both Rocky VMs. The privileged test `bulkstat_blocks_match_statx` picks 10,000 random inodes on a loop XFS image and asserts `bulk_disk_bytes(ino) == statx.blocks * 512` for each. The conversion constant lives in one function with this test next to it.
 
 ## 6. Throttling
 
@@ -269,7 +272,7 @@ v5 `bs_projectid` gives the project ID of every inode. v1 only records each dire
 |-----------|------|
 | Directory open + each `getdents64` call | 1 |
 | `statx` | 1 |
-| Bulkstat call returning *n* inodes | `ceil(n / inodes_per_cluster)`, where `inodes_per_cluster = 32` for 512-byte inodes |
+| Each bulkstat iterator call | Before the I/O, conservatively charge `ceil(batch / inodes_per_cluster)`, where `inodes_per_cluster = 32` for 512-byte inodes; the first call also covers geometry |
 | Phase 3 directory re-read | 1 |
 
 ### 6.2 Adaptive gate (`tidemark-fs::throttle`, W1-D)
@@ -295,9 +298,42 @@ v5 `bs_projectid` gives the project ID of every inode. v1 only records each dire
   Real targets come from the pilot baseline.
 - Our own I/O counts toward `util` on purpose: the goal is to keep the array below the cap, whoever is causing the load.
 
-The caller resolves leaves with `blockdev::resolve_leaves`; unavailable discovery means an empty slice and the configured minimum gate rate. `StatSampler` and `read_disk_stats` return exactly one sample per leaf in input order and fail the whole sample if any device cannot be read. Samplers finish within one interval. Signatures stay unchanged; `controller_step` is counter-only, so callers mask utilisation (`io_ticks_ms = 0`) for non-rotational, unknown or multi-queue devices. `FixedGate::new` is private.
+The caller resolves leaves with `blockdev::resolve_leaves`; unavailable discovery means an empty slice and the configured minimum gate rate. `StatSampler` and `read_disk_stats` return exactly one sample per leaf in input order and fail the whole sample if any device cannot be read. Samplers finish within one interval. Sampler signatures stay unchanged; `controller_step` is counter-only, so callers mask utilisation (`io_ticks_ms = 0`) for non-rotational, unknown or multi-queue devices. `FixedGate::new` is private.
 
 The token bucket accounts for outstanding token debt: elapsed earnings use the previous rate before a rate change, and waiting acquisitions recheck their targets at the new rate. Per `docs/handoff/W1-D-fix.md`, cumulative issued/earned tokens use constant-size mutex/condition-variable state, with no waiter queue; surplus is capped to 0.25 seconds at the current rate.
+
+The factory returns a `ScanGate` handle (G2, `13`):
+
+```rust
+pub struct ScanGate { /* private fields */ }
+impl ScanGate {
+    /// The gate to pass to the walker and the bulk pipeline.
+    pub fn gate(&self) -> Arc<dyn Gate>;
+    /// Statistics so far.
+    pub fn stats(&self) -> GateStats;
+    /// Stop the controller thread (joined within one interval) and return the final statistics.
+    pub fn stop(self) -> GateStats;
+}
+pub fn gate_from_config(
+    profile: &str,
+    cfg: &ThrottleConfig,
+    leaves: &[BlockDevInfo],
+    sampler: StatSampler,
+) -> Result<ScanGate, ConfigIssue>;
+```
+
+`GateStats` is `tidemark_core::scan::GateStats`, unchanged. For an adaptive gate the statistics are
+the controller's. For a fixed-rate gate: `mean_rate` and `min_rate` are the fixed rate,
+`throttled_ms` is the measured blocked time, `decreases` and `increases` are 0. For profile `max`
+(no throttling): every field is 0, and the documentation says that a rate of 0 together with
+profile `max` means "unthrottled". Dropping a `ScanGate` without calling `stop` also stops the
+controller. Acquisitions already waiting when `stop` is called complete at the last rate.
+
+Replace the accumulated `f64` counters with exact integer arithmetic (for example
+nano-tokens in `u128`, or `u64` with checked arithmetic and a rebasing step that preserves the
+targets of waiters). Rates stay `f64` in the public API. No counter may wrap or lose precision
+for any legal rate and any run length. Add regressions seeded near 2^53 units, with and without
+outstanding waiters, asserting that each acquisition is still charged.
 
 ## 7. Mode selection (`auto`)
 
@@ -314,7 +350,11 @@ Choose **bulk** if all of the following hold, otherwise choose **walk** and log 
    bytes      ≈ dents × 12 + dirs × 320 + 64 MiB
    ```
 
-The walk-mode estimate is `dirs × 320 + link_entries × 72 + 64 MiB`. If it exceeds the budget, the scan still runs but logs a warning; the cap is enforced by the systemd `MemoryLimit`.
+The walk-mode base estimate is `dirs × 320 + link_entries × 72 + 64 MiB`; add candidate storage below. The orchestrator sizes the walker output channel from the scan memory budget.
+
+For top-N candidate storage, let `T = threads`, `C = output channel capacity`, `N = top_files`, `L = maximum allocated name bytes` and `B = bytes per candidate` (measured layout plus name storage and allocation/capacity overhead, at least `size_of::<NotableFile>() + L`). The walker holds at most `(T + C) * N * B + T * N * size_of::<u64>()` bytes of top-N candidates and worker cutoff heaps. Record headers, links, skipped entries, errors, traversal tasks and buffers are additional memory. If over-threshold candidates are separate, add `(T + C) * H * B` for their documented exact per-directory cap `H`; if exact bounded retention cannot be implemented, W1-B must file its G3 SCR rather than silently truncate.
+
+W2-C assigns a share `M_queue` of the scan memory budget to queued records and chooses `C` so that `C * top_files * B <= M_queue`, i.e. `C <= floor(M_queue / (top_files * B))` for nonzero `top_files`. Include any separate threshold class and other record storage in the queued-record estimate, and reserve the producer term `T * N * B`, heaps and other scan state separately. Zero `top_files` contributes no top-N storage; channel capacity remains bounded for other record fields. If the budget cannot fit a usable channel plus producer state, refuse with an explicit resource error; do not rely on cgroup OOM as backpressure.
 
 An explicit `--mode bulk` without v5 fails with exit code 5 and a message naming missing v5 bulkstat; it does not fall back to v1 metadata.
 

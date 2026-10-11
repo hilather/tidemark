@@ -72,7 +72,7 @@
 
 | Module | Content |
 |--------|---------|
-| `path` | `RawName` (non-empty, no `/`) and `RawPath` (absolute, normalised, no trailing slash except `/`), backed by bytes. Methods: `from_path`, `as_path`, `join`, `parent`, `file_name`, `starts_with` (component-wise), `display_lossy` (escapes control chars and invalid UTF-8 as `\xNN`), `hash64` (xxh3, as `i64`), `to_json` (`{"path": …}` or `{"path_b64": …}`). Implements `Ord` by bytes. |
+| `path` | `RawName` (non-empty, no `/`) and `RawPath` (absolute, normalised, no trailing slash except `/`), backed by bytes. Methods: `from_path`, `as_path`, `join`, `parent`, `file_name`, `starts_with` (component-wise), `display_lossy` (escapes control chars and invalid UTF-8 as `\xNN`), `hash64` (xxh3, as `i64`), `to_json` (`{"path": …}` or `{"path_b64": …}`). Implements `Ord` by bytes. SCR-007 adds `pub fn display_lossy_bytes(bytes: &[u8]) -> String`: printable Unicode is kept; control characters, invalid UTF-8 bytes and backslashes use uppercase `\xNN`. Both `display_lossy` methods delegate to it with unchanged behaviour. |
 | `units` | `ByteSize` (serde from `"1GiB"` or an integer), `fmt_bytes(u64)` (exact bytes below 1 KiB; otherwise binary units, 3 significant digits after rounding and unit promotion: `1.23 GiB`, `611 GiB`), `parse_rate("50GiB/h") -> Result<f64, CoreError>` (bytes/s), `fmt_rate`. |
 | `time` | `AGE_BOUNDS_SECS = [86_400, 604_800, 2_592_000, 7_776_000, 31_536_000]`, `age_bucket(scan_start, mtime) -> usize` (future mtime → 0), `ScanId::new(now: i64) -> Result<ScanId, CoreError>` (`YYYYMMDDTHHMMSSZ-<8 lowercase hex>`; errors outside the four-digit UTC-year range), `unix_now()`, humantime helpers. |
 | `scan` | Exactly the types in `04-scanner.md` §1, including `Gate` and `NoopGate`. Add `SnapshotStatus { Complete, Partial }` and `ScanMode { Walk, Bulk }`. |
@@ -131,11 +131,13 @@ Owner map for the command files: `probe` W1-A · `scan` `snapshots` `top` `files
 
 ### `xtask vm-test`
 
-`cargo xtask vm-test --host <ssh> [--remote-dir DIR] [--filter PATTERN] [--suite cargo|install|fault]`:
+`cargo xtask vm-test --host <ssh> [--remote-dir DIR] [--filter PATTERN] [--suite cargo|install|fault] [--env NAME=VALUE]... [--nocapture]`:
 
 1. rsync the workspace, excluding `target/`.
 2. Over SSH: `cargo build --workspace --features privileged --tests`, then `sudo env "PATH=$PATH" cargo test --workspace --features privileged -- --test-threads=1 [PATTERN]` (EL8 sudo's `secure_path` ignores `-E`, so pass `PATH` explicitly). Privileged tests are gated by the feature only, **not** by `#[ignore]`; scale tests use `#[ignore = "scale"]` and are not run here. `--suite install|fault` runs the script suites in `tests/install/` and `tests/fault/` instead of cargo tests.
-3. Stream the output; exit with the remote exit code.
+3. Stream the output; exit with the remote exit code. `--nocapture` appends `--nocapture` to test binary arguments after `--`.
+4. Repeatable `--env NAME=VALUE` accepts only names matching `TIDEMARK_[A-Z0-9_]+`, rejecting others before any connection. Pass pairs through SSH and sudo next to PATH (`sudo env "PATH=$PATH" NAME=VALUE ... cargo test ...`), shell-quoting values so spaces, quotes and metacharacters cannot escape. Unit-test accepted/rejected names, a value with a space, quote and semicolon, and argument positions.
+5. Document disposable loop-device md provisioning in `xtask/README.md` and pass `--env TIDEMARK_W1A_MD_DEVICE=/dev/mdX`; commands and required gate evidence are in `09` §5. Run provisioning only in the VM.
 
 Document VM prerequisites in `xtask/README.md`: Rocky 8.8 and 8.10 VMs, packages from `09` §5, a passwordless-sudo test user, and a rustup toolchain.
 

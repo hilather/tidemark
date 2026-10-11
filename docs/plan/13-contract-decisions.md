@@ -71,6 +71,7 @@ The generic cross-task stub rule requires `Err(NotYetImplemented)`, but some doc
 
 **Decision: accepted.**
 
+
 - A stub whose documented signature can return an error returns `Err(NotYetImplemented)`.
 - A stub whose documented signature cannot return an error keeps that exact signature and returns an inert placeholder: `None`, an empty collection, zero or a default value. The signature in the wave file always wins over the generic stub rule.
 - Callers treat these functions as "unknown" until the owning task merges; placeholders must not be treated as real data. The owning task replaces the body without changing the signature.
@@ -82,6 +83,7 @@ Plan locations: W0-A deliverable 3 and W0-B Cross-task stubs; W1 entry; `05` §3
 The normative `t_apparent` definition includes directory `st_size`, but GNU `du` apparent mode differs across releases. In a `rockylinux:8` container, `du (GNU coreutils) 8.30` was measured to count directory sizes; coreutils 9.2 and later count only regular files and symbolic links in apparent mode.
 
 **Decision: accepted.**
+
 
 - Keep the directory-inclusive `t_apparent` definition in `03` unchanged. Direct equality with `du -sxB1 --apparent-size` holds when `du` counts directory sizes, including on the target platform; NFR-1 is unchanged in meaning.
 - Compare `t_disk` directly with `du -sxB1` on every version.
@@ -115,13 +117,23 @@ Plan locations: `03` §2–3; `09` §3; `01` NFR-1; W2-C oracle tests. Affected 
 
 These final coordinator decisions supersede pending request text in the Wave 1 handoffs. Implementation details cited below follow the fix notes; module inspection is not runtime verification.
 
+| Wave 1 request | Status | Decision section |
+|----------------|--------|------------------|
+| `scr-W1-A/SCR-001` | **Decided** | Mount roots; G4 |
+| `scr-W1-A/SCR-002` | **Decided** | CLI surface tests |
+| `scr-W1-D/SCR-001` | **Decided** | Throttle; G2/G7 |
+| `scr-W1-E/SCR-1` | **Decided** | Store; G5 |
+
+The request files themselves remain unchanged.
+
 ### Mount roots
 
 Kernel-object mount roots from nsfs are not paths. Rejecting them must not invalidate other mounts in the table.
 
 **Decision: accepted.**
 
-`MountInfo.root` is `enum MountRoot { Path(RawPath), Object(Vec<u8>) }`. Object roots such as `net:[4026533000]` remain mount boundaries. Report and skip malformed lines, returning well-formed records.
+
+`MountInfo.root` is `enum MountRoot { Path(RawPath), Object(Vec<u8>) }`. Object roots such as `net:[4026533000]` remain mount boundaries. Preserve independently decoded boundaries and fail closed as specified in G4 below.
 
 Plan locations: W1-A interface/details; `04` §2.2. Affected tasks: W1-A, W1-B, W2-C.
 
@@ -130,6 +142,7 @@ Plan locations: W1-A interface/details; `04` §2.2. Affected tasks: W1-A, W1-B, 
 Lexical normalization before realpath can change what a symlink-containing path resolves to. Unresolved paths must not borrow another mount’s facts, and printable UTF-8 still needs safe escaping.
 
 **Decision: accepted.**
+
 
 Canonicalize the user-supplied path (resolve symlinks as realpath) before constructing `RawPath`; never lexically normalize first. Return unknown facts with the reason on resolution failure. Escape every displayed mount field like `RawPath::display_lossy`, whether valid UTF-8 or not.
 
@@ -140,6 +153,7 @@ Plan locations: W1-A details; SCR-004 above. Affected tasks: W1-A, W2-C, later q
 Legacy v1 bulkstat has a 16-bit link count: 65,537 arrives as 1 without detectable overflow. Exact link counts determine reclaimable space (`03` §4).
 
 **Decision: accepted.**
+
 
 `tidemark_sys::xfs::bulkstat` uses `XFS_IOC_BULKSTAT` v5 with 32-bit `bs_nlink` only, returning `Unsupported` when unavailable. `bulkstat_probe` still reports `BulkstatSupport { v1, v5 }`. Auto chooses bulk only with v5; explicit `--mode bulk` without it fails with exit code 5 and a message naming the reason. Walk uses exact `statx` counts.
 
@@ -155,7 +169,8 @@ Counter-only samples need stable leaf identity and meaningful utilisation. Immut
 
 **Decision: accepted.**
 
-Signatures are unchanged. The caller resolves leaves with `blockdev::resolve_leaves`; unavailable discovery means an empty slice and the configured minimum gate rate. `StatSampler` and `read_disk_stats` return exactly one sample per leaf in input order and fail the whole sample if any device cannot be read. Samplers finish within one interval. Signatures stay unchanged; `controller_step` is counter-only, so callers mask utilisation (`io_ticks_ms = 0`) for non-rotational, unknown or multi-queue devices. `FixedGate::new` is private.
+
+Except for the G2 factory handle below, sampler signatures are unchanged. The caller resolves leaves with `blockdev::resolve_leaves`; unavailable discovery means an empty slice and the configured minimum gate rate. `StatSampler` and `read_disk_stats` return exactly one sample per leaf in input order and fail the whole sample if any device cannot be read. Samplers finish within one interval. Signatures stay unchanged; `controller_step` is counter-only, so callers mask utilisation (`io_ticks_ms = 0`) for non-rotational, unknown or multi-queue devices. `FixedGate::new` is private.
 
 The token bucket accounts for outstanding token debt: elapsed earnings use the previous rate before a rate change, and waiting acquisitions recheck their targets at the new rate. Per `docs/handoff/W1-D-fix.md`, cumulative issued/earned tokens use constant-size mutex/condition-variable state, with no waiter queue; surplus is capped to 0.25 seconds at the current rate.
 
@@ -166,6 +181,7 @@ Plan locations: `04` §6.2; W1-A/D notes; W2-C gate setup. Affected tasks: W1-A/
 Retention can otherwise remove a root’s last usable snapshot with zero recent retention. A corrupt shared database cannot be rebuilt through a catalog that failed to open, and lossy glob matching changes path meaning.
 
 **Decision: accepted.**
+
 
 Always keep each root’s newest complete snapshot regardless of policy. `Catalog::open` remains non-destructive. After an open reports corruption, callers stop writers and close all catalog/sample connections, then call `tidemark_store::catalog::recover_catalog(state_dir)` to preserve the database and WAL/SHM sidecars by rename, create a fresh database and rebuild the catalog from valid snapshot files. The daemon at startup and `snapshots rebuild-catalog` use this path only on reported corruption and log the preserved paths. Per `docs/handoff/W1-E-fix.md`, preservation uses an exclusively created private `timeseries-recovery-N` directory inside `state_dir`, with at most 10,000 namespace attempts and directory syncs; no artifacts are deleted. `Catalog::recovery_files() -> &[PathBuf]` reports the preserved paths. Historical samples are unavailable in the new database but remain in those artifacts.
 
@@ -179,7 +195,8 @@ Worker-local filename tie breaking can discard the global winner before final di
 
 **Decision: accepted.**
 
-Workers emit every candidate that could win global top-N under `(disk desc, final directory id asc, inode asc)`, including all ties at the worker's size cutoff. The heap holds at most `top_files` sizes (configuration cap 200,000), with no worker-wide tie collection. Per `docs/handoff/W1-B-fix.md`, ties live in the current `DirRecord`, capped by the existing 1,000,000 direct-entry limit: exceeding it returns `WalkError::Limit("million-entry directory cap")` and aborts the scan, never silently truncates candidates. At most `threads` producer records and `out.capacity()` queued records are retained (validated bounds 64 and 1,024), giving at most `(threads + out.capacity()) * 1,000,000` notable candidates plus `threads * top_files` heap size values. Consumer retention is the consumer's responsibility; this large finite ceiling is not a measured worst-case RSS guarantee.
+
+A `DirRecord` carries at most `top_files` top-N candidates, chosen by `(disk desc, inode asc)` within that directory. This preserves every possible global top-N winner under `(disk desc, final directory id asc, inode asc)`; cross-directory ties at the worker cutoff are still emitted. A separate over-threshold class must have an exact per-directory bound for `03` §4 Step G, or W1-B writes `docs/handoff/scr-W1-B/SCR-001.md` with the trade-off and implements the safest bounded behaviour. See G3 below and `04` §7 for the byte budget; the million-entry cap is not a candidate memory budget.
 
 Plan locations: `04` §2.2; W1-B notes; W2-A selection. Affected tasks: W1-B, W2-A/B.
 
@@ -188,6 +205,7 @@ Plan locations: `04` §2.2; W1-B notes; W2-A selection. Affected tasks: W1-B, W2
 SCR-006’s target-platform claim now has a measurement. The directory-inclusive metric remains normative across differing coreutils behaviour.
 
 **Decision: accepted.**
+
 
 In a `rockylinux:8` container, `du (GNU coreutils) 8.30` with `--apparent-size` was measured to count directory sizes; coreutils 9.2 and later do not. SCR-006 stands: probe local behaviour and normalize using measured directory/non-regular inode sizes when needed, never a version-string branch.
 
@@ -199,6 +217,7 @@ A `cargo test` run on overlayfs in a `rockylinux:8` container exposed literal al
 
 **Decision: accepted.**
 
+
 Measure allocated sizes (`st_blocks`), directory sizes and `du` figures; do not assert filesystem-dependent literals. Assert the `03` §6 worked example exactly only in the in-memory reference test and privileged loop-XFS test.
 
 Plan locations: `09` §1; W1-B tests/acceptance; W2-A golden tests. Affected tasks: All fixture-test owners, especially W0-C, W1-B/C/E, W2-A/C.
@@ -209,6 +228,179 @@ Surface tests that require an unimplemented-command error fail as implementation
 
 **Decision: accepted.**
 
+
 Assert commands, flags, help, parsing and exit-code mapping only, never that a command remains unimplemented.
 
 Plan locations: `09` §1; W1-A SCR-002. Affected tasks: W0-A, W1-A, W2-C and later CLI owners.
+
+### G2 — the gate factory returns a handle
+
+**Decision: accepted.**
+
+`gate_from_config` currently returns
+`Result<Arc<dyn Gate>, ConfigIssue>`, so a caller cannot read statistics or stop the controller.
+Change it to exactly:
+
+```rust
+pub struct ScanGate { /* private fields */ }
+impl ScanGate {
+    /// The gate to pass to the walker and the bulk pipeline.
+    pub fn gate(&self) -> Arc<dyn Gate>;
+    /// Statistics so far.
+    pub fn stats(&self) -> GateStats;
+    /// Stop the controller thread (joined within one interval) and return the final statistics.
+    pub fn stop(self) -> GateStats;
+}
+pub fn gate_from_config(
+    profile: &str,
+    cfg: &ThrottleConfig,
+    leaves: &[BlockDevInfo],
+    sampler: StatSampler,
+) -> Result<ScanGate, ConfigIssue>;
+```
+
+`GateStats` is `tidemark_core::scan::GateStats`, unchanged. For an adaptive gate the statistics are
+the controller's. For a fixed-rate gate: `mean_rate` and `min_rate` are the fixed rate,
+`throttled_ms` is the measured blocked time, `decreases` and `increases` are 0. For profile `max`
+(no throttling): every field is 0, and the documentation says that a rate of 0 together with
+profile `max` means "unthrottled". Dropping a `ScanGate` without calling `stop` also stops the
+controller. Acquisitions already waiting when `stop` is called complete at the last rate.
+
+Plan locations: `04` §6.2; W1-D; W2-C.
+
+### G7 — exact token accounting
+
+**Decision: accepted.**
+
+The token counters are `f64` values that accumulate for the
+life of the gate; at 2^53 adding one unit no longer changes them, so acquisitions stop being
+charged. Replace the accumulated `f64` counters with exact integer arithmetic (for example
+nano-tokens in `u128`, or `u64` with checked arithmetic and a rebasing step that preserves the
+targets of waiters). Rates stay `f64` in the public API. No counter may wrap or lose precision
+for any legal rate and any run length. Add regressions seeded near 2^53 units, with and without
+outstanding waiters, asserting that each acquisition is still charged.
+
+Plan locations: `04` §6.2; W1-D.
+
+### G3 — bound the notable candidates per directory, exactly
+
+**Decision: accepted.**
+
+Since the tie fix, a directory
+record keeps every file tied at the worker's size cutoff, which can be a million candidates
+for one directory of equal-sized files. The global selection (`03` §4 Step G) takes `top_files`
+files in the order `(disk desc, final directory id asc, inode asc)`. Inside one directory the
+directory id is the same for all files, so one directory can contribute at most `top_files`
+winners and they are its first `top_files` files by `(disk desc, inode asc)`. Therefore: a
+`DirRecord` carries at most `top_files` top-N candidates, chosen by `(disk desc, inode asc)`
+within that directory. This loses nothing. Keep the cross-directory behaviour (ties at the
+worker's cutoff are still emitted). If files at or above `big_file_threshold` form a separate
+class of candidates, bound that class per directory in a way that is also exact for the
+normative selection, or, if it cannot be made exact, write
+`docs/handoff/scr-W1-B/SCR-001.md` with the trade-off and implement the safest bounded behaviour.
+State the resulting worst-case bytes held by the walker as a formula of `threads`, the output
+channel capacity, `top_files` and the name length. Add a test with several wide directories of
+equal-sized files and a slow consumer that asserts the per-record candidate count never
+exceeds `top_files` and that the global winners are all present.
+In addition, for the plan: the scan orchestrator (W2-C) sizes the walker's output channel from
+the scan memory budget, so that `capacity * top_files * (bytes per candidate)` stays inside the
+share of the budget given to queued records; `04` §7 must state the formula.
+
+Plan locations: `04` §2.2/§7; W1-B; W2-C.
+
+### G4 — never lose a mount boundary
+
+**Decision: accepted.**
+
+`parse_mountinfo` now skips a malformed line and returns
+the rest, so a line with a readable mount point but a broken later field disappears from the
+table, and the walker's "mount table unavailable" safety check does not trigger because the
+result is `Ok`. Decide per line: if the mount id, parent id, device and mount point can be
+decoded, keep the record as a boundary even when later fields are malformed (set those fields
+to empty and log the line with `tracing::warn!`). If the mount point of any line cannot be
+decoded, return `Err` for the whole table, so callers fail closed. Valid nsfs records are
+unaffected. In the walker, keep the rule that when mount discovery returns `Err` and the kernel
+reports no mount ids, the scan refuses to run. Add a regression: a table with a line whose final
+field is missing still yields that line's mount point from `submounts_under`; a table with an
+undecodable mount point returns `Err`.
+
+Plan locations: `04` §2.2; W1-A/B.
+
+### G5 — do not let SQLite touch a corrupt database before recovery
+
+**Decision: accepted.**
+
+When `timeseries.db`
+holds garbage, `Catalog::open` (and `TimeSeries::open`) hands it to SQLite, which returns "not a
+database" and deletes the `-wal` and `-shm` sidecars; `recover_catalog` afterwards can preserve
+only the main file. Add a preflight used by every open of an existing `timeseries.db`: read the
+first 16 bytes of the file yourself; if the file exists, is not empty, and does not start with
+the SQLite header string `SQLite format 3\0`, return the corruption error **without** opening it
+with SQLite. A missing or empty file is created as today. A file with a valid header is opened
+normally, and SQLite's own WAL recovery applies. Reading Tidemark's own state file this way is
+allowed; the "never read file contents" rule is about scanned files. Replace the test that
+recreates the sidecars after a failed open with one that runs the real sequence: garbage in the
+database and both sidecars present, ordinary open fails, then `recover_catalog` succeeds and the
+original bytes of all three files exist under the recovery names. Keep the test for a valid
+header with a damaged page behaving as SQLite decides.
+The daemon and `snapshots rebuild-catalog` call `recover_catalog` after an open reports
+corruption, with all connections closed, and log the recovery file names (W2-C, W6-A).
+
+Plan locations: `05` §4; W1-E; W2-C; W6-A.
+
+### G6 — `xtask vm-test` must pass test parameters and show output
+
+**Decision: accepted.**
+
+1. Add a repeatable option `--env NAME=VALUE`. `NAME` must match `TIDEMARK_[A-Z0-9_]+`; anything
+   else is rejected before any connection is made. The pairs are passed into the remote test
+   process through `ssh` and `sudo` next to `PATH` (`sudo env "PATH=$PATH" NAME=VALUE ... cargo
+   test ...`), with the value quoted so that spaces and shell metacharacters cannot break out of
+   the command.
+2. Add `--nocapture`, which appends `--nocapture` to the test binary arguments, so diagnostic
+   output of passing tests (for example the bulkstat v5 probe result) is visible.
+3. Unit-test the command construction: accepted and rejected names, a value containing a space,
+   a quote and a semicolon, and the position of the arguments.
+4. In `xtask/README.md`, document how to provision a disposable md RAID array inside the VM from
+   loop devices (the commands, run in the VM only, never on a development host) and how to pass
+   it to the suite with `--env TIDEMARK_W1A_MD_DEVICE=/dev/mdX`; list the findings the Wave 1 gate
+   asks the operator to record (bulkstat v5 at run time, the `bs_blocks` unit, the default I/O
+   scheduler) and the command that shows each.
+Do not try to reach a host from this sandbox.
+
+Plan locations: `09` §5; W0-C xtask notes.
+
+### SCR-007 — One display-escaping helper (G8)
+
+**Decision: accepted.**
+
+The
+escaping of control characters, invalid bytes and backslashes exists twice. Add to
+`crates/tidemark-core/src/path.rs`:
+
+```rust
+/// Escape bytes for terminal display: printable Unicode is kept; control characters, invalid
+/// UTF-8 bytes and backslashes are written as uppercase `\xNN`.
+pub fn display_lossy_bytes(bytes: &[u8]) -> String;
+```
+
+with exactly the behaviour `RawPath::display_lossy` has today; make `RawPath::display_lossy` and
+`RawName::display_lossy` delegate to it, and use it in `crates/tidemark-fs/src/mount.rs` instead
+of the copy there. This is the only change allowed in `tidemark-core`; do not change any other
+core item or any existing behaviour. Existing tests must pass unchanged; add one that the three
+entry points give identical output for a table of inputs.
+
+Plan locations: W0-B path table; W1-A; SCR-004.
+
+### Wave 2 readiness notes
+
+**Decision: accepted.**
+
+The bulk pipeline (W2-B) charges the `Gate` before
+each call to the bulkstat iterator, with a conservative per-batch cost, not after the I/O with
+the number of records returned; the first call also covers the geometry read. `BulkInode`
+`disk_bytes` is already in bytes and must not be multiplied again. The orchestrator (W2-C), not
+the bulk pipeline, resolves leaf devices and builds the gate. The CLI canonicalizes the original
+path before it becomes `ScanRequest.root`.
+
+Plan locations: `04` §5–7; W2-B/C.
