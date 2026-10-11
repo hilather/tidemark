@@ -142,36 +142,8 @@ fn watcher_namespace_guard() {
         .unwrap();
     assert!(status.success());
 }
-#[test]
-fn watch_overflow_marks_lossy() {
-    let fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
-    // Deliberately leave the bounded kernel queue unread until the writer finishes.
-    let group = Fanotify::init(InitMode::FdMode).unwrap();
-    group.mark_mount(&fs.mountpoint, mask::CLOSE_WRITE).unwrap();
-    let status = Command::new("sh")
-        .args([
-            "-c",
-            "i=0; while [ $i -lt 100000 ]; do  : > \"$1/$i\"; i=$((i+1)); done",
-            "w5a",
-        ])
-        .arg(&fs.mountpoint)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let mut buffer = vec![0; 65536];
-    let mut overflow = false;
-    loop {
-        let mut count = 0;
-        for event in group.read(&mut buffer).unwrap() {
-            count += 1;
-            overflow |= matches!(event.unwrap(), RawEvent::Overflow);
-        }
-        if count == 0 {
-            break;
-        }
-    }
-    assert!(overflow, "queue overflow not induced");
-}
+// Kernel overflow through the running watcher is tested in the watch module,
+// where the processing lock can pause consumption without a production test API.
 #[test]
 fn fid_mode_create_delete_rename() {
     let fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
@@ -234,24 +206,118 @@ fn fid_mode_create_delete_rename() {
 #[ignore = "scale"]
 fn watcher_sixty_second_load_and_ten_minute_fd_stability() {
     let fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
+    let tasks = || {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let prior_tasks = tasks();
     let watch = watcher(options(&fs.mountpoint));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let tid = loop {
+        let current = tasks();
+        if let Some(tid) = current.difference(&prior_tasks).find(|tid| {
+            std::fs::read_to_string(
+                std::path::Path::new("/proc/self/task")
+                    .join(tid)
+                    .join("comm"),
+            )
+            .is_ok_and(|name| name.trim() == "tidemark-watch")
+        }) {
+            break tid.clone();
+        }
+        assert!(Instant::now() < deadline, "watcher thread not found");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let cpu_ticks = || {
+        let stat = std::fs::read_to_string(
+            std::path::Path::new("/proc/self/task")
+                .join(&tid)
+                .join("stat"),
+        )
+        .unwrap();
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+    };
+    let hz = String::from_utf8(
+        Command::new("getconf")
+            .arg("CLK_TCK")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .parse::<f64>()
+    .unwrap();
     let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
     let before = count();
+    let cpu_before = cpu_ticks();
     let started = Instant::now();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "privileged::paced_writer_child",
+            "--test-threads=1",
+        ])
+        .env("TIDEMARK_W5A_LOAD_PATH", &fs.mountpoint)
+        .spawn()
+        .unwrap();
+    let mut measured = false;
+    let mut previous = watch.stats().events_total;
     while started.elapsed() < Duration::from_secs(600) {
-        let mut child = Command::new("sh")
-            .args([
-                "-c",
-                "i=0; while [ $i -lt 2000 ]; do  : > \"$1/$i\"; i=$((i+1)); done",
-                "w5a",
-            ])
-            .arg(&fs.mountpoint)
-            .spawn()
-            .unwrap();
-        child.wait().unwrap();
         std::thread::sleep(Duration::from_secs(1));
+        let current = watch.stats().events_total;
+        assert!(current > previous, "watcher stopped processing");
+        previous = current;
+        assert_ne!(watch.mode(), tidemark_live::watch::WatchMode::Failed);
+        if !measured && started.elapsed() >= Duration::from_secs(60) {
+            let cpu_pct =
+                (cpu_ticks() - cpu_before) as f64 / hz / started.elapsed().as_secs_f64() * 100.0;
+            println!(
+                "watcher CPU {cpu_pct:.3}% of one core; events={}, elapsed={:?}",
+                watch.stats().events_total,
+                started.elapsed()
+            );
+            assert!(cpu_pct < 2.0, "watcher exceeds CPU budget");
+            measured = true;
+        }
     }
+    assert!(child.wait().unwrap().success());
+    let achieved = 1_200_000.0 / started.elapsed().as_secs_f64();
+    println!("generated close-write rate={achieved:.2}/s");
+    assert!(
+        achieved >= 1960.0,
+        "VM cannot sustain calibrated 2,000 closes/s"
+    );
+    assert!(measured);
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(count(), before);
     watch.stop();
+}
+#[test]
+fn paced_writer_child() {
+    let Some(path) = std::env::var_os("TIDEMARK_W5A_LOAD_PATH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let started = Instant::now();
+    for n in 0..1_200_000 {
+        let due = started + Duration::from_micros(n * 500);
+        if let Some(delay) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(delay);
+        }
+        std::fs::write(path.join((n % 2000).to_string()), b"load").unwrap();
+        if n == 119_999 {
+            let achieved = 120_000.0 / started.elapsed().as_secs_f64();
+            println!("first 60 seconds generated {achieved:.2} closes/s");
+            assert!(achieved >= 1960.0, "VM cannot sustain calibrated load");
+        }
+    }
 }
