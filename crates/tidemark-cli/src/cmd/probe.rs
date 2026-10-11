@@ -4,7 +4,7 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Root.
+    /// Root paths to probe for capabilities.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     pub root: Vec<std::path::PathBuf>,
 }

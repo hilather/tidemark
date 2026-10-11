@@ -4,19 +4,19 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Path.
+    /// Directory path to query (canonicalised before lookup).
     #[arg(value_name = "PATH")]
     pub path: Option<std::path::PathBuf>,
-    /// Check targets.
+    /// Stat targets to detect dangling, looping or other-filesystem links.
     #[arg(long)]
     pub check_targets: bool,
-    /// Dangling.
+    /// List only dangling symlinks.
     #[arg(long)]
     pub dangling: bool,
-    /// Escaping.
+    /// List only links resolving outside PATH.
     #[arg(long)]
     pub escaping: bool,
-    /// Limit.
+    /// Maximum number of results.
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
 }

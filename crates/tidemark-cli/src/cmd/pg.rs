@@ -4,10 +4,10 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Relations.
+    /// Include Postgres relations.
     #[arg(long)]
     pub relations: bool,
-    /// Db.
+    /// Select the Postgres database.
     #[arg(long, value_name = "NAME")]
     pub db: Option<String>,
 }

@@ -4,13 +4,13 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// From.
+    /// Config file to install; global -c names the installed path.
     #[arg(long, value_name = "FILE")]
     pub from: Option<std::path::PathBuf>,
-    /// Start now.
+    /// Start the service immediately after staging.
     #[arg(long)]
     pub start_now: bool,
-    /// Skip check.
+    /// Skip named warning-level pre-flight checks.
     #[arg(long, value_name = "NAME", num_args = 1.., action = clap::ArgAction::Append)]
     pub skip_check: Vec<String>,
 }

@@ -4,22 +4,22 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Path.
+    /// Directory path to query (canonicalised before lookup).
     #[arg(value_name = "PATH")]
     pub path: Option<std::path::PathBuf>,
-    /// Boundary.
+    /// Boundary path globs for hard-link analysis.
     #[arg(long, value_name = "GLOB", num_args = 1.., conflicts_with = "boundary_depth")]
     pub boundary: Vec<String>,
-    /// Boundary depth.
+    /// Directory depth defining hard-link boundaries.
     #[arg(long, value_name = "N")]
     pub boundary_depth: Option<usize>,
-    /// Incomplete.
+    /// Show incomplete hard-link sets.
     #[arg(long)]
     pub incomplete: bool,
-    /// Top.
+    /// Maximum number of hard-link sets.
     #[arg(long, value_name = "N")]
     pub top: Option<usize>,
-    /// Show paths.
+    /// Resolve hard-link names live and show paths.
     #[arg(long)]
     pub show_paths: bool,
 }

@@ -11,33 +11,33 @@ pub struct Args {
 /// Available operations.
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// List operation.
+    /// List the snapshot catalog.
     List {
-        /// Root.
+        /// Root path to scan or select.
         #[arg(long, value_name = "ROOT")]
         root: Option<std::path::PathBuf>,
     },
-    /// Show operation.
+    /// Show a snapshot from the catalog.
     Show {
-        /// Id.
+        /// Snapshot ID to show.
         #[arg(value_name = "ID")]
         id: String,
-        /// Root.
+        /// Root path to scan or select.
         #[arg(long, value_name = "ROOT")]
         root: Option<std::path::PathBuf>,
     },
-    /// Prune operation.
+    /// Prune the snapshot catalog.
     Prune {
-        /// Root.
+        /// Root path to scan or select.
         #[arg(long, value_name = "ROOT")]
         root: Option<std::path::PathBuf>,
-        /// Dry run.
+        /// Show snapshots that would be pruned without deleting them.
         #[arg(long)]
         dry_run: bool,
     },
-    /// RebuildCatalog operation.
+    /// Rebuild the snapshot catalog.
     RebuildCatalog {
-        /// Root.
+        /// Root path to scan or select.
         #[arg(long, value_name = "ROOT")]
         root: Option<std::path::PathBuf>,
     },

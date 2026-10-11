@@ -4,7 +4,7 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Show config.
+    /// Print effective config including default alert rules.
     #[arg(long)]
     pub show_config: bool,
 }

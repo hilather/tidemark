@@ -11,21 +11,21 @@ pub struct Args {
 /// Available operations.
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// Ncdu operation.
+    /// ncdu JSON export.
     Ncdu {
-        /// Path.
+        /// Directory path to query (canonicalised before lookup).
         #[arg(value_name = "PATH")]
         path: Option<std::path::PathBuf>,
-        /// Output.
+        /// Write ncdu JSON to this file.
         #[arg(short = 'o', value_name = "FILE")]
         output: Option<std::path::PathBuf>,
-        /// Snapshot.
+        /// Snapshot ID to query.
         #[arg(long, value_name = "ID")]
         snapshot: Option<String>,
-        /// Utf8 lossy.
+        /// Replace invalid UTF-8 in exported names.
         #[arg(long)]
         utf8_lossy: bool,
-        /// Max depth.
+        /// Maximum directory depth to export.
         #[arg(long, value_name = "N")]
         max_depth: Option<usize>,
     },

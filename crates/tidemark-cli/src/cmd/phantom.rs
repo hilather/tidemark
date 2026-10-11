@@ -4,10 +4,10 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Mount.
+    /// Filter by mount path.
     #[arg(long, value_name = "M")]
     pub mount: Option<std::path::PathBuf>,
-    /// Direct.
+    /// Scan /proc now without the daemon.
     #[arg(long)]
     pub direct: bool,
 }

@@ -4,16 +4,16 @@
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Window.
+    /// Time window for activity.
     #[arg(long, value_parser = ["1m", "5m", "15m", "60m"])]
     pub window: Option<String>,
-    /// By.
+    /// Group activity by directory, unit or command.
     #[arg(long, value_parser = ["dir", "unit", "comm"])]
     pub by: Option<String>,
-    /// Mount.
+    /// Filter by mount path.
     #[arg(long, value_name = "M")]
     pub mount: Option<std::path::PathBuf>,
-    /// Limit.
+    /// Maximum number of results.
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
 }
