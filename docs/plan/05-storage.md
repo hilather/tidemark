@@ -275,7 +275,7 @@ weekly = 8      # plus the newest snapshot of each of the last 8 ISO weeks
 
 Retention always keeps each root's newest complete snapshot, even with `recent = 0`, expired calendar windows or an all-zero policy.
 
-Partial and failed snapshots are deleted after 24 h. `tidemark snapshots prune --dry-run` shows what would go.
+Partial and failed snapshots are deleted after 24 h. `tidemark snapshots prune --dry-run` shows what would go. Non-dry-run prune opens a writable catalog, deletes the snapshot files returned by the retention plan, then calls `Catalog::rebuild_from_files` for all roots using the files that remain. This removes deleted snapshots from the catalog without changing the store interface.
 
 ## 8. Space guard (NFR-7)
 

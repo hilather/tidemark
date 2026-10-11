@@ -117,14 +117,20 @@ Implement `03` §4 Steps A–F exactly:
 
 ```rust
 pub struct BulkParams { pub walk: WalkConfig /* stat_entries forced false */, pub batch: usize, pub threads: usize }
+pub struct BulkProgress { pub phase: &'static str, pub dirs: u64, pub entries: u64,
+                          pub inodes: u64, pub errors: u64, pub races: u64 }
 pub struct BulkStats { pub phase_ms: [u64; 3], pub dents: u64, pub inodes_streamed: u64, pub joined: u64,
-                       pub races: u64, pub ags: u32, pub names_resolved: u64, pub names_missing: u64 }
+                       pub races: u64, pub ags: u32, pub names_resolved: u64, pub names_missing: u64,
+                       pub noatime_fallbacks: u64 }
 pub fn estimate_memory(used_inodes: u64, dirs_estimate: u64) -> u64;      // 04 §7 formula
 pub fn run_bulk(p: &BulkParams, mount_fd: BorrowedFd<'_>, geo: &XfsGeometry, gate: &dyn Gate,
-                cancel: &AtomicBool, agg: Aggregator) -> Result<(Prepared, BulkStats), BulkError>;
+                cancel: &AtomicBool, progress: &(dyn Fn(&BulkProgress) + Sync),
+                agg: Aggregator) -> Result<(Prepared, BulkStats), BulkError>;
 ```
 
 `run_bulk` performs phases 1–2, calls `agg.prepare()`, then runs phase 3 (names via `tidemark_fs::walk::read_dir_entries` for `prepared.needs_names()`) and `set_names`, and returns the `Prepared`.
+
+`BulkError::BeforePhase2(String)` means failure before the first phase-two bulkstat call has been issued and safe redoing by walk; namespace collection, sorting-worker creation and geometry validation failures qualify. Cancellation returns `Cancelled` and takes precedence. `BulkStats.noatime_fallbacks` comes from the namespace walker. The progress callback is called at most every two seconds with one cadence shared across phases, including waiting during collection, sorting and name resolution.
 
 ### Implementation notes
 
@@ -140,7 +146,7 @@ pub fn run_bulk(p: &BulkParams, mount_fd: BorrowedFd<'_>, geo: &XfsGeometry, gat
   - Translate `mode` to `FileKind`. `disk` comes from `BulkInode.disk_bytes`, already in bytes; never multiply it again.
 - **Kind mismatch:** if the dent was a child entry but the inode is now a directory (or vice versa), count a race.
 - **Phase 3:** group needed names by directory, read each directory once (gated), match inode numbers, and report `names_missing` for files gone since phase 1.
-- **Cancellation** is checked between batches; on cancel, drain the channel and return `BulkError::Cancelled`.
+- **Cancellation** is checked between batches; on cancel, drain the channel and return `BulkError::Cancelled`, producing no snapshot even with `--keep-partial` (walk-only).
 
 ### Tests
 
@@ -194,18 +200,18 @@ pub fn run_scan(cfg: &Config, req: &ScanRequest, recorder: &dyn ScanRecorder, ca
 3. **Host-wide scan lock:** take an exclusive `flock` on `state_dir/scan.lock` (non-blocking). If it's held, return `ScanError::Busy` (ADR-015). The daemon scheduler takes the same lock, so a CLI scan and a daemon scan can never overlap.
 4. **Space guard** (`05` §8). If refused, return `ScanError::NoSpace`.
 5. **Gate:** retain the `ScanGate` returned by `gate_from_config(profile_name, &cfg.throttle, &leaves, sampler)` with `leaves = resolve_leaves(dev)` (empty on unavailable discovery) and a bounded sampler built from ordered, all-or-error `read_disk_stats(&leaves)`.
-6. Fallible `ScanId::new(now)` (propagate invalid UTC-year errors; retry a collision with a fresh id, never replace an existing snapshot); `recorder.scan_started`.
-7. Choose the mode (`choose_mode`, `04` §7): auto requires v5. Explicit `--mode bulk` without v5 fails with exit code 5 and a reason naming missing v5 bulkstat. Auto may fall back to walk on a bulk failure before phase 2 starts and records why.
-8. Size the walker output channel from the scan memory budget with `04` §7: `capacity * top_files * bytes_per_candidate <= queued_records_budget`; reserve producer candidates and other state separately, including any threshold class. Run walk (W1-B → W2-A on a collector thread) or bulk (W2-B) with `scan_gate.gate()`. Report progress every 2 s.
+6. Fallible `ScanId::new(now)` (propagate invalid UTC-year errors; retry a writer-creation collision with a fresh id, never replace an existing snapshot); `recorder.scan_started`.
+7. Choose the mode (`choose_mode`, `04` §7): auto requires v5. Explicit `--mode bulk` without v5 fails with exit code 5 and a reason naming missing v5 bulkstat. Auto falls back only on `BulkError::Unsupported` or `BeforePhase2`, with a fresh aggregator and updated mode and `mode_reason`; cancellation takes precedence and other bulk errors fail the scan.
+8. Size the walker output channel from the scan memory budget with `04` §7: `capacity * top_files * bytes_per_candidate <= queued_records_budget`; reserve producer candidates and other state separately, including any threshold class. Run walk (W1-B → W2-A on a collector thread) or bulk (W2-B) with `scan_gate.gate()`. Report progress every 2 s. The memory budget is admission control by estimate, not a hard guarantee; no new `WalkConfig` budget field is added, and the service cgroup supplies the hard limit. Check summed record `errors_total` against `WalkSummary.errors` in both modes, warning and marking degraded on mismatch without replacing the record total.
 9. `prepared.annotate(…)` for every request annotation.
-10. `SnapshotWriter::create` → `prepared.write(&mut WriterSink)` → `finish(meta)`. Fill `meta` per `05` §1, including phase timings and final gate stats from `scan_gate.stop()` after all scan acquisitions finish. Use `scan_gate.stats()` for observations during the scan; Drop also stops the controller. Profile `max` with rate 0 means unthrottled (`13` G2).
+10. `SnapshotWriter::create` → `prepared.write(&mut WriterSink)` → `finish(meta)`. Fill `meta` per `05` §1, including phase timings and final gate stats from `scan_gate.stop()` after all scan acquisitions finish. Use `scan_gate.stats()` for observations during the scan; Drop also stops the controller. Profile `max` with rate 0 means unthrottled (`13` G2). A collision from `SnapshotWriter::finish` returns typed `ScanError::PublicationCollision`, fails the scan without retry and leaves the existing snapshot untouched; no store interface changes.
 11. `recorder.scan_finished`; `recorder.dir_series` for directories at depth ≤ `series_depth` (capped at `MAX_SERIES_ROWS = 20_000`, largest first); apply `retention_plan` for this root and delete the files it names.
-12. Return the outcome. The exit code is 3 if degraded or partial.
+12. Log the working-set estimate and observed process peak RSS after publication, series and retention work (process VmHWM includes earlier or concurrent work). Return the outcome. The exit code is 3 if degraded or partial.
 
 ### CLI
 
 - `scan` (direct mode; uses a `DirectRecorder` that writes `timeseries.db`, valid only while the daemon is not running): text progress on stderr (single updating line on a TTY; one line per 10 s otherwise). Final summary: mode and reason, duration, dirs/files, `t_disk`, reclaimable, link sets (incomplete), errors, races, snapshot path. `--json` prints `ScanOutcome`. **W6-A adds the daemon branch:** when `tidemarkd` is up, `scan` calls `scan.start` and follows `scan.status`, and `--cancel` calls `scan.cancel`.
-- `snapshots list|show|prune [--dry-run]|rebuild-catalog`. Direct catalog opens perform the header preflight before SQLite (`05` §4) and stay non-destructive; only reported corruption triggers `catalog::recover_catalog`, with all connections closed and writers stopped. Log preserved recovery file names (`05` §4). A healthy or missing catalog uses ordinary open/rebuild.
+- `snapshots list|show|prune [--dry-run]|rebuild-catalog`. Non-dry-run prune opens a writable catalog, deletes retention-selected files, then globally calls `Catalog::rebuild_from_files` on remaining files. Rebuild `--root PATH` validates the path but rebuilds all roots; help says so. No store interface changes. Direct catalog opens perform the header preflight before SQLite (`05` §4) and stay non-destructive; only reported corruption triggers `catalog::recover_catalog`, with all connections closed and writers stopped. Log preserved recovery file names (`05` §4). A healthy or missing catalog uses ordinary open/rebuild.
 - `top`: per `08` §1.4.
   - Columns SIZE, RECLAIM, SHARED (with `H`), FILES, NEWEST (optional `--wide`), and Δ24h when the catalog has a complete snapshot within ±6 h of now − 24 h (looked up per displayed path in the old snapshot).
   - `--depth N` renders a tree; `--sort` and `--min-size` as in the spec. The CLI wrapper’s `Growth` case compares two snapshots (the selected snapshot and the older complete snapshot used for Δ24h), orders by descending signed disk-byte delta and breaks ties by raw path bytes; error if no older snapshot exists. It is not a single-snapshot `SortKey` variant.
@@ -218,7 +224,7 @@ pub fn run_scan(cfg: &Config, req: &ScanRequest, recorder: &dyn ScanRecorder, ca
 - `choose_mode` truth table: every condition in `04` §7, with reasons.
 - End-to-end (unprivileged): `tidemark scan <fixture>` then `top` / `files` / `snapshots` produce `insta` snapshots, with timestamps redacted.
 - **Oracle:** after scanning each mandatory fixture in walk mode, `top --depth 99 --json` values equal `du -sxB1` / `--apparent-size` and `find` counts for every directory, with apparent-size oracle normalization as specified in `09-testing.md` §3.
-- Cancellation: SIGINT during a scan leaves no `.db` and a catalog row with `status = failed` (or `partial` with `--keep-partial`).
+- Cancellation: SIGINT during a scan leaves no `.db` and a catalog row with `status = failed` (or `partial` in walk mode with `--keep-partial`); bulk cancellation always returns `Cancelled` without a snapshot. `scan --help` labels keep-partial as walk-only.
 - The space-guard refusal path (injected) leaves no partial files.
 - Privileged: `auto` chooses bulk on a loop XFS mount root and walk on a small subdirectory; reasons are recorded in `meta`.
 
