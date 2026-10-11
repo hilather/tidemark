@@ -47,7 +47,9 @@ Paths given on the command line are canonicalised (`realpath`) before lookup, so
 | `tui [PATH]` | Interactive browser (FR-21) | `--snapshot` | root |
 | `completions <SHELL>` | Shell completions | | — |
 
-All commands require effective uid 0, except `completions` and `--help` (including command help). A non-root invocation fails early, before reading config or state or connecting to the daemon, with exit code **5** and a clear message: `Tidemark requires root; run this command with sudo.`
+The privileges column describes an installed system, where all Tidemark files are root-only. The config, snapshots and API socket are `0600 root:root`; state and runtime directories are `0700 root:root`. Administrators use `sudo`; there is no `tidemark` group or `socket_group` key.
+
+The CLI has no effective-uid check. A non-root user can run it against a config, state directory and socket they own, as unprivileged tests do. If a non-root command fails because the config, state directory, a snapshot or the socket is not readable, it retains the exit code for that failure and adds the hint: `Tidemark's files are root-only; run this command with sudo.`
 
 ### 1.3 Exit codes
 
@@ -78,7 +80,7 @@ The `Δ24h` column appears when a snapshot about 24 h older exists.
 
 - **Transport:** Unix stream socket `/run/tidemark/api.sock`, mode `0600 root:root`.
 - **Framing:** newline-delimited JSON. One request per line, one response per line; the connection may carry several requests.
-- **Authentication:** socket permissions. Every request is logged with the peer's `SO_PEERCRED` uid/pid. Every method requires peer uid 0; other peers receive `forbidden`.
+- **Authentication:** socket permissions. Every request is logged with the peer's `SO_PEERCRED` uid/pid. Every method accepts peer uid 0 or a peer uid equal to the daemon's own effective uid; other peers receive `forbidden`. In production the daemon runs as root, so only root is accepted.
 
 ```json
 {"v":1,"id":"c1","method":"now","params":{"mount":"/data"}}

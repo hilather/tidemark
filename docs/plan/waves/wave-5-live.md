@@ -125,7 +125,7 @@ impl ProcScanner {
 - Open writers: `flags & O_ACCMODE ∈ {O_WRONLY, O_RDWR}`, path not under `exclude_prefixes`. Keep history per `(dev, ino)` as a ring of the last 60 samples (size, disk, ts). `writers(window)` reports `disk(now) − disk(now − window)`, sorted descending. Entries not seen for 2 passes are dropped.
 - Memory bound: at most 10,000 tracked writers with a 60-sample ring each (evict the smallest growth); about 15 MB worst case.
 - **CLI:**
-  - `phantom`: direct mode runs one pass (requires root) and prints total per mount plus holders (pid, comm, unit, path, size), with a hint to restart or HUP the holder. Daemon mode is wired in W6-A.
+  - `phantom`: direct mode runs one pass (root for full coverage; non-root runs cover the readable subset) and prints total per mount plus holders (pid, comm, unit, path, size), with a hint to restart or HUP the holder. Daemon mode is wired in W6-A.
   - `writers --direct [--interval 10s]`: two passes separated by the interval, then shows growth.
 
 ### Tests
