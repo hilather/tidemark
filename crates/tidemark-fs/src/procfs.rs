@@ -30,7 +30,7 @@ fn bytes(path: impl AsRef<std::path::Path>) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 fn text(path: impl AsRef<std::path::Path>) -> io::Result<String> {
-    String::from_utf8(bytes(path)?).map_err(|_| invalid())
+    Ok(String::from_utf8_lossy(&bytes(path)?).into_owned())
 }
 fn ids(path: &str) -> io::Result<Vec<u32>> {
     let mut result = Vec::new();
@@ -141,12 +141,15 @@ pub fn read_fdinfo_flags(pid: u32, fd: u32) -> io::Result<u32> {
 }
 /// Read the real UID from process status.
 pub fn read_uid(pid: u32) -> io::Result<u32> {
-    parse_uid(&text(format!("/proc/{pid}/status"))?).ok_or_else(invalid)
+    parse_uid(&bytes(format!("/proc/{pid}/status"))?).ok_or_else(invalid)
 }
-fn parse_uid(status: &str) -> Option<u32> {
-    status.lines().find_map(|l| {
-        l.strip_prefix("Uid:")
-            .and_then(|s| s.split_whitespace().next()?.parse().ok())
+fn parse_uid(status: &[u8]) -> Option<u32> {
+    status.split(|b| *b == b'\n').find_map(|line| {
+        let fields = line.strip_prefix(b"Uid:")?;
+        let uid = fields
+            .split(u8::is_ascii_whitespace)
+            .find(|s| !s.is_empty())?;
+        std::str::from_utf8(uid).ok()?.parse().ok()
     })
 }
 
@@ -252,13 +255,17 @@ mod tests {
     #[test]
     fn uid_parser_and_error_policy() {
         assert_eq!(
-            parse_uid("Name:\tworker\nUid:\t1000\t1001\t1002\t1003\n"),
+            parse_uid(b"Name:\tworker\nUid:\t1000\t1001\t1002\t1003\n"),
             Some(1000)
         );
-        assert!(parse_uid(include_str!("../tests/w1d/data/status.txt")).is_some());
-        assert_eq!(parse_uid("Uid: -1"), None);
-        assert_eq!(parse_uid("Uid: 4294967296"), None);
-        assert_eq!(parse_uid("Uid:"), None);
+        assert!(parse_uid(include_bytes!("../tests/w1d/data/status.txt")).is_some());
+        assert_eq!(
+            parse_uid(b"Name:\tbad-\xff-name\nUid:\t1000\t1001\t1002\t1003\n"),
+            Some(1000)
+        );
+        assert_eq!(parse_uid(b"Uid: -1"), None);
+        assert_eq!(parse_uid(b"Uid: 4294967296"), None);
+        assert_eq!(parse_uid(b"Uid:"), None);
         assert!(transient(&io::Error::from_raw_os_error(libc::ESRCH)));
         assert!(!transient(&io::Error::from_raw_os_error(libc::EIO)));
     }

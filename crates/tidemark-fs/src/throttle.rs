@@ -39,56 +39,70 @@ const MAX_LEAVES: usize = 4096;
 pub type StatSampler = Box<dyn FnMut() -> io::Result<Vec<DiskStat>> + Send>;
 
 struct Bucket {
-    epoch: Instant,
-    next: AtomicU64,
-    rate: AtomicU64,
+    state: Mutex<TokenState>,
+    wake: Condvar,
     blocked_ns: AtomicU64,
+}
+// Constant-size accounting: issued - earned is outstanding token debt.
+// Each caller keeps its own FIFO target, so no waiter collection is needed.
+struct TokenState {
+    last: Instant,
+    rate: f64,
+    issued: f64,
+    earned: f64,
+}
+impl TokenState {
+    fn account(&mut self, now: Instant) {
+        self.earned = (self.earned + self.rate * now.duration_since(self.last).as_secs_f64())
+            .min(self.issued + self.rate * 0.25);
+        self.last = now;
+    }
 }
 impl Bucket {
     fn new(rate: f64) -> Self {
         Self {
-            epoch: Instant::now(),
-            next: AtomicU64::new(0),
-            rate: AtomicU64::new(rate.to_bits()),
+            state: Mutex::new(TokenState {
+                last: Instant::now(),
+                rate,
+                issued: 0.0,
+                earned: rate * 0.25,
+            }),
+            wake: Condvar::new(),
             blocked_ns: AtomicU64::new(0),
         }
     }
     fn rate(&self) -> f64 {
-        f64::from_bits(self.rate.load(Ordering::Relaxed))
+        self.state.lock().rate
+    }
+    fn set_rate(&self, rate: f64) {
+        let mut state = self.state.lock();
+        // Earn tokens at the old rate up to the transition, never retroactively.
+        state.account(Instant::now());
+        state.rate = rate;
+        state.earned = state.earned.min(state.issued + rate * 0.25);
+        self.wake.notify_all();
     }
     fn acquire(&self, cost: u32) {
         if cost == 0 {
             return;
         }
         let before = Instant::now();
-        // Shift the virtual clock by the burst allowance. Initial calls may spend
-        // 250ms of tokens; idle time cannot accumulate a larger burst.
-        let now = nanos(self.epoch.elapsed()).saturating_add(250_000_000);
-        let duration = (f64::from(cost) / self.rate() * 1e9)
-            .ceil()
-            .clamp(1.0, u64::MAX as f64) as u64;
-        let mut old = self.next.load(Ordering::Relaxed);
-        let finish = loop {
-            let finish = old
-                .max(now.saturating_sub(250_000_000))
-                .saturating_add(duration);
-            match self
-                .next
-                .compare_exchange_weak(old, finish, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => break finish,
-                Err(actual) => old = actual,
-            }
-        };
-        let deadline = finish.saturating_sub(250_000_000);
+        let mut state = self.state.lock();
+        state.account(Instant::now());
+        state.issued += f64::from(cost);
+        let target = state.issued;
+        let mut blocked = false;
         loop {
-            let remaining = deadline.saturating_sub(nanos(self.epoch.elapsed()));
-            if remaining == 0 {
+            state.account(Instant::now());
+            let debt = target - state.earned;
+            if debt <= 0.0 {
                 break;
             }
-            thread::park_timeout(Duration::from_nanos(remaining));
+            blocked = true;
+            let wait = Duration::from_secs_f64((debt / state.rate).min(u32::MAX as f64));
+            self.wake.wait_for(&mut state, wait);
         }
-        if finish > now {
+        if blocked {
             self.blocked_ns
                 .fetch_add(nanos(before.elapsed()), Ordering::Relaxed);
         }
@@ -104,7 +118,7 @@ pub struct FixedGate {
 }
 impl FixedGate {
     /// Construct a bucket. Invalid/nonpositive rates are normalized to one unit/s.
-    pub fn new(rate: f64) -> Self {
+    fn new(rate: f64) -> Self {
         Self {
             bucket: Bucket::new(if rate.is_finite() && rate > 0.0 {
                 rate
@@ -201,7 +215,7 @@ impl AdaptiveGate {
                             }
                             metrics.stats.min_rate = metrics.stats.min_rate.min(next);
                             metrics.rate = next;
-                            worker.bucket.rate.store(next.to_bits(), Ordering::Relaxed);
+                            worker.bucket.set_rate(next);
                         }
                         previous = Some((current, now));
                     }
@@ -402,4 +416,119 @@ pub fn gate_from_config(
         },
         masked,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn time_weighted_debt_and_burst() {
+        let start = Instant::now();
+        let mut state = TokenState {
+            last: start,
+            rate: 1000.0,
+            issued: 1000.0,
+            earned: 250.0,
+        };
+        state.account(start + Duration::from_millis(100));
+        state.rate = 1.0;
+        state.account(start + Duration::from_millis(800));
+        assert!((state.earned - 350.7).abs() < 1e-9);
+        assert!(state.earned < state.issued);
+        state.rate = 1000.0;
+        state.account(start + Duration::from_millis(1500));
+        assert!((state.earned - 1050.7).abs() < 1e-9);
+        state.account(start + Duration::from_secs(100));
+        assert_eq!(state.earned, state.issued + 250.0);
+    }
+
+    // Real wait/notification tests allow 2 units for floating point and scheduling.
+    // Integrate the actual rate transition times; late scheduling adds no credit.
+    #[test]
+    fn concurrent_waiters_follow_rate_decrease() {
+        let bucket = Arc::new(Bucket::new(100.0));
+        bucket.acquire(25);
+        let start = Instant::now();
+        let count = Arc::new(AtomicU64::new(0));
+        let handles: Vec<_> = (0..64)
+            .map(|_| {
+                let bucket = Arc::clone(&bucket);
+                let count = Arc::clone(&count);
+                thread::spawn(move || {
+                    bucket.acquire(1);
+                    count.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(50));
+        bucket.set_rate(1.0);
+        let changed = start.elapsed().as_secs_f64();
+        thread::sleep(Duration::from_millis(700));
+        let end = start.elapsed().as_secs_f64();
+        let granted = count.load(Ordering::Relaxed) as f64;
+        assert!(
+            granted <= 100.0 * changed + (end - changed) + 25.0 + 2.0,
+            "granted {granted}, change {changed}, end {end}"
+        );
+        bucket.set_rate(1000.0);
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 64);
+    }
+
+    #[test]
+    fn bulk_waiter_follows_decrease_and_recovery() {
+        let bucket = Arc::new(Bucket::new(1000.0));
+        let start = Instant::now();
+        let clone = Arc::clone(&bucket);
+        let (send, recv) = std::sync::mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            clone.acquire(1000);
+            send.send(start.elapsed()).unwrap();
+        });
+        thread::sleep(Duration::from_millis(100));
+        bucket.set_rate(1.0);
+        let decreased = start.elapsed().as_secs_f64();
+        thread::sleep(Duration::from_millis(800));
+        assert!(
+            recv.try_recv().is_err(),
+            "bulk request ignored the decrease"
+        );
+        bucket.set_rate(1000.0);
+        let recovered = start.elapsed().as_secs_f64();
+        let finished = recv
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .as_secs_f64();
+        let earned = 1000.0 * decreased + (recovered - decreased) + 1000.0 * (finished - recovered);
+        assert!(1000.0 <= earned + 250.0 + 2.0, "earned {earned}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn four_thread_fixed_rate() {
+        let gate = Arc::new(FixedGate::new(1000.0));
+        // Spend the documented initial 250ms burst before measuring steady state.
+        gate.acquire(250);
+        let start = Instant::now();
+        let count = Arc::new(AtomicU64::new(0));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                let count = Arc::clone(&count);
+                std::thread::spawn(move || {
+                    while start.elapsed() < Duration::from_secs(2) {
+                        gate.acquire(1);
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let count = count.load(Ordering::Relaxed);
+        assert!((1900..=2100).contains(&count), "count {count}");
+    }
 }

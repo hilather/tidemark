@@ -174,31 +174,6 @@ fn controller_table() {
     assert_eq!(controller_step(500.0, &[], &[], 500.0, &p), 500.0);
 }
 #[test]
-fn four_thread_fixed_rate() {
-    let gate = Arc::new(FixedGate::new(1000.0));
-    // Spend the documented initial 250ms burst before measuring steady state.
-    gate.acquire(250);
-    let start = Instant::now();
-    let count = Arc::new(AtomicU64::new(0));
-    let handles: Vec<_> = (0..4)
-        .map(|_| {
-            let gate = Arc::clone(&gate);
-            let count = Arc::clone(&count);
-            std::thread::spawn(move || {
-                while start.elapsed() < Duration::from_secs(2) {
-                    gate.acquire(1);
-                    count.fetch_add(1, Ordering::Relaxed);
-                }
-            })
-        })
-        .collect();
-    for handle in handles {
-        handle.join().unwrap();
-    }
-    let count = count.load(Ordering::Relaxed);
-    assert!((1900..=2100).contains(&count), "count {count}");
-}
-#[test]
 fn controller_stop_drop_and_sampler_failure() {
     let calls = Arc::new(AtomicU64::new(0));
     let counter = Arc::clone(&calls);
