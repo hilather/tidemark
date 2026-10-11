@@ -1,13 +1,20 @@
 //! Owned by: W5-A
-//! Cross-task interface stubs.
+//! Linux fanotify bindings and bounds-checked event decoding.
+
+#![allow(unsafe_code)]
 
 use std::{
+    ffi::CString,
     io,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
     path::Path,
 };
 
-/// Reserved for W5-A.
+/// Results of independently trying kernel initialization and mark variants.
 pub struct FanotifyCaps {
     /// Contract field.
     pub available: bool,
@@ -22,15 +29,40 @@ pub struct FanotifyCaps {
     /// Contract field.
     pub error: Option<String>,
 }
-/// Reserved for W5-A.
+/// Probe each reporting mode with harmless close-write marks; all groups close on return.
 pub fn probe(mount: &Path) -> io::Result<FanotifyCaps> {
-    let _ = mount;
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "NotYetImplemented",
-    ))
+    let mut caps = FanotifyCaps {
+        available: false,
+        fd_mode: false,
+        report_fid: false,
+        report_dfid_name: false,
+        mark_filesystem: false,
+        error: None,
+    };
+    for mode in [InitMode::DfidName, InitMode::Fid, InitMode::FdMode] {
+        match Fanotify::init(mode) {
+            Ok(group) => {
+                let filesystem = group.mark_filesystem(mount, mask::CLOSE_WRITE).is_ok();
+                let mounted = group.mark_mount(mount, mask::CLOSE_WRITE).is_ok();
+                let works = filesystem || mounted;
+                caps.available |= works;
+                caps.mark_filesystem |= filesystem;
+                match mode {
+                    InitMode::FdMode => caps.fd_mode = mounted,
+                    InitMode::Fid => caps.report_fid = works,
+                    InitMode::DfidName => caps.report_dfid_name = works,
+                }
+            }
+            Err(e) => caps.error = Some(e.to_string()),
+        }
+    }
+    if caps.available {
+        caps.error = None;
+    }
+    Ok(caps)
 }
 /// Reserved for W5-A.
+#[derive(Clone, Copy)]
 pub enum InitMode {
     /// Contract variant.
     FdMode,
@@ -39,51 +71,82 @@ pub enum InitMode {
     /// Contract variant.
     DfidName,
 }
-/// Reserved for W5-A.
+/// Owns a nonblocking notification group; never requests permission events.
 pub struct Fanotify {
     fd: OwnedFd,
 }
 impl Fanotify {
-    /// Reserved for W5-A.
+    /// Create a close-on-exec, nonblocking group in the requested reporting mode.
     pub fn init(mode: InitMode) -> io::Result<Fanotify> {
-        let _ = mode;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "NotYetImplemented",
-        ))
+        // Flags from linux/fanotify.h: REPORT_FID=0x200, DFID_NAME=0xc00.
+        let report = match mode {
+            InitMode::FdMode => 0,
+            InitMode::Fid => 0x200,
+            InitMode::DfidName => 0xe00,
+        };
+        // SAFETY: fanotify_init has no pointer arguments; successful result is a new owned fd.
+        let fd = unsafe {
+            libc::fanotify_init(
+                0x1 | 0x2 | report,
+                (libc::O_RDONLY | libc::O_LARGEFILE | libc::O_CLOEXEC) as u32,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful syscall returned a unique descriptor.
+        Ok(Self {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+        })
     }
-    /// Reserved for W5-A.
+    /// Attach a notification mark to the named mount without following its final symlink.
     pub fn mark_mount(&self, path: &Path, mask: u64) -> io::Result<()> {
-        let _ = path;
-        let _ = mask;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "NotYetImplemented",
-        ))
+        self.mark(path, mask, 0x10)
     }
-    /// Reserved for W5-A.
+    /// Attach a notification mark to the filesystem containing path.
     pub fn mark_filesystem(&self, path: &Path, mask: u64) -> io::Result<()> {
-        let _ = path;
-        let _ = mask;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "NotYetImplemented",
-        ))
+        self.mark(path, mask, 0x100)
     }
-    /// Reserved for W5-A.
+    /// Read metadata records; EAGAIN yields an empty iterator.
     pub fn read<'b>(&self, buf: &'b mut [u8]) -> io::Result<EventIter<'b>> {
-        let _ = buf;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "NotYetImplemented",
-        ))
+        // SAFETY: buf is writable for its full length and fd remains borrowed.
+        let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::WouldBlock {
+                return Ok(EventIter { buffer: &[] });
+            }
+            return Err(e);
+        }
+        Ok(EventIter {
+            buffer: &buf[..n as usize],
+        })
     }
-    /// Reserved for W5-A.
+    fn mark(&self, path: &Path, mask: u64, kind: u32) -> io::Result<()> {
+        let path =
+            CString::new(path.as_os_str().as_bytes()).map_err(|_| invalid("NUL in mark path"))?;
+        // SAFETY: path is NUL terminated and valid throughout the call; fd is borrowed.
+        let result = unsafe {
+            libc::fanotify_mark(
+                self.fd.as_raw_fd(),
+                1 | 4 | kind,
+                mask,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    /// Borrow the group descriptor for polling.
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
 }
-/// Reserved for W5-A.
+/// An owned notification decoded from kernel metadata and information records.
 pub enum RawEvent {
     /// Contract variant.
     Overflow,
@@ -112,19 +175,37 @@ pub enum RawEvent {
         name: Option<Vec<u8>>,
     },
 }
-/// Reserved for W5-A.
+/// Resolve a bounded kernel handle with O_PATH, without opening file contents.
 pub fn open_by_handle(
     mount_fd: BorrowedFd<'_>,
     handle_type: i32,
     handle: &[u8],
 ) -> io::Result<OwnedFd> {
-    let _ = mount_fd;
-    let _ = handle_type;
-    let _ = handle;
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "NotYetImplemented",
-    ))
+    if handle.len() > 128 {
+        return Err(invalid("file handle exceeds kernel maximum"));
+    }
+    // u64 storage gives file_handle sufficient alignment, including its variable tail.
+    let mut storage = [0u64; 17];
+    let ptr = storage.as_mut_ptr().cast::<u8>();
+    // SAFETY: storage has 136 bytes, enough for the 8-byte header and capped handle.
+    unsafe {
+        std::ptr::copy_nonoverlapping((handle.len() as u32).to_ne_bytes().as_ptr(), ptr, 4);
+        std::ptr::copy_nonoverlapping(handle_type.to_ne_bytes().as_ptr(), ptr.add(4), 4);
+        std::ptr::copy_nonoverlapping(handle.as_ptr(), ptr.add(8), handle.len());
+    }
+    // SAFETY: aligned initialized file_handle is valid throughout the syscall.
+    let fd = unsafe {
+        libc::open_by_handle_at(
+            mount_fd.as_raw_fd(),
+            ptr.cast(),
+            libc::O_PATH | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is newly returned and uniquely owned.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 /// Reserved for W5-A.
 pub mod mask {
@@ -144,62 +225,351 @@ pub mod mask {
     pub const ONDIR: u64 = 0x40000000;
 }
 
-/// Event iterator shape reserved for W5-A.
+/// Bounds-checked event iterator; dropping it closes descriptors in unread records.
 pub struct EventIter<'b> {
     buffer: &'b [u8],
 }
 impl Iterator for EventIter<'_> {
     type Item = io::Result<RawEvent>;
     fn next(&mut self) -> Option<Self::Item> {
-        let _ = self.buffer;
-        None
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let result = decode(self.buffer);
+        match result {
+            Ok((event, len)) => {
+                self.buffer = &self.buffer[len..];
+                Some(Ok(event))
+            }
+            Err(e) => {
+                let len = if self.buffer.len() >= 24 {
+                    u32_at(self.buffer, 0) as usize
+                } else {
+                    0
+                };
+                self.buffer = if len >= 24 && len <= self.buffer.len() {
+                    &self.buffer[len..]
+                } else {
+                    &[]
+                };
+                Some(Err(e))
+            }
+        }
     }
+}
+impl Drop for EventIter<'_> {
+    fn drop(&mut self) {
+        // Consume unread records so abandoned batches never leak event descriptors.
+        while self.next().is_some() {}
+    }
+}
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+fn decode(b: &[u8]) -> io::Result<(RawEvent, usize)> {
+    if b.len() < 24 {
+        return Err(invalid("truncated metadata"));
+    }
+    let len = u32_at(b, 0) as usize;
+    let raw_fd = u32_at(b, 16) as i32;
+    // SAFETY: only buffers returned by fanotify read reach this private decoder in production;
+    // each descriptor is transferred once and closed even when validation fails.
+    let fd = if raw_fd >= 0 {
+        Some(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+    } else {
+        None
+    };
+    let metadata_len = u16::from_ne_bytes([b[6], b[7]]) as usize;
+    if b[4] != 3 || len < 24 || len > b.len() || metadata_len < 24 || metadata_len > len {
+        return Err(invalid("invalid fanotify metadata"));
+    }
+    let mask = u64::from_ne_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+    let pid = u32_at(b, 20) as i32;
+    if mask & 0x4000 != 0 {
+        return Ok((RawEvent::Overflow, len));
+    }
+    if let Some(fd) = fd {
+        return Ok((RawEvent::Fd { mask, pid, fd }, len));
+    }
+    let mut at = metadata_len;
+    let mut event = None;
+    let mut priority = 0;
+    while at < len {
+        if len - at < 4 {
+            return Err(invalid("truncated info header"));
+        }
+        let record_len = u16::from_ne_bytes([b[at + 2], b[at + 3]]) as usize;
+        if record_len < 4 || record_len > len - at {
+            return Err(invalid("invalid info length"));
+        }
+        let r = &b[at..at + record_len];
+        if matches!(r[0], 1..=3) {
+            if r.len() < 20 {
+                return Err(invalid("truncated file handle"));
+            }
+            let bytes = u32_at(r, 12) as usize;
+            if bytes > 128 || bytes > r.len() - 20 {
+                return Err(invalid("invalid handle length"));
+            }
+            let name = if r[0] == 2 {
+                let tail = &r[20 + bytes..];
+                let end = tail
+                    .iter()
+                    .position(|v| *v == 0)
+                    .ok_or_else(|| invalid("unterminated name"))?;
+                Some(tail[..end].to_vec())
+            } else {
+                None
+            };
+            let candidate_priority = match r[0] {
+                2 => 3,
+                1 => 2,
+                _ => 1,
+            };
+            if candidate_priority > priority {
+                priority = candidate_priority;
+                event = Some(RawEvent::Fid {
+                    mask,
+                    pid,
+                    fsid: [u32_at(r, 4) as i32, u32_at(r, 8) as i32],
+                    handle_type: u32_at(r, 16) as i32,
+                    handle: r[20..20 + bytes].to_vec(),
+                    name,
+                });
+            }
+        }
+        at += record_len;
+    }
+    event
+        .map(|e| (e, len))
+        .ok_or_else(|| invalid("missing FID record"))
+}
+
+// Hand-transcribed from linux/fanotify.h; parsing uses bytes to avoid alignment assumptions.
+#[repr(C)]
+#[allow(dead_code)]
+struct Metadata {
+    event_len: u32,
+    vers: u8,
+    reserved: u8,
+    metadata_len: u16,
+    mask: u64,
+    fd: i32,
+    pid: i32,
+}
+#[repr(C)]
+#[allow(dead_code)]
+struct InfoHeader {
+    info_type: u8,
+    pad: u8,
+    len: u16,
+}
+#[repr(C)]
+#[allow(dead_code)]
+struct InfoFid {
+    header: InfoHeader,
+    fsid: [i32; 2],
+}
+#[repr(C)]
+#[allow(dead_code)]
+struct HandleHeader {
+    bytes: u32,
+    handle_type: i32,
 }
 
 #[cfg(test)]
-mod signature_tests {
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
     use super::*;
+    fn metadata(mask: u64, fd: i32, len: u32) -> Vec<u8> {
+        let mut b = vec![0; 24];
+        b[..4].copy_from_slice(&len.to_ne_bytes());
+        b[4] = 3;
+        b[6..8].copy_from_slice(&24u16.to_ne_bytes());
+        b[8..16].copy_from_slice(&mask.to_ne_bytes());
+        b[16..20].copy_from_slice(&fd.to_ne_bytes());
+        b[20..24].copy_from_slice(&42i32.to_ne_bytes());
+        b
+    }
     #[test]
-    fn every_stub_has_an_inert_result() -> io::Result<()> {
-        let path = Path::new("/");
+    fn uapi_layout() {
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!((size_of::<Metadata>(), align_of::<Metadata>()), (24, 8));
         assert_eq!(
-            probe(path).err().map(|e| e.kind()),
-            Some(io::ErrorKind::Unsupported)
+            (
+                offset_of!(Metadata, event_len),
+                offset_of!(Metadata, vers),
+                offset_of!(Metadata, metadata_len),
+                offset_of!(Metadata, mask),
+                offset_of!(Metadata, fd),
+                offset_of!(Metadata, pid)
+            ),
+            (0, 4, 6, 8, 16, 20)
         );
-        for mode in [InitMode::FdMode, InitMode::Fid, InitMode::DfidName] {
-            assert_eq!(
-                Fanotify::init(mode).err().map(|e| e.kind()),
-                Some(io::ErrorKind::Unsupported)
-            );
+        assert_eq!(
+            (
+                size_of::<InfoHeader>(),
+                align_of::<InfoHeader>(),
+                offset_of!(InfoHeader, len)
+            ),
+            (4, 2, 2)
+        );
+        assert_eq!(
+            (
+                size_of::<InfoFid>(),
+                align_of::<InfoFid>(),
+                offset_of!(InfoFid, fsid)
+            ),
+            (12, 4, 4)
+        );
+        assert_eq!(
+            (
+                size_of::<HandleHeader>(),
+                align_of::<HandleHeader>(),
+                offset_of!(HandleHeader, handle_type)
+            ),
+            (8, 4, 4)
+        );
+    }
+    #[test]
+    fn multiple_overflows_and_truncated_tail() {
+        let mut bytes = metadata(0x4000, -1, 24);
+        bytes.extend(metadata(0x4000, -1, 24));
+        bytes.push(0);
+        let mut iter = EventIter { buffer: &bytes };
+        assert!(matches!(iter.next().unwrap().unwrap(), RawEvent::Overflow));
+        assert!(matches!(iter.next().unwrap().unwrap(), RawEvent::Overflow));
+        assert!(iter.next().unwrap().is_err());
+        assert!(iter.next().is_none());
+    }
+    fn fid(named: bool) -> Vec<u8> {
+        let mut record = vec![if named { 2 } else { 1 }, 0, 0, 0];
+        record.extend(7i32.to_ne_bytes());
+        record.extend(8i32.to_ne_bytes());
+        record.extend(3u32.to_ne_bytes());
+        record.extend(9i32.to_ne_bytes());
+        record.extend([1, 2, 3]);
+        if named {
+            record.extend(b"raw\xff\0");
         }
-        // A harmless owned descriptor exercises otherwise unreachable instance methods.
-        let f = Fanotify {
-            fd: std::fs::File::open(path)?.into(),
-        };
-        assert_eq!(
-            f.mark_mount(path, 0).err().map(|e| e.kind()),
-            Some(io::ErrorKind::Unsupported)
+        let len = record.len() as u16;
+        record[2..4].copy_from_slice(&len.to_ne_bytes());
+        let mut bytes = metadata(mask::CREATE, -1, 24 + u32::from(len));
+        bytes.extend(record);
+        bytes
+    }
+    #[test]
+    fn fid_with_and_without_name_and_invalid_lengths() {
+        for named in [false, true] {
+            let bytes = fid(named);
+            match (EventIter { buffer: &bytes }).next().unwrap().unwrap() {
+                RawEvent::Fid {
+                    fsid,
+                    handle_type,
+                    handle,
+                    name,
+                    ..
+                } => {
+                    assert_eq!(fsid, [7, 8]);
+                    assert_eq!(handle_type, 9);
+                    assert_eq!(handle, [1, 2, 3]);
+                    assert_eq!(
+                        name,
+                        if named {
+                            Some(b"raw\xff".to_vec())
+                        } else {
+                            None
+                        }
+                    );
+                }
+                _ => panic!("expected FID"),
+            }
+            for end in 0..bytes.len() {
+                if end == 0 {
+                    continue;
+                }
+                assert!(EventIter {
+                    buffer: &bytes[..end]
+                }
+                .next()
+                .unwrap()
+                .is_err());
+            }
+        }
+        let mut b = fid(true);
+        b[36..40].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(EventIter { buffer: &b }.next().unwrap().is_err());
+        let mut b = fid(true);
+        *b.last_mut().unwrap() = 1;
+        assert!(EventIter { buffer: &b }.next().unwrap().is_err());
+        for len in [0, 23, u32::MAX] {
+            let b = metadata(0x4000, -1, len);
+            assert!(EventIter { buffer: &b }.next().unwrap().is_err());
+        }
+    }
+    #[test]
+    fn descriptors_close_on_error_and_abandoned_batch() {
+        const CHILD: &str = "TIDEMARK_W5A_PARSER_FD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fanotify::tests::descriptors_close_on_error_and_abandoned_batch",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let before = count();
+
+        // Check each exact descriptor rather than all process fds (parallel tests open files).
+        use std::os::fd::IntoRawFd;
+        let first = std::fs::File::open("/").unwrap().into_raw_fd();
+        let second = std::fs::File::open("/").unwrap().into_raw_fd();
+        let mut bytes = metadata(mask::CLOSE_WRITE, first, 24);
+        bytes.extend(metadata(mask::CLOSE_WRITE, second, 24));
+        let mut iter = EventIter { buffer: &bytes };
+        drop(iter.next());
+        drop(iter);
+        assert_closed(first);
+        assert_closed(second);
+        let fd = std::fs::File::open("/").unwrap().into_raw_fd();
+        let mut bytes = metadata(mask::CLOSE_WRITE, fd, 24);
+        bytes[4] = 2;
+        assert!(EventIter { buffer: &bytes }.next().unwrap().is_err());
+        assert_closed(fd);
+        assert_eq!(count(), before);
+    }
+    fn assert_closed(fd: i32) {
+        // SAFETY: fcntl validates the integer fd; no pointers or ownership transfer.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+    #[cfg(feature = "privileged")]
+    #[test]
+    fn fanotify_probe_reports_capabilities() {
+        let temp = tempfile::tempdir().unwrap();
+        let caps = probe(temp.path()).unwrap();
+        eprintln!(
+            "fanotify caps: available={} fd={} fid={} dfid_name={} filesystem={} error={:?}",
+            caps.available,
+            caps.fd_mode,
+            caps.report_fid,
+            caps.report_dfid_name,
+            caps.mark_filesystem,
+            caps.error
         );
-        assert_eq!(
-            f.mark_filesystem(path, 0).err().map(|e| e.kind()),
-            Some(io::ErrorKind::Unsupported)
-        );
-        assert_eq!(
-            f.read(&mut []).err().map(|e| e.kind()),
-            Some(io::ErrorKind::Unsupported)
-        );
-        assert_eq!(
-            open_by_handle(f.as_fd(), 0, &[]).err().map(|e| e.kind()),
-            Some(io::ErrorKind::Unsupported)
-        );
-        assert!(EventIter { buffer: &[] }.next().is_none());
-        assert_eq!(mask::CLOSE_WRITE, 0x8);
-        assert_eq!(mask::MODIFY, 0x2);
-        assert_eq!(mask::CREATE, 0x100);
-        assert_eq!(mask::DELETE, 0x200);
-        assert_eq!(mask::MOVED_FROM, 0x40);
-        assert_eq!(mask::MOVED_TO, 0x80);
-        assert_eq!(mask::ONDIR, 0x40000000);
-        Ok(())
+        assert!(caps.fd_mode, "{}", caps.error.unwrap_or_default());
     }
 }
