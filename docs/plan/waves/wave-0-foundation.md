@@ -33,7 +33,7 @@
 3. **Crate skeletons** with the module files listed in the table below. Every file compiles, and each starts with a doc comment `//! Owned by: W<task>` plus a one-line purpose. **`tidemark-cli` and `tidemarkd` are lib + bin crates** (`src/lib.rs` holds everything; `src/main.rs` is a thin `fn main`), so `tidemarkd::firstboot`, `tidemark_cli::client` and their parsers are reachable from tests and fuzz targets.
    - **(Done in W0-B, after `tidemark-core` exists.)** Stub every public signature given in the wave files: `wave-1-primitives.md` (W1-A … W1-E), plus `tidemark_sys::fanotify::{probe, FanotifyCaps}` (W5-A), `tidemark_pg::{probe_from_config, PgProbe}` (W5-C), `tidemark_fs::lvm::{collect, LvmReport}` (W4-A) and `tidemark_live::rates::{slope_bytes_per_sec, time_to_full}` (W5-D). Cross-task calls then compile from day one. For W4-A, stub the **whole** `tidemark_fs::lvm` interface with final field lists, not just `collect`.
    - Tidemark is strictly read-only (ADR-008): no crate may contain code that changes file metadata, mounts, LVM or boot configuration. `xtask ci` scans the **non-test library and binary sources** (excluding `test-support/`, `xtask/`, `tests/`, `#[cfg(test)]` modules and string literals) for forbidden symbols: `FS_IOC_FSSETXATTR`, `Q_SETQUOTA`/`Q_XSETQLIM`, `libc::mount`/`umount`, and `Command::new` with an `lv*`/`vg*`/`pv*` command other than `lvs`/`vgs`. Any hit fails CI.
-   - Stubs return `Err(NotYetImplemented)` (an `io::ErrorKind::Unsupported` error, or the crate's error type with a `NotYetImplemented` variant), never `unimplemented!()`, so callers can treat them as "unknown".
+   - Stubs whose documented signatures can return an error return `Err(NotYetImplemented)` (an `io::ErrorKind::Unsupported` error, or the crate's error type with a `NotYetImplemented` variant), never `unimplemented!()`, so callers can treat them as "unknown". Error-free signatures (plain values, `Option`, references, constructors or unit) keep their exact signature and return inert placeholders: `None`, an empty collection, zero or a default value. The wave-file signature wins over this generic rule. Callers treat placeholders as "unknown", never real data, until the owning task replaces the body without changing the signature (SCR-005, `13`).
    - Later waves' internal modules may use `unimplemented!("W<task>")`.
 4. **`tidemark-sys`** gets its lints from its own `[lints]` table (above). Unsafe is allowed per module with `#![allow(unsafe_code)]`. All other crates inherit `forbid`.
 5. **`xtask`** (binary crate, `cargo xtask <cmd>` via `.cargo/config.toml` alias):
@@ -97,7 +97,7 @@ All structs derive `Debug, Clone` and, where sensible, `PartialEq` and `serde::{
 
 ### Cross-task stubs (after `tidemark-core` is written)
 
-Create the stub signatures described in W0-A item 3 in their owners' files. Stubs return `NotYetImplemented`; their types use the real `tidemark-core` types, so callers compile against final signatures.
+Create the stub signatures described in W0-A item 3 in their owners' files. Stubs follow the error-capable/error-free rules in W0-A item 3 (SCR-005, `13`); their types use the real `tidemark-core` types, so callers compile against final signatures.
 
 Owner map for the command files: `probe` W1-A · `scan` `snapshots` `top` `files` W2-C · `diff` W3-A · `links` `symlinks` W3-B · `export` `wide` W3-C · `lvm` W4-A · `deploy/*` W4-B · `watch` W5-A · `phantom` `writers` W5-B · `pg` W5-C · `now` `hot` `alerts` `status` W6-A · `tui` W7-A.
 

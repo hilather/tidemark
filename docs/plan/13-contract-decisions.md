@@ -1,6 +1,6 @@
 # 13 — W0-B1 contract decisions
 
-The coordinator accepts every finding in `docs/reviews/W0-B1-review.md` and decides SCR-001–004 **MODIFY (accepted with modifications)** as specified below. This decision record takes precedence over the “Decision: Pending” lines in `docs/handoff/SCR-001.md` through `SCR-004.md`. These are the decided contracts for later tasks; the implementation changes are a separate task.
+The coordinator accepts every finding in `docs/reviews/W0-B1-review.md` and decides SCR-001–004 **MODIFY (accepted with modifications)** and SCR-005–006 **ACCEPT** as specified below. This decision record takes precedence over the “Decision: Pending” lines in `docs/handoff/SCR-001.md` through `SCR-006.md`. These are the decided contracts for later tasks; the implementation changes are a separate task.
 
 ## SCR-001 — Snapshot types, filters and bounds
 
@@ -64,6 +64,30 @@ Helper signatures and construction/error policies were unspecified. The static s
 - `DevKind::Md.level: String` (e.g. raid5), major/minor `u32`, DiskStat fields `u64`. `JsonDoc<T> { schema: Cow<'static, str>, data: T }` supports owned Deserialize without serde borrow, while output may borrow schema constants.
 
 Plan locations: W0-B; `08` §1.1; `05` §2; W1-E, W2-C. Affected tasks: W0-B2, W1-A/E, W2-C and all later path/JSON consumers.
+
+## SCR-005 — Stubs with error-free signatures
+
+The generic cross-task stub rule requires `Err(NotYetImplemented)`, but some documented signatures return plain values, `Option`, references, constructors or unit. Returning an error from those signatures would change the frozen contract.
+
+**Decision: accepted.**
+
+- A stub whose documented signature can return an error returns `Err(NotYetImplemented)`.
+- A stub whose documented signature cannot return an error keeps that exact signature and returns an inert placeholder: `None`, an empty collection, zero or a default value. The signature in the wave file always wins over the generic stub rule.
+- Callers treat these functions as "unknown" until the owning task merges; placeholders must not be treated as real data. The owning task replaces the body without changing the signature.
+
+Plan locations: W0-A deliverable 3 and W0-B Cross-task stubs; W1 entry; `05` §3; W4-A; W5-D. Affected tasks: W0-B3, W1-A–E, W4-A, W5-D.
+
+## SCR-006 — `du` apparent-size oracle
+
+The normative `t_apparent` definition includes directory `st_size`, but GNU `du` apparent mode differs across releases. Coreutils 8.30, shipped with Rocky Linux 8, counts directory sizes; coreutils 9.2 and later count only regular files and symbolic links in apparent mode.
+
+**Decision: accepted.**
+
+- Keep the directory-inclusive `t_apparent` definition in `03` unchanged. Direct equality with `du -sxB1 --apparent-size` holds when `du` counts directory sizes, including on the target platform; NFR-1 is unchanged in meaning.
+- Compare `t_disk` directly with `du -sxB1` on every version.
+- For `t_apparent`, probe the local `du` with an empty directory to learn whether apparent mode counts directory sizes. When it does not, add the measured `st_size` of the subtree's directories (including its root) and any other non-regular, non-symlink inode with non-zero `st_size` to the `du` figure before comparing. Count distinct inodes consistently with `03`; the probe decides, never a version string.
+
+Plan locations: `03` §2–3; `09` §3; `01` NFR-1; W2-C oracle tests. Affected tasks: W0-C, W1-B, W2-A, W2-C.
 
 ## Accepted review findings
 

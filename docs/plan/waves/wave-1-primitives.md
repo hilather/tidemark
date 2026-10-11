@@ -2,7 +2,7 @@
 
 **Goal:** all low-level building blocks, each independently tested: mount and device discovery with the probe, the parallel walker, XFS FFI (geometry, bulkstat), throttling with procfs parsers, and the SQLite store.
 
-**Agents:** 5 in parallel. **Entry:** `wave-0-done`. Tasks compile against the Wave 0 stubs and contracts. Cross-task calls go through the stub signatures, which return `NotYetImplemented` until the owning task merges, and callers treat that as "unknown".
+**Agents:** 5 in parallel. **Entry:** `wave-0-done`. Tasks compile against the Wave 0 stubs and contracts. Cross-task calls go through the stub signatures, which return `NotYetImplemented` where the signature permits an error, or inert placeholders for error-free signatures (W0-A item 3; SCR-005, `13`). Callers treat both as "unknown" until the owning task merges.
 
 | Task | Title | Owned paths | Depends on |
 |------|-------|-------------|------------|

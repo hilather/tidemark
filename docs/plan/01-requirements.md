@@ -94,7 +94,7 @@ Wave files reference these IDs. FR-10 to FR-13 (project quotas) are **deferred**
 
 | ID | Requirement | How it's verified |
 |----|-------------|-------------------|
-| NFR-1 | **Correctness**: `t_disk` and `t_apparent` of every fixture directory equal `du -sxB1` and `du -sxB1 --apparent-size`. Bulk mode equals walk mode on quiescent trees. | Oracle tests (W2), VM tests |
+| NFR-1 | **Correctness**: `t_disk` and `t_apparent` of every fixture directory equal `du -sxB1` and `du -sxB1 --apparent-size`. Bulk mode equals walk mode on quiescent trees. See `09-testing.md` §3 for apparent-size oracle normalization on development hosts. | Oracle tests (W2), VM tests |
 | NFR-2 | **Scan speed**: cold-cache full scan at least 3× faster than `du -sx` on the staging copy with throttling off. With adaptive throttling on, the scan must not raise p99 Postgres latency (pgbench) by more than 10%. Targets revisited after pilot measurements. | `xtask bench` (W7) |
 | NFR-3 | **Live latency**: filesystem samples every 30 s; hot-directory attribution visible ≤ 60 s after a file is closed. | Integration test (W5/W6) |
 | NFR-4 | **Footprint**: daemon steady-state RSS ≤ 300 MiB and ≤ 2% of one core outside scans. Scan memory within the configured budget (default 1.25 GiB, inside the service's 2 GiB cgroup limit). Watcher overhead on writers not measurable in pgbench. | Soak test (W7) |
