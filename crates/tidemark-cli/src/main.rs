@@ -1,6 +1,7 @@
-//! Owned by: W0-B
-//! tidemark-cli binary skeleton; argument parsing follows in W0-B.
+//! Owned by: W0-B2
+//! Thin CLI executable entry point.
 
 #![forbid(unsafe_code)]
-
-fn main() {}
+fn main() -> std::process::ExitCode {
+    tidemark_cli::main_entry()
+}

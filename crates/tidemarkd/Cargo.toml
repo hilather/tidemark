@@ -10,3 +10,10 @@ privileged = []
 
 [lints]
 workspace = true
+
+[dependencies]
+tidemark-core = { path = "../tidemark-core" }
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

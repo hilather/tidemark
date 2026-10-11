@@ -1,0 +1,47 @@
+//! Owned by: W0-B2
+//! Command surface and shared CLI support.
+
+/// alerts command.
+pub mod alerts;
+/// completions command.
+pub mod completions;
+/// deploy command.
+pub mod deploy;
+/// diff command.
+pub mod diff;
+/// export command.
+pub mod export;
+/// files command.
+pub mod files;
+/// hot command.
+pub mod hot;
+/// links command.
+pub mod links;
+/// lvm command.
+pub mod lvm;
+/// now command.
+pub mod now;
+/// pg command.
+pub mod pg;
+/// phantom command.
+pub mod phantom;
+/// probe command.
+pub mod probe;
+/// scan command.
+pub mod scan;
+/// snapshots command.
+pub mod snapshots;
+/// status command.
+pub mod status;
+/// symlinks command.
+pub mod symlinks;
+/// top command.
+pub mod top;
+/// tui command.
+pub mod tui;
+/// watch command.
+pub mod watch;
+/// wide command.
+pub mod wide;
+/// writers command.
+pub mod writers;
