@@ -1,0 +1,45 @@
+---
+source: crates/tidemark-cli/tests/w3b.rs
+expression: "serde_json::from_slice::<serde_json::Value>(&output).unwrap()"
+---
+{
+  "data": {
+    "absolute": 0,
+    "by_class": [
+      [
+        "dangling",
+        1
+      ],
+      [
+        "loop",
+        1
+      ]
+    ],
+    "examples": [
+      {
+        "class": "dangling",
+        "link": {
+          "path": "/r/a"
+        },
+        "target": {
+          "path": "../missing"
+        }
+      },
+      {
+        "class": "loop",
+        "link": {
+          "path_b64": "L3Iv/w=="
+        },
+        "target": {
+          "path_b64": "/w=="
+        }
+      }
+    ],
+    "relative": 2,
+    "root": {
+      "path": "/r"
+    },
+    "total": 2
+  },
+  "schema": "tidemark.symlinks.v1"
+}

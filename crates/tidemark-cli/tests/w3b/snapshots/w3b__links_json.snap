@@ -1,0 +1,41 @@
+---
+source: crates/tidemark-cli/tests/w3b.rs
+expression: "serde_json::from_slice::<serde_json::Value>(&output).unwrap()"
+---
+{
+  "data": {
+    "crossing": [],
+    "incomplete_top_dirs": [
+      {
+        "directory": {
+          "path": "/r/b"
+        },
+        "disk": 8192,
+        "sets": 1
+      }
+    ],
+    "largest_sets": [],
+    "most_shared_dirs": [
+      {
+        "directory": {
+          "path": "/r/b"
+        },
+        "shared": 12288,
+        "t_disk": 12288
+      }
+    ],
+    "paths": [],
+    "region_pairs": [],
+    "snapshot": null,
+    "totals": {
+      "crossing_disk": 0,
+      "crossing_sets": 0,
+      "disk": 24576,
+      "incomplete_disk": 8192,
+      "incomplete_sets": 1,
+      "instances": 5,
+      "sets": 3
+    }
+  },
+  "schema": "tidemark.links.v1"
+}

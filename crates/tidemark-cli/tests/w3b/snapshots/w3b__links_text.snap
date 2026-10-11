@@ -1,0 +1,11 @@
+---
+source: crates/tidemark-cli/tests/w3b.rs
+expression: "String::from_utf8(output).unwrap()"
+---
+Link sets: 3, instances: 5, bytes: 24576
+Incomplete: 1 sets, 8192 pinned bytes
+Pinned directories:
+8192 bytes, 1 sets  /r/b
+Largest link sets:
+Most shared directories:
+12288 shared / 12288 bytes  /r/b
