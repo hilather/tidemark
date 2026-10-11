@@ -6,7 +6,28 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-privileged = []
+privileged = ["test-support/privileged"]
 
 [lints]
 workspace = true
+
+[dependencies]
+rustix.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+globset.workspace = true
+smallvec.workspace = true
+rayon.workspace = true
+crossbeam-channel.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
+tidemark-sys.workspace = true
+tidemark-fs.workspace = true
+tidemark-store.workspace = true
+tidemark-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+test-support.workspace = true

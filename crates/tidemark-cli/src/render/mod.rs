@@ -24,3 +24,8 @@ pub fn json<T: serde::Serialize>(
 }
 /// Host and filesystem capability probe output.
 pub mod probe;
+
+/// Scan progress rendering.
+pub mod scan_progress;
+/// Tree rendering.
+pub mod tree;

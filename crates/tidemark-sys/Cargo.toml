@@ -18,6 +18,7 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [dependencies]
+rustix.workspace = true
 libc.workspace = true
 
 [dev-dependencies]

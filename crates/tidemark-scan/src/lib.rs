@@ -14,3 +14,8 @@ pub mod mode;
 pub mod orchestrator;
 /// progress module skeleton.
 pub mod progress;
+
+pub use agg::SinkError;
+pub use mode::{choose_mode, ModeFacts, ModeRequest};
+pub use orchestrator::{run_scan, ScanError, ScanOutcome, ScanRecorder, ScanRequest};
+pub use progress::Progress;
