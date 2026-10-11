@@ -80,6 +80,9 @@ pub struct DirRecord {
     pub notable: Vec<NotableFile>,
     pub skipped: Vec<Skip>,
     pub errors: Vec<ScanErrorRec>,
+    /// All errors attributed directly to this directory, whether or not a detail row was kept in
+    /// `errors` (which is a bounded sample).
+    pub errors_total: u32,
     pub races: u32,                // entries that vanished or changed type mid-scan
 }
 
@@ -90,7 +93,12 @@ pub struct NsRecord {
     pub ino: Ino, pub dev: DevId,
     pub entries: u32,
     pub children: Vec<Ino>,        // non-directory entries' inode numbers (from d_ino)
-    pub skipped: Vec<Skip>, pub errors: Vec<ScanErrorRec>, pub races: u32,
+    pub skipped: Vec<Skip>,
+    pub errors: Vec<ScanErrorRec>,
+    /// All errors attributed directly to this directory, whether or not a detail row was kept in
+    /// `errors` (which is a bounded sample).
+    pub errors_total: u32,
+    pub races: u32,
 }
 
 /// A child directory that was queued (so its DirId exists) but turned out not to be scannable.
@@ -116,6 +124,8 @@ pub trait Gate: Send + Sync {
 }
 pub struct NoopGate;
 ```
+
+SCR-008 (`13`, Wave 2) approves only these two `errors_total` additions to core. The walker and bulk namespace phase count every directory error independently of retained details and use a checked conversion; more than `u32::MAX` errors in one directory returns `WalkError::Limit`. The aggregator uses `errors_total` for `DirRow.errors`, subtree totals and the summary. The orchestrator checks the sum against `WalkSummary.errors` in both modes; a mismatch logs a warning and marks the snapshot degraded, preserving the record total. Bulk carries the namespace summary privately, without another `BulkStats` field.
 
 ## 2. Walk mode
 
@@ -182,6 +192,16 @@ Records arrive in nondeterministic order. The aggregator stores them by `DirId` 
 
 ## 3. Bulk mode
 
+```rust
+pub struct BulkProgress { pub phase: &'static str, pub dirs: u64, pub entries: u64,
+                          pub inodes: u64, pub errors: u64, pub races: u64 }
+pub fn run_bulk(p: &BulkParams, mount_fd: BorrowedFd<'_>, geo: &XfsGeometry, gate: &dyn Gate,
+                cancel: &AtomicBool, progress: &(dyn Fn(&BulkProgress) + Sync),
+                agg: Aggregator) -> Result<(Prepared, BulkStats), BulkError>;
+```
+
+`BulkStats` includes `pub noatime_fallbacks: u64` from the namespace phase. `BulkError::BeforePhase2(String)` classifies failures before the first phase-two bulkstat call has been issued, when nothing consumed prevents redoing the scan by walk. This includes namespace collection, sorting-worker creation and geometry validation failures. Cancellation remains `BulkError::Cancelled` and takes precedence over fallback. In auto mode only `Unsupported` or `BeforePhase2` triggers walk with a **fresh** aggregator and an updated mode and `mode_reason`; other bulk errors fail the scan. Cancelled bulk scans produce no snapshot, even with `--keep-partial`, which is walk-only and labelled so in `scan --help`. The progress callback shares one cadence across all phases and is called at most every two seconds, including while collection, sorting or name resolution is waiting.
+
 ### 3.1 Phase 1 — namespace walk (`getdents64` only)
 
 The same walker with `stat_entries = false` emits `NsRecord`s:
@@ -192,7 +212,7 @@ The same walker with `stat_entries = false` emits `NsRecord`s:
 
 A collector thread turns `NsRecord`s into:
 
-- **Directory skeleton:** `Vec<DirSkel { parent, name, ino, entries, skipped, errors, races }>` indexed by `DirId`.
+- **Directory skeleton:** `Vec<DirSkel { parent, name, ino, entries, skipped, errors, errors_total, races }>` indexed by `DirId`.
 - **Dent list:** `Vec<DentRef>`, where `DentRef = { ino: u64, slot: u32 }` packed into 12 bytes (for example `[u32; 3]`).
   - `slot & 0x8000_0000 == 0` means "entry in directory `slot`".
   - `slot & 0x8000_0000 != 0` means "this inode **is** directory `slot & 0x7FFF_FFFF`". Check each directory slot is at most `0x7FFF_FFFF` before setting the flag (at most 2^31 zero-based slots); fail explicitly on overflow, never truncate. One self-reference is added per directory so the join also delivers each directory's own blocks, mtime and project ID.
@@ -350,6 +370,8 @@ Choose **bulk** if all of the following hold, otherwise choose **walk** and log 
    bytes      ≈ dents × 12 + dirs × 320 + 64 MiB
    ```
 
+`scan.memory_budget` is admission control by estimate for mode choice and queue sizing, not a hard allocation guarantee. No new `WalkConfig` budget field is added. The service cgroup memory limit supplies the hard bound. The orchestrator logs its working-set estimate and observed process peak RSS after publication, series and retention work; process VmHWM includes earlier or concurrent work and is not an isolated scan measurement.
+
 The walk-mode base estimate is `dirs × 320 + link_entries × 72 + 64 MiB`; add candidate storage below. The orchestrator sizes the walker output channel from the scan memory budget.
 
 For top-N candidate storage, let `T = threads`, `C = output channel capacity`, `N = top_files`, `L = maximum allocated name bytes` and `B = bytes per candidate` (measured layout plus name storage and allocation/capacity overhead, at least `size_of::<NotableFile>() + L`). The walker holds at most `(T + C) * N * B + T * N * size_of::<u64>()` bytes of top-N candidates and worker cutoff heaps. Record headers, links, skipped entries, errors, traversal tasks and buffers are additional memory. If over-threshold candidates are separate, add `(T + C) * H * B` for their documented exact per-directory cap `H`; if exact bounded retention cannot be implemented, W1-B must file its G3 SCR rather than silently truncate.
@@ -361,7 +383,8 @@ An explicit `--mode bulk` without v5 fails with exit code 5 and a message naming
 ## 8. Cancellation, failures and partial snapshots
 
 - SIGINT/SIGTERM or an API `scan.cancel` sets an `AtomicBool`. Workers stop taking tasks, finish their current directory and exit.
-- A cancelled or failed scan deletes its `.db.tmp`, unless `--keep-partial` is given, in which case the snapshot is written with `meta.status = partial` and is never chosen as "latest" by default.
+- A cancelled or failed scan deletes its `.db.tmp`, unless walk mode is running and `--keep-partial` is given, in which case the snapshot is written with `meta.status = partial` and is never chosen as "latest" by default.
+- Bulk cancellation returns `BulkError::Cancelled` and produces no snapshot; `--keep-partial` applies only to walk mode.
 - A scan whose error count is > 0 is `status = complete` with `meta.degraded = true`. Reports show this.
 
 ## 9. Progress and observability

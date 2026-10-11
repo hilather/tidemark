@@ -25,7 +25,7 @@ Machine output uses `JsonDoc<T> { schema: Cow<'static, str>, data: T }`, with ow
 | Command | Purpose | Key options | Needs |
 |---------|---------|-------------|-------|
 | `probe` | Capability and environment report (FR-1) | `--root PATH…` | root |
-| `scan [ROOT]` | Run a scan and write a snapshot (FR-2/3) | `--mode auto\|walk\|bulk`, `--throttle gentle\|normal\|max`, `--threads N`, `--exclude GLOB…`, `--keep-partial`, `--cancel` (ask the daemon to cancel the running scan of ROOT) | root |
+| `scan [ROOT]` | Run a scan and write a snapshot (FR-2/3) | `--mode auto\|walk\|bulk`, `--throttle gentle\|normal\|max`, `--threads N`, `--exclude GLOB…`, `--keep-partial` (walk mode only), `--cancel` (ask the daemon to cancel the running scan of ROOT) | root |
 | `snapshots list\|show ID\|prune\|rebuild-catalog` | Snapshot catalog (FR-6) | `--root`, `--dry-run` | root |
 | `top [PATH]` | Directory drill-down (FR-7) | `--depth N` (1), `--sort disk\|apparent\|reclaimable\|charged\|files\|inodes\|newest\|name\|growth`, `--limit N` (25), `--min-size SIZE`, `--snapshot ID`, `--wide` (adds NEWEST, INODES, APPARENT), `--live` (rescan PATH now, throttled, and show deltas vs snapshot) | root |
 | `files [PATH]` | Largest files (FR-7) | `--limit`, `--min-size`, `--older-than DUR`, `--newer-than DUR`, `--snapshot` | root |
@@ -47,6 +47,8 @@ Machine output uses `JsonDoc<T> { schema: Cow<'static, str>, data: T }`, with ow
 | `status` | Daemon health, versions, component states | `--show-config` (print the effective config including default alert rules) | root |
 | `tui [PATH]` | Interactive browser (FR-21) | `--snapshot` | root |
 | `completions <SHELL>` | Shell completions | | — |
+
+`scan --keep-partial` retains a partial walk snapshot on cancellation; cancelled bulk scans produce no snapshot. `scan --help` explicitly says the option is walk-only. `snapshots prune` deletes retention-selected files, then rebuilds the catalog from remaining files for all roots; `--dry-run` only shows proposed deletions. `snapshots rebuild-catalog --root PATH` validates PATH but rebuilds the catalog for all roots, as its help text states.
 
 `--sort growth` uses a CLI sort wrapper with a `Growth` case, requiring two snapshots; it is not a `snapshot::SortKey` variant. W2-C compares the selected snapshot with the older complete snapshot used for Δ24h, sorts descending signed disk-byte growth with raw-byte path tie breaking, and errors when the older snapshot is unavailable. `writers --window` accepts any positive humantime duration (`2m`, `1h`, etc.); no additional maximum is imposed by this contract. `hot` retains only `1m|5m|15m|60m`. CLI/API throttle overrides accept only `gentle|normal|max`; configured root throttle may select custom profiles.
 

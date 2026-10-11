@@ -405,3 +405,72 @@ the bulk pipeline, resolves leaf devices and builds the gate. The CLI canonicali
 path before it becomes `ScanRequest.root`.
 
 Plan locations: `04` §5–7; W2-B/C.
+
+---
+
+## Wave 2 decisions
+
+These final coordinator decisions supersede the pending decisions in `docs/handoff/scr-W2-A/SCR-001.md`, `scr-W2-C/SCR-001.md` and `scr-W2-C/SCR-002.md`. Implementation precision below follows `docs/handoff/W2-integ.md`.
+
+### SCR-008 — Per-directory error totals (D1)
+
+Bounded error detail samples cannot supply uncapped directory totals.
+
+**Decision: accepted; approved change to `tidemark-core`.**
+
+Add exactly one field directly after `errors` in each of `tidemark_core::scan::DirRecord` and `NsRecord`:
+
+```rust
+/// All errors attributed directly to this directory, whether or not a detail row was kept in
+/// `errors` (which is a bounded sample).
+pub errors_total: u32,
+```
+
+The walker and bulk namespace phase set it for every directory with checked conversion; more than `u32::MAX` directory errors returns `WalkError::Limit`. Aggregation uses `errors_total`, never `errors.len()`, for `DirRow.errors`, subtree totals and the summary. The sum over records must equal `WalkSummary.errors`. The orchestrator checks both modes, logs a warning on disagreement and marks degraded without replacing the record total. Bulk privately carries the namespace summary, without extending `BulkStats` for it. No other core change is authorized by this decision.
+
+Plan locations: `04` §1/§3; W2-C sequence. Affected tasks: W1-B, W2-A/B/C.
+
+### Bulk interface (D2)
+
+**Decision: accepted in this form.**
+
+```rust
+pub struct BulkProgress { pub phase: &'static str, pub dirs: u64, pub entries: u64,
+                          pub inodes: u64, pub errors: u64, pub races: u64 }
+pub fn run_bulk(p: &BulkParams, mount_fd: BorrowedFd<'_>, geo: &XfsGeometry, gate: &dyn Gate,
+                cancel: &AtomicBool, progress: &(dyn Fn(&BulkProgress) + Sync),
+                agg: Aggregator) -> Result<(Prepared, BulkStats), BulkError>;
+```
+
+`BulkStats` gains `pub noatime_fallbacks: u64` from the namespace phase. `BulkError::BeforePhase2(String)` means a failure before the first phase-two bulkstat call has been issued, when nothing consumed prevents redoing by walk. Namespace collection, sorting-worker creation and geometry validation failures qualify. In auto mode only `Unsupported` or `BeforePhase2` falls back to walk with a **fresh** aggregator, updated mode and recorded `mode_reason`; other bulk errors fail. Cancellation takes precedence, returns `Cancelled` and produces no snapshot. `--keep-partial` is walk-only and `scan --help` says so. Progress is called at most every two seconds, sharing a cadence across phases including waits in collection, sorting and name resolution.
+
+Plan locations: `04` §3/§8; `08` §1; W2-B interface and W2-C sequence. Affected tasks: W2-B/C.
+
+### Memory budget (D3)
+
+**Decision: accepted with modifications.**
+
+No new `WalkConfig` budget field. `scan.memory_budget` is admission control by estimate for mode choice and queue sizing with `04` §7's formula, not a hard guarantee. The service cgroup memory limit supplies the hard bound. The orchestrator logs the working-set estimate and observed process peak RSS after publication, series and retention work. As the integration handoff clarifies, process VmHWM includes earlier or concurrent work and is not an isolated scan allocation measurement.
+
+Plan locations: `04` §7; W2-C sequence. Affected tasks: W1-B, W2-C, W6-A.
+
+### Snapshot id collision at publication (D4)
+
+**Decision: accepted with modifications.**
+
+The host-wide scan lock permits one scan at a time. Writer-creation collisions retain the existing fresh-id retries. A collision from `SnapshotWriter::finish` fails the scan with typed `ScanError::PublicationCollision`, leaves the existing snapshot untouched and is not retried. No store interface change is authorized. This qualifies SCR-004's earlier retry wording: retries apply at writer creation, not publication.
+
+Plan locations: W2-C sequence steps 3/6/10. Affected tasks: W1-E, W2-C.
+
+### `snapshots prune` (D5)
+
+**Decision: accepted.**
+
+Non-dry-run prune opens a writable catalog, deletes the files returned by the retention plan, then calls `Catalog::rebuild_from_files` globally from remaining snapshot files, removing deleted snapshot rows. `--dry-run` only reports proposed deletions. `snapshots rebuild-catalog --root PATH` validates the path but rebuilds for all roots; help says so. No store interface change.
+
+Plan locations: `05` §7; `08` §1; W2-C CLI. Affected tasks: W2-C, later catalog callers.
+
+## Wave 5 requests
+
+- `docs/handoff/scr-W5-C/SCR-001.md` and `SCR-002.md` are **closed without a decision** because the PostgreSQL collector was removed (ADR-019).
+- `docs/handoff/scr-W5-D/SCR-1.md` is **open**: alert inputs for arbitrary windows, automatic stale cadence, collector availability and webhook redaction will be decided by a design task before Wave 6 starts. Until then the affected rule inputs stay unevaluated as described in `docs/handoff/W5-D.md`; this record does not approve new input contracts.
