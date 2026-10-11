@@ -1,0 +1,41 @@
+---
+source: crates/tidemark-cli/tests/w3a/reports.rs
+expression: doc
+---
+{
+  "data": {
+    "diff": [
+      {
+        "class": "removed",
+        "delta": -2048,
+        "depth_rel": 0,
+        "new": null,
+        "old": 2048,
+        "path": "/fixture"
+      },
+      {
+        "class": "removed",
+        "delta": -1024,
+        "depth_rel": 1,
+        "new": null,
+        "old": 1024,
+        "path_b64": "L2ZpeHR1cmUvYf8="
+      }
+    ],
+    "explanation": {
+      "own_delta": -1024,
+      "spread": [],
+      "spread_children": 0,
+      "steps": [
+        {
+          "delta": -1024,
+          "path_b64": "L2ZpeHR1cmUvYf8=",
+          "share_of_parent": 0.5
+        }
+      ],
+      "target_delta": -2048
+    },
+    "notice": "comparison snapshot actual age: 2h"
+  },
+  "schema": "tidemark.diff.v1"
+}
