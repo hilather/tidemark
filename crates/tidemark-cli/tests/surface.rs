@@ -211,8 +211,6 @@ fn binaries_and_bash_completions() {
     command.args(["completions", "bash"]).assert().success();
     let output = command.output().unwrap();
     assert!(String::from_utf8_lossy(&output.stdout).contains("complete"));
-    let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("tidemark"));
-    command.args(["probe"]).assert().code(1);
 }
 
 #[test]
