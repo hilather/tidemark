@@ -92,5 +92,7 @@ pub fn read_dir_entries(
     getdents::read(dir, gate)
 }
 
+pub use getdents::read_dir_entries_checked;
+
 mod getdents;
 mod worker;

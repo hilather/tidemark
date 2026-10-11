@@ -109,7 +109,7 @@ fn bulk_refuses_ftype_zero() {
 }
 #[test]
 #[ignore = "scale"]
-fn bulk_equals_walk_million_file_smoke() {
+fn bulk_equals_walk_million_file_timing_smoke() {
     let fs = LoopXfs::new(8 * 1024 * 1024 * 1024, &[], "");
     for d in 0..100 {
         let dir = fs.mountpoint.join(format!("d{d:03}"));
@@ -126,11 +126,9 @@ fn bulk_equals_walk_million_file_smoke() {
     let (mut actual, stats) = bulk_sink(root, &fs.mountpoint);
     let bulk_ms = start.elapsed().as_millis();
     compare(&mut expected, &mut actual);
-    let rss = std::fs::read_to_string("/proc/self/status").unwrap();
-    let peak = rss.lines().find(|line| line.starts_with("VmHWM:")).unwrap();
+    // Timing/equivalence only. Isolated bulk RSS acceptance remains pending VM.
     eprintln!(
-        "walk_ms={walk_ms} bulk_ms={bulk_ms} phases={:?} estimate={} {peak}",
-        stats.phase_ms,
-        estimate_memory(1_000_101, 101)
+        "walk_ms={walk_ms} bulk_ms={bulk_ms} phases={:?}",
+        stats.phase_ms
     );
 }
