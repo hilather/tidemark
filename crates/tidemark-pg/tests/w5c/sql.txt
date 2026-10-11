@@ -1,0 +1,14 @@
+SELECT datname::text, pg_database_size(oid)::text FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname
+SELECT pg_database_size(oid)::text FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname LIMIT 1
+SELECT oid::text, datname::text FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname
+SELECT COALESCE(sum(size),0)::text FROM pg_ls_waldir()
+SELECT current_setting('server_version_num')::text, pg_is_in_recovery()::text
+SELECT archived_count::text, failed_count::text, EXTRACT(EPOCH FROM last_failed_time)::bigint::text, EXTRACT(EPOCH FROM last_archived_time)::bigint::text FROM pg_stat_archiver
+SELECT datname::text, temp_bytes::text, temp_files::text FROM pg_stat_database WHERE datname IS NOT NULL ORDER BY datname
+SHOW data_directory
+SELECT oid::text, datname::text FROM pg_database ORDER BY oid
+SELECT spcname::text, pg_tablespace_location(oid)::text FROM pg_tablespace ORDER BY spcname
+SELECT schemaname::text, relname::text, n_live_tup::text, n_dead_tup::text, EXTRACT(EPOCH FROM last_autovacuum)::bigint::text FROM pg_stat_user_tables ORDER BY n_dead_tup DESC, schemaname, relname LIMIT 20
+SELECT slot_name::text, slot_type::text, active::text, pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint::text FROM pg_replication_slots ORDER BY slot_name
+SELECT slot_name::text, slot_type::text, active::text, pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint::text, wal_status::text FROM pg_replication_slots ORDER BY slot_name
+SELECT n.nspname::text, c.relname::text, c.relkind::text, pg_total_relation_size(c.oid)::text AS b FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','m') ORDER BY pg_total_relation_size(c.oid) DESC NULLS LAST, n.nspname, c.relname LIMIT 20
