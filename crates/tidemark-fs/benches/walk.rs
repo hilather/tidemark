@@ -23,6 +23,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         scan_start: 0,
         getdents_buf: 256 * 1024,
         io_idle: true,
+        // Bound each directory record to 64 MiB for the generated benchmark tree.
+        max_record_bytes: 64 * 1024 * 1024,
     };
     let (tx, rx) = crossbeam_channel::bounded(1024);
     let start = Instant::now();
