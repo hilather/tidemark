@@ -10,3 +10,10 @@ privileged = []
 
 [lints]
 workspace = true
+
+[dependencies]
+tidemark-core.workspace = true
+tempfile.workspace = true
+serde.workspace = true
+toml.workspace = true
+rustix.workspace = true

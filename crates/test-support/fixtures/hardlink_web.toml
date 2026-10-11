@@ -1,0 +1,10 @@
+generate = "hardlink_web"
+# Each set spans 2–50 directories; two sets also have outside links.
+[[outside]]
+path = "s2"
+kind = "hardlink"
+target = "d00/s2"
+[[outside]]
+path = "s50"
+kind = "hardlink"
+target = "d00/s50"

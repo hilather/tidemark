@@ -56,7 +56,7 @@ fn main() -> Result<()> {
             println!("ci: all available checks passed");
             Ok(())
         }
-        Some("vm-test") => bail!("vm-test is not implemented yet (owner W0-C)"),
+        Some("vm-test") => vm_test::run(root, args),
         Some("gen-fixture" | "bench") => bail!("command is not implemented yet (owner W7-B)"),
         Some("rpm") => bail!("rpm is not implemented yet (owner W6-C)"),
         _ => bail!("usage: cargo xtask <ci|vm-test|gen-fixture|bench|rpm>"),

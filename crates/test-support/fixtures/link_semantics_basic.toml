@@ -1,0 +1,37 @@
+# 03 §6: directory blocks/apparent sizes are measured at test time.
+[[entry]]
+path = "a/x"
+kind = "file"
+size = 4096
+[[entry]]
+path = "a/big"
+kind = "file"
+size = "1MiB"
+[[entry]]
+path = "b/y"
+kind = "hardlink"
+target = "a/x"
+[[entry]]
+path = "b/z"
+kind = "file"
+size = 8192
+[[entry]]
+path = "c/s"
+kind = "symlink"
+target = "../a"
+[[entry]]
+path = "c/d/w"
+kind = "file"
+size = 12288
+[[entry]]
+path = "c/e/v"
+kind = "hardlink"
+target = "c/d/w"
+[[outside]]
+path = "elsewhere/z2"
+kind = "hardlink"
+target = "b/z"
+[[outside]]
+path = "elsewhere/z3"
+kind = "hardlink"
+target = "b/z"

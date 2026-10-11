@@ -1,0 +1,6 @@
+[[entry]]
+path = "pipe"
+kind = "fifo"
+[[entry]]
+path = "socket"
+kind = "socket"
