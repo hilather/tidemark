@@ -9,7 +9,22 @@ pub struct Args {
     pub wait: Option<std::time::Duration>,
 }
 
-/// Execute this command (implemented by its later owner).
-pub fn run(_args: &Args, _context: &crate::Context) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!("not implemented yet (W4-B)"))
+/// Verify the service, staged report and API status, returning exit 6 until healthy.
+pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
+    let api = crate::deploy::SocketPing {
+        socket: context.config.general.socket.clone(),
+        timeout: std::time::Duration::from_secs(10),
+    };
+    let result = crate::deploy::verify(
+        &context.config.general.state_dir,
+        args.wait.unwrap_or_default(),
+        &crate::deploy::RealSystemctl,
+        &api,
+    )?;
+    super::render::verified(&result, context.json)?;
+    if result.healthy {
+        Ok(())
+    } else {
+        Err(crate::CliError::Unhealthy("deployment not healthy".into()).into())
+    }
 }
