@@ -32,3 +32,5 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         Command::Unstage(a) => unstage::run(a, context),
     }
 }
+
+mod render;
