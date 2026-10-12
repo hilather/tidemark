@@ -110,3 +110,11 @@ Record these Wave 1 findings on both VMs in `docs/handoff/W1-gate.md`; preserve 
 
 Environment pairs also reach script suites. Empty values are allowed; repeated names
 are passed in order (the last value wins). `--nocapture` is cargo-only.
+
+`cargo xtask rpm --native` builds the locked release binaries, bash completion
+and RPM directly in a prepared EL8 guest or container, without podman or docker.
+It requires cargo-generate-rpm already installed and defaults to `--offline`;
+use `--online` to permit Cargo network access, `--version 0.1.1` for an upgrade
+package, or `--allow-foreign-host` to explicitly override the EL8 host guard.
+`--native` conflicts with `--container`; the default remains the cached container
+build. See `packaging/rpm/README.md` for CI and guest preparation commands.

@@ -224,3 +224,97 @@ fn install_vm() {
         .unwrap()
         .success());
 }
+
+#[test]
+fn native_options_and_command_order() {
+    let parse = |args: &[&str]| rpm::parse_args(args.iter().map(|s| (*s).to_owned()));
+    let defaults = parse(&[]).unwrap();
+    assert!(!defaults.native);
+    assert_eq!(defaults.version, "0.1.0");
+    let options = parse(&[
+        "--native",
+        "--online",
+        "--allow-foreign-host",
+        "--version",
+        "0.1.1",
+    ])
+    .unwrap();
+    assert!(options.native && options.online && options.allow_foreign_host);
+    assert_eq!(options.version, "0.1.1");
+    for args in [
+        vec!["--native", "--container"],
+        vec!["--container", "--native"],
+        vec!["--native", "--native"],
+        vec!["--online"],
+        vec!["--allow-foreign-host"],
+        vec!["--native", "--version"],
+        vec!["--native", "--version", "2.0.0"],
+    ] {
+        assert!(parse(&args).is_err(), "{args:?}");
+    }
+    for online in [false, true] {
+        let commands = rpm::native_commands("0.1.1", online).unwrap();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].program, "cargo");
+        assert_eq!(commands[0].args[0], "build");
+        assert!(commands[0].args.contains(&"--locked".into()));
+        assert!(commands[0].args.contains(&"--release".into()));
+        assert!(commands[0].args.contains(&"tidemark-cli".into()));
+        assert!(commands[0].args.contains(&"tidemarkd".into()));
+        assert_eq!(commands[0].args.contains(&"--offline".into()), !online);
+        assert_eq!(commands[1].program, "target/release/tidemark");
+        assert_eq!(commands[1].args, ["completions", "bash"]);
+        assert_eq!(
+            commands[1].stdout.as_deref(),
+            Some("target/release/tidemark.bash")
+        );
+        assert_eq!(commands[2].program, "cargo");
+        assert_eq!(commands[2].args, rpm::generate_rpm_args("0.1.1").unwrap());
+    }
+    assert!(rpm::native_commands("bad", false).is_err());
+}
+
+#[test]
+fn injected_el8_os_release() {
+    for id in ["rocky", "rhel", "centos", "almalinux", "ol"] {
+        for version in ["8", "8.8", "8.10"] {
+            assert!(rpm::is_el8(&format!(
+                "ID=\"{id}\"\nVERSION_ID='{version}'\n"
+            )));
+        }
+    }
+    for content in [
+        "",
+        "ID=ubuntu\nVERSION_ID=8\n",
+        "ID=rocky\nVERSION_ID=9\n",
+        "ID=rocky\nVERSION_ID=80\n",
+        "ID_LIKE=rhel\nVERSION_ID=8\n",
+    ] {
+        assert!(!rpm::is_el8(content), "{content}");
+    }
+}
+
+#[test]
+fn workflow_and_new_shell_syntax() {
+    // No YAML parser is a workspace dependency: assert the requested contracts.
+    let workflow = read(".github/workflows/ci.yml");
+    for required in [
+        "el: [\"8.8\", \"8.10\"]",
+        "tools/el8-build-env.sh ${{ matrix.el }}",
+        "cargo xtask rpm --native",
+        "tools/check-rpm.sh",
+        "permissions:\n  contents: read",
+        "fail-fast: false",
+    ] {
+        assert!(workflow.contains(required), "missing {required}");
+    }
+    assert!(workflow.find("vault/rocky/8.8").unwrap() < workflow.find("dnf install").unwrap());
+    for file in ["tools/check-rpm.sh", "tools/el8-build-env.sh"] {
+        assert!(Command::new("sh")
+            .arg("-n")
+            .arg(root().join(file))
+            .status()
+            .unwrap()
+            .success());
+    }
+}
