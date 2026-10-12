@@ -1,0 +1,101 @@
+[general]
+state_dir    = "/var/lib/tidemark"     # root filesystem by default; keeps Tidemark writes off /data
+socket       = "/run/tidemark/api.sock"
+log_level    = "info"                  # error|warn|info|debug|trace
+
+[[roots]]                              # one entry per tracked filesystem
+path               = "/data"
+mode               = "auto"            # auto|walk|bulk
+schedule           = "every 6h"        # "every <dur>" | "daily HH:MM" | "off"
+window             = "00:00-06:00"     # optional; scans only START inside this local-time window
+throttle           = "normal"          # gentle|normal|max or a user-defined profile
+exclude            = []                # full-path globs, e.g. "/data/tmp/cache/**"
+series_depth       = 2                 # dirs at <= depth (relative to root) recorded in dir_series (max 20,000 rows per scan)
+big_file_threshold = "1GiB"
+top_files          = 10000
+
+[[roots]]
+path               = "/"               # never crosses into /data, /proc, /sys, /run, tmpfs (other filesystems)
+mode               = "walk"            # small tree: walk is simplest
+schedule           = "daily 03:30"
+throttle           = "normal"
+exclude            = []                # state_dir is always excluded
+series_depth       = 2
+big_file_threshold = "256MiB"
+top_files          = 2000
+
+[scan]
+threads           = 8
+memory_budget     = "1280MiB"            # scan working set; fits the unit's 2G cgroup limit (see §6)
+getdents_buf      = "256KiB"
+bulk_batch        = 4096
+link_instances    = "all"              # all|none
+max_notable       = 200000
+max_stored_errors = 10000
+
+[throttle]
+max_ops_per_sec = 50000
+min_ops_per_sec = 200
+sample_interval = "500ms"
+  [throttle.profiles.gentle]
+  max_util_pct      = 50
+  target_latency_ms = 15
+  [throttle.profiles.normal]
+  max_util_pct      = 70
+  target_latency_ms = 25
+
+[sampler]
+mounts   = ["/", "/data"]              # statvfs sampling
+interval = "30s"
+
+[lvm]
+enabled  = true                        # auto "n/a" if not on LVM or lvm2 missing
+interval = "5m"
+timeout  = "30s"
+
+[watch]
+enabled          = true
+mounts           = ["/", "/data"]
+events           = ["close_write"]     # add "modify" only for short investigations
+hot_depth        = 6
+exclude_prefixes = []                  # state_dir is always excluded
+lru_entries      = 200000
+
+[procscan]
+enabled          = true
+interval         = "60s"
+open_writers     = true
+exclude_prefixes = []
+
+[metrics]
+textfile              = "/var/lib/node_exporter/textfile_collector/tidemark.prom"   # "" = disabled
+listen                = ""             # e.g. "127.0.0.1:9877"; "" = disabled
+interval              = "60s"
+dir_metrics_depth     = 2
+max_series_per_metric = 500
+
+[alerts]
+webhook  = ""
+renotify = "4h"
+
+  [[alerts.rule]]
+  name   = "fs_full_soon"
+  kind   = "time_to_full"
+  mount  = "/data"
+  below  = "12h"
+  window = "1h"
+  for    = "10m"
+  # Other default rules are listed in 07 §6.4; `tidemark status --show-config` prints the effective set.
+
+[retention]
+max_state_size = "20GiB"
+min_free_pct   = 5
+  [retention.snapshots]
+  recent = 4
+  daily  = 14
+  weekly = 8
+  [retention.samples]
+  raw         = "48h"
+  five_min    = "35d"
+  hourly      = "400d"
+  hot_minutes = "7d"
