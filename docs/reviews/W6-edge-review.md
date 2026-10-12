@@ -8,7 +8,7 @@ Read AGENTS.md, all of Wave 6, relevant 08 contracts, 11 rollout, ADR-018/019 an
 
 ### F01 — BLOCKER: optional HTTP metrics permits unbounded local resource consumption
 
-**Reference:** `finding:W6-edge-F01`. **Locations:** `crates/tidemarkd/src/metrics.rs:471`, `:532`, `:599`.
+**Reference:** `finding:w6-edge-f01`. **Locations:** `crates/tidemarkd/src/metrics.rs:471`, `:532`, `:599`.
 
 With `metrics.listen='127.0.0.1:9877'`, any local account can open unlimited idle connections or send an unending request/header line. The single application responder does not bound tiny_http's internal transport. The exact locked dependency, tiny_http 0.12.0, was checked in the host registry: `src/lib.rs:320–338` schedules each client; `src/util/task_pool.rs:67–83` creates workers without a maximum; `src/util/messages_queue.rs:29–33` appends to an unbounded queue; `src/client.rs:80–101` grows a line until CRLF. A slow response reader can also block `respond`, preventing listener reload. Shutdown detaches the responder after 250 ms. Thus threads, queued requests, request bytes, and socket lifetime violate the bounded-everything requirement. HTTP is disabled by default; this becomes reachable when the documented optional listener is enabled. The W6-B handoff acknowledges this unresolved seam.
 
@@ -16,7 +16,7 @@ With `metrics.listen='127.0.0.1:9877'`, any local account can open unlimited idl
 
 ### F02 — SHOULD-FIX: API connections never expire before a complete request
 
-**Reference:** `finding:W6-edge-F02`. **Locations:** `crates/tidemarkd/src/api.rs:147–166`, `:177–198`, `:217`, `:249`.
+**Reference:** `finding:w6-edge-f02`. **Locations:** `crates/tidemarkd/src/api.rs:147–166`, `:177–198`, `:217`, `:249`.
 
 Open 32 connections and send nothing, or one byte without newline on each. Each 100 ms read timeout simply restarts the loop forever; the ten-second deadline begins only after a whole JSON request has been parsed and a handler spawned. Every admission slot remains occupied, and all subsequent CLI clients are dropped. Peer credentials are fetched before reading, but uid authorization is deferred until `dispatch`: a nonroot peer able to reach the socket is also allowed to hold a slot, feed the parser, and receive `bad_request` for malformed JSON rather than being refused first. A failed credential lookup does correctly close immediately. Response write_all uses a per-write timeout with no total deadline/shutdown check, so a reader making tiny progress can also extend response and connection shutdown well beyond ten seconds.
 
@@ -24,7 +24,7 @@ Open 32 connections and send nothing, or one byte without newline on each. Each 
 
 ### F03 — SHOULD-FIX: API timeout abandons running handlers instead of ending them
 
-**Reference:** `finding:W6-edge-F03`. **Locations:** `crates/tidemarkd/src/api.rs:240–245`, `:252–271`, `:374`.
+**Reference:** `finding:w6-edge-f03`. **Locations:** `crates/tidemarkd/src/api.rs:240–245`, `:252–271`, `:374`.
 
 The handler JoinHandle is dropped after spawn. A timed-out callback retains its permit/context indefinitely, and server shutdown joins only connection workers. The existing `pair_controllable_timeout_and_shutdown` and `controllable_handler_timeout_keeps_admission_bounded` tests prove this directly: they join the server **before** releasing the blocked reload callback. Thirty-two stuck callbacks exhaust future admission until those callbacks finish, indefinitely if they never do; an in-flight reload can continue after transport shutdown. Memory/thread count is capped, but lifetime and complete worker shutdown are not. The W6-A3 handoff explicitly acknowledges the detachment.
 
@@ -32,7 +32,7 @@ The handler JoinHandle is dropped after spawn. A timed-out callback retains its 
 
 ### F04 — SHOULD-FIX: API path operations depend on unchecked, mutable parent paths
 
-**Reference:** `finding:W6-edge-F04`. **Locations:** `crates/tidemarkd/src/api.rs:313–331`, `:373`; `crates/tidemark-core/src/config.rs:747`.
+**Reference:** `finding:w6-edge-f04`. **Locations:** `crates/tidemarkd/src/api.rs:313–331`, `:373`; `crates/tidemark-core/src/config.rs:747`.
 
 The final leaf is checked with symlink_metadata, but parent ownership/modes/symlinks are not checked or pinned. Configuration only requires an absolute socket path. With the permitted socket path under an attacker-writable, non-sticky directory, another user can replace the newly bound leaf with a symlink before pathname `set_permissions`, causing the root daemon to chmod the symlink target to 0600. Stale detection/unlink and shutdown unlink also do not verify that they remove the socket previously inspected/created. A full-backlog existing listener can block the startup liveness probe's raw `UnixStream::connect`. The packaged 0700 root-owned `/run/tidemark` mitigates the unprivileged race at the default location; this is a defect in accepted custom-path handling, not a claimed exploit of the default directory.
 
@@ -40,7 +40,7 @@ The final leaf is checked with symlink_metadata, but parent ownership/modes/syml
 
 ### F05 — SHOULD-FIX: scan fallback bypasses the shared client's deadline
 
-**Reference:** `finding:W6-edge-F05`. **Locations:** `crates/tidemark-cli/src/cmd/scan.rs:33`, `:132`, `:145`.
+**Reference:** `finding:w6-edge-f05`. **Locations:** `crates/tidemark-cli/src/cmd/scan.rs:33`, `:132`, `:145`.
 
 A socket listener that never accepts and has a full backlog first causes bounded `Client::connect` to expire after 11 seconds. The broad `if let Ok` then falls into direct mode and calls blocking `UnixStream::connect` twice, without deadlines. The first can hang forever, before direct signal handling is installed. Timeout/permission errors are also incorrectly treated as evidence to try direct mode.
 
@@ -48,7 +48,7 @@ A socket listener that never accepts and has a full backlog first causes bounded
 
 ### F06 — SHOULD-FIX: scan polling follows a later scan on the same root
 
-**Reference:** `finding:W6-edge-F06`. **Location:** `crates/tidemark-cli/src/cmd/scan.rs:93–110`.
+**Reference:** `finding:w6-edge-f06`. **Location:** `crates/tidemark-cli/src/cmd/scan.rs:93–110`.
 
 After the CLI starts scan A, A can complete and B start before the next poll. A valid status then has `last_complete=A`, `running=B`. The CLI checks A's completion only when running is None, so it follows B and eventually exits 3 claiming A failed when the latest completion becomes B. A signal during that incorrect wait can send root-only cancellation for B.
 
@@ -56,7 +56,7 @@ After the CLI starts scan A, A can complete and B start before the next poll. A 
 
 ### F07 — SHOULD-FIX: daemon-backed degraded scans exit successfully
 
-**Reference:** `finding:W6-edge-F07`. **Location:** `crates/tidemark-cli/src/cmd/scan.rs:100–104`.
+**Reference:** `finding:w6-edge-f07`. **Location:** `crates/tidemark-cli/src/cmd/scan.rs:100–104`.
 
 A completed walk with per-directory errors is stored as complete **and degraded** (`crates/tidemark-scan/src/agg/rollup.rs:155`, `orchestrator.rs:575–582`). Scheduler `last_scan` (`crates/tidemarkd/src/scheduler.rs:484–490`) discards that flag because frozen LastScan has no outcome field. The CLI returns Ok whenever the completion ID matches, whereas direct mode at `scan.rs:211–216` correctly exits 3 for degraded completion. This breaks 08's completed-with-errors exit code. Source verified; the candidate's separate known daemon ENOTDIR issue prevents treating this as a demonstrated successful real scan here.
 
@@ -64,7 +64,7 @@ A completed walk with per-directory errors is stored as complete **and degraded*
 
 ### F08 — SHOULD-FIX: live tables ignore terminal width
 
-**Reference:** `finding:W6-edge-F08`. **Locations:** `crates/tidemark-cli/src/render/hot.rs:32`, `render/alerts.rs:27`, `:53`, `render/status.rs:32`, `render/now.rs:28–137`.
+**Reference:** `finding:w6-edge-f08`. **Locations:** `crates/tidemark-cli/src/render/hot.rs:32`, `render/alerts.rs:27`, `:53`, `render/status.rs:32`, `render/now.rs:28–137`.
 
 A 200-character hot path prints a line over 200 columns in an 80-column terminal. These renderers send complete fields to `table::aligned` or writeln; table widths derive from data, not terminal dimensions. The new TIOCGWINSZ handling applies only to `now`. This is separate from the explicitly excluded now mid-word truncation problem. Escaping controls/non-UTF-8 bytes is present in the table fields, but escaping alone does not bound line width.
 
@@ -72,7 +72,7 @@ A 200-character hot path prints a line over 200 columns in an 80-column terminal
 
 ### F09 — SHOULD-FIX: snapshot cache rejects valid large inventories before cardinality selection
 
-**Reference:** `finding:W6-edge-F09`. **Locations:** `crates/tidemarkd/src/metrics.rs:46–57`, `:66–74`.
+**Reference:** `finding:w6-edge-f09`. **Locations:** `crates/tidemarkd/src/metrics.rs:46–57`, `:66–74`.
 
 With 100,001 eligible directories, or several roots whose combined cache exceeds 100,000, refresh fails before the configured largest 500 can be chosen. First publication lacks all directory/error series and omission counts; subsequent publications retain old values despite a new successful scan. The contract calls for largest-first retention and dropped-series counts on million-wide trees. The 10,000-directory test never crosses the implementation ceiling. W6-B's proposed store streaming seam remains unresolved.
 
@@ -80,7 +80,7 @@ With 100,001 eligible directories, or several roots whose combined cache exceeds
 
 ### F10 — SHOULD-FIX: restart drops metrics for existing latest snapshots
 
-**Reference:** `finding:W6-edge-F10`. **Locations:** `crates/tidemarkd/src/metrics.rs:492–500`, `:565–570`.
+**Reference:** `finding:w6-edge-f10`. **Locations:** `crates/tidemarkd/src/metrics.rs:492–500`, `:565–570`.
 
 LiveState starts with no metrics cache (`state.rs:130`); only post-scan processing publishes it (`scheduler.rs:439–454`). Startup reads latest catalog entries for statuses but never opens them for metrics. Restart with a valid snapshot and `schedule='off'`: directory used/reclaimable and scan-error metrics disappear until a manual scan, although last-success/duration remain. The latest-snapshot contract is not restricted to snapshots from this daemon process. Root removal/depth-increase reloads also lack cache reconciliation.
 
@@ -88,7 +88,7 @@ LiveState starts with no metrics cache (`state.rs:130`); only post-scan processi
 
 ### F11 — SHOULD-FIX: a crash-left textfile temporary prevents every future update
 
-**Reference:** `finding:W6-edge-F11`. **Location:** `crates/tidemarkd/src/metrics.rs:441–448`.
+**Reference:** `finding:w6-edge-f11`. **Location:** `crates/tidemarkd/src/metrics.rs:441–448`.
 
 Kill the writer after creation of `<textfile>.tmp` and before rename. Every later export, even after daemon restart, fails create_new; the old complete `.prom` remains stale indefinitely. The error is logged/degraded, but normal restart cannot restore monitoring. The handoff requires manual deletion, and `crates/tidemarkd/tests/w6b.rs:284–287` deliberately asserts unconditional existing-temp refusal. This is a recovery defect, distinct from the already documented limitations of absent(up).
 
@@ -96,7 +96,7 @@ Kill the writer after creation of `<textfile>.tmp` and before rename. Every late
 
 ### F12 — SHOULD-FIX: validated metrics interval panics the exporter
 
-**Reference:** `finding:W6-edge-F12`. **Location:** `crates/tidemarkd/src/metrics.rs:593`.
+**Reference:** `finding:w6-edge-f12`. **Location:** `crates/tidemarkd/src/metrics.rs:593`.
 
 `[metrics] interval='18446744073709551615s'` passes parsing and validation (`crates/tidemark-core/src/config.rs:864–885` checks only positivity). `Instant::now() + interval` then panics on overflow. **Reproduced against the exact compiled candidate libraries**, with both outputs disabled and no filesystem/service access: validation returned `[]`, followed by the metrics thread panic at line 593 and a failed join. Artifact `library/metrics-overflow.rs`/`.log` contains the probe/output.
 
@@ -104,7 +104,7 @@ Kill the writer after creation of `<textfile>.tmp` and before rename. Every late
 
 ### F13 — SHOULD-FIX: install assertions do not discriminate required lifecycle behavior
 
-**Reference:** `finding:W6-edge-F13`. **Locations:** `tests/install/install.sh:72`, `:103–120`; `xtask/src/rpm.rs:21`.
+**Reference:** `finding:w6-edge-f13`. **Locations:** `tests/install/install.sh:72`, `:103–120`; `xtask/src/rpm.rs:21`.
 
 Fresh install is asserted disabled, then the test only starts the service. It never enables it before checking erase disables it, so removal of `systemctl disable` from preun would still pass. The documented upgrade changes only version metadata while shipping identical default config bytes, which does not test a conflicting new default requiring noreplace behavior. Auditd activity is required, but SELinux Enforcing is not, so empty AVC output can also be vacuous. No faulty production scriptlet is alleged; these are missing gate preconditions.
 
