@@ -691,3 +691,67 @@ fn busy_keeps_fixed_deferral_and_does_not_increment_failure_attempts() {
     // First actual failure gets 30 seconds, rather than the second-attempt minute.
     wait(|| next_due() == Some(base + 60));
 }
+
+#[test]
+fn catalog_reader_in_separate_process() {
+    let Some(state) = std::env::var_os("TIDEMARK_CATALOG_READER_STATE") else {
+        return;
+    };
+    let root = std::env::var_os("TIDEMARK_CATALOG_READER_ROOT").unwrap();
+    let catalog =
+        tidemark_store::catalog::Catalog::open(std::path::Path::new(&state), false).unwrap();
+    let root = RawPath::from_path(std::path::Path::new(&root)).unwrap();
+    let entry = catalog.latest(&root).unwrap().unwrap();
+    let file = entry.file.unwrap();
+    assert!(file.exists());
+    assert!(tidemark_store::reader::Snapshot::open(&file).is_ok());
+}
+
+#[test]
+fn bound_storage_snapshot_readable_in_separate_process_without_sockets() {
+    let h = Harness::new("every 1h", "max");
+    wait(|| {
+        h.control
+            .status(&ScanStatusParams { root: None })
+            .unwrap()
+            .iter()
+            .any(|s| s.last_complete.is_some())
+    });
+    h.idle();
+    let catalog = tidemark_store::catalog::Catalog::open(&h.cfg.general.state_dir, false).unwrap();
+    let entry = catalog.latest(&h.root()).unwrap().unwrap();
+    let file = entry.file.unwrap();
+    assert!(file.exists());
+    assert!(tidemark_store::reader::Snapshot::open(&file).is_ok());
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::catalog_reader_in_separate_process",
+            "--nocapture",
+        ])
+        .env("TIDEMARK_CATALOG_READER_STATE", &h.cfg.general.state_dir)
+        .env("TIDEMARK_CATALOG_READER_ROOT", &h.cfg.roots[0].path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    // Cargo does not expose another package's binary to this test crate.
+    // An explicit path allows the workspace validation run to exercise the CLI.
+    if let Some(cli) = std::env::var_os("TIDEMARK_CATALOG_CLI") {
+        let output = std::process::Command::new(cli)
+            .arg("--config")
+            .arg(h.cfg.general.state_dir.join("missing.toml"))
+            .arg("--state-dir")
+            .arg(&h.cfg.general.state_dir)
+            .args(["--json", "snapshots", "list"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(output
+            .stdout
+            .windows(entry.scan_id.len())
+            .any(|w| w == entry.scan_id.as_bytes()));
+        assert_eq!(json["schema"], "tidemark.snapshots.v1");
+    }
+}

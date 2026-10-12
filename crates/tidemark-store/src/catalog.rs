@@ -6,7 +6,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::{
     fs,
     os::unix::ffi::{OsStrExt, OsStringExt},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 use tidemark_core::{path::RawPath, scan::ScanMode};
 /// Encode root bytes injectively for the snapshot directory name.
@@ -40,7 +40,8 @@ pub struct ScanEntry {
     pub status: String,
     #[doc = "Scan catalog field (05 §4)."]
     pub degraded: bool,
-    #[doc = "Scan catalog field (05 §4)."]
+    /// Snapshot path resolved against the reading catalog's state directory.
+    /// Stored as relative bytes; existing legacy absolute paths remain readable.
     pub file: Option<PathBuf>,
     #[doc = "Scan catalog field (05 §4)."]
     pub t_disk: Option<u64>,
@@ -139,7 +140,7 @@ impl Catalog {
             "SELECT * FROM scans WHERE (? IS NULL OR root=?) ORDER BY started_at DESC,scan_id DESC",
         )?;
         let result = stmt
-            .query_map(params![root, root], row)?
+            .query_map(params![root, root], |r| self.read_row(r))?
             .take(crate::error::MAX_QUERY_ROWS + 1)
             .collect::<rusqlite::Result<Vec<_>>>()?;
         crate::error::check_result_bound(&result)?;
@@ -147,18 +148,62 @@ impl Catalog {
     }
     /// Select the newest complete scan for one root.
     pub fn latest(&self, root: &RawPath) -> Result<Option<ScanEntry>, StoreError> {
-        Ok(self.conn.query_row("SELECT * FROM scans WHERE root=? AND status='complete' ORDER BY started_at DESC,scan_id DESC LIMIT 1",[root.as_bytes()],row).optional()?)
+        Ok(self.conn.query_row("SELECT * FROM scans WHERE root=? AND status='complete' ORDER BY started_at DESC,scan_id DESC LIMIT 1",[root.as_bytes()],|r| self.read_row(r)).optional()?)
     }
     /// Select the newest complete scan starting at or before the supplied time.
     pub fn nearest_before(&self, root: &RawPath, ts: i64) -> Result<Option<ScanEntry>, StoreError> {
-        Ok(self.conn.query_row("SELECT * FROM scans WHERE root=? AND status='complete' AND started_at<=? ORDER BY started_at DESC,scan_id DESC LIMIT 1",params![root.as_bytes(),ts],row).optional()?)
+        Ok(self.conn.query_row("SELECT * FROM scans WHERE root=? AND status='complete' AND started_at<=? ORDER BY started_at DESC,scan_id DESC LIMIT 1",params![root.as_bytes(),ts],|r| self.read_row(r)).optional()?)
     }
     /// Fetch an explicitly selected scan, including partial scans.
     pub fn get(&self, scan_id: &str) -> Result<Option<ScanEntry>, StoreError> {
         Ok(self
             .conn
-            .query_row("SELECT * FROM scans WHERE scan_id=?", [scan_id], row)
+            .query_row("SELECT * FROM scans WHERE scan_id=?", [scan_id], |r| {
+                self.read_row(r)
+            })
             .optional()?)
+    }
+    fn relative_file(&self, file: &Path) -> Result<PathBuf, StoreError> {
+        // Components removes interior dots without resolving symlinks or parents.
+        let clean =
+            |p: &Path| -> PathBuf { p.components().filter(|c| *c != Component::CurDir).collect() };
+        let file = clean(file);
+        let state = clean(&self.state_dir);
+        let relative = file.strip_prefix(state).map_err(|_| {
+            StoreError::Invalid("snapshot file is outside catalog state directory".into())
+        })?;
+        if relative.components().any(|c| c == Component::ParentDir) {
+            return Err(StoreError::Invalid(
+                "snapshot file contains parent traversal".into(),
+            ));
+        }
+        Ok(relative.to_owned())
+    }
+    fn read_row(&self, r: &Row<'_>) -> rusqlite::Result<ScanEntry> {
+        let mut entry = row(r)?;
+        entry.file = entry.file.map(|file| {
+            if !file.is_absolute() {
+                return self.state_dir.join(file);
+            }
+            if file.exists() {
+                return file;
+            }
+            let mut components = file.components();
+            while let Some(component) = components.next_back() {
+                if component == Component::Normal(std::ffi::OsStr::new("snapshots")) {
+                    let tail = file.strip_prefix(components.as_path());
+                    if let Ok(tail) = tail {
+                        let resolved = self.state_dir.join(tail);
+                        if resolved.exists() {
+                            return resolved;
+                        }
+                    }
+                    break;
+                }
+            }
+            file
+        });
+        Ok(entry)
     }
     /// Record a new scan; duplicate ids are rejected.
     pub fn record_start(&self, e: &ScanEntry) -> Result<(), StoreError> {
@@ -172,7 +217,12 @@ impl Catalog {
         if !["running", "complete", "partial", "failed"].contains(&e.status.as_str()) {
             return Err(StoreError::Invalid("invalid scan status".into()));
         }
-        let file = e.file.as_ref().map(|p| SqlPath(p.as_os_str().as_bytes()));
+        let relative = e
+            .file
+            .as_deref()
+            .map(|p| self.relative_file(p))
+            .transpose()?;
+        let file = relative.as_ref().map(|p| SqlPath(p.as_os_str().as_bytes()));
         let tail = if replace {
             " ON CONFLICT(scan_id) DO UPDATE SET root=excluded.root,root_slug=excluded.root_slug,mode=excluded.mode,started_at=excluded.started_at,finished_at=excluded.finished_at,status=excluded.status,degraded=excluded.degraded,file=excluded.file,t_disk=excluded.t_disk,t_inodes=excluded.t_inodes,t_dirs=excluded.t_dirs,errors=excluded.errors,duration_ms=excluded.duration_ms,tool_version=excluded.tool_version"
         } else {
