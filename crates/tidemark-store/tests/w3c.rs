@@ -205,9 +205,12 @@ fn notable_files_above_old_cap_stream_and_io_errors_propagate() {
         .map(|entry| entry["name"].as_str().unwrap())
         .collect();
     assert_eq!(names.len(), 4097);
-    assert!(names
-        .windows(2)
-        .all(|pair| pair[0].as_bytes() < pair[1].as_bytes()));
+    for (id, name) in names.iter().enumerate() {
+        assert_eq!(*name, format!("file-{id}"));
+    }
+    let mut again = vec![];
+    export_ncdu(&snap, &root, &mut again, &opts).unwrap();
+    assert_eq!(out, again);
     assert_eq!(entries.last().unwrap()["name"], "[other files: 0]");
     assert_eq!(std::fs::read(&file).unwrap(), original);
     let absent = RawPath::new(b"/absent".to_vec()).unwrap();
@@ -230,4 +233,134 @@ fn notable_files_above_old_cap_stream_and_io_errors_propagate() {
         export_ncdu(&snap, &root, &mut Failing, &opts),
         Err(tidemark_store::StoreError::Io(_))
     ));
+}
+
+#[test]
+fn symlinks_are_a_subset_of_other_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut row = support::row(0, None, b"/fixture", 30);
+    row.subtree_end = 0;
+    row.own_files = 3;
+    row.own_symlinks = 1;
+    let path = support::snapshot(temp.path(), &[row], 500);
+    let snap = Snapshot::open(&path).unwrap();
+    let mut out = vec![];
+    export_ncdu(
+        &snap,
+        &snap.meta().root,
+        &mut out,
+        &NcduOptions {
+            utf8_lossy: true,
+            max_depth: None,
+        },
+    )
+    .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(doc[3][1]["name"], "[other files: 3]");
+}
+#[test]
+fn outside_subroot_link_keeps_apparent_charge_at_every_depth() {
+    let temp = tempfile::tempdir().unwrap();
+    // A 500-byte shared inode has names in a/d/e and b and is charged at root.
+    let mut root = support::row(0, None, b"/fixture", 500);
+    root.subtree_end = 4;
+    root.t_charged = 564;
+    let mut a = support::row(1, Some(0), b"/fixture/a", 10);
+    a.subtree_end = 3;
+    a.t_charged = 32;
+    a.t_apparent = 532;
+    let mut d = support::row(2, Some(1), b"/fixture/a/d", 10);
+    d.depth = 2;
+    d.subtree_end = 3;
+    d.t_charged = 22;
+    d.t_apparent = 522;
+    let mut e = support::row(3, Some(2), b"/fixture/a/d/e", 12);
+    e.depth = 3;
+    e.t_apparent = 512;
+    let b = support::row(4, Some(0), b"/fixture/b", 32);
+    let path = support::snapshot(temp.path(), &[root, a, d, e, b], 600);
+    let snap = Snapshot::open(&path).unwrap();
+    fn apparent(v: &serde_json::Value) -> u64 {
+        if let Some(a) = v.as_array() {
+            a.iter().map(apparent).sum()
+        } else {
+            v["asize"].as_u64().unwrap_or(0)
+        }
+    }
+    let under = tidemark_core::path::RawPath::new(b"/fixture/a".to_vec()).unwrap();
+    for depth in [None, Some(0), Some(1), Some(2), Some(3)] {
+        let mut out = vec![];
+        export_ncdu(
+            &snap,
+            &under,
+            &mut out,
+            &NcduOptions {
+                utf8_lossy: true,
+                max_depth: depth,
+            },
+        )
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(apparent(&doc[3]), 32, "depth {depth:?}");
+        assert_eq!(sum(&doc[3]), 32);
+    }
+}
+#[test]
+fn notable_paging_uses_index_seek_without_sort() {
+    let source = include_str!("../src/export_ncdu.rs");
+    let sql = source
+        .split("let mut files = snap.conn().prepare(")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .nth(1)
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let mut row = support::row(0, None, b"/fixture", 0);
+    row.subtree_end = 0;
+    let path = support::snapshot(temp.path(), &[row], 700);
+    let query = format!("EXPLAIN QUERY PLAN {sql}");
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let mut statement = conn.prepare(&query).unwrap();
+    // Both the first and subsequent pages must seek, rather than sort/filter a directory repeatedly.
+    for after in [-1i64, 0, 4096] {
+        let mut rows = statement.query([0i64, after, 256]).unwrap();
+        let mut plan = String::new();
+        while let Some(row) = rows.next().unwrap() {
+            plan.push_str(&row.get::<_, String>(3).unwrap());
+        }
+        assert!(
+            plan.contains("SEARCH files USING INDEX files_dir") && plan.contains("rowid>"),
+            "{plan}"
+        );
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+}
+
+#[test]
+fn truncated_apparent_sum_reports_overflow() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut root = support::row(0, None, b"/fixture", 0);
+    root.subtree_end = 3;
+    let mut rows = vec![root];
+    for id in 1..=3 {
+        let mut row = support::row(id, Some(0), format!("/fixture/{id}").as_bytes(), 0);
+        row.own_apparent = i64::MAX as u64;
+        rows.push(row);
+    }
+    let path = support::snapshot(temp.path(), &rows, 800);
+    let snap = Snapshot::open(&path).unwrap();
+    let error = export_ncdu(
+        &snap,
+        &snap.meta().root,
+        &mut vec![],
+        &NcduOptions {
+            utf8_lossy: true,
+            max_depth: Some(0),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, tidemark_store::StoreError::Integer(_)));
 }

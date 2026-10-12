@@ -26,8 +26,8 @@ pub struct ExportStats {
 }
 // Directory depth is bounded independently of input tree width.
 const MAX_OPEN_ARRAYS: usize = 65536;
-// Reader sorting scratch lives in memory. LIMIT bounds SQLite's top-N sorter
-// even without a (dir_id, name, ino) index; keyset pages impose no total cap.
+// files_dir includes the INTEGER PRIMARY KEY as its implicit rowid suffix.
+// Directory/id keyset pages seek that existing index without sorting.
 const FILE_PAGE_ROWS: u32 = 256;
 
 /// Stream ncdu v1.2 arrays in preorder without recursion or a resident tree.
@@ -47,8 +47,8 @@ pub fn export_ncdu(
     let mut files = snap.conn().prepare(
         "SELECT name, apparent, disk, ino, id FROM files
          WHERE dir_id = ?1 AND nlink = 1 AND name IS NOT NULL
-           AND (?2 IS NULL OR (name, ino, id) > (?2, ?3, ?4))
-         ORDER BY name, ino, id LIMIT ?5",
+           AND id > ?2
+         ORDER BY id LIMIT ?3",
     )?;
     let metadata = serde_json::json!({"progname":"tidemark", "progver":snap.meta().tool_version,
         "timestamp":snap.meta().started_at, "note":"Sizes are the charged (additive) view."});
@@ -103,20 +103,11 @@ pub fn export_ncdu(
             .own_apparent
             .checked_sub(dir.dir_apparent)
             .ok_or_else(|| StoreError::Invalid("own_apparent below dir_apparent".into()))?;
-        let mut count = dir
-            .own_files
-            .checked_add(dir.own_symlinks)
-            .ok_or_else(|| StoreError::Integer("aggregate file count".into()))?;
-        let mut after: Option<(Vec<u8>, i64, u32)> = None;
+        let mut count = dir.own_files;
+        // IDs are nonnegative; -1 includes id zero on the first page.
+        let mut after = -1i64;
         loop {
-            let mut rows = files.query(rusqlite::params![
-                id,
-                after.as_ref().map(|key| &key.0),
-                after.as_ref().map(|key| key.1),
-                after.as_ref().map(|key| key.2),
-                FILE_PAGE_ROWS,
-            ])?;
-            let mut last: Option<(Vec<u8>, i64, u32)> = None;
+            let mut rows = files.query(rusqlite::params![id, after, FILE_PAGE_ROWS])?;
             let mut emitted = 0;
             while let Some(file) = rows.next()? {
                 let name = file.get_ref(0)?.as_blob().map_err(|error| {
@@ -143,17 +134,12 @@ pub fn export_ncdu(
                 stats.files += 1;
                 add_disk(&mut stats, file_disk)?;
                 emitted += 1;
-                // Retain only the final row's key, never the page or subtree.
-                let key = last.get_or_insert_with(|| (Vec::new(), 0, 0));
-                key.0.clear();
-                key.0.extend_from_slice(name);
-                key.1 = file.get(3)?;
-                key.2 = file.get(4)?;
+                // Retain only the final primary key, never a page or name buffer.
+                after = file.get(4)?;
             }
             if emitted < FILE_PAGE_ROWS {
                 break;
             }
-            after = last;
         }
         out.write_all(b",")?;
         info(
@@ -179,11 +165,7 @@ pub fn export_ncdu(
             info(
                 out,
                 b"[depth-limited descendants]",
-                dir.t_apparent
-                    .checked_sub(dir.own_apparent)
-                    .ok_or_else(|| {
-                        StoreError::Invalid("subtree apparent below own apparent".into())
-                    })?,
+                descendant_apparent(snap, id, dir.subtree_end)?,
                 descendants,
                 0,
                 None,
@@ -209,6 +191,21 @@ pub fn export_ncdu(
     }
     out.write_all(b"]\n")?;
     Ok(stats)
+}
+fn descendant_apparent(snap: &Snapshot, id: u32, end: u32) -> Result<u64, StoreError> {
+    // Union t_apparent includes links charged at ancestors outside this subtree.
+    // Stream additive charges instead; checked Rust arithmetic avoids SQL SUM overflow.
+    let mut statement = snap
+        .conn()
+        .prepare("SELECT own_apparent FROM dirs WHERE id > ?1 AND id <= ?2 ORDER BY id")?;
+    let mut rows = statement.query(rusqlite::params![id, end])?;
+    let mut total = 0u64;
+    while let Some(row) = rows.next()? {
+        total = total
+            .checked_add(crate::error::read_u64(row, 0)?)
+            .ok_or_else(|| StoreError::Integer("descendant apparent total".into()))?;
+    }
+    Ok(total)
 }
 fn add_disk(stats: &mut ExportStats, disk: u64) -> Result<(), StoreError> {
     stats.disk_bytes = stats

@@ -1,0 +1,9 @@
+---
+source: crates/tidemark-cli/tests/w3a/reports.rs
+expression: "String::from_utf8(out).unwrap()"
+---
+From: Snapshot old · Walk · 200s ago · complete
+To: Snapshot new · Walk · 100s ago · partial (degraded)
+WARNING: to snapshot new is partial (degraded); deltas may reflect incomplete coverage.
+Notice: comparison snapshot actual age: 2h
+CLASS  DELTA  PATH

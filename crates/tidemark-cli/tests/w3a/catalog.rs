@@ -92,3 +92,78 @@ fn since_age_notice_latest_complete_and_from_default_to() {
         Some(2)
     );
 }
+
+#[test]
+fn explicit_partial_or_degraded_diff_warns_and_shows_both_inputs() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let state = temp.path().join("state");
+    let catalog = Catalog::open(&state, true).unwrap();
+    let mut row = support::row(0, None, root.as_os_str().as_bytes(), 100);
+    row.subtree_end = 0;
+    let a = record(
+        &catalog,
+        support::snapshot(&state.join("snapshots"), &[row.clone()], 100),
+        "complete",
+    );
+    row.t_disk = 40;
+    let b = record(
+        &catalog,
+        support::snapshot(&state.join("snapshots"), &[row], 200),
+        "partial",
+    );
+    for (status, degraded) in [("partial", false), ("complete", true), ("partial", true)] {
+        let mut entry = catalog.get(&b).unwrap().unwrap();
+        entry.status = status.into();
+        entry.degraded = degraded;
+        catalog.record_finish(&entry).unwrap();
+        for reverse in [false, true] {
+            for json in [false, true] {
+                let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"));
+                cmd.arg("--config")
+                    .arg(temp.path().join("missing"))
+                    .arg("--state-dir")
+                    .arg(&state);
+                if json {
+                    cmd.arg("--json");
+                }
+                let (from, to) = if reverse { (&b, &a) } else { (&a, &b) };
+                let out = cmd
+                    .arg("diff")
+                    .arg(&root)
+                    .args(["--from", from, "--to", to])
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                if json {
+                    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                    let notice = doc["data"]["notice"].as_str().unwrap();
+                    assert!(
+                        notice.contains("WARNING")
+                            && notice.contains("deltas may reflect incomplete coverage")
+                    );
+                    assert_eq!(doc["data"].as_object().unwrap().len(), 3);
+                } else {
+                    let text = String::from_utf8(out.stdout).unwrap();
+                    assert!(
+                        text.contains(&a)
+                            && text.contains(&b)
+                            && text.contains("Walk")
+                            && text.contains("s ago")
+                    );
+                    assert!(
+                        text.contains("WARNING")
+                            && text.contains("deltas may reflect incomplete coverage")
+                    );
+                    assert!(text.contains(if degraded { "degraded" } else { "partial" }));
+                }
+            }
+        }
+    }
+}
