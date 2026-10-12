@@ -68,6 +68,31 @@ fn exact_normative_unit_and_config() {
     );
 }
 #[test]
+fn unit_values_have_no_trailing_comments() {
+    let actual = read("packaging/systemd/tidemarkd.service");
+    for (index, line) in actual.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with(['#', ';'])
+            || (line.starts_with('[') && line.ends_with(']'))
+        {
+            continue;
+        }
+        let (_, value) = line.split_once('=').unwrap();
+        assert!(
+            !value.contains(" #") && !value.contains(" ;"),
+            "trailing comment on unit line {}: {line}",
+            index + 1
+        );
+    }
+    for setting in ["MemoryLimit=2G", "MemoryMax=2G"] {
+        assert!(
+            actual.lines().any(|line| line == setting),
+            "missing {setting}"
+        );
+    }
+}
+#[test]
 fn metadata_and_scriptlet_contract() {
     let manifest: toml::Value = toml::from_str(&read("crates/tidemark-cli/Cargo.toml")).unwrap();
     assert!(manifest["package"]["metadata"]["generate-rpm"].is_table());
