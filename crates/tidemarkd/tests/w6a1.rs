@@ -1,5 +1,6 @@
 //! Owned by: W6-A1
 //! Unprivileged state, persistence and lifecycle evidence.
+#![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used)]
 use std::{
     path::{Path, PathBuf},
@@ -105,9 +106,24 @@ fn alert_source_unavailable_empty_and_measured() {
     assert!(v.lvm().is_none());
     assert!(v.dir_growth("/fixture", 2).is_none());
     assert!(v.scan_age("unknown").is_none());
+    assert!(v.scan_age("/fixture").is_none());
+    assert!(v.scans().is_none());
+    publish(
+        &s,
+        Publication::Scan(ScanStatus {
+            root: "/fixture".into(),
+            running: None,
+            last_complete: None,
+            next_due: None,
+        }),
+    );
     assert_eq!(
-        v.scan_age("/fixture").unwrap().effective_cadence,
+        s.view().scan_age("/fixture").unwrap().effective_cadence,
         Some(Duration::from_secs(86400))
+    );
+    assert_eq!(
+        s.view().scan_age("/fixture").unwrap().last_complete_at,
+        None
     );
     publish(
         &s,
@@ -694,4 +710,70 @@ fn symlink_state_artifacts_are_refused() {
     )
     .is_err());
     assert_eq!(std::fs::read(target).unwrap(), b"unchanged");
+}
+
+#[test]
+fn startup_reads_last_complete_from_catalog() {
+    let (_dir, path, cfg) = fixture();
+    let catalog = tidemark_store::catalog::Catalog::open(&cfg.general.state_dir, true).unwrap();
+    let entry = tidemark_store::catalog::ScanEntry {
+        scan_id: "previous".into(),
+        root: RawPath::from_path(&cfg.roots[0].path).unwrap(),
+        mode: tidemark_core::scan::ScanMode::Walk,
+        started_at: 10,
+        finished_at: Some(20),
+        status: "complete".into(),
+        degraded: false,
+        file: None,
+        t_disk: Some(0),
+        t_inodes: Some(0),
+        t_dirs: Some(0),
+        errors: Some(0),
+        duration_ms: Some(10_000),
+    };
+    catalog.record_finish(&entry).unwrap();
+    drop(catalog);
+    let state = LiveState::new(&cfg, 100);
+    let root = cfg.roots[0].path.to_str().unwrap().to_owned();
+    let stop = Shutdown::default();
+    let h = {
+        let state = state.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            tidemarkd::run_controlled(
+                cfg,
+                tidemarkd::RunOptions {
+                    config_path: path,
+                    now: 100,
+                },
+                state,
+                stop,
+                Shutdown::default(),
+            )
+        })
+    };
+    wait(|| {
+        state
+            .view()
+            .status(100)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "daemon" && c.state == "ok")
+    });
+    assert_eq!(
+        state.view().scan_age(&root).unwrap().last_complete_at,
+        Some(20)
+    );
+    assert_eq!(
+        state.view().scans().unwrap()[0]
+            .last_complete
+            .as_ref()
+            .unwrap()
+            .scan_id,
+        "previous"
+    );
+    stop.store(true, Ordering::Release);
+    wait(|| h.is_finished());
+    h.join().unwrap().unwrap();
 }

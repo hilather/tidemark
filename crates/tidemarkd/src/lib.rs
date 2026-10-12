@@ -322,6 +322,31 @@ pub fn run_controlled(
         }
         Err(error) => return Err(DaemonError::Store(error.to_string())),
     };
+    // Read catalog history before treating any configured root as measured never-scanned.
+    for root in &config.roots {
+        let raw = tidemark_core::path::RawPath::from_path(&root.path)
+            .map_err(|e| DaemonError::Config(e.to_string()))?;
+        let entry = catalog
+            .latest(&raw)
+            .map_err(|e| DaemonError::Store(e.to_string()))?;
+        let last_complete = entry.and_then(|e| {
+            Some(tidemark_core::live::LastScan {
+                scan_id: e.scan_id,
+                finished_at: e.finished_at?,
+                mode: format!("{:?}", e.mode).to_lowercase(),
+                duration_ms: e.duration_ms.unwrap_or(0),
+            })
+        });
+        state.publish(
+            state::Publication::Scan(tidemark_core::live::ScanStatus {
+                root: root.path.to_string_lossy().into_owned(),
+                running: None,
+                last_complete,
+                next_due: None,
+            }),
+            component("catalog", "ok", "scan history read"),
+        )?;
+    }
     drop(catalog);
     let ts = tidemark_store::timeseries::TimeSeries::open(&storage.join("timeseries.db"), true)
         .map_err(|e| DaemonError::Store(e.to_string()))?;

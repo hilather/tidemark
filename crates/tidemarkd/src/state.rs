@@ -613,24 +613,17 @@ impl LiveStateView {
     pub fn alert_diagnostics(&self) -> Option<Vec<AlertDiagnostic>> {
         self.data.alerts.as_ref().map(|r| r.1.clone())
     }
-    /// Configured roots are a known inventory, including never-scanned roots.
+    /// Complete known scan statuses; unavailable until every configured root was observed.
     pub fn scans(&self) -> Option<Vec<ScanStatus>> {
-        Some(
-            self.data
-                .config
-                .roots
-                .iter()
-                .map(|r| {
-                    let root = r.path.to_string_lossy().into_owned();
-                    self.data.scans.get(&root).cloned().unwrap_or(ScanStatus {
-                        root,
-                        running: None,
-                        last_complete: None,
-                        next_due: None,
-                    })
-                })
-                .collect(),
-        )
+        if self.data.config.roots.iter().any(|r| {
+            !self
+                .data
+                .scans
+                .contains_key(&r.path.to_string_lossy().into_owned())
+        }) {
+            return None;
+        }
+        Some(self.data.scans.values().cloned().collect())
     }
     /// Latest observations no later than this view's injected clock.
     pub fn fs_samples(&self) -> Option<Vec<FsSample>> {
@@ -758,12 +751,9 @@ impl AlertSource for LiveStateView {
         if cfg.window.is_some() {
             cadence = cadence.map(|d| d.max(Duration::from_secs(86400)));
         }
+        let status = self.data.scans.get(root)?;
         Some(ScanAge {
-            last_complete_at: self
-                .data
-                .scans
-                .get(root)
-                .and_then(|s| s.last_complete.as_ref().map(|l| l.finished_at)),
+            last_complete_at: status.last_complete.as_ref().map(|l| l.finished_at),
             effective_cadence: cadence,
         })
     }
