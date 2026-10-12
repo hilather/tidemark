@@ -6,12 +6,20 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-privileged = []
+privileged = ["test-support/privileged"]
 
 [dependencies]
+toml.workspace = true
+serde_json.workspace = true
+serde.workspace = true
 anyhow.workspace = true
 proc-macro2.workspace = true
 syn.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+test-support.workspace = true
+assert_cmd.workspace = true
+tempfile.workspace = true

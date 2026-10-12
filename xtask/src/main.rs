@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod checks;
+mod rpm;
 mod vm_test;
 
 use anyhow::{bail, Context, Result};
@@ -58,7 +59,7 @@ fn main() -> Result<()> {
         }
         Some("vm-test") => vm_test::run(root, args),
         Some("gen-fixture" | "bench") => bail!("command is not implemented yet (owner W7-B)"),
-        Some("rpm") => bail!("rpm is not implemented yet (owner W6-C)"),
+        Some("rpm") => rpm::run(root, args),
         _ => bail!("usage: cargo xtask <ci|vm-test|gen-fixture|bench|rpm>"),
     }
 }

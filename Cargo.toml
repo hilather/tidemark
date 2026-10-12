@@ -68,7 +68,7 @@ syn = { version = "2", features = ["full", "visit"] }
 
 humantime = "2"
 base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 sha2 = "0.10"
 

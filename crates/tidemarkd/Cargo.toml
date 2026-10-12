@@ -12,6 +12,21 @@ privileged = ["test-support/privileged"]
 workspace = true
 
 [dependencies]
+sha2.workspace = true
+humantime.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tiny_http.workspace = true
+tracing-subscriber.workspace = true
+signal-hook.workspace = true
+sd-notify.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+tidemark-sys.workspace = true
+tidemark-live.workspace = true
+tidemark-store.workspace = true
+tidemark-scan.workspace = true
+tidemark-fs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -22,6 +37,8 @@ tidemark-core.workspace = true
 clap.workspace = true
 
 [dev-dependencies]
+insta.workspace = true
+assert_cmd.workspace = true
 test-support.workspace = true
 
 tempfile.workspace = true
