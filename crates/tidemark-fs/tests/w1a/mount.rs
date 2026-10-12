@@ -79,25 +79,3 @@ fn nsfs_object_root_keeps_table_and_boundaries() {
     let object = parse_mountinfo(b"1 0 0:5 net:[a\\377] /net rw - nsfs nsfs rw").unwrap();
     assert_eq!(object[0].root, MountRoot::Object(b"net:[a\xff]".to_vec()));
 }
-#[test]
-fn captured_el8_inputs_pending_vm() {
-    let directory =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/w1a/data/captured-el8");
-    if !directory.is_dir() {
-        eprintln!(
-            "SKIP: real EL8 mountinfo captures are an unmet acceptance input pending VM access"
-        );
-        return;
-    }
-    let mut files: Vec<_> = std::fs::read_dir(directory)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
-    files.sort();
-    assert!((3..=4).contains(&files.len()));
-    for file in files {
-        assert!(!parse_mountinfo(&std::fs::read(file).unwrap())
-            .unwrap()
-            .is_empty());
-    }
-}

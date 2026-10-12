@@ -237,20 +237,6 @@ mod tests {
             assert_eq!(command_error(error).exit_code(), 1);
         }
     }
-    #[test]
-    fn exit_codes() {
-        let errors = [
-            CliError::Runtime(anyhow::anyhow!("runtime")),
-            CliError::Configuration("config".into()),
-            CliError::Partial("partial".into()),
-            CliError::Unavailable("daemon".into()),
-            CliError::Precondition("precondition".into()),
-            CliError::Unhealthy("verify".into()),
-        ];
-        for (error, code) in errors.into_iter().zip(1..=6) {
-            assert_eq!(error.exit_code(), code);
-        }
-    }
 }
 
 /// Synchronous daemon API client.

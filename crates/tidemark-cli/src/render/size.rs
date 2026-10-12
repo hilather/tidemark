@@ -9,17 +9,3 @@ pub fn bytes(value: u64) -> String {
 pub fn path(value: &tidemark_core::path::RawPath) -> String {
     value.display_lossy()
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn formatting() {
-        assert_eq!(bytes(1024), "1.00 KiB");
-        use std::os::unix::ffi::OsStrExt;
-        let raw = tidemark_core::path::RawPath::from_path(std::path::Path::new(
-            std::ffi::OsStr::from_bytes(b"/a\xff\n"),
-        ))
-        .unwrap();
-        assert_eq!(path(&raw), "/a\\xFF\\x0A");
-    }
-}

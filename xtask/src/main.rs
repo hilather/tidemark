@@ -43,6 +43,16 @@ fn main() -> Result<()> {
                 ],
             )?;
             run(root, &["test", "--workspace"])?;
+            run(
+                root,
+                &[
+                    "build",
+                    "--workspace",
+                    "--features",
+                    "privileged",
+                    "--tests",
+                ],
+            )?;
             let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
             if Command::new(cargo)
                 .args(["deny", "--version"])

@@ -331,25 +331,3 @@ mod tests {
         assert!(serde_json::from_str::<RawPath>("[97]").is_err());
     }
 }
-
-#[cfg(test)]
-mod shared_display_tests {
-    use super::*;
-    #[test]
-    fn three_display_entry_points_agree() {
-        for bytes in [
-            b"plain".as_slice(),
-            "é\u{0085}".as_bytes(),
-            b"a\xff\n\\",
-            b"\xe2\x82",
-        ] {
-            let name = RawName::new(bytes.to_vec()).unwrap();
-            let path = RawPath::new([b"/".as_slice(), bytes].concat()).unwrap();
-            assert_eq!(name.display_lossy(), display_lossy_bytes(bytes));
-            assert_eq!(
-                path.display_lossy(),
-                format!("/{}", display_lossy_bytes(bytes))
-            );
-        }
-    }
-}

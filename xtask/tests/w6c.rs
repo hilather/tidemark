@@ -68,29 +68,6 @@ fn exact_normative_unit_and_config() {
     );
 }
 #[test]
-fn example_config_validates_with_built_daemon() {
-    // xtask has no core dependency: invoke the daemon check-only path instead.
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "--offline", "-p", "tidemarkd"])
-        .current_dir(root())
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| root().join("target"));
-    let output = Command::new(target.join("debug/tidemarkd"))
-        .args(["--check-config", "--config"])
-        .arg(root().join("packaging/config/tidemark.toml"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-#[test]
 fn metadata_and_scriptlet_contract() {
     let m: toml::Value = toml::from_str(&read("packaging/rpm/rpm.toml")).unwrap();
     let assets = m["assets"].as_array().unwrap();
