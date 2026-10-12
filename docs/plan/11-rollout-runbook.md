@@ -55,6 +55,8 @@ tidemark deploy stage --from ./tidemark.toml        # pre-flight failure changes
 tidemark deploy verify --wait 5m                      # non-zero → see output; Tidemark is not healthy
 ```
 
+An RPM upgrade restarts a running daemon and leaves a stopped daemon stopped, without changing enablement.
+
 On stage failure, read the initiating and compensation errors. A blocking pre-flight failure changes nothing; a failure after pre-flight attempts best-effort compensation and may leave changes or observed service downtime. Inspect state, then retry stage or unstage; staging is not a transaction.
 
 After verify:

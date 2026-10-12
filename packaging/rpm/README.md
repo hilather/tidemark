@@ -30,6 +30,7 @@ Bash completion is generated from the release CLI before packaging.
 
 Only config/state/runtime are private (0600/0700 root:root); binaries are 0755
 and public unit/docs/completion files 0644 root:root. No account is created.
+An upgrade restarts a running daemon and leaves a stopped daemon stopped, without changing enablement.
 
 On a fresh disposable Rocky 8.8 or 8.10 VM with auditd, python3, loop-XFS fixture,
 Cargo cache and built RPMs, run `cargo xtask vm-test --host VM --filter install`

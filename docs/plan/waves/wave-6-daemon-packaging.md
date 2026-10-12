@@ -181,7 +181,7 @@ Contract details: daemon LVM omits segment type and other LVs; CLI trends remain
   5. `tidemark status`.
   6. **Namespace sanity:** write a file as another unit and assert `tidemark hot` sees it.
   7. `ausearch -m AVC -ts recent` returns nothing for `tidemarkd`.
-  8. Upgrade to a rebuilt `0.1.1` RPM preserves an edited config.
+  8. Upgrade to a rebuilt `0.1.1` RPM preserves an edited config, restarts a running daemon with a new main PID and API readiness within 60 seconds, and leaves a stopped daemon stopped on reinstall.
   9. Erase stops the service and leaves `/var/lib/tidemark`.
   10. **`deploy_stage_reboot_verify`** (written by W4-B): `deploy stage` → reboot the VM → `deploy verify --wait 5m` exits 0 with a healthy `firstboot.json`.
 
