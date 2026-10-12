@@ -69,7 +69,6 @@ Final results are appended below. All Cargo operations use pinned Rust 1.98.0 an
 
 ## Assumptions and limits
 
-- The exact submission contract requires `7488/TEST-e2e-deploy.md` and rejects `docs/handoff/TEST-e2e-deploy.md`. This handoff uses the required artifact path instead of changing an unaccepted path.
 - Treat the task's non-local-state row as blocking pre-flight exit 5; the root-only local-filesystem language in 08 §5 needs coordinator resolution as described above.
 - A fake host invokes the deployment engine with injected interfaces. Exit assertions reuse CliError's mappings after engine execution, matching the command adapters; this is not a subprocess test of successful command rendering. Retained CLI tests cover parsing and existing error statuses.
 - The sandbox rejects UnixListener::bind with EPERM. An initial strict listener run failed (table.log), so healthy/unhealthy sockets use socket pairs; no skip or ignore was added for this environmental restriction. Production pathname-connect success is not established by these rows. Existing client socket-pair unit tests retain framing coverage; real listener and service lifecycle need VM review.

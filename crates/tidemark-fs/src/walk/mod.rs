@@ -93,8 +93,23 @@ pub fn read_dir_entries(
 }
 
 pub use getdents::{
-    open_directory, read_dir_entries_checked, read_dir_entries_checked_cancellable,
+    open_attempts, open_directory, read_dir_entries_checked, read_dir_entries_checked_cancellable,
 };
 
 mod getdents;
 mod worker;
+
+/// Decide whether an entry crosses the root device or a known root mount ID.
+#[doc(hidden)]
+pub fn boundary_reason(
+    root_dev: DevId,
+    root_mount: u64,
+    child_dev: DevId,
+    child_mount: u64,
+) -> Option<tidemark_core::scan::SkipReason> {
+    if child_dev != root_dev || (root_mount != 0 && child_mount != root_mount) {
+        Some(tidemark_core::scan::SkipReason::OtherFs)
+    } else {
+        None
+    }
+}
