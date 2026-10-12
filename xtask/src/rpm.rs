@@ -49,23 +49,149 @@ pub fn container_args(root: &Path, version: &str) -> Result<Vec<OsString>> {
     ])
 }
 
-/// Build an RPM in a pre-provisioned Rocky 8 image; never install tools or pull images.
-/// Accepts optional `--container` and `--version 0.1.0|0.1.1`.
-pub fn run(root: &Path, args: impl Iterator<Item = String>) -> Result<()> {
-    let mut args = args.peekable();
-    let mut container = false;
-    let mut version = None;
+/// Parsed RPM build options; container mode remains the default.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Options {
+    /// Build directly on the current host.
+    pub native: bool,
+    /// Permit Cargo dependency fetching during the release build.
+    pub online: bool,
+    /// Explicitly bypass the EL8 host guard.
+    pub allow_foreign_host: bool,
+    /// Validated package version.
+    pub version: String,
+}
+
+/// Parse options without probing the host or executing commands.
+pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
+    let mut options = Options {
+        native: false,
+        online: false,
+        allow_foreign_host: false,
+        version: "0.1.0".into(),
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut args = args;
     while let Some(arg) = args.next() {
+        if !seen.insert(arg.clone()) {
+            bail!("duplicate rpm argument: {arg}");
+        }
         match arg.as_str() {
-            "--container" if !container => container = true,
-            "--version" if version.is_none() => {
-                version = Some(args.next().context("--version needs a value")?)
-            }
-            _ => bail!("unknown or duplicate rpm argument: {arg}"),
+            "--native" => options.native = true,
+            "--container" => {}
+            "--online" => options.online = true,
+            "--allow-foreign-host" => options.allow_foreign_host = true,
+            "--version" => options.version = args.next().context("--version needs a value")?,
+            _ => bail!("unknown rpm argument: {arg}"),
         }
     }
-    let version = version.as_deref().unwrap_or("0.1.0");
-    let command = container_args(root, version)?;
+    if options.native && seen.contains("--container") {
+        bail!("--native and --container conflict");
+    }
+    if !options.native && (options.online || options.allow_foreign_host) {
+        bail!("--online and --allow-foreign-host require --native");
+    }
+    generate_rpm_args(&options.version)?;
+    Ok(options)
+}
+
+/// Identify EL8 using injected os-release text, without executing that text.
+pub fn is_el8(content: &str) -> bool {
+    let value = |key: &str| {
+        content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(key))
+            .map(|v| v.trim().trim_matches(['\"', '\'']))
+    };
+    matches!(
+        value("ID="),
+        Some("rocky" | "rhel" | "centos" | "almalinux" | "ol")
+    ) && value("VERSION_ID=").is_some_and(|v| v == "8" || v.starts_with("8."))
+}
+
+/// One native command and optional stdout destination relative to the workspace.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NativeCommand {
+    /// Executable name or workspace-relative path.
+    pub program: String,
+    /// Arguments passed without shell interpretation.
+    pub args: Vec<String>,
+    /// Optional workspace-relative file receiving standard output.
+    pub stdout: Option<String>,
+}
+
+/// Assemble the ordered build, completion and generator commands.
+pub fn native_commands(version: &str, online: bool) -> Result<Vec<NativeCommand>> {
+    let mut build = vec![
+        "build",
+        "--locked",
+        "--release",
+        "-p",
+        "tidemark-cli",
+        "-p",
+        "tidemarkd",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect::<Vec<_>>();
+    if !online {
+        build.push("--offline".into());
+    }
+    Ok(vec![
+        NativeCommand {
+            program: "cargo".into(),
+            args: build,
+            stdout: None,
+        },
+        NativeCommand {
+            program: "target/release/tidemark".into(),
+            args: vec!["completions".into(), "bash".into()],
+            stdout: Some("target/release/tidemark.bash".into()),
+        },
+        NativeCommand {
+            program: "cargo".into(),
+            args: generate_rpm_args(version)?,
+            stdout: None,
+        },
+    ])
+}
+
+/// Build natively on EL8 or in the existing pre-provisioned container.
+pub fn run(root: &Path, args: impl Iterator<Item = String>) -> Result<()> {
+    let options = parse_args(args)?;
+    if options.native {
+        if !options.allow_foreign_host
+            && !is_el8(
+                &std::fs::read_to_string("/etc/os-release")
+                    .context("read /etc/os-release (use --allow-foreign-host to override)")?,
+            )
+        {
+            bail!("Native RPM builds require Rocky Linux 8 or another EL8; use --allow-foreign-host to override");
+        }
+        if !Command::new("cargo")
+            .args(["generate-rpm", "--version"])
+            .current_dir(root)
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            bail!("Install cargo-generate-rpm 0.20.0 before running rpm --native");
+        }
+        for spec in native_commands(&options.version, options.online)? {
+            let mut command = Command::new(&spec.program);
+            command.args(&spec.args).current_dir(root);
+            if let Some(path) = spec.stdout {
+                command.stdout(std::fs::File::create(root.join(path))?);
+            }
+            let status = command
+                .status()
+                .with_context(|| format!("run {}", spec.program))?;
+            if !status.success() {
+                bail!("Native RPM command {} failed: {status}", spec.program);
+            }
+        }
+        return Ok(());
+    }
+    let command = container_args(root, &options.version)?;
     let tool = ["podman", "docker"]
         .into_iter()
         .find(|tool| {
