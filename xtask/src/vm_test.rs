@@ -13,6 +13,7 @@ struct Options {
     suite: String,
     env: Vec<String>,
     nocapture: bool,
+    no_fail_fast: bool,
 }
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
     let mut args = args.into_iter();
@@ -22,7 +23,15 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
     let mut suite = None;
     let mut env = Vec::new();
     let mut nocapture = false;
+    let mut no_fail_fast = false;
     while let Some(flag) = args.next() {
+        if flag == "--no-fail-fast" {
+            if no_fail_fast {
+                bail!("duplicate --no-fail-fast");
+            }
+            no_fail_fast = true;
+            continue;
+        }
         if flag == "--nocapture" {
             if nocapture {
                 bail!("duplicate --nocapture");
@@ -91,6 +100,9 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
     if suite != "cargo" && nocapture {
         bail!("--nocapture is supported only for --suite cargo");
     }
+    if suite != "cargo" && no_fail_fast {
+        bail!("--no-fail-fast is supported only for --suite cargo");
+    }
     Ok(Options {
         host,
         remote_dir,
@@ -98,6 +110,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
         suite,
         env,
         nocapture,
+        no_fail_fast,
     })
 }
 fn quote(text: &str) -> String {
@@ -111,7 +124,12 @@ fn remote_command(o: &Options) -> String {
         sudo_env.push_str(&quote(pair));
     }
     if o.suite == "cargo" {
-        script.push_str(&format!("cargo build --workspace --features privileged --tests; {sudo_env} cargo test --workspace --features privileged -- --test-threads=1"));
+        let fail_fast = if o.no_fail_fast {
+            " --no-fail-fast"
+        } else {
+            ""
+        };
+        script.push_str(&format!("cargo build --workspace --features privileged --tests; {sudo_env} cargo test --workspace --features privileged{fail_fast} -- --test-threads=1"));
         if let Some(filter) = &o.filter {
             script.push(' ');
             script.push_str(&quote(filter));
@@ -192,7 +210,8 @@ mod tests {
                 filter: None,
                 suite: "cargo".into(),
                 env: Vec::new(),
-                nocapture: false
+                nocapture: false,
+                no_fail_fast: false
             }
         );
     }
@@ -274,6 +293,32 @@ mod tests {
             .unwrap();
             assert!(remote_command(&o).contains("sudo env \"PATH=$PATH\" 'TIDEMARK_A=x' bash"));
         }
+    }
+    #[test]
+    fn no_fail_fast_is_a_cargo_test_argument() {
+        for extras in [
+            vec![],
+            vec!["--filter", "probe"],
+            vec!["--nocapture", "--env", "TIDEMARK_A=x"],
+            vec!["--filter", "probe", "--nocapture", "--env", "TIDEMARK_A=x"],
+        ] {
+            let mut input = vec!["--host", "vm", "--no-fail-fast"];
+            input.extend(extras);
+            let cmd = remote_command(&parse(args(&input)).unwrap());
+            let (build, test) = cmd.split_once("; sudo env").unwrap();
+            assert!(!build.contains("--no-fail-fast"));
+            assert!(test.contains(
+                "cargo test --workspace --features privileged --no-fail-fast -- --test-threads=1"
+            ));
+            assert_eq!(cmd.matches("--no-fail-fast").count(), 1);
+        }
+    }
+    #[test]
+    fn rejects_no_fail_fast_for_scripts_and_duplicates() {
+        for suite in ["install", "fault"] {
+            assert!(parse(args(&["--host", "vm", "--suite", suite, "--no-fail-fast"])).is_err());
+        }
+        assert!(parse(args(&["--host", "vm", "--no-fail-fast", "--no-fail-fast"])).is_err());
     }
     #[test]
     fn constructs_both_script_suites() {

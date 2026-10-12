@@ -34,6 +34,26 @@ cargo xtask vm-test --host rocky810 --suite install
 cargo xtask vm-test --host rocky810 --suite fault
 ```
 
+For a whole run that continues through failing test binaries:
+
+```sh
+cargo xtask vm-test --host <vm> --no-fail-fast --env TIDEMARK_DEPLOY_TEST_VM=1 --env TIDEMARK_W1A_MD_DEVICE=/dev/md127
+```
+
+`--no-fail-fast` is cargo-only, appears before Cargo's `--` separator, and
+applies only to testing. The disposable VM marker is never set implicitly.
+`deploy_stage_reboot_verify` prints a skip line unless `TIDEMARK_DEPLOY_VM_PHASE`
+is set; stage/verify requires `TIDEMARK_DEPLOY_VM_CONFIG`. `install_vm` prints a
+skip line unless `TIDEMARK_INSTALL_RPM` is set. When these variables are set,
+the marker must be `1`; other deployment tests always require the marker.
+Use `--nocapture` to expose printed lines for passing tests.
+
+Loop devices and the md fixture do not survive a guest reboot and must be
+recreated. The SSH client is whichever `ssh` is first on `PATH`; a wrapper
+using its own configuration file works. On an SELinux-enforcing guest, tests
+starting a binary through systemd must copy it out of the home directory to
+an executable location such as `/usr/local/bin` and restore its context first.
+
 The default remote directory is `tidemark-vm-test` relative to the SSH user's
 home. The runner creates it and rsyncs the checkout, excluding `target/` and
 `.git/`. Use a dedicated directory: rsync replaces matching files but does not

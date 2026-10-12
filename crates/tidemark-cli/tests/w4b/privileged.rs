@@ -19,7 +19,7 @@ fn vm_only() {
 #[test]
 fn deploy_stage_preflight_blocks() {
     vm_only();
-    let _lock = SERVICE_TEST.lock().unwrap();
+    let _lock = SERVICE_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source.toml");
     let installed = dir.path().join("installed.toml");
@@ -51,7 +51,7 @@ fn deploy_stage_preflight_blocks() {
 #[test]
 fn deploy_unstage() {
     vm_only();
-    let _lock = SERVICE_TEST.lock().unwrap();
+    let _lock = SERVICE_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let sys = RealSystemctl;
     assert!(
         !sys.is_active("tidemarkd").unwrap(),
@@ -80,15 +80,21 @@ fn deploy_unstage() {
 /// The VM harness invokes the same test before and after its ordinary reboot.
 #[test]
 fn deploy_stage_reboot_verify() {
+    let Some(phase) = std::env::var_os("TIDEMARK_DEPLOY_VM_PHASE") else {
+        eprintln!(
+            "skipped: needs TIDEMARK_DEPLOY_VM_PHASE=stage|verify and TIDEMARK_DEPLOY_VM_CONFIG"
+        );
+        return;
+    };
     vm_only();
-    let _lock = SERVICE_TEST.lock().unwrap();
+    let _lock = SERVICE_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let source = PathBuf::from(
         std::env::var_os("TIDEMARK_DEPLOY_VM_CONFIG")
             .expect("VM harness must supply its configuration file"),
     );
     let cfg = tidemark_core::config::Config::load(&source).unwrap();
-    match std::env::var("TIDEMARK_DEPLOY_VM_PHASE").as_deref() {
-        Ok("stage") => {
+    match phase.to_str() {
+        Some("stage") => {
             let env = RealEnv {
                 installed_config: Path::new("/etc/tidemark/tidemark.toml").into(),
                 now: tidemark_core::time::unix_now(),
@@ -96,7 +102,7 @@ fn deploy_stage_reboot_verify() {
             deploy::stage(&source, &StageOptions::default(), &RealSystemctl, &env).unwrap();
             assert!(RealSystemctl.is_enabled("tidemarkd").unwrap());
         }
-        Ok("verify") => {
+        Some("verify") => {
             let api = deploy::SocketPing {
                 socket: cfg.general.socket.clone(),
                 timeout: Duration::from_secs(10),

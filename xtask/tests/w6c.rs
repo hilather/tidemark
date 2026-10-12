@@ -194,6 +194,10 @@ fn shell_syntax_and_vm_guard() {
 #[cfg(feature = "privileged")]
 #[test]
 fn install_vm() {
+    if std::env::var_os("TIDEMARK_INSTALL_RPM").is_none() {
+        eprintln!("skipped: needs TIDEMARK_INSTALL_RPM");
+        return;
+    }
     assert_eq!(std::env::var("TIDEMARK_DEPLOY_TEST_VM").as_deref(), Ok("1"));
     assert!(Command::new("bash")
         .arg(root().join("tests/install/install.sh"))
