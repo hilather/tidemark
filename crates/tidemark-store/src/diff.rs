@@ -329,29 +329,58 @@ fn joined(
     limit: usize,
     direction: Option<i64>,
 ) -> Result<(Vec<DiffRow>, u32), StoreError> {
+    let (sql, aggregate) = joined_sql(metric, direction.is_some());
+    // COUNT streams the union with constant aggregate state. In particular, no
+    // window or materialized CTE retains all children under temp_store=MEMORY.
+    // Target totals already come from dir_by_path. A child SUM cannot replace
+    // them: own files and hard-link LCA charges also belong to the target.
+    let count = if let Some(sql) = aggregate {
+        let mut statement = new.conn().prepare(&sql)?;
+        bind_joined(&mut statement, n, o, depth, limit, direction)?;
+        let count = statement
+            .raw_query()
+            .next()?
+            .ok_or_else(|| StoreError::Invalid("missing contributor count".into()))?
+            .get::<_, u32>(0)?;
+        count
+    } else {
+        0
+    };
+    let mut statement = new.conn().prepare(&sql)?;
+    bind_joined(&mut statement, n, o, depth, limit, direction)?;
+    let mut cursor = statement.raw_query();
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.next()? {
+        let path = RawPath::new(row.get::<_, Vec<u8>>(0)?)?;
+        let depth_rel = row.get::<_, u32>(1)?;
+        let nv = crate::error::read_optional_u64(row, 2)?;
+        let ov = crate::error::read_optional_u64(row, 3)?;
+        rows.push(make_row(&path, depth_rel, nv, ov)?);
+    }
+    Ok((rows, count))
+}
+
+fn joined_sql(metric: DiffMetric, children: bool) -> (String, Option<String>) {
     let column = match metric {
         DiffMetric::Disk => "t_disk",
         DiffMetric::Reclaimable => "t_reclaimable",
         DiffMetric::Files => "t_files",
     };
-    let (n_filter, o_filter, order, count) = if direction.is_some() {
+    let (n_filter, o_filter, order) = if children {
         (
             "n.parent_id = :n_lo",
             "o2.parent_id = :o_lo",
             "delta * :sign DESC, path",
-            "SUM(CASE WHEN delta * :count_sign > 0 THEN 1 ELSE 0 END) OVER ()",
         )
     } else {
         (
             "n.id BETWEEN :n_lo AND :n_hi AND n.depth <= :n_depth",
             "o2.id BETWEEN :o_lo AND :o_hi AND o2.depth <= :o_depth",
             "ABS(delta) DESC, path",
-            "0",
         )
     };
-    let sql = format!(
-        "SELECT path, depth_rel, new_value, old_value, {count} FROM (
-         SELECT n.path, n.depth - :n_base AS depth_rel,
+    let union = format!(
+        "SELECT n.path, n.depth - :n_base AS depth_rel,
                 n.{column} AS new_value, o2.{column} AS old_value,
                 n.{column} - COALESCE(o2.{column}, 0) AS delta
          FROM main.dirs n LEFT JOIN o.dirs o2
@@ -362,9 +391,22 @@ fn joined(
          FROM o.dirs o2 WHERE {o_filter}
            AND NOT EXISTS (SELECT 1 FROM main.dirs n
                            WHERE n.path_hash = o2.path_hash AND n.path = o2.path)
-         ) ORDER BY {order} LIMIT :limit"
+         "
     );
-    let mut statement = new.conn().prepare(&sql)?;
+    let aggregate =
+        children.then(|| format!("SELECT COUNT(*) FROM ({union}) WHERE delta * :count_sign > 0"));
+    (format!("SELECT path, depth_rel, new_value, old_value FROM ({union}) ORDER BY {order} LIMIT :limit"), aggregate)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_joined(
+    statement: &mut rusqlite::Statement<'_>,
+    n: Option<&tidemark_core::snapshot::DirRow>,
+    o: Option<&tidemark_core::snapshot::DirRow>,
+    depth: u32,
+    limit: usize,
+    direction: Option<i64>,
+) -> Result<(), StoreError> {
     // Bind only parameters present in the chosen query variant.
     let mut bind = |name: &str, value: i64| -> Result<(), StoreError> {
         if let Some(index) = statement.parameter_index(name)? {
@@ -395,23 +437,140 @@ fn joined(
         },
     )?;
     bind(":count_sign", direction.map_or(0, i64::signum))?;
-    let mut cursor = statement.raw_query();
-    let mut rows = Vec::new();
-    let mut count = 0;
-    while let Some(row) = cursor.next()? {
-        let path = RawPath::new(row.get::<_, Vec<u8>>(0)?)?;
-        let depth_rel = row.get::<_, u32>(1)?;
-        let nv = crate::error::read_optional_u64(row, 2)?;
-        let ov = crate::error::read_optional_u64(row, 3)?;
-        count = row.get(4)?;
-        rows.push(make_row(&path, depth_rel, nv, ov)?);
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "../tests/w3a/row.rs"]
+mod test_row;
+
+#[cfg(test)]
+mod test_support {
+    pub use super::test_row::row;
+    use crate::writer::SnapshotWriter;
+
+    pub fn snapshot(
+        dir: &std::path::Path,
+        rows: &[tidemark_core::snapshot::DirRow],
+        now: i64,
+    ) -> std::path::PathBuf {
+        let mut meta = crate::test_meta();
+        meta.schema_version = 1;
+        meta.root = rows[0].path.clone();
+        meta.scan_id = tidemark_core::time::ScanId::new(now).unwrap();
+        meta.dirs = rows.len() as u64;
+        let mut writer = SnapshotWriter::create(dir, &meta).unwrap();
+        writer.put_dirs(rows).unwrap();
+        writer.finish(&meta).unwrap()
     }
-    Ok((rows, count))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "scale"]
+    fn wide_explain_uses_streaming_count_and_bounded_top_n() {
+        const CHILDREN: u32 = 200_000;
+        let dir = tempfile::tempdir().unwrap();
+        let mut rows = vec![test_support::row(0, None, b"/fixture", 0)];
+        rows[0].subtree_end = CHILDREN;
+        // Long paths amplify the old window query's per-child scratch usage.
+        let prefix = "x".repeat(220);
+        for id in 1..=CHILDREN {
+            rows.push(test_support::row(
+                id,
+                Some(0),
+                format!("/fixture/{prefix}{id:08}").as_bytes(),
+                0,
+            ));
+        }
+        let a = test_support::snapshot(dir.path(), &rows, 1);
+        rows[0].t_disk = u64::from(CHILDREN);
+        for child in &mut rows[1..] {
+            child.t_disk = 1;
+        }
+        let b = test_support::snapshot(dir.path(), &rows, 2);
+        drop(rows);
+        let new = Snapshot::open(&b).unwrap();
+        let old = Snapshot::open(&a).unwrap();
+        let target = RawPath::new(b"/fixture".to_vec()).unwrap();
+        let n = new.dir_by_path(&target).unwrap();
+        let o = old.dir_by_path(&target).unwrap();
+        with_old(&new, &old, || {
+            // Inspect the exact production SQL, including subtree diff and all
+            // metrics. EXPLAIN QUERY PLAN's "TEMP B-TREE" also labels bounded
+            // top-N sorts, so inspect the VDBE instructions instead.
+            for metric in [DiffMetric::Disk, DiffMetric::Reclaimable, DiffMetric::Files] {
+                for children in [false, true] {
+                    let (limited, aggregate) = joined_sql(metric, children);
+                    for (sql, limited) in std::iter::once((limited, true))
+                        .chain(aggregate.into_iter().map(|sql| (sql, false)))
+                    {
+                        let mut stmt = new.conn().prepare(&format!("EXPLAIN {sql}"))?;
+                        bind_joined(&mut stmt, n.as_ref(), o.as_ref(), 1, 5, Some(1))?;
+                        let ops: Vec<String> = stmt
+                            .raw_query()
+                            .mapped(|r| r.get(1))
+                            .collect::<Result<_, _>>()?;
+                        assert!(
+                            !ops.iter().any(|op| op == "SorterOpen"),
+                            "unbounded sort: {ops:?}"
+                        );
+                        assert!(
+                            !ops.iter().any(|op| op == "OpenAutoindex"),
+                            "unbounded automatic index: {ops:?}"
+                        );
+                        if limited {
+                            // Once LIMIT slots are filled, IfNotZero falls
+                            // through to Last/IdxLE/Delete before IdxInsert:
+                            // only the best LIMIT rows stay in the sorter.
+                            let mut sorts = 0;
+                            for (i, op) in ops.iter().enumerate() {
+                                if op == "OpenEphemeral" {
+                                    sorts += 1;
+                                }
+                                if op == "IdxInsert" {
+                                    let guard =
+                                        ops[..i].iter().rposition(|op| op == "IfNotZero").unwrap();
+                                    assert_eq!(
+                                        &ops[guard + 1..guard + 4],
+                                        &["Last", "IdxLE", "Delete"]
+                                    );
+                                    assert!(!ops[guard + 4..i].iter().any(|op| op == "IdxInsert"));
+                                }
+                            }
+                            assert!(sorts > 0);
+                            assert_eq!(sorts, ops.iter().filter(|op| *op == "IdxInsert").count());
+                        } else {
+                            assert!(
+                                !ops.iter().any(|op| op == "OpenEphemeral"),
+                                "materialized aggregate: {ops:?}"
+                            );
+                            assert!(ops.iter().any(|op| op == "AggStep"));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        for (new, old, sign) in [(&new, &a, 1), (&old, &b, -1)] {
+            let result = explain(new, old, &target, DiffMetric::Disk, 0.5, 1, 5).unwrap();
+            assert_eq!(result.target_delta, i64::from(CHILDREN) * sign);
+            assert!(result.steps.is_empty());
+            assert_eq!(result.spread_children, CHILDREN);
+            assert_eq!(result.spread.len(), 5);
+            for (i, child) in result.spread.iter().enumerate() {
+                assert_eq!(child.delta, sign);
+                assert_eq!(
+                    child.path.as_bytes(),
+                    format!("/fixture/{prefix}{:08}", i + 1).as_bytes()
+                );
+            }
+        }
+    }
 
     #[test]
     fn query_restores_mapping_limit_and_detaches_on_error_and_unwind() {
