@@ -755,10 +755,17 @@ fn directory(
     }
     // Preserve worker cutoff ties across directories, but retain only the exact
     // first top_files within each directory (final directory ID is constant).
-    r.notable.extend(top.into_iter().filter(|f| {
-        f.disk < s.cfg.big_file_threshold
-            && heap.peek().is_some_and(|Reverse(cutoff)| f.disk >= *cutoff)
-    }));
+    merge_notable(
+        s.cfg,
+        &t.path,
+        r.entries,
+        &mut record_bytes,
+        &mut r.notable,
+        top,
+        directory_heap,
+        heap.peek().map(|Reverse(cutoff)| *cutoff),
+        &|_| {},
+    )?;
     set_error_total(&mut r, errors_before, c.errors)?;
     c.dirs += 1;
     c.entries += u64::from(r.entries);
@@ -786,6 +793,54 @@ fn directory(
             races: r.races,
         }))
     }
+}
+
+// The observer sees every live allocation at the merge boundary; production uses a no-op.
+#[allow(clippy::too_many_arguments)]
+fn merge_notable(
+    cfg: &WalkConfig,
+    path: &RawPath,
+    entries: u32,
+    used: &mut u64,
+    output: &mut Vec<NotableFile>,
+    mut top: Vec<NotableFile>,
+    directory_heap: BinaryHeap<(Reverse<u64>, u64, usize)>,
+    cutoff: Option<u64>,
+    observe: &dyn Fn(usize),
+) -> Result<(), WalkError> {
+    let bytes = |v: &Vec<NotableFile>| {
+        v.capacity() * std::mem::size_of::<NotableFile>()
+            + v.iter()
+                .map(|f| f.name.as_ref().map_or(0, |n| n.as_bytes().len()))
+                .sum::<usize>()
+    };
+    observe(
+        bytes(output)
+            + bytes(&top)
+            + directory_heap.capacity() * std::mem::size_of::<(Reverse<u64>, u64, usize)>(),
+    );
+    drop(directory_heap);
+    top.retain(|f| f.disk < cfg.big_file_threshold && cutoff.is_some_and(|c| f.disk >= c));
+    let needed = top
+        .len()
+        .checked_add(output.len())
+        .ok_or_else(|| WalkError::Limit("candidate count overflow".into()))?;
+    if needed > top.capacity() {
+        // reserve_exact may temporarily keep the old buffer alive. Charge the
+        // entire new allocation, not just its incremental payload, before reserve.
+        let allocation = needed
+            .checked_mul(std::mem::size_of::<NotableFile>())
+            .ok_or_else(|| WalkError::Limit("candidate byte overflow".into()))?;
+        charge_record(cfg, path, entries, used, allocation as u64)?;
+        observe(bytes(output) + bytes(&top) + allocation);
+        top.reserve_exact(needed - top.len());
+    }
+    observe(bytes(output) + bytes(&top));
+    top.append(output);
+    // Assignment drops the old threshold buffer and transfers top's allocation.
+    *output = top;
+    observe(bytes(output));
+    Ok(())
 }
 
 // Charges conservatively include Vec growth, allocator padding and candidate clones.
@@ -821,6 +876,130 @@ fn cancel_error(error: io::Error) -> WalkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn notable_merge_charges_coexisting_reserve_before_allocation() {
+        let root = RawPath::new(b"/fixture".to_vec()).unwrap();
+        let cfg = WalkConfig {
+            root: root.clone(),
+            threads: 1,
+            stat_entries: true,
+            exclude: globset::GlobSet::empty(),
+            skip_mounts: vec![],
+            big_file_threshold: 2,
+            top_files: 1,
+            scan_start: 0,
+            getdents_buf: 4096,
+            io_idle: false,
+            max_record_bytes: 4096,
+        };
+        let candidate = |ino, disk| NotableFile {
+            ino,
+            disk,
+            apparent: 0,
+            mtime: 0,
+            name: None,
+        };
+        let mut output = vec![candidate(2, 2); 100];
+        let original_capacity = output.capacity();
+        let top = vec![candidate(1, 1)];
+        let mut used = 4000;
+        let observations = std::cell::Cell::new(0);
+        let result = merge_notable(
+            &cfg,
+            &root,
+            101,
+            &mut used,
+            &mut output,
+            top,
+            BinaryHeap::new(),
+            Some(1),
+            &|_| observations.set(observations.get() + 1),
+        );
+        assert!(matches!(result, Err(WalkError::Limit(_))));
+        assert_eq!(output.capacity(), original_capacity);
+        assert_eq!(output.len(), 100);
+        assert_eq!(observations.get(), 1, "refusal must precede reserve");
+    }
+
+    #[test]
+    fn notable_merge_power_of_two_plus_one_peak() {
+        for threshold_count in [0, 4096] {
+            let root = RawPath::new(b"/fixture".to_vec()).unwrap();
+            let cfg = WalkConfig {
+                root: root.clone(),
+                threads: 1,
+                stat_entries: true,
+                exclude: globset::GlobSet::empty(),
+                skip_mounts: vec![],
+                big_file_threshold: 2,
+                top_files: 65_537,
+                scan_start: 0,
+                getdents_buf: 4096,
+                io_idle: false,
+                max_record_bytes: 16 * 1024 * 1024,
+            };
+            let candidate = |ino, disk| NotableFile {
+                ino,
+                disk,
+                apparent: 0,
+                mtime: 0,
+                name: Some(RawName::new(b"1234567".to_vec()).unwrap()),
+            };
+            let mut top = Vec::new();
+            let mut heap = BinaryHeap::new();
+            let mut output = Vec::new();
+            let mut used = 2048;
+            for i in 0..65_537 {
+                charge_record(
+                    &cfg,
+                    &root,
+                    i,
+                    &mut used,
+                    (2 * std::mem::size_of::<NotableFile>()
+                        + 7
+                        + 32
+                        + 2 * std::mem::size_of::<(Reverse<u64>, u64, usize)>())
+                        as u64,
+                )
+                .unwrap();
+                top.push(candidate(u64::from(i), 1));
+                heap.push((Reverse(1), u64::from(i), i as usize));
+            }
+            for i in 0..threshold_count {
+                charge_record(
+                    &cfg,
+                    &root,
+                    65_537,
+                    &mut used,
+                    (2 * std::mem::size_of::<NotableFile>() + 7 + 32) as u64,
+                )
+                .unwrap();
+                output.push(candidate(100_000 + i, 2));
+            }
+            let peak = std::cell::Cell::new(0);
+            merge_notable(
+                &cfg,
+                &root,
+                65_537,
+                &mut used,
+                &mut output,
+                top,
+                heap,
+                Some(1),
+                &|bytes| peak.set(peak.get().max(bytes + 2048)),
+            )
+            .unwrap();
+            assert!(
+                peak.get() as u64 <= cfg.max_record_bytes,
+                "peak={} bound={}",
+                peak.get(),
+                cfg.max_record_bytes
+            );
+            assert!(peak.get() as u64 <= used);
+            assert_eq!(output.len(), 65_537 + threshold_count as usize);
+        }
+    }
+
     #[test]
     fn record_byte_bound_names_directory_and_preserves_smaller_records() {
         let fixture = test_support::materialize("[[entry]]\npath='file'\nkind='file'\nsize=8\n[[entry]]\npath='link'\nkind='hardlink'\ntarget='file'\n");
