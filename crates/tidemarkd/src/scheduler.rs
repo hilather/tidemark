@@ -203,6 +203,8 @@ struct Shared {
     shutdown: Shutdown,
     active: Mutex<Option<Active>>,
     commands: Sender<Command>,
+    clock: crate::Clock,
+    // Same MAX_SUBJECTS cap as the scan-status inventory.
     failures: Arc<Mutex<std::collections::BTreeMap<RawPath, Retry>>>,
 }
 #[derive(Clone)]
@@ -219,7 +221,11 @@ fn scheduler_health(
     failures: &Mutex<std::collections::BTreeMap<RawPath, Retry>>,
     message: &str,
 ) -> tidemark_core::api::ComponentState {
-    match failures.lock().first_key_value() {
+    match failures
+        .lock()
+        .iter()
+        .find(|(_, retry)| !retry.error.is_empty())
+    {
         Some((root, retry)) => component(
             "scheduler",
             "degraded",
@@ -256,7 +262,8 @@ impl ScanControl {
             return Err(DaemonError::Scan("Busy".into()));
         }
         // Reserve inventory capacity for configured roots as well as observed
-        // manual roots. The temporary set contains at most twice MAX_SUBJECTS.
+        // manual roots and preflight failures. The temporary set contains at most
+        // three times MAX_SUBJECTS.
         let mut labels: std::collections::BTreeSet<String> = shared
             .state
             .view()
@@ -265,6 +272,7 @@ impl ScanControl {
             .into_iter()
             .map(|s| s.root)
             .collect();
+        labels.extend(shared.failures.lock().keys().map(root_label));
         for root in &shared.state.config().0.roots {
             let raw =
                 RawPath::from_path(&root.path).map_err(|e| DaemonError::Invalid(e.to_string()))?;
@@ -342,6 +350,7 @@ struct Recorder {
     config: Arc<Config>,
     reply: Mutex<Option<Sender<Result<ScanStartResult, DaemonError>>>>,
     previous: Mutex<Option<ScanEntry>>,
+    clock: crate::Clock,
     failures: Arc<Mutex<std::collections::BTreeMap<RawPath, Retry>>>,
 }
 fn scan_error(e: impl std::fmt::Display) -> ScanError {
@@ -381,7 +390,7 @@ impl Recorder {
                     &parse_schedule(&r.schedule)?,
                     r.window.as_deref().map(parse_window).transpose()?.as_ref(),
                     last.and_then(|e| e.finished_at),
-                    crate::unix_now(),
+                    (self.clock)(),
                 )
             })
             .transpose()
@@ -648,6 +657,7 @@ fn launch(
                 reply: Mutex::new(Some(command.reply)),
                 previous: Mutex::new(None),
                 failures: shared.failures.clone(),
+                clock: shared.clock.clone(),
             };
             let result = run_scan(&config, &req, &recorder, &command.cancel, &|p| {
                 if let Some(mut s) = shared
@@ -674,15 +684,56 @@ fn launch(
                 }
                 if !matches!(e, ScanError::Cancelled | ScanError::Busy) {
                     let mut failures = shared.failures.lock();
-                    let attempts = failures.get(&req.root).map_or(1, |r| r.attempts.saturating_add(1));
-                    let due = retry_due(crate::unix_now(), attempts);
-                    if failures.len() == crate::state::MAX_SUBJECTS && !failures.contains_key(&req.root) {
+                    let attempts = failures
+                        .get(&req.root)
+                        .map_or(1, |r| r.attempts.saturating_add(1));
+                    let due = retry_due((shared.clock)(), attempts);
+                    if failures.len() == crate::state::MAX_SUBJECTS
+                        && !failures.contains_key(&req.root)
+                    {
                         failures.pop_first();
                     }
-                    failures.insert(req.root.clone(), Retry { attempts, due, error: e.to_string(), configured: cfg.is_some() });
-                    tracing::warn!(root = %req.root.display_lossy(), mode = match req.mode { ModeRequest::Walk => "walk", ModeRequest::Bulk => "bulk", ModeRequest::Auto => "auto" }, scheduled = command.scheduled, error = %e, attempt = attempts, next_due = due, "scan failed");
+                    failures.insert(
+                        req.root.clone(),
+                        Retry { attempts, due, error: e.to_string(), configured: cfg.is_some() },
+                    );
+                    let mode = match req.mode {
+                        ModeRequest::Walk => "walk",
+                        ModeRequest::Bulk => "bulk",
+                        ModeRequest::Auto => "auto",
+                    };
+                    tracing::warn!(
+                        root = %req.root.display_lossy(), mode, scheduled = command.scheduled,
+                        error = %e, attempt = attempts, next_due = due, "scan failed"
+                    );
+                } else {
+                    // Preserve the existing 30-second scheduled deferral without
+                    // counting Busy/cancellation as a failure or claiming recovery.
+                    let mut failures = shared.failures.lock();
+                    let due = (shared.clock)().saturating_add(30);
+                    if failures.len() == crate::state::MAX_SUBJECTS
+                        && !failures.contains_key(&req.root)
+                    {
+                        failures.pop_first();
+                    }
+                    failures.entry(req.root.clone()).and_modify(|r| r.due = due).or_insert(Retry {
+                        attempts: 0, due, error: String::new(), configured: cfg.is_some(),
+                    });
                 }
                 let health = scheduler_health(&shared.failures, &e.to_string());
+                let retry_due = if cfg.is_some_and(|r| r.schedule.trim() != "off") {
+                    shared.failures.lock().get(&req.root).map(|r| r.due)
+                } else {
+                    None
+                };
+                if let Some(due) = retry_due {
+                    if let Some(mut status) = shared.state.view().scans().and_then(|v| {
+                        v.into_iter().find(|s| s.root == root_label(&req.root))
+                    }) {
+                        status.next_due = Some(due);
+                        shared.state.publish(Publication::Scan(status), health.clone())?;
+                    }
+                }
                 if matches!(e, ScanError::NoSpace) {
                     shared
                         .state
@@ -761,6 +812,17 @@ pub fn start(
     writer: tswriter::Sender,
     shutdown: Shutdown,
 ) -> Result<(ScanControl, crate::ServiceHandle), DaemonError> {
+    start_with_clock(config, state, writer, shutdown, Arc::new(crate::unix_now))
+}
+/// Start scan scheduling with an injected Unix-seconds clock for retry and due times.
+/// Scan metadata timestamps remain owned by the orchestrator.
+pub fn start_with_clock(
+    config: Arc<Config>,
+    state: LiveState,
+    writer: tswriter::Sender,
+    shutdown: Shutdown,
+    clock: crate::Clock,
+) -> Result<(ScanControl, crate::ServiceHandle), DaemonError> {
     crate::state::validate_bounds(&config)?;
     for root in &config.roots {
         parse_schedule(&root.schedule)?;
@@ -772,6 +834,7 @@ pub fn start(
         shutdown,
         active: Mutex::new(None),
         commands: tx,
+        clock,
         failures: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
     });
     let control = ScanControl {
@@ -847,7 +910,7 @@ fn scheduler(
     shared
         .state
         .publish_component(component("scheduler", "ok", "scheduler started"))?;
-    initialize_schedules(&shared.state, crate::unix_now())?;
+    initialize_schedules(&shared.state, (shared.clock)())?;
     while !shared.shutdown.load(Ordering::Acquire) {
         if job.as_ref().is_some_and(|j| j.handle.is_finished()) {
             if let Some(j) = job.take() {
@@ -861,7 +924,7 @@ fn scheduler(
                 }
             }
         }
-        let now = crate::unix_now();
+        let now = (shared.clock)();
         if !reported && now >= report_at {
             report_at = now.saturating_add(1);
             match report_firstboot(&shared.state, now) {
@@ -909,6 +972,7 @@ fn scheduler(
         }
         schedule_at = now.saturating_add(1);
         if generation != current_generation {
+            // Reload resets delays and attempts, but cannot claim a failed root recovered.
             shared.failures.lock().values_mut().for_each(|r| {
                 r.attempts = 0;
                 r.due = now;
@@ -940,7 +1004,13 @@ fn scheduler(
                 last.as_ref().and_then(|e| e.finished_at),
                 now,
             )?;
-            let next_due = shared.failures.lock().get(&raw).map(|r| r.due).or(due);
+            let next_due = due.map(|scheduled| {
+                shared
+                    .failures
+                    .lock()
+                    .get(&raw)
+                    .map_or(scheduled, |r| r.due)
+            });
             shared.state.publish(
                 Publication::Scan(ScanStatus {
                     root: root_label(&raw),
@@ -1044,6 +1114,7 @@ mod tests {
             writer,
             reply: Mutex::new(None),
             previous: Mutex::new(previous),
+            clock: Arc::new(crate::unix_now),
             failures: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         }
     }

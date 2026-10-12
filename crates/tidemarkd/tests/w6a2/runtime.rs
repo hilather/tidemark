@@ -35,6 +35,9 @@ impl Harness {
         Self::with_nested_storage(schedule, throttle, false)
     }
     fn with_nested_storage(schedule: &str, throttle: &str, nested: bool) -> Self {
+        Self::with_clock(schedule, throttle, nested, Arc::new(tidemarkd::unix_now))
+    }
+    fn with_clock(schedule: &str, throttle: &str, nested: bool, clock: tidemarkd::Clock) -> Self {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("child")).unwrap();
         std::fs::write(root.path().join("child/file"), b"fixture").unwrap();
@@ -60,8 +63,14 @@ impl Harness {
         let writer_stop = Arc::new(AtomicBool::new(false));
         let (writer, wh) =
             tswriter::start(Arc::new(cfg.clone()), state.clone(), writer_stop.clone()).unwrap();
-        let (control, sh) =
-            scheduler::start(Arc::new(cfg.clone()), state.clone(), writer, stop.clone()).unwrap();
+        let (control, sh) = scheduler::start_with_clock(
+            Arc::new(cfg.clone()),
+            state.clone(),
+            writer,
+            stop.clone(),
+            clock,
+        )
+        .unwrap();
         Self {
             _root: root,
             _state: storage,
@@ -328,6 +337,9 @@ fn bound_storage_scheduled_then_api_scan_publishes_and_excludes_state() {
     let first = catalog.latest(&h.root()).unwrap().unwrap();
     let first_file = first.file.as_ref().unwrap();
     assert!(first_file.exists());
+    assert!(std::fs::canonicalize(first_file)
+        .unwrap()
+        .starts_with(&h.cfg.general.state_dir));
     let snapshot = tidemark_store::reader::Snapshot::open(first_file).unwrap();
     assert!(snapshot
         .dir_by_path(&RawPath::from_path(&h.cfg.general.state_dir).unwrap())
@@ -420,6 +432,9 @@ fn bound_storage_scheduled_then_api_scan_publishes_and_excludes_state() {
     h.idle();
     let second = catalog.latest(&h.root()).unwrap().unwrap();
     assert!(second.file.as_ref().unwrap().exists());
+    assert!(std::fs::canonicalize(second.file.as_ref().unwrap())
+        .unwrap()
+        .starts_with(&h.cfg.general.state_dir));
     assert!(h
         .control
         .status(&ScanStatusParams {
@@ -592,10 +607,87 @@ fn bound_storage_api_request_publishes_first_snapshot() {
     let catalog = tidemark_store::catalog::Catalog::open(&h.cfg.general.state_dir, false).unwrap();
     let entry = catalog.get(&id).unwrap().unwrap();
     assert!(entry.file.as_ref().unwrap().exists());
+    assert!(std::fs::canonicalize(entry.file.as_ref().unwrap())
+        .unwrap()
+        .starts_with(&h.cfg.general.state_dir));
     let snapshot = tidemark_store::reader::Snapshot::open(entry.file.as_ref().unwrap()).unwrap();
     assert!(snapshot
         .dir_by_path(&RawPath::from_path(&h.cfg.general.state_dir).unwrap())
         .unwrap()
         .is_none());
     assert_no_tmp(&h.cfg.general.state_dir);
+}
+
+#[test]
+fn scheduled_failures_back_off_with_injected_clock_and_reload_resets() {
+    use std::sync::atomic::AtomicI64;
+    let now = Arc::new(AtomicI64::new(tidemarkd::unix_now()));
+    let clock = {
+        let now = now.clone();
+        Arc::new(move || now.load(Ordering::Acquire))
+    };
+    let h = Harness::with_clock("off", "max", false, clock);
+    let mut cfg = h.cfg.clone();
+    cfg.roots[0].path = h.cfg.roots[0].path.join("absent");
+    cfg.roots[0].schedule = "every 1h".into();
+    let raw = RawPath::from_path(&cfg.roots[0].path).unwrap();
+    h.state.replace_config(cfg.clone()).unwrap();
+    let next_due = || {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(raw.clone()),
+            })
+            .unwrap()
+            .first()
+            .and_then(|s| s.next_due)
+    };
+    for delay in [30, 60, 120, 240, 480, 960, 1920, 3600, 3600] {
+        let expected = now.load(Ordering::Acquire) + delay;
+        wait(|| next_due() == Some(expected));
+        now.store(expected, Ordering::Release);
+    }
+    h.state.replace_config(cfg).unwrap();
+    let expected = now.load(Ordering::Acquire) + 30;
+    wait(|| next_due() == Some(expected));
+}
+
+#[test]
+fn busy_keeps_fixed_deferral_and_does_not_increment_failure_attempts() {
+    use std::sync::atomic::AtomicI64;
+    let base = tidemarkd::unix_now();
+    let now = Arc::new(AtomicI64::new(base));
+    let clock = {
+        let now = now.clone();
+        Arc::new(move || now.load(Ordering::Acquire))
+    };
+    let h = Harness::with_clock("off", "max", false, clock);
+    let lock = tidemark_scan::orchestrator::ScanLock::acquire(&h.cfg.general.state_dir).unwrap();
+    let mut cfg = h.cfg.clone();
+    cfg.roots[0].schedule = "every 1h".into();
+    h.state.replace_config(cfg).unwrap();
+    let next_due = || {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(h.root()),
+            })
+            .unwrap()
+            .first()
+            .and_then(|s| s.next_due)
+    };
+    wait(|| next_due() == Some(base + 30));
+    let component = h
+        .state
+        .view()
+        .status(base)
+        .unwrap()
+        .components
+        .into_iter()
+        .find(|c| c.name == "scheduler")
+        .unwrap();
+    assert_eq!(component.state, "ok");
+    drop(lock);
+    std::fs::remove_dir_all(&h.cfg.roots[0].path).unwrap();
+    now.store(base + 30, Ordering::Release);
+    // First actual failure gets 30 seconds, rather than the second-attempt minute.
+    wait(|| next_due() == Some(base + 60));
 }
