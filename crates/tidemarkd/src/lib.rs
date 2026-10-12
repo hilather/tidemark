@@ -457,7 +457,13 @@ pub fn run_controlled(
     let outcome = match started {
         Ok((scans, reload)) => {
             state.publish_component(component("daemon", "ok", "ready"))?;
-            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+            let _ = sd_notify::notify(
+                false,
+                &[
+                    sd_notify::NotifyState::Ready,
+                    sd_notify::NotifyState::Status("Tidemark ready"),
+                ],
+            );
             tracing::info!("daemon ready");
             while !shutdown.load(Ordering::Acquire) {
                 if reload_flag.swap(false, Ordering::AcqRel) {
@@ -496,7 +502,13 @@ pub fn run_controlled(
         }
         Err(e) => Err(e),
     };
-    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
+    let _ = sd_notify::notify(
+        false,
+        &[
+            sd_notify::NotifyState::Stopping,
+            sd_notify::NotifyState::Status("Tidemark stopping"),
+        ],
+    );
     tracing::info!("daemon stopping");
     shutdown.store(true, Ordering::Release);
     let deadline = shutdown_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(9));
@@ -635,12 +647,24 @@ pub fn reload_callback(path: std::path::PathBuf, state: state::LiveState) -> api
             Ok::<_, DaemonError>(())
         })();
         match result {
-            Ok(()) => Ok(tidemark_core::api::ConfigReloadResult {
-                reloaded: true,
-                warnings: Vec::new(),
-            }),
+            Ok(()) => {
+                let _ = sd_notify::notify(
+                    false,
+                    &[sd_notify::NotifyState::Status("Configuration reloaded")],
+                );
+                Ok(tidemark_core::api::ConfigReloadResult {
+                    reloaded: true,
+                    warnings: Vec::new(),
+                })
+            }
             Err(e) => {
                 tracing::error!(error=%e,"keeping previous config");
+                let _ = sd_notify::notify(
+                    false,
+                    &[sd_notify::NotifyState::Status(
+                        "Configuration invalid; retaining previous configuration",
+                    )],
+                );
                 state.publish_component(component("config", "error", e.to_string()))?;
                 Ok(tidemark_core::api::ConfigReloadResult {
                     reloaded: false,
@@ -725,9 +749,17 @@ fn prepare_state(c: &tidemark_core::config::Config) -> Result<std::os::fd::Owned
             context: "stat state_dir".into(),
             source: e.into(),
         })?;
-        if stat.st_mode & 0o777 != 0o700 || stat.st_uid != rustix::process::geteuid().as_raw() {
+        if stat.st_mode & 0o7777 != 0o700
+            || stat.st_uid != rustix::process::geteuid().as_raw()
+            || stat.st_gid
+                != if rustix::process::geteuid().is_root() {
+                    0
+                } else {
+                    rustix::process::getegid().as_raw()
+                }
+        {
             return Err(DaemonError::Config(
-                "existing state_dir must be private 0700 and owned by daemon uid".into(),
+                "existing state_dir must be private 0700 and owned by daemon uid/gid".into(),
             ));
         }
     }
