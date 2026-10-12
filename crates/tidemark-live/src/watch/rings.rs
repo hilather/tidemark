@@ -141,16 +141,28 @@ impl Rings {
                 bucket.units[index].retain(|key, _| map.contains_key(key));
                 bucket.lossy = true;
             }
-            let row = map.entry(key.clone()).or_insert(HotEntry {
-                key,
-                events: 0,
-                files: 0,
-                bytes_delta: 0,
-                top_unit: None,
-                lossy: false,
-            });
+            let row = if map.contains_key(&key) {
+                map.get_mut(&key)
+            } else {
+                Some(map.entry(key.clone()).or_insert(HotEntry {
+                    key,
+                    events: 0,
+                    files: 0,
+                    bytes_delta: 0,
+                    top_unit: None,
+                    lossy: false,
+                }))
+            };
+            let Some(row) = row else {
+                continue;
+            };
             if let Some(unit) = unit.as_deref() {
-                let counts = bucket.units[index].entry(row.key.clone()).or_default();
+                if !bucket.units[index].contains_key(&row.key) {
+                    bucket.units[index].insert(row.key.clone(), UnitCounts::default());
+                }
+                let Some(counts) = bucket.units[index].get_mut(&row.key) else {
+                    continue;
+                };
                 counts.add(unit, delta.unsigned_abs());
                 let top = counts.top();
                 if row.top_unit.as_ref() != top {

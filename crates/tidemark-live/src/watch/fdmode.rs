@@ -55,13 +55,98 @@ impl Sizes {
         delta
     }
 }
+// FID resolution still consumes rustix::Stat; keep its existing internal adapter.
+// The fd-mode watcher uses resolve_event below and never calls this adapter.
 pub(super) fn resolve(fd: BorrowedFd<'_>) -> io::Result<(RawPath, rustix::fs::Stat, i64)> {
     let stat = rustix::fs::fstat(fd)?;
-    let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+    let path = descriptor_path(fd)?;
     let raw = RawPath::from_path(&path).map_err(io::Error::other)?;
     let created = birth(fd, "", rustix::fs::AtFlags::EMPTY_PATH, stat.st_ctime);
     Ok((raw, stat, created))
 }
+#[derive(Clone, Copy)]
+pub(super) struct EventStat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    #[allow(dead_code)] // Kept for parity with descriptor metadata.
+    pub st_size: i64,
+    pub st_blocks: i64,
+    #[allow(dead_code)] // Kept for parity with descriptor metadata.
+    pub st_mode: u32,
+    pub st_ctime: i64,
+}
+impl From<rustix::fs::Stat> for EventStat {
+    fn from(s: rustix::fs::Stat) -> Self {
+        Self {
+            st_dev: s.st_dev,
+            st_ino: s.st_ino,
+            st_size: s.st_size,
+            st_blocks: s.st_blocks,
+            st_mode: s.st_mode,
+            st_ctime: s.st_ctime,
+        }
+    }
+}
+fn event_stat(s: rustix::fs::Statx) -> io::Result<(EventStat, i64)> {
+    let required = rustix::fs::StatxFlags::BASIC_STATS.bits();
+    if s.stx_mask & required != required {
+        return Err(io::Error::other("statx basic metadata unavailable"));
+    }
+    let stat = EventStat {
+        st_dev: rustix::fs::makedev(s.stx_dev_major, s.stx_dev_minor),
+        st_ino: s.stx_ino,
+        st_size: i64::try_from(s.stx_size).map_err(io::Error::other)?,
+        st_blocks: i64::try_from(s.stx_blocks).map_err(io::Error::other)?,
+        st_mode: u32::from(s.stx_mode),
+        st_ctime: s.stx_ctime.tv_sec,
+    };
+    let created = if s.stx_mask & rustix::fs::StatxFlags::BTIME.bits() != 0 {
+        s.stx_btime.tv_sec
+    } else {
+        stat.st_ctime
+    };
+    Ok((stat, created))
+}
+pub(super) fn resolve_event(fd: BorrowedFd<'_>) -> io::Result<(RawPath, EventStat, i64)> {
+    resolve_with(fd, || {
+        rustix::fs::statx(
+            fd,
+            "",
+            rustix::fs::AtFlags::EMPTY_PATH,
+            rustix::fs::StatxFlags::BASIC_STATS | rustix::fs::StatxFlags::BTIME,
+        )
+        .map_err(Into::into)
+    })
+}
+fn resolve_with(
+    fd: BorrowedFd<'_>,
+    stat: impl FnOnce() -> io::Result<rustix::fs::Statx>,
+) -> io::Result<(RawPath, EventStat, i64)> {
+    let (stat, created) = match stat().and_then(event_stat) {
+        Ok(value) => value,
+        // Previously a failed birth-time statx still recorded fstat metadata.
+        // Retain that behavior on unsupported kernels/filesystems or seccomp.
+        Err(_) => {
+            let stat = EventStat::from(rustix::fs::fstat(fd)?);
+            (stat, stat.st_ctime)
+        }
+    };
+    let path = descriptor_path(fd)?;
+    let raw = RawPath::from_path(&path).map_err(io::Error::other)?;
+    Ok((raw, stat, created))
+}
+fn descriptor_path(fd: BorrowedFd<'_>) -> io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = [0u8; 32];
+    let length = {
+        let mut cursor = io::Cursor::new(buffer.as_mut_slice());
+        write!(cursor, "/proc/self/fd/{}", fd.as_raw_fd())?;
+        cursor.position() as usize
+    };
+    std::fs::read_link(std::ffi::OsStr::from_bytes(&buffer[..length]))
+}
+
 pub(super) fn birth(
     fd: BorrowedFd<'_>,
     name: &str,
@@ -94,6 +179,67 @@ mod tests {
         }
         assert!(sizes.order.len() <= 4);
         assert_eq!(Sizes::new(0, 0).delta((1, 1), 10, 1, 1), 0);
+    }
+    #[test]
+    fn single_statx_matches_fstat_and_ctime_fallback() {
+        use std::os::fd::AsFd;
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(12345).unwrap();
+        let old = rustix::fs::fstat(file.as_fd()).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let sx = rustix::fs::statx(
+            file.as_fd(),
+            "",
+            rustix::fs::AtFlags::EMPTY_PATH,
+            rustix::fs::StatxFlags::BASIC_STATS | rustix::fs::StatxFlags::BTIME,
+        )
+        .unwrap();
+        let (_, new, created) = resolve_with(file.as_fd(), || {
+            calls.set(calls.get() + 1);
+            Ok(sx)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            (
+                new.st_dev,
+                new.st_ino,
+                new.st_size,
+                new.st_blocks,
+                new.st_mode,
+                new.st_ctime
+            ),
+            (
+                old.st_dev,
+                old.st_ino,
+                old.st_size,
+                old.st_blocks,
+                old.st_mode,
+                old.st_ctime
+            )
+        );
+        assert_eq!(
+            created,
+            birth(
+                file.as_fd(),
+                "",
+                rustix::fs::AtFlags::EMPTY_PATH,
+                old.st_ctime
+            )
+        );
+        let mut absent = sx;
+        absent.stx_mask &= !rustix::fs::StatxFlags::BTIME.bits();
+        assert_eq!(event_stat(absent).unwrap().1, old.st_ctime);
+        let (_, fallback, created) = resolve_with(file.as_fd(), || {
+            calls.set(calls.get() + 1);
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::NOSYS.raw_os_error(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(fallback.st_ino, old.st_ino);
+        assert_eq!(created, old.st_ctime);
     }
     #[test]
     fn resolve_only_metadata_and_raw_path() {

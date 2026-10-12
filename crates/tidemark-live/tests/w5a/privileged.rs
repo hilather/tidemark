@@ -284,15 +284,35 @@ fn watcher_sixty_second_load_and_ten_minute_fd_stability() {
     let mut mode_failed = false;
     let mut measured = false;
     let mut previous = watch.stats().events_total;
+    let events_before = previous;
+    let mut interval_at = started;
+    let mut interval_cpu = cpu_before;
+    let mut interval_events = previous;
     while started.elapsed() < Duration::from_secs(600) {
         std::thread::sleep(Duration::from_secs(1));
         let current = watch.stats().events_total;
         progress_failed |= current <= previous;
         previous = current;
         mode_failed |= watch.mode() == tidemark_live::watch::WatchMode::Failed;
+        if interval_at.elapsed() >= Duration::from_secs(10) {
+            let at = Instant::now();
+            let ticks = cpu_ticks();
+            let seconds = at.duration_since(interval_at).as_secs_f64();
+            let cpu_seconds = (ticks - interval_cpu) as f64 / hz;
+            let events = current - interval_events;
+            let pct = cpu_seconds / seconds * 100.0;
+            let micros = cpu_seconds * 1_000_000.0 / events as f64;
+            println!("watcher interval CPU {pct:.3}%; events={events}; elapsed={seconds:.3}s; cost={micros:.3} us/event");
+            interval_at = at;
+            interval_cpu = ticks;
+            interval_events = current;
+        }
         if !measured && started.elapsed() >= Duration::from_secs(60) {
             let cpu_pct =
                 (cpu_ticks() - cpu_before) as f64 / hz / started.elapsed().as_secs_f64() * 100.0;
+            let events = current - events_before;
+            let micros = (cpu_ticks() - cpu_before) as f64 / hz * 1_000_000.0 / events as f64;
+            println!("watcher 60-second cost={micros:.3} us/event");
             println!(
                 "watcher CPU {cpu_pct:.3}% of one core; events={}, elapsed={:?}",
                 watch.stats().events_total,
@@ -353,7 +373,14 @@ fn paced_writer_child() {
         if let Some(delay) = due.checked_duration_since(Instant::now()) {
             std::thread::sleep(delay);
         }
-        std::fs::write(path.join((n % 2000).to_string()), b"load").unwrap();
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path.join((n % 2000).to_string()))
+            .unwrap();
+        file.write_all(b"load").unwrap();
+        drop(file);
         if n == 119_999 {
             let achieved = 120_000.0 / started.elapsed().as_secs_f64();
             println!("first 60 seconds generated {achieved:.2} closes/s");
