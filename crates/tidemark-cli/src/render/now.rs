@@ -1,6 +1,6 @@
 //! Owned by: W6-A3
 //! Shared live situation rendering at terminal width.
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 /// Render the raw report as a machine document or the shared situation view.
 pub fn write(
     report: &tidemark_core::live::NowReport,
@@ -10,8 +10,12 @@ pub fn write(
     if context.json {
         return crate::render::json("tidemark.now.v1", report, out);
     }
-    // Coordinator must enable rustix termios for TIOCGWINSZ; use the frozen fallback.
-    let width = 100;
+    let stdout = std::io::stdout();
+    let width = select_width(stdout.is_terminal(), || {
+        rustix::termios::tcgetwinsize(&stdout)
+            .ok()
+            .map(|size| size.ws_col)
+    });
     out.write_all(tidemark_live::now::render_now_text(report, width, context.color).as_bytes())?;
     Ok(())
 }
@@ -140,4 +144,26 @@ pub fn fallback(command: &str) -> anyhow::Result<()> {
         "daemon unavailable; falling back to direct {command} mode"
     )?;
     Ok(())
+}
+
+fn select_width(is_terminal: bool, query: impl FnOnce() -> Option<u16>) -> usize {
+    if is_terminal {
+        query().filter(|width| *width > 0).map_or(100, usize::from)
+    } else {
+        100
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    #[test]
+    fn terminal_width_selection() {
+        assert_eq!(
+            super::select_width(false, || panic!("nonterminal queried")),
+            100
+        );
+        assert_eq!(super::select_width(true, || Some(132)), 132);
+        assert_eq!(super::select_width(true, || Some(0)), 100);
+        assert_eq!(super::select_width(true, || None), 100);
+    }
 }

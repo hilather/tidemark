@@ -19,6 +19,10 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         "scan.status",
         &tidemark_core::api::ScanStatusParams { root: None },
     )?;
+    if args.show_config && !context.json {
+        use std::io::Write;
+        writeln!(std::io::stdout().lock(), "CLI effective configuration: the running daemon may hold an older configuration until it is reloaded.")?;
+    }
     crate::render::status::write(
         &report,
         &scans,

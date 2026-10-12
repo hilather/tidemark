@@ -6,33 +6,47 @@ use crate::{
 };
 use clap::Parser;
 #[test]
-fn daemon_unavailable_exit_four() {
-    let ctx = Context {
+fn missing_daemon_takes_direct_setup_without_scanning_proc() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = Context {
         config: tidemark_core::config::Config::default(),
-        config_path: "/etc/tidemark/tidemark.toml".into(),
+        config_path: dir.path().join("config.toml"),
         json: true,
         color: false,
     };
-    let err = phantom::run(
-        &phantom::Args {
-            mount: None,
-            direct: false,
-        },
-        &ctx,
-    )
-    .unwrap_err();
-    assert_eq!(err.downcast_ref::<CliError>().unwrap().exit_code(), 4);
-    let err = writers::run(
-        &writers::Args {
-            mount: None,
-            direct: false,
-            window: None,
-            interval: std::time::Duration::from_secs(10),
-        },
-        &ctx,
-    )
-    .unwrap_err();
-    assert_eq!(err.downcast_ref::<CliError>().unwrap().exit_code(), 4);
+    ctx.config.general.socket = dir.path().join("absent.sock");
+    // Missing explicit mount fails in direct setup, before ProcScanner::scan_once.
+    let mount = Some(dir.path().join("missing-mount"));
+    for direct in [false, true] {
+        let phantom_error = phantom::run(
+            &phantom::Args {
+                mount: mount.clone(),
+                direct,
+            },
+            &ctx,
+        )
+        .unwrap_err();
+        let writers_error = writers::run(
+            &writers::Args {
+                mount: mount.clone(),
+                direct,
+                window: None,
+                interval: std::time::Duration::from_millis(1),
+            },
+            &ctx,
+        )
+        .unwrap_err();
+        for error in [phantom_error, writers_error] {
+            assert!(
+                !matches!(
+                    error.downcast_ref::<CliError>(),
+                    Some(CliError::Unavailable(_))
+                ),
+                "{error}"
+            );
+            assert!(!error.to_string().contains("daemon unavailable"), "{error}");
+        }
+    }
 }
 #[test]
 fn duration_and_interval_validation() {

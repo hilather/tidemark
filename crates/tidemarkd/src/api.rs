@@ -70,7 +70,7 @@ pub fn dispatch(
     context: &Context,
     now: i64,
 ) -> Result<Response, DaemonError> {
-    if peer_uid != 0 && peer_uid != rustix::process::geteuid().as_raw() {
+    if peer_uid != 0 {
         return Ok(error(
             &request.id,
             ApiErrorCode::Forbidden,
@@ -273,18 +273,24 @@ fn connection(
         }
     }
 }
-/// Lifecycle entry point. Transport remains disabled until the coordinator
-/// enables safe SO_PEERCRED support; no unauthenticated socket is created.
+/// Start the lifecycle transport with kernel-verified, root-only peer credentials.
 pub fn start(
-    _config: Arc<tidemark_core::config::Config>,
-    _context: Context,
-    _shutdown: crate::Shutdown,
+    config: Arc<tidemark_core::config::Config>,
+    context: Context,
+    shutdown: crate::Shutdown,
 ) -> Result<crate::ServiceHandle, DaemonError> {
-    tracing::error!("API requires coordinator to enable rustix net for SO_PEERCRED; refusing unauthenticated transport");
-    Err(DaemonError::NotYetImplemented)
+    start_with_peer(
+        config,
+        context,
+        shutdown,
+        Arc::new(|stream| {
+            rustix::net::sockopt::socket_peercred(stream)
+                .map(|c| (c.uid.as_raw(), c.pid.as_raw_pid()))
+                .map_err(std::io::Error::from)
+        }),
+    )
 }
-/// Credential provider returning verified (uid, pid), for transport tests and
-/// integration by the coordinator once the safe SO_PEERCRED wrapper is enabled.
+/// Credential provider returning verified (uid, pid), injectable for transport tests.
 pub type PeerCredentials = Arc<dyn Fn(&UnixStream) -> std::io::Result<(u32, i32)> + Send + Sync>;
 /// Start transport with a credential provider. Production must supply
 /// SO_PEERCRED; callers must never infer credentials from socket ownership.

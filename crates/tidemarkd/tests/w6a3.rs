@@ -54,7 +54,7 @@ fn request(method: &str, params: &str) -> Request {
 #[test]
 fn every_method_authorizes_before_dispatch_and_validates_parameters() {
     let ctx = context(&Config::default());
-    let own = rustix::process::geteuid().as_raw();
+    let own = 0; // Valid requests use root even on a non-root test host.
     let other = if own == 1 { 2 } else { 1 };
     for &(method, params) in METHODS {
         let r = request(method, params);
@@ -67,7 +67,8 @@ fn every_method_authorizes_before_dispatch_and_validates_parameters() {
             ApiErrorCode::Forbidden,
             "{method}"
         );
-        for uid in [0, own] {
+        {
+            let uid = 0;
             let response = api::dispatch(&r, uid, &ctx, 20).unwrap();
             assert_ne!(
                 response.error.as_ref().map(|e| e.code),
@@ -126,7 +127,7 @@ fn framing_multiple_requests_private_socket_and_idle_shutdown() {
         Arc::new(c.clone()),
         context(&c),
         stop.clone(),
-        Arc::new(|_| Ok((rustix::process::geteuid().as_raw(), 1))),
+        Arc::new(|_| Ok((0, 1))),
     )
     .unwrap();
     assert_eq!(
@@ -299,3 +300,57 @@ fn socket_available() -> bool {
 }
 #[path = "w6a3/operator.rs"]
 mod operator;
+
+#[test]
+fn injected_nonroot_peer_is_forbidden_over_real_socket() {
+    if !socket_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let c = socket_config(&dir);
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = api::start_with_peer(
+        Arc::new(c.clone()),
+        context(&c),
+        stop.clone(),
+        Arc::new(|_| Ok((1000, 42))),
+    )
+    .unwrap();
+    let stream = UnixStream::connect(&c.general.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut stream = BufReader::new(stream);
+    write(&mut stream, &request("status", "{}"));
+    assert_eq!(
+        read(&mut stream).error.unwrap().code,
+        ApiErrorCode::Forbidden
+    );
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap().unwrap();
+}
+
+#[test]
+fn lifecycle_start_uses_kernel_credentials_over_real_socket() {
+    if !socket_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let c = socket_config(&dir);
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = api::start(Arc::new(c.clone()), context(&c), stop.clone()).unwrap();
+    let stream = UnixStream::connect(&c.general.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut stream = BufReader::new(stream);
+    write(&mut stream, &request("status", "{}"));
+    let response = read(&mut stream);
+    if rustix::process::geteuid().as_raw() == 0 {
+        assert!(response.ok, "{response:?}");
+    } else {
+        assert_eq!(response.error.unwrap().code, ApiErrorCode::Forbidden);
+    }
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap().unwrap();
+}
