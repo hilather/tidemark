@@ -118,6 +118,26 @@ fn bulk_equals_walk_million_file_timing_smoke() {
             File::create(dir.join(format!("f{f:05}"))).unwrap();
         }
     }
+    // A fresh copy of this already compiled test executable measures bulk alone.
+    // The parent owns/cleans the fixture; the child never mounts or compiles.
+    let measured = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "vm::bulk_memory_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("TIDEMARK_BULK_MEMORY_ROOT", &fs.mountpoint)
+        .env("TIDEMARK_BULK_MEMORY_DIRS", "101")
+        .env("TIDEMARK_BULK_MEMORY_FILES", "1000000")
+        .output()
+        .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&measured.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&measured.stderr));
+    assert!(
+        measured.status.success(),
+        "isolated bulk memory child failed"
+    );
     let root = RawPath::from_path(&fs.mountpoint).unwrap();
     let start = Instant::now();
     let mut expected = walk_sink(root.clone());
@@ -126,9 +146,102 @@ fn bulk_equals_walk_million_file_timing_smoke() {
     let (mut actual, stats) = bulk_sink(root, &fs.mountpoint);
     let bulk_ms = start.elapsed().as_millis();
     compare(&mut expected, &mut actual);
-    // Timing/equivalence only. Isolated bulk RSS acceptance remains pending VM.
+    // The separate child above measures RSS; this process measures equivalence/timing.
     eprintln!(
         "walk_ms={walk_ms} bulk_ms={bulk_ms} phases={:?}",
         stats.phase_ms
     );
+}
+
+// This test is also enumerated normally, when it does no work without the parent seam.
+#[test]
+fn bulk_memory_child() {
+    use std::io::Read;
+    let Some(mount) = std::env::var_os("TIDEMARK_BULK_MEMORY_ROOT") else {
+        return;
+    };
+    let dirs: u64 = std::env::var("TIDEMARK_BULK_MEMORY_DIRS")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let files: u64 = std::env::var("TIDEMARK_BULK_MEMORY_FILES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mount = std::path::PathBuf::from(mount);
+    let root = RawPath::from_path(&mount).unwrap();
+    let fd = File::open(&mount).unwrap();
+    let fs = rustix::fs::fstatvfs(&fd).unwrap();
+    let used_inodes = fs.f_files.saturating_sub(fs.f_ffree);
+    let estimate = estimate_memory(used_inodes, dirs);
+    let geo = tidemark_sys::xfs::geometry(fd.as_fd()).unwrap();
+    let params = BulkParams {
+        walk: config(root.clone()),
+        batch: 4096,
+        threads: 2,
+    };
+    let (prepared, _) = run_bulk(
+        &params,
+        fd.as_fd(),
+        &geo,
+        &NoopGate,
+        &AtomicBool::new(false),
+        &|_| {},
+        aggregator(root),
+    )
+    .unwrap();
+    let summary = prepared.write(&mut DiscardRows).unwrap();
+    assert_eq!(summary.dirs, dirs);
+    assert_eq!(summary.files, files);
+    let mut status = String::new();
+    File::open("/proc/self/status")
+        .unwrap()
+        .take(65_536)
+        .read_to_string(&mut status)
+        .unwrap();
+    let peak = status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmHWM:")
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(|kb| kb.parse::<u64>().unwrap() * 1024)
+        })
+        .unwrap();
+    eprintln!("bulk-only dirs={dirs} files={files} used_inodes={used_inodes} estimate_bytes={estimate} peak_rss_bytes={peak}");
+    assert!(u128::from(peak) * 100 <= u128::from(estimate) * 120,
+        "bulk peak RSS {peak} exceeds 120% of estimate {estimate}; dirs={dirs} files={files} used_inodes={used_inodes}");
+}
+
+struct DiscardRows;
+impl agg::RowSink for DiscardRows {
+    fn dirs(&mut self, _: &[tidemark_core::snapshot::DirRow]) -> Result<(), agg::SinkError> {
+        Ok(())
+    }
+    fn files(&mut self, _: &[tidemark_core::snapshot::FileRow]) -> Result<(), agg::SinkError> {
+        Ok(())
+    }
+    fn link_sets(
+        &mut self,
+        _: &[tidemark_core::snapshot::LinkSetRow],
+    ) -> Result<(), agg::SinkError> {
+        Ok(())
+    }
+    fn link_instances(
+        &mut self,
+        _: &[tidemark_core::snapshot::LinkInstanceRow],
+    ) -> Result<(), agg::SinkError> {
+        Ok(())
+    }
+    fn skipped(&mut self, _: &[tidemark_core::snapshot::SkipRow]) -> Result<(), agg::SinkError> {
+        Ok(())
+    }
+    fn errors(&mut self, _: &[tidemark_core::snapshot::ErrorRow]) -> Result<(), agg::SinkError> {
+        Ok(())
+    }
+    fn annotations(
+        &mut self,
+        _: &[tidemark_core::snapshot::AnnotationRow],
+    ) -> Result<(), agg::SinkError> {
+        Ok(())
+    }
 }

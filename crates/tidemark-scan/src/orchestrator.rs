@@ -75,6 +75,27 @@ pub fn run_scan(
     cancel: &AtomicBool,
     progress: &(dyn Fn(&Progress) + Sync),
 ) -> Result<ScanOutcome, ScanError> {
+    run_scan_with_environment(
+        cfg,
+        req,
+        recorder,
+        cancel,
+        progress,
+        &tidemark_core::time::unix_now,
+        &|| read_os_release(std::fs::File::open("/etc/os-release")),
+    )
+}
+
+// Host metadata is separate from scanned regular files; tests replace both seams.
+fn run_scan_with_environment(
+    cfg: &Config,
+    req: &ScanRequest,
+    recorder: &dyn ScanRecorder,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(&Progress) + Sync),
+    clock: &dyn Fn() -> i64,
+    os_release: &dyn Fn() -> String,
+) -> Result<ScanOutcome, ScanError> {
     use std::{os::fd::AsFd, sync::atomic::Ordering, time::Instant};
     use tidemark_core::config::RootConfig;
     use tidemark_fs::{blockdev, mount, throttle};
@@ -144,7 +165,7 @@ pub fn run_scan(
             &cfg.general.state_dir,
             &catalog,
             cfg.retention.snapshots.recent,
-            tidemark_core::time::unix_now(),
+            clock(),
             || {
                 Ok(tidemark_store::space_guard::space_check(
                     &cfg.general.state_dir,
@@ -220,7 +241,7 @@ pub fn run_scan(
             cfg.scan.getdents_buf.0,
             root_cfg.top_files,
         )?;
-        let now = tidemark_core::time::unix_now();
+        let now = clock();
         let dir = cfg
             .general
             .state_dir
@@ -247,12 +268,7 @@ pub fn run_scan(
         recorded(
             &mut entry,
             recorder,
-            || {
-                (
-                    tidemark_core::time::unix_now(),
-                    milliseconds(start.elapsed()),
-                )
-            },
+            || (clock(), milliseconds(start.elapsed())),
             |entry, recorder| {
                 // Escape the state path as literal glob bytes; Glob only accepts UTF-8.
                 // Non-UTF-8 state directories are handled by an explicit walker mount-style boundary.
@@ -300,6 +316,7 @@ pub fn run_scan(
                 let (mut prepared, noatime, partial) = loop {
                     let agg = new_agg();
                     if mode == ScanMode::Walk {
+                        let walk_started = Instant::now();
                         let (mut agg, walk_result) = collect_walk(
                             &walk_cfg,
                             gate.as_ref(),
@@ -322,7 +339,7 @@ pub fn run_scan(
                             }
                             Err(e) => return Err(e.into()),
                         };
-                        phases.insert("walk".into(), milliseconds(start.elapsed()));
+                        record_walk_phase(&mut phases, walk_started.elapsed());
                         if partial && agg.is_empty() {
                             // Cancellation can arrive during walker setup, before any record is emitted.
                             // Preserve only the already observed root metadata in that partial snapshot.
@@ -472,7 +489,7 @@ pub fn run_scan(
                     exclude,
                     link_instances: cfg.scan.link_instances,
                     started_at: now,
-                    finished_at: tidemark_core::time::unix_now(),
+                    finished_at: now,
                     host: rustix::system::uname()
                         .nodename()
                         .to_string_lossy()
@@ -481,7 +498,7 @@ pub fn run_scan(
                         .release()
                         .to_string_lossy()
                         .into_owned(),
-                    os_release: String::new(),
+                    os_release: os_release(),
                     fs_uuid: geometry
                         .as_ref()
                         .map(|g| g.uuid.iter().map(|b| format!("{b:02x}")).collect())
@@ -551,6 +568,9 @@ pub fn run_scan(
                     .collect();
                 status = publication_status(status, mode, req.keep_partial, cancel)?;
                 meta.status = status;
+                // Rows are complete. The consuming writer still owns index/sync timing;
+                // its frozen API cannot refresh metadata after those operations.
+                meta.finished_at = clock();
                 let file = finish_snapshot(writer, &meta, &|| cancel.load(Ordering::Acquire))?;
                 entry.status = if status == SnapshotStatus::Partial {
                     "partial"
@@ -1207,6 +1227,29 @@ fn admit_memory(
     Ok(())
 }
 
+const OS_RELEASE_LIMIT: usize = 16 * 1024;
+fn read_os_release<R: std::io::Read>(reader: std::io::Result<R>) -> String {
+    use std::io::Read;
+    let Ok(reader) = reader else {
+        return String::new();
+    };
+    let mut bytes = Vec::new();
+    if reader
+        .take(OS_RELEASE_LIMIT as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn record_walk_phase(phases: &mut std::collections::BTreeMap<String, u64>, elapsed: Duration) {
+    phases
+        .entry("walk".into())
+        .or_insert_with(|| milliseconds(elapsed));
+}
+
 fn finish_snapshot(
     writer: tidemark_store::writer::SnapshotWriter,
     meta: &tidemark_core::snapshot::SnapshotMeta,
@@ -1312,6 +1355,72 @@ mod tests {
             duration_ms: None,
         }
     }
+    #[test]
+    fn scan_provenance_uses_injected_environment() {
+        let fixture = test_support::materialize("[[entry]]\npath='file'\nkind='file'\nsize=8\n");
+        let state = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.general.state_dir = state.path().to_owned();
+        let req = ScanRequest {
+            root: RawPath::from_path(&fixture.root).unwrap(),
+            mode: crate::mode::ModeRequest::Walk,
+            throttle: Some("max".into()),
+            threads: Some(1),
+            exclude_extra: vec![],
+            keep_partial: false,
+            annotations: vec![],
+        };
+        let calls = std::cell::Cell::new(0);
+        let recorder = Recorder::default();
+        let result = run_scan_with_environment(
+            &cfg,
+            &req,
+            &recorder,
+            &AtomicBool::new(false),
+            &|_| {},
+            &|| {
+                let call = calls.get();
+                calls.set(call + 1);
+                100 + call * 10
+            },
+            &|| "NAME=Fixture OS\n".into(),
+        )
+        .unwrap();
+        let snapshot =
+            tidemark_store::reader::Snapshot::open(result.file.as_ref().unwrap()).unwrap();
+        assert_eq!(snapshot.meta().os_release, "NAME=Fixture OS\n");
+        // The first clock read is preflight retention, the second starts the scan,
+        // and the third is after row writing, immediately before writer finalization.
+        assert_eq!(snapshot.meta().started_at, 110);
+        assert_eq!(snapshot.meta().finished_at, 120);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn walk_phase_preserves_measured_duration() {
+        let mut phases = std::collections::BTreeMap::new();
+        phases.insert("walk".to_owned(), milliseconds(Duration::from_millis(17)));
+        record_walk_phase(&mut phases, Duration::from_millis(999));
+        assert_eq!(phases["walk"], 17);
+    }
+
+    #[test]
+    fn os_release_read_is_bounded_and_replaceable() {
+        assert_eq!(
+            read_os_release(Ok(std::io::Cursor::new(b"NAME=Fixture\n"))),
+            "NAME=Fixture\n"
+        );
+        assert!(
+            read_os_release::<std::io::Cursor<Vec<u8>>>(Err(std::io::Error::other("unavailable")))
+                .is_empty()
+        );
+        let data = vec![b'x'; OS_RELEASE_LIMIT + 1];
+        assert_eq!(
+            read_os_release(Ok(std::io::Cursor::new(data))).len(),
+            OS_RELEASE_LIMIT
+        );
+    }
+
     #[test]
     fn cancellation_monitor_releases_bulk_cost_during_preflight_or_any_phase() {
         use std::sync::atomic::Ordering;
