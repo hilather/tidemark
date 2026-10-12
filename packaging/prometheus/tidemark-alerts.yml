@@ -1,0 +1,86 @@
+{
+  "groups": [
+    {
+      "name": "tidemark",
+      "rules": [
+        {
+          "alert": "TidemarkTimeToFull",
+          "expr": "tidemark_fs_time_to_full_seconds < 86400",
+          "for": "15m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "TidemarkTimeToFull on {{ $labels.instance }}"
+          }
+        },
+        {
+          "alert": "TidemarkThinPool",
+          "expr": "tidemark_lvm_thin_data_percent > 85 or tidemark_lvm_thin_metadata_percent > 85",
+          "for": "5m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "TidemarkThinPool on {{ $labels.instance }}"
+          }
+        },
+        {
+          "alert": "TidemarkPhantomBytes",
+          "expr": "tidemark_phantom_bytes > 1073741824",
+          "for": "15m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "TidemarkPhantomBytes on {{ $labels.instance }}"
+          }
+        },
+        {
+          "alert": "TidemarkScanStale",
+          "expr": "time() - tidemark_scan_last_success_timestamp_seconds > 172800",
+          "for": "15m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "TidemarkScanStale on {{ $labels.instance }}"
+          }
+        },
+        {
+          "alert": "TidemarkWatcherLossy",
+          "expr": "increase(tidemark_watch_overflows_total[15m]) > 0",
+          "for": "0m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "TidemarkWatcherLossy on {{ $labels.instance }}"
+          }
+        },
+        {
+          "alert": "TidemarkDown",
+          "expr": "absent(tidemark_up)",
+          "for": "5m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "TidemarkDown on {{ $labels.instance }}"
+          }
+        },
+        {
+          "alert": "TidemarkAlertFiring",
+          "expr": "tidemark_alert_firing == 1",
+          "for": "0m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "TidemarkAlertFiring on {{ $labels.instance }}"
+          }
+        }
+      ]
+    }
+  ]
+}
