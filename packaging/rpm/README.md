@@ -22,7 +22,9 @@ Use Docker in place of Podman if necessary. Bootstrap downloads are explicit
 operator actions; they are never invoked by xtask. The toolchain and generator
 are cached in the image. The generator is pinned to 0.20.0; compatibility and
 actual package metadata remain build-host gates. Gzip payload supports EL8.
-External metadata overrides avoid changing any Cargo manifest. See the
+The CLI manifest carries only the empty table required by cargo-generate-rpm;
+package metadata comes from `packaging/rpm/rpm.toml`. Asset and script paths
+are relative to the workspace root, where the generator command must run. See the
 [generator metadata documentation](https://github.com/cat-in-136/cargo-generate-rpm#configuration).
 Bash completion is generated from the release CLI before packaging.
 

@@ -69,8 +69,27 @@ fn exact_normative_unit_and_config() {
 }
 #[test]
 fn metadata_and_scriptlet_contract() {
+    let manifest: toml::Value = toml::from_str(&read("crates/tidemark-cli/Cargo.toml")).unwrap();
+    assert!(manifest["package"]["metadata"]["generate-rpm"].is_table());
     let m: toml::Value = toml::from_str(&read("packaging/rpm/rpm.toml")).unwrap();
     let assets = m["assets"].as_array().unwrap();
+    for asset in assets {
+        let source = asset["source"].as_str().unwrap();
+        if !source.starts_with("target/") {
+            assert!(root().join(source).is_file(), "missing RPM asset: {source}");
+        }
+    }
+    for key in [
+        "post_install_script",
+        "pre_uninstall_script",
+        "post_uninstall_script",
+    ] {
+        let script = m[key].as_str().unwrap();
+        assert!(
+            root().join(script).is_file(),
+            "missing RPM script: {script}"
+        );
+    }
     let expected = [
         ("/usr/bin/tidemark", "0755"),
         ("/usr/bin/tidemarkd", "0755"),
