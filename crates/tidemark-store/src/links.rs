@@ -2,7 +2,7 @@
 //! Bounded hard-link topology queries and laminar preorder regions.
 
 use crate::{reader::Snapshot, StoreError};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use tidemark_core::{
     path::RawPath,
     snapshot::{LinkFilter, LinkSetHit},
@@ -195,7 +195,7 @@ pub fn crossing_sets(
         .dir_by_path(&regions.under)?
         .ok_or_else(|| StoreError::Invalid("report root absent".into()))?;
     let mut totals = CrossingTotals::default();
-    let mut out = Vec::new();
+    let mut out = BinaryHeap::new();
     let mut sample_count = 0usize;
     let mut samples = BTreeMap::new();
     stream_sets(snap, root.id, root.subtree_end, |hit, dirs| {
@@ -215,53 +215,14 @@ pub fn crossing_sets(
             totals.incomplete_sets += 1;
             totals.incomplete_disk = add(totals.incomplete_disk, hit.row.disk)?;
         }
-        if limit > 0
-            && (out.len() < limit
-                || out
-                    .last()
-                    .is_some_and(|last: &(u64, RawPath, CrossingSet)| {
-                        order(
-                            hit.row.disk,
-                            &hit.lca_path,
-                            hit.row.ino,
-                            last.0,
-                            &last.1,
-                            last.2.ino,
-                        )
-                        .is_lt()
-                    }))
-        {
-            sample_count += samples.len();
-            if sample_count > CAP {
-                return Err(StoreError::Invalid("crossing sample cap reached".into()));
-            }
-            let (rs, ds) = samples.iter().map(|(&r, &d)| (r, d)).unzip();
-            out.push((
-                hit.row.disk,
-                hit.lca_path.clone(),
-                CrossingSet {
-                    ino: hit.row.ino,
-                    disk: hit.row.disk,
-                    nlink: hit.row.nlink,
-                    found: hit.row.found,
-                    regions: rs,
-                    sample_dirs: ds,
-                },
-            ));
-            out.sort_unstable_by(|a, b| {
-                b.0.cmp(&a.0)
-                    .then_with(|| a.1.cmp(&b.1))
-                    .then_with(|| a.2.ino.cmp(&b.2.ino))
-            });
-            if out.len() > limit {
-                if let Some(removed) = out.pop() {
-                    sample_count -= removed.2.regions.len();
-                }
-            }
-        }
+        retain_crossing(&mut out, &mut sample_count, hit, &samples, limit)?;
         Ok(())
     })?;
-    let out = out.into_iter().map(|(_, _, set)| set).collect();
+    let out = out
+        .into_sorted_vec()
+        .into_iter()
+        .map(|entry| entry.value)
+        .collect();
     Ok((out, totals))
 }
 fn order(
@@ -272,10 +233,110 @@ fn order(
     other_path: &RawPath,
     other_ino: u64,
 ) -> std::cmp::Ordering {
+    #[cfg(test)]
+    COMPARISONS.with(|count| count.set(count.get() + 1));
     other_disk
         .cmp(&disk)
         .then_with(|| path.cmp(other_path))
         .then_with(|| ino.cmp(&other_ino))
+}
+// The maximum heap entry is the worst retained result. Payloads do not
+// participate in ordering; all three selectors share the frozen ranking.
+struct Ranked<T> {
+    disk: u64,
+    path: RawPath,
+    ino: u64,
+    value: T,
+}
+impl<T> Ranked<T> {
+    fn new(hit: &LinkSetHit, value: T) -> Self {
+        Self {
+            disk: hit.row.disk,
+            path: hit.lca_path.clone(),
+            ino: hit.row.ino,
+            value,
+        }
+    }
+}
+impl<T> PartialEq for Ranked<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl<T> Eq for Ranked<T> {}
+impl<T> PartialOrd for Ranked<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T> Ord for Ranked<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        order(
+            self.disk,
+            &self.path,
+            self.ino,
+            other.disk,
+            &other.path,
+            other.ino,
+        )
+    }
+}
+fn admits<T>(heap: &BinaryHeap<Ranked<T>>, hit: &LinkSetHit, limit: usize) -> bool {
+    limit > 0
+        && (heap.len() < limit
+            || heap.peek().is_some_and(|worst| {
+                order(
+                    hit.row.disk,
+                    &hit.lca_path,
+                    hit.row.ino,
+                    worst.disk,
+                    &worst.path,
+                    worst.ino,
+                )
+                .is_lt()
+            }))
+}
+fn retain_crossing(
+    heap: &mut BinaryHeap<Ranked<CrossingSet>>,
+    sample_count: &mut usize,
+    hit: &LinkSetHit,
+    samples: &BTreeMap<Option<RegionId>, u32>,
+    limit: usize,
+) -> Result<(), StoreError> {
+    if !admits(heap, hit, limit) {
+        return Ok(());
+    }
+    let displaced = if heap.len() == limit {
+        heap.peek().map_or(0, |entry| entry.value.regions.len())
+    } else {
+        0
+    };
+    let prospective = *sample_count - displaced + samples.len();
+    if prospective > CAP {
+        return Err(StoreError::Invalid("crossing sample cap reached".into()));
+    }
+    // Release obsolete samples before allocating the replacement's vectors.
+    if heap.len() == limit {
+        heap.pop();
+    }
+    *sample_count = prospective;
+    let (regions, sample_dirs) = samples.iter().map(|(&r, &d)| (r, d)).unzip();
+    heap.push(Ranked::new(
+        hit,
+        CrossingSet {
+            ino: hit.row.ino,
+            disk: hit.row.disk,
+            nlink: hit.row.nlink,
+            found: hit.row.found,
+            regions,
+            sample_dirs,
+        },
+    ));
+    Ok(())
+}
+#[cfg(test)]
+thread_local! {
+    static COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 // One reusable flat directory-id buffer; no names or global instance collection.
 fn stream_sets(
@@ -385,39 +446,21 @@ pub fn link_report(
         .dir_by_path(under)?
         .ok_or_else(|| StoreError::Invalid("report root absent".into()))?;
     require_instances(snap)?;
-    let mut largest_sets = Vec::new();
+    let mut largest_sets = BinaryHeap::new();
     let regions = spec.map(|s| Regions::build(snap, under, s)).transpose()?;
     let mut totals = LinkTotals::default();
     let mut pinned: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
     let mut pairs: BTreeMap<(Option<RegionId>, Option<RegionId>), (u64, u64)> = BTreeMap::new();
-    let mut crossing = Vec::new();
+    let mut crossing = BinaryHeap::new();
     let mut sample_count = 0usize;
     let mut samples = BTreeMap::new();
     let mut visited = BTreeSet::new();
     stream_sets(snap, root.id, root.subtree_end, |hit, dirs| {
-        if top > 0
-            && (largest_sets.len() < top
-                || largest_sets.last().is_some_and(|last: &LinkSetHit| {
-                    order(
-                        hit.row.disk,
-                        &hit.lca_path,
-                        hit.row.ino,
-                        last.row.disk,
-                        &last.lca_path,
-                        last.row.ino,
-                    )
-                    .is_lt()
-                }))
-        {
-            largest_sets.push(hit.clone());
-            largest_sets.sort_unstable_by(|a, b| {
-                b.row
-                    .disk
-                    .cmp(&a.row.disk)
-                    .then_with(|| a.lca_path.cmp(&b.lca_path))
-                    .then_with(|| a.row.ino.cmp(&b.row.ino))
-            });
-            largest_sets.truncate(top);
+        if admits(&largest_sets, hit, top) {
+            if largest_sets.len() == top {
+                largest_sets.pop();
+            }
+            largest_sets.push(Ranked::new(hit, hit.clone()));
         }
         totals.sets += 1;
         totals.instances = add(totals.instances, u64::from(hit.row.found))?;
@@ -474,54 +517,20 @@ pub fn link_report(
                     }
                 }
             }
-            if top > 0
-                && (crossing.len() < top
-                    || crossing
-                        .last()
-                        .is_some_and(|last: &(RawPath, CrossingSet)| {
-                            order(
-                                hit.row.disk,
-                                &hit.lca_path,
-                                hit.row.ino,
-                                last.1.disk,
-                                &last.0,
-                                last.1.ino,
-                            )
-                            .is_lt()
-                        }))
-            {
-                sample_count += samples.len();
-                if sample_count > CAP {
-                    return Err(StoreError::Invalid("crossing sample cap reached".into()));
-                }
-                let (rs, ds) = samples.iter().map(|(&r, &d)| (r, d)).unzip();
-                crossing.push((
-                    hit.lca_path.clone(),
-                    CrossingSet {
-                        ino: hit.row.ino,
-                        disk: hit.row.disk,
-                        nlink: hit.row.nlink,
-                        found: hit.row.found,
-                        regions: rs,
-                        sample_dirs: ds,
-                    },
-                ));
-                crossing.sort_unstable_by(|a, b| {
-                    b.1.disk
-                        .cmp(&a.1.disk)
-                        .then_with(|| a.0.cmp(&b.0))
-                        .then_with(|| a.1.ino.cmp(&b.1.ino))
-                });
-                if crossing.len() > top {
-                    if let Some(removed) = crossing.pop() {
-                        sample_count -= removed.1.regions.len();
-                    }
-                }
-            }
+            retain_crossing(&mut crossing, &mut sample_count, hit, &samples, top)?;
         }
         Ok(())
     })?;
-    let crossing = crossing.into_iter().map(|(_, set)| set).collect();
+    let crossing = crossing
+        .into_sorted_vec()
+        .into_iter()
+        .map(|entry| entry.value)
+        .collect();
+    let largest_sets = largest_sets
+        .into_sorted_vec()
+        .into_iter()
+        .map(|entry| entry.value)
+        .collect();
     let mut incomplete_top_dirs = pinned
         .into_iter()
         .map(|(id, (bytes, sets))| Ok((snap.dir(id)?.path, bytes, sets)))
@@ -574,6 +583,88 @@ pub fn link_report(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    fn hit(ino: u64, disk: u64) -> LinkSetHit {
+        LinkSetHit {
+            row: tidemark_core::snapshot::LinkSetRow {
+                ino,
+                disk,
+                apparent: disk,
+                nlink: 2,
+                found: 2,
+                complete: true,
+                lca_dir_id: 0,
+                mtime: 0,
+            },
+            lca_path: RawPath::new(b"/r".to_vec()).unwrap(),
+            instance_count: 2,
+        }
+    }
+
+    #[test]
+    fn crossing_replacement_at_sample_cap() {
+        // Shared by crossing_sets and link_report: 1,000 retained sets,
+        // each spanning 1,000 regions, followed by a better replacement.
+        let samples = (0..1000)
+            .map(|id| (Some(RegionId(id)), id as u32))
+            .collect();
+        let mut heap = BinaryHeap::new();
+        let mut count = 0;
+        for ino in 0..1001 {
+            retain_crossing(&mut heap, &mut count, &hit(ino, ino), &samples, 1000).unwrap();
+            assert_eq!(count, heap.len() * 1000);
+        }
+        assert_eq!(count, CAP);
+        let result = heap.into_sorted_vec();
+        assert_eq!(result.first().unwrap().value.ino, 1000);
+        assert_eq!(result.last().unwrap().value.ino, 1);
+        assert!(result
+            .iter()
+            .all(|entry| entry.value.sample_dirs.len() == 1000));
+
+        // A genuinely oversized retained result must still fail.
+        let mut heap = BinaryHeap::new();
+        let mut count = 0;
+        for ino in 0..1000 {
+            retain_crossing(&mut heap, &mut count, &hit(ino, ino), &samples, 1001).unwrap();
+        }
+        assert!(retain_crossing(&mut heap, &mut count, &hit(1000, 1000), &samples, 1001).is_err());
+        assert_eq!(count, CAP);
+        assert_eq!(heap.len(), 1000);
+    }
+
+    #[test]
+    fn largest_supported_limit_has_logarithmic_selection_work() {
+        // Exercise the production heap/comparator at the maximum supported k.
+        // Increasing sizes force replacement after filling the entire heap.
+        let mut heap = BinaryHeap::new();
+        COMPARISONS.with(|count| count.set(0));
+        for ino in 0..2 * CAP as u64 {
+            let candidate = hit(ino, ino);
+            if admits(&heap, &candidate, CAP) {
+                if heap.len() == CAP {
+                    heap.pop();
+                }
+                heap.push(Ranked::new(&candidate, ()));
+            }
+        }
+        let selection = COMPARISONS.with(|count| count.get());
+        let log_k = (usize::BITS - CAP.leading_zeros()) as usize;
+        assert!(selection < 4 * 2 * CAP * log_k, "{selection} comparisons");
+        let result = heap.into_sorted_vec();
+        let total = COMPARISONS.with(|count| count.get());
+        assert!(
+            total < 6 * 2 * CAP * log_k,
+            "{total} comparisons including final sort"
+        );
+        assert_eq!(result.len(), CAP);
+        for (i, entry) in result.iter().enumerate() {
+            assert_eq!(entry.ino, (2 * CAP - 1 - i) as u64);
+        }
+        eprintln!(
+            "maximum top={CAP}: selection={selection}, including final sort={total} comparisons"
+        );
+    }
+
     proptest! {
         #[test]
         fn intervals_match_bruteforce(selected in prop::collection::vec(any::<bool>(), 1..200), point in 0u32..220) {
