@@ -1,0 +1,39 @@
+[Unit]
+Description=Tidemark disk usage monitor
+Documentation=file:///usr/share/doc/tidemark/README.md
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/tidemarkd --config /etc/tidemark/tidemark.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+User=root
+UMask=0077
+Nice=10
+# No IOSchedulingClass here: scan worker threads set idle priority for themselves
+# (04 §2.2); the samplers and DB writer must not be starved.
+MemoryLimit=2G                   # cgroup v1 (EL8 default). Budget: ~300 MiB steady + scan memory_budget 1.25 GiB
+                                 # + SQLite build cache 256 MiB ≈ 1.8 GiB. Raise both together if you raise memory_budget.
+MemoryMax=2G                     # cgroup v2
+CPUQuota=200%
+LimitNOFILE=65536
+StateDirectory=tidemark
+StateDirectoryMode=0700
+RuntimeDirectory=tidemark
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SYS_PTRACE
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# DO NOT add ProtectSystem=, ProtectHome=, PrivateTmp=, ReadWritePaths=, ProtectKernel*= or
+# other options that create a private mount namespace: fanotify mount marks would then attach
+# to the namespace's copies and the watcher would silently see nothing (ADR-013).
+
+[Install]
+WantedBy=multi-user.target

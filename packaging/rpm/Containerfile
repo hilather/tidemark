@@ -1,0 +1,7 @@
+# Owned by: W6-C. Explicit, operator-requested build-host bootstrap only.
+FROM rockylinux:8
+RUN dnf install -y gcc gcc-c++ make curl ca-certificates rpm-build && dnf clean all
+ENV CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup
+ENV PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
+RUN cargo install cargo-generate-rpm --version 0.20.0 --locked
