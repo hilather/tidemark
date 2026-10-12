@@ -1,0 +1,165 @@
+//! Owned by: W6-A3
+//! One real-binary operator scenario, requiring Unix bind permission.
+use super::*;
+use std::{
+    os::unix::ffi::OsStrExt,
+    process::{Child, Command, Output},
+    time::Instant,
+};
+struct Daemon(Child);
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn wait(mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !f() {
+        assert!(Instant::now() < deadline, "operator state deadline");
+        std::thread::yield_now();
+    }
+}
+fn cli(config: &std::path::Path, args: &[&str]) -> Output {
+    let executable =
+        std::path::Path::new(env!("CARGO_BIN_EXE_tidemarkd")).with_file_name("tidemark");
+    let out = Command::new(executable)
+        .arg("-c")
+        .arg(config)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{:?}: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+fn query(socket: &std::path::Path, method: &str, params: serde_json::Value) -> Response {
+    let s = UnixStream::connect(socket).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(11))).unwrap();
+    let mut s = BufReader::new(s);
+    write(
+        &mut s,
+        &Request {
+            v: 1,
+            id: "operator".into(),
+            method: method.into(),
+            params,
+        },
+    );
+    read(&mut s)
+}
+#[test]
+fn real_operator_status_scan_top_now_reload_cancel_and_sigterm() {
+    if !socket_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("tree");
+    std::fs::create_dir(&root).unwrap();
+    let bad = root.join(std::ffi::OsStr::from_bytes(b"nonutf\xff"));
+    std::fs::write(&bad, b"fixture").unwrap();
+    std::fs::hard_link(&bad, root.join("linked")).unwrap();
+    let config = dir.path().join("config.toml");
+    let socket = dir.path().join("api.sock");
+    let state = dir.path().join("state");
+    let text=format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='1s'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[throttle]\nmin_ops_per_sec=10\nmax_ops_per_sec=10\n[[roots]]\npath='{}'\nmode='walk'\nschedule='off'\n",state.display(),socket.display(),root.display(),dir.path().join("metrics.prom").display(),root.display());
+    std::fs::write(&config, &text).unwrap();
+    let mut daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_tidemarkd"))
+            .arg("--config")
+            .arg(&config)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait(|| {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited before API readiness"
+        );
+        socket.exists()
+    });
+    let out = cli(&config, &["status"]);
+    let status = String::from_utf8_lossy(&out.stdout);
+    assert!(status.contains("api") && status.contains("sampler") && status.contains("disabled"));
+    let path = root.to_str().unwrap();
+    cli(
+        &config,
+        &["scan", path, "--mode", "walk", "--throttle", "max"],
+    );
+    cli(&config, &["top", path]);
+    cli(&config, &["now"]);
+    let out = cli(&config, &["--json", "now"]);
+    let now: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(now["schema"], "tidemark.now.v1");
+    cli(&config, &["alerts"]);
+    cli(&config, &["alerts", "--all"]);
+    let changed=format!("{text}\n[[alerts.rule]]\nname='operator_changed'\nkind='fs_used_pct'\nmount='{}'\nabove=99\nfor='1s'\n",root.display());
+    std::fs::write(&config, &changed).unwrap();
+    let reload = query(&socket, "config.reload", serde_json::json!({}));
+    assert!(reload.ok);
+    assert_eq!(reload.result.unwrap()["reloaded"], true);
+    std::fs::write(&config, "unknown_config_key=true").unwrap();
+    let reload = query(&socket, "config.reload", serde_json::json!({}));
+    assert!(!reload.ok);
+    assert_eq!(reload.error.unwrap().code, ApiErrorCode::BadRequest);
+    std::fs::write(&config, &changed).unwrap();
+    // A large inventory with a ten-op gate ensures cancellation is observed
+    // before completion without guessing a sleep duration.
+    for n in 0..1000 {
+        std::fs::create_dir(root.join(format!("cancel-{n:04}"))).unwrap();
+    }
+    let started = query(
+        &socket,
+        "scan.start",
+        serde_json::json!({"root":path,"mode":"walk","throttle":"gentle"}),
+    );
+    assert!(started.ok);
+    let id = started.result.unwrap()["scan_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    cli(&config, &["scan", path, "--cancel"]);
+    wait(|| {
+        let r = query(&socket, "scan.status", serde_json::json!({"root":path}));
+        assert!(r.ok);
+        let statuses: Vec<tidemark_core::live::ScanStatus> =
+            serde_json::from_value(r.result.unwrap()).unwrap();
+        statuses.first().is_some_and(|s| s.running.is_none())
+    });
+    let catalog = tidemark_store::catalog::Catalog::open(&state, false).unwrap();
+    let rows = catalog.list(None).unwrap();
+    let failed = rows.iter().find(|r| r.scan_id == id).unwrap();
+    assert_eq!(failed.status, "failed");
+    assert!(failed.file.is_none());
+    drop(catalog);
+    let snapshot_root = state.join("snapshots");
+    for d in std::fs::read_dir(snapshot_root).unwrap() {
+        for f in std::fs::read_dir(d.unwrap().path()).unwrap() {
+            assert!(!f
+                .unwrap()
+                .file_name()
+                .as_encoded_bytes()
+                .ends_with(b".db.tmp"));
+        }
+    }
+    let start = Instant::now();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    let mut exit = None;
+    wait(|| {
+        exit = daemon.0.try_wait().unwrap();
+        exit.is_some()
+    });
+    assert!(exit.unwrap().success());
+    assert!(start.elapsed() < Duration::from_secs(10));
+    assert!(!socket.exists());
+}

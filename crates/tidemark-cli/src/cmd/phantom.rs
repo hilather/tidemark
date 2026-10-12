@@ -14,6 +14,36 @@ pub struct Args {
 
 /// Run a direct metadata pass or report daemon unavailability until Wave 6.
 pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
+    // W6-A3: daemon-first forwarding; explicit direct mode skips the socket.
+    if !args.direct {
+        match crate::client::Client::connect(
+            &context.config.general.socket,
+            std::time::Duration::from_secs(11),
+        ) {
+            Ok(mut client) => {
+                let rows: tidemark_core::api::PhantomResult = super::now::call(
+                    &mut client,
+                    "phantom",
+                    &tidemark_core::api::PhantomParams {
+                        mount: super::now::mount(args.mount.as_deref())?,
+                    },
+                )?;
+                return crate::render::now::phantom(
+                    &rows,
+                    context.json,
+                    &mut std::io::stdout().lock(),
+                );
+            }
+            Err(_) => {
+                crate::render::now::fallback("phantom")?;
+                let direct = Args {
+                    mount: args.mount.clone(),
+                    direct: true,
+                };
+                return run(&direct, context);
+            }
+        }
+    }
     use std::io::Write;
     if !args.direct {
         return Err(crate::CliError::Unavailable("daemon unavailable; use --direct".into()).into());

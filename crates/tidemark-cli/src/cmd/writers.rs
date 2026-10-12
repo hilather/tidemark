@@ -21,6 +21,39 @@ pub struct Args {
 
 /// Measure direct growth with two passes, or report daemon unavailability.
 pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
+    // W6-A3: daemon-first forwarding; explicit direct mode skips the socket.
+    if !args.direct {
+        match crate::client::Client::connect(
+            &context.config.general.socket,
+            std::time::Duration::from_secs(11),
+        ) {
+            Ok(mut client) => {
+                let rows: tidemark_core::api::WritersResult = super::now::call(
+                    &mut client,
+                    "writers",
+                    &tidemark_core::api::WritersParams {
+                        mount: super::now::mount(args.mount.as_deref())?,
+                        window: args.window.unwrap_or(std::time::Duration::from_secs(60)),
+                    },
+                )?;
+                return crate::render::now::writers(
+                    &rows,
+                    context.json,
+                    &mut std::io::stdout().lock(),
+                );
+            }
+            Err(_) => {
+                crate::render::now::fallback("writers")?;
+                let direct = Args {
+                    mount: args.mount.clone(),
+                    window: args.window,
+                    direct: true,
+                    interval: args.interval,
+                };
+                return run(&direct, context);
+            }
+        }
+    }
     use std::io::Write;
     if !args.direct {
         return Err(crate::CliError::Unavailable("daemon unavailable; use --direct".into()).into());
