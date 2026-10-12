@@ -13,10 +13,14 @@ impl Drop for Daemon {
         let _ = self.0.wait();
     }
 }
-fn wait(mut f: impl FnMut() -> bool) {
+fn wait(stderr: &std::path::Path, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !f() {
-        assert!(Instant::now() < deadline, "operator state deadline");
+        assert!(
+            Instant::now() < deadline,
+            "operator state deadline: {}",
+            std::fs::read_to_string(stderr).unwrap()
+        );
         std::thread::yield_now();
     }
 }
@@ -68,19 +72,27 @@ fn real_operator_status_scan_top_now_reload_cancel_and_sigterm() {
     let state = dir.path().join("state");
     let text=format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='1s'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[throttle]\nmin_ops_per_sec=10\nmax_ops_per_sec=10\n[[roots]]\npath='{}'\nmode='walk'\nschedule='off'\n",state.display(),socket.display(),root.display(),dir.path().join("metrics.prom").display(),root.display());
     std::fs::write(&config, &text).unwrap();
+    // Root-only production API requires root for this full operator scenario.
+    if rustix::process::geteuid().as_raw() != 0 {
+        eprintln!("pending root host: production API serves uid 0 only");
+        return;
+    }
+    let stderr_path = dir.path().join("daemon.stderr");
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
     let mut daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_tidemarkd"))
             .arg("--config")
             .arg(&config)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(stderr)
             .spawn()
             .unwrap(),
     );
-    wait(|| {
+    wait(&stderr_path, || {
         assert!(
             daemon.0.try_wait().unwrap().is_none(),
-            "daemon exited before API readiness"
+            "daemon exited before API readiness: {}",
+            std::fs::read_to_string(&stderr_path).unwrap()
         );
         socket.exists()
     });
@@ -125,7 +137,7 @@ fn real_operator_status_scan_top_now_reload_cancel_and_sigterm() {
         .unwrap()
         .to_owned();
     cli(&config, &["scan", path, "--cancel"]);
-    wait(|| {
+    wait(&stderr_path, || {
         let r = query(&socket, "scan.status", serde_json::json!({"root":path}));
         assert!(r.ok);
         let statuses: Vec<tidemark_core::live::ScanStatus> =
@@ -155,7 +167,7 @@ fn real_operator_status_scan_top_now_reload_cancel_and_sigterm() {
     )
     .unwrap();
     let mut exit = None;
-    wait(|| {
+    wait(&stderr_path, || {
         exit = daemon.0.try_wait().unwrap();
         exit.is_some()
     });

@@ -27,7 +27,7 @@ tidemark-store = { path = "crates/tidemark-store" }
 tidemark-scan = { path = "crates/tidemark-scan" }
 tidemark-live = { path = "crates/tidemark-live" }
 test-support = { path = "crates/test-support" }
-rustix = { version = "1", features = ["fs", "process", "system", "event"] }
+rustix = { version = "1", features = ["fs", "process", "system", "event", "net", "termios"] }
 libc = "0.2"
 signal-hook = "0.3"
 rusqlite = { version = "0.38", features = ["bundled"] }

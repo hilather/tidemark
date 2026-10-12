@@ -143,7 +143,7 @@ fn live_tables_and_shared_byte_path_machine_output() {
             "tidemark.now.v1",
         ),
         (
-            vec!["status"],
+            vec!["status", "--show-config"],
             vec![
                 (
                     "status",
@@ -151,7 +151,7 @@ fn live_tables_and_shared_byte_path_machine_output() {
                 ),
                 ("scan.status", serde_json::json!([])),
             ],
-            "COMPONENT  STATE  DETAIL",
+            "the running daemon may hold an older configuration until it is reloaded",
         ),
         (
             vec!["hot"],
@@ -267,4 +267,57 @@ fn lvm_fallback_notice_with_collector_disabled() {
     let out = cli(&p, &["lvm"]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("falling back to direct lvm mode"));
+}
+
+#[test]
+fn phantom_and_writers_fallback_notice_and_direct_setup_seam() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = config(&dir);
+    let missing = dir.path().join("missing-mount");
+    let missing = missing.to_str().unwrap();
+    for command in ["phantom", "writers"] {
+        let fallback = cli(&p, &[command, "--mount", missing]);
+        let direct = cli(&p, &[command, "--direct", "--mount", missing]);
+        let notice = format!("falling back to direct {command} mode");
+        let stderr = String::from_utf8_lossy(&fallback.stderr);
+        assert_eq!(stderr.matches(&notice).count(), 1, "{stderr}");
+        assert!(!String::from_utf8_lossy(&direct.stderr).contains("falling back"));
+        // The same direct canonicalization failure occurs before any /proc pass.
+        assert_eq!(fallback.status.code(), direct.status.code(), "{stderr}");
+        assert!(!fallback.status.success(), "missing mount accepted");
+        assert_ne!(fallback.status.code(), Some(4), "{stderr}");
+        let direct_error = String::from_utf8_lossy(&direct.stderr);
+        assert!(
+            stderr.ends_with(direct_error.as_ref()),
+            "fallback: {stderr}; direct: {direct_error}"
+        );
+    }
+}
+
+#[test]
+fn explicit_direct_never_connects_to_listening_daemon() {
+    if !socket_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = config(&dir);
+    let listener = UnixListener::bind(dir.path().join("api.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let missing = dir.path().join("missing-mount");
+    for command in ["phantom", "writers"] {
+        let out = cli(
+            &p,
+            &[command, "--direct", "--mount", missing.to_str().unwrap()],
+        );
+        assert!(
+            !out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("falling back"));
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "{command} contacted daemon"
+        );
+    }
 }
