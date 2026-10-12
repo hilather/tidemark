@@ -54,6 +54,9 @@ impl Systemctl for FakeSystemctl {
 }
 struct FakeEnv {
     installed: PathBuf,
+    required: Vec<PathBuf>,
+    filesystem: &'static str,
+    filesystem_path: Option<PathBuf>,
     failures: Vec<&'static str>,
     now: i64,
     capacity: (u64, u64),
@@ -109,11 +112,27 @@ impl Env for FakeEnv {
     fn now(&self) -> i64 {
         self.now
     }
-    fn installation(&self, _: &Config) -> io::Result<()> {
-        self.probe("installation")
+    fn installation(&self, cfg: &Config) -> io::Result<()> {
+        self.probe("installation")?;
+        real::installation(
+            cfg,
+            &self.installed,
+            &self
+                .required
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>(),
+        )
     }
-    fn local_directory(&self, _: &Path) -> io::Result<()> {
-        self.probe("roots")
+    fn local_directory(&self, path: &Path) -> io::Result<()> {
+        self.probe("roots")?;
+        real::local_filesystem(
+            if self.filesystem_path.as_deref().is_none_or(|p| p == path) {
+                self.filesystem
+            } else {
+                "xfs"
+            },
+        )
     }
     fn mount_point(&self, _: &Path) -> io::Result<()> {
         self.probe("mounts")
@@ -166,8 +185,18 @@ impl Fixture {
         let source = dir.path().join("source.toml");
         let state = dir.path().join("state");
         fs::write(&source, format!("[general]\nstate_dir = {:?}\n", state)).unwrap();
+        let required: Vec<_> = ["tidemark", "tidemarkd", "tidemarkd.service", "systemctl"]
+            .into_iter()
+            .map(|name| dir.path().join(name))
+            .collect();
+        for path in &required {
+            fs::write(path, b"fake installed artifact").unwrap();
+        }
         let env = FakeEnv {
             installed: dir.path().join("etc/tidemark.toml"),
+            required,
+            filesystem: "xfs",
+            filesystem_path: None,
             failures: vec![],
             now: 100,
             capacity: (4 << 30, 10 << 30),
@@ -269,92 +298,6 @@ fn capacity_byte_and_percentage_floors() {
     assert_eq!(preflight(&cfg, &fixture.env)[4].status, CheckStatus::Pass);
 }
 #[test]
-fn blocking_failures_change_nothing() {
-    for name in ["installation", "roots", "mounts", "state_space"] {
-        let mut fixture = Fixture::new();
-        fixture.env.failures = vec![name];
-        fs::create_dir_all(fixture.env.installed.parent().unwrap()).unwrap();
-        fs::write(&fixture.env.installed, b"original").unwrap();
-        assert!(matches!(
-            stage(
-                &fixture.source,
-                &StageOptions::default(),
-                &fixture.sys,
-                &fixture.env
-            ),
-            Err(DeployError::Preflight(_))
-        ));
-        assert_eq!(fs::read(&fixture.env.installed).unwrap(), b"original");
-        assert!(fixture.sys.calls.borrow().is_empty());
-        assert!(!fixture.state.exists());
-    }
-}
-#[test]
-fn invalid_config_changes_nothing() {
-    let fixture = Fixture::new();
-    fs::write(&fixture.source, "[general]\nunknown = true\n").unwrap();
-    assert!(matches!(
-        stage(
-            &fixture.source,
-            &StageOptions::default(),
-            &fixture.sys,
-            &fixture.env
-        ),
-        Err(DeployError::Preflight(_))
-    ));
-    assert!(!fixture.state.exists());
-    assert!(!fixture.env.installed.exists());
-    assert!(fixture.sys.calls.borrow().is_empty());
-}
-#[test]
-fn private_install_backup_hash_and_idempotence() {
-    let fixture = Fixture::new();
-    fs::create_dir_all(fixture.env.installed.parent().unwrap()).unwrap();
-    fs::write(&fixture.env.installed, b"previous config").unwrap();
-    let record = fixture.stage();
-    assert_eq!(
-        fs::read(
-            fixture
-                .env
-                .installed
-                .with_file_name("tidemark.toml.100.bak")
-        )
-        .unwrap(),
-        b"previous config"
-    );
-    assert_eq!(
-        record.config_sha256,
-        format!("{:x}", Sha256::digest(fs::read(&fixture.source).unwrap()))
-    );
-    assert_eq!(
-        fs::read(&fixture.env.installed).unwrap(),
-        fs::read(&fixture.source).unwrap()
-    );
-    for path in [
-        &fixture.env.installed,
-        &fixture.state.join("deploy/staged.json"),
-        &fixture.state.join(MARKER),
-    ] {
-        assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-    assert_eq!(
-        fs::metadata(&fixture.state).unwrap().permissions().mode() & 0o777,
-        0o700
-    );
-    assert_eq!(*fixture.sys.calls.borrow(), vec!["enable"]);
-    let old = fs::read(fixture.state.join("deploy/staged.json")).unwrap();
-    let second = fixture.stage();
-    assert_eq!(record.staged_at, second.staged_at);
-    assert_eq!(*fixture.sys.calls.borrow(), vec!["enable"]);
-    assert_eq!(
-        old,
-        fs::read(fixture.state.join("deploy/staged.json")).unwrap()
-    );
-}
-#[test]
 fn warning_checks_allow_staging_and_start_now() {
     let mut fixture = Fixture::new();
     fixture.env.failures = vec!["fanotify", "bulkstat", "lvm"];
@@ -407,32 +350,6 @@ fn new_config_restage_requires_new_report() {
             .unwrap()
             .healthy
     );
-}
-#[test]
-fn failed_enable_and_record_publication_restore_previous_files() {
-    for fail_enable in [true, false] {
-        let fixture = Fixture::new();
-        fs::create_dir_all(fixture.env.installed.parent().unwrap()).unwrap();
-        fs::write(&fixture.env.installed, b"original").unwrap();
-        fixture.sys.fail_enable.set(fail_enable);
-        fixture.env.fail_record.set(!fail_enable);
-        assert!(stage(
-            &fixture.source,
-            &StageOptions::default(),
-            &fixture.sys,
-            &fixture.env
-        )
-        .is_err());
-        assert_eq!(fs::read(&fixture.env.installed).unwrap(), b"original");
-        assert!(!fixture.state.join("deploy/staged.json").exists());
-        assert!(!fixture.state.join(MARKER).exists());
-        assert!(!fixture
-            .env
-            .installed
-            .with_file_name("tidemark.toml.100.bak")
-            .exists());
-        assert!(!fixture.sys.enabled.get());
-    }
 }
 #[test]
 fn verify_missing_stale_unhealthy_healthy_and_api_failure() {
@@ -493,26 +410,6 @@ fn verify_timeout_is_bounded() {
     assert!(!result.healthy);
     assert!(start.elapsed() >= Duration::from_millis(20));
     assert!(start.elapsed() < Duration::from_secs(1));
-}
-#[test]
-fn unstage_retains_data_and_purge_removes_only_state() {
-    let fixture = Fixture::new();
-    fixture.stage();
-    fs::write(fixture.state.join("keep.db"), b"own data").unwrap();
-    unstage(&fixture.state, false, &fixture.sys).unwrap();
-    assert!(fixture.state.join("keep.db").exists());
-    assert!(!fixture.state.join("deploy/staged.json").exists());
-    fixture.stage();
-    let outside = fixture._dir.path().join("outside");
-    fs::create_dir(&outside).unwrap();
-    fs::write(outside.join("keep"), b"untouched").unwrap();
-    symlink(&outside, fixture.state.join("external-link")).unwrap();
-    fs::create_dir(fixture.state.join("nested")).unwrap();
-    fs::write(fixture.state.join("nested/file"), b"own data").unwrap();
-    unstage(&fixture.state, true, &fixture.sys).unwrap();
-    assert!(!fixture.state.exists());
-    assert_eq!(fs::read(outside.join("keep")).unwrap(), b"untouched");
-    assert!(fixture.env.installed.exists());
 }
 #[test]
 fn purge_missing_marker_config_mismatch_and_replaced_symlink_leave_state_untouched() {
@@ -774,35 +671,6 @@ fn state_symlinks_refused_before_service_for_all_operations() {
             assert!(f.sys.calls.borrow().is_empty());
             assert_eq!(fs::read(outside.join("staged.json")).unwrap(), b"outside");
         }
-    }
-}
-
-#[test]
-fn installed_symlink_blocks_identical_and_differing_config() {
-    for identical in [false, true] {
-        let f = Fixture::new();
-        f.stage();
-        f.sys.calls.borrow_mut().clear();
-        let outside = f._dir.path().join("outside.toml");
-        let bytes = if identical {
-            fs::read(&f.source).unwrap()
-        } else {
-            b"outside".to_vec()
-        };
-        fs::write(&outside, &bytes).unwrap();
-        fs::remove_file(&f.env.installed).unwrap();
-        symlink(&outside, &f.env.installed).unwrap();
-        assert!(matches!(
-            stage(&f.source, &StageOptions::default(), &f.sys, &f.env),
-            Err(DeployError::Preflight(_))
-        ));
-        assert_eq!(fs::read(&outside).unwrap(), bytes);
-        assert!(f.sys.calls.borrow().is_empty());
-        assert!(!f
-            .env
-            .installed
-            .with_file_name("tidemark.toml.100.bak")
-            .exists());
     }
 }
 
@@ -1190,3 +1058,14 @@ fn marker_authorizes_state_normalization_only_after_deploy_is_eligible() {
     assert!(f.sys.calls.borrow().is_empty());
     assert_eq!(f.sys.queries.get(), 0);
 }
+
+use super::files::FOREIGN_OWNER;
+struct OwnerProbe;
+impl Drop for OwnerProbe {
+    fn drop(&mut self) {
+        FOREIGN_OWNER.with(|owner| *owner.borrow_mut() = None);
+    }
+}
+
+#[path = "scenarios.rs"]
+mod scenarios;

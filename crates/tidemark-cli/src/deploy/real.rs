@@ -68,24 +68,16 @@ impl Env for RealEnv {
         self.now
     }
     fn installation(&self, cfg: &Config) -> io::Result<()> {
-        for path in [
-            "/usr/bin/tidemark",
-            "/usr/bin/tidemarkd",
-            "/usr/lib/systemd/system/tidemarkd.service",
-            "/usr/bin/systemctl",
-        ] {
-            if !std::fs::metadata(path)?.is_file() {
-                return Err(io::Error::other(format!("missing installed file: {path}")));
-            }
-        }
-        ensure_writable(
-            self.installed_config
-                .parent()
-                .ok_or_else(|| io::Error::other("config path has no parent"))?,
-        )?;
-        ensure_writable(&cfg.general.state_dir)?;
-        super::files::state_handles(&cfg.general.state_dir, false)?;
-        Ok(())
+        installation(
+            cfg,
+            &self.installed_config,
+            &[
+                Path::new("/usr/bin/tidemark"),
+                Path::new("/usr/bin/tidemarkd"),
+                Path::new("/usr/lib/systemd/system/tidemarkd.service"),
+                Path::new("/usr/bin/systemctl"),
+            ],
+        )
     }
 
     fn local_directory(&self, path: &Path) -> io::Result<()> {
@@ -191,7 +183,27 @@ impl ApiPing for SocketPing {
     }
 }
 
-fn local_filesystem(kind: &str) -> io::Result<()> {
+// Shared installation probe; tests replace only the required installation paths.
+pub(super) fn installation(cfg: &Config, installed: &Path, required: &[&Path]) -> io::Result<()> {
+    for path in required {
+        if !std::fs::metadata(path)?.is_file() {
+            return Err(io::Error::other(format!(
+                "missing installed file: {}",
+                path.display()
+            )));
+        }
+    }
+    ensure_writable(
+        installed
+            .parent()
+            .ok_or_else(|| io::Error::other("config path has no parent"))?,
+    )?;
+    ensure_writable(&cfg.general.state_dir)?;
+    super::files::state_handles(&cfg.general.state_dir, false)?;
+    Ok(())
+}
+
+pub(super) fn local_filesystem(kind: &str) -> io::Result<()> {
     if [
         "xfs", "ext2", "ext3", "ext4", "btrfs", "tmpfs", "zfs", "f2fs", "jfs", "reiserfs",
     ]
