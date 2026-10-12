@@ -180,9 +180,21 @@ fn flush_fs(
     if rows.is_empty() {
         return Ok(());
     }
-    let result = ts.insert_fs(rows).map_err(store_error);
-    rows.clear();
-    result
+    // The frozen primary key is mount/res/whole-second timestamp. Reloads and
+    // quick restarts can repeat a key; keep its first persisted observation.
+    let mut keys = std::collections::BTreeSet::new();
+    let mut unique = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        if keys.insert((row.mount.clone(), row.ts))
+            && ts
+                .query_fs(&row.mount, row.ts, row.ts)
+                .map_err(store_error)?
+                .is_empty()
+        {
+            unique.push(row);
+        }
+    }
+    ts.insert_fs(&unique).map_err(store_error)
 }
 fn persist(
     ts: &tidemark_store::timeseries::TimeSeries,
@@ -195,7 +207,19 @@ fn persist(
             if rows.len() > MAX_BATCH_ROWS {
                 return Err(too_big());
             }
-            ts.insert_lvm(&rows).map_err(store_error)
+            let mut keys = std::collections::BTreeSet::new();
+            let mut unique = Vec::with_capacity(rows.len());
+            for row in rows {
+                if keys.insert((row.vg.clone(), row.lv.clone(), row.ts))
+                    && ts
+                        .query_lvm(&row.vg, &row.lv, row.ts, row.ts)
+                        .map_err(store_error)?
+                        .is_empty()
+                {
+                    unique.push(row);
+                }
+            }
+            ts.insert_lvm(&unique).map_err(store_error)
         }
         Message::Hot(rows) => {
             if rows.len() > MAX_BATCH_ROWS {

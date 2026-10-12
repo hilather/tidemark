@@ -60,22 +60,21 @@ pub fn start(
                 let mut errors = Vec::new();
                 last_sample.retain(|path, _| config.sampler.mounts.contains(path));
                 for path in &config.sampler.mounts {
-                    // The frozen storage key has whole-second precision. Reloads and
-                    // subsecond intervals must never insert the same mount/second twice.
-                    if last_sample.get(path) == Some(&now) {
-                        continue;
-                    }
                     if shutdown.load(Ordering::Acquire) {
                         break;
                     }
                     match sample(path, now) {
                         Ok(s) => {
-                            last_sample.insert(path.clone(), now);
                             state.publish(
                                 Publication::Fs(s.clone()),
                                 crate::component("sampler", "ok", "statvfs sampled"),
                             )?;
-                            rows.push(s);
+                            // Measure every configured interval, but queue each whole-second
+                            // storage key only once. Memory keeps the latest same-second fact.
+                            if last_sample.get(path) != Some(&now) {
+                                last_sample.insert(path.clone(), now);
+                                rows.push(s);
+                            }
                         }
                         Err(e) => errors.push(e.to_string()),
                     }

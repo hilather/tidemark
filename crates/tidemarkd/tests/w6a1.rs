@@ -779,3 +779,53 @@ fn startup_reads_last_complete_from_catalog() {
     wait(|| h.is_finished());
     h.join().unwrap().unwrap();
 }
+
+#[test]
+fn repeated_gauge_keys_and_restart_do_not_poison_writer() {
+    let (_dir, _, cfg) = fixture();
+    std::fs::create_dir(&cfg.general.state_dir).unwrap();
+    let state = LiveState::new(&cfg, 100);
+    let stop = Shutdown::default();
+    let (tx, handle) = tswriter::start(Arc::new(cfg.clone()), state, stop.clone()).unwrap();
+    tx.send(Message::Fs(vec![sample(100, 1), sample(100, 2)]))
+        .unwrap();
+    flush(&tx);
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap().unwrap();
+    drop(tx);
+    let state = LiveState::new(&cfg, 100);
+    let stop = Shutdown::default();
+    let (tx, handle) = tswriter::start(Arc::new(cfg.clone()), state.clone(), stop.clone()).unwrap();
+    tx.send(Message::Fs(vec![sample(100, 3), sample(101, 4)]))
+        .unwrap();
+    let lv = LvmSample {
+        ts: 100,
+        vg: "vg".into(),
+        lv: "lv".into(),
+        lv_size: 100,
+        vg_free: 10,
+        data_pct: None,
+        meta_pct: None,
+    };
+    tx.send(Message::Lvm(vec![lv.clone(), lv.clone()])).unwrap();
+    flush(&tx);
+    tx.send(Message::Lvm(vec![lv])).unwrap();
+    flush(&tx);
+    assert!(state
+        .view()
+        .status(100)
+        .unwrap()
+        .components
+        .iter()
+        .any(|c| c.name == "tswriter" && c.state == "ok"));
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap().unwrap();
+    let db = tidemark_store::timeseries::TimeSeries::open(
+        &cfg.general.state_dir.join("timeseries.db"),
+        false,
+    )
+    .unwrap();
+    let rows = db.query_fs("/fixture", 100, 101).unwrap();
+    assert_eq!(rows.iter().map(|r| r.used).collect::<Vec<_>>(), vec![1, 4]);
+    assert_eq!(db.query_lvm("vg", "lv", 100, 100).unwrap().len(), 1);
+}
