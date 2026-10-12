@@ -556,6 +556,8 @@ fn binary_ready_and_stopping() {
         .arg("--config")
         .arg(path)
         .env("NOTIFY_SOCKET", &notify)
+        .env_remove("INVOCATION_ID")
+        .env("RUST_LOG", "info")
         .stderr(stderr)
         .spawn()
         .unwrap();
