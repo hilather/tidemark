@@ -391,9 +391,11 @@ UMask=0077
 Nice=10
 # No IOSchedulingClass here: scan worker threads set idle priority for themselves
 # (04 §2.2); the samplers and DB writer must not be starved.
-MemoryLimit=2G                   # cgroup v1 (EL8 default). Budget: ~300 MiB steady + scan memory_budget 1.25 GiB
-                                 # + SQLite build cache 256 MiB ≈ 1.8 GiB. Raise both together if you raise memory_budget.
-MemoryMax=2G                     # cgroup v2
+# cgroup v1 (EL8 default). Budget: ~300 MiB steady + scan memory_budget 1.25 GiB
+# + SQLite build cache 256 MiB ≈ 1.8 GiB. Raise both together if you raise memory_budget.
+MemoryLimit=2G
+# cgroup v2
+MemoryMax=2G
 CPUQuota=200%
 LimitNOFILE=65536
 StateDirectory=tidemark

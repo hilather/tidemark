@@ -38,13 +38,18 @@ ok 'exact payload file list'
 rpm -qp --requires "$package" > "$tmp/requires"
 grep -E '^systemd([[:space:]]|$)' "$tmp/requires" >/dev/null || fail 'systemd requirement'
 ok 'systemd requirement'
+grep -Fx '/bin/sh' "$tmp/requires" >/dev/null || fail '/bin/sh requirement'
+ok '/bin/sh requirement'
 for pair in 'POSTIN post.sh' 'PREUN preun.sh' 'POSTUN postun.sh'; do
     set -- $pair
     rpm -qp --qf "%{$1}" "$package" > "$tmp/script"
     cp "packaging/rpm/$2" "$tmp/source"
     # Command substitution normalizes the terminal newline only.
     [ "$(cat "$tmp/script")" = "$(cat "$tmp/source")" ] || fail "scriptlet: $1"
-    [ "$(rpm -qp --qf "[%{$1PROG}]" "$package")" = /bin/sh ] || fail "scriptlet interpreter: $1"
+    case "$(rpm -qp --qf "[%{$1PROG}]" "$package")" in
+        ''|/bin/sh) ;;
+        *) fail "scriptlet interpreter: $1" ;;
+    esac
     ok "scriptlet: $1"
 done
 rpm2cpio "$package" > "$tmp/payload.cpio"
