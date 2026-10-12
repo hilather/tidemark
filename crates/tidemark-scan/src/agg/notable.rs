@@ -40,6 +40,9 @@ pub(super) fn select(
 #[derive(Default)]
 pub(super) struct Candidates {
     buckets: std::collections::BTreeMap<u64, Bucket>,
+    total: usize,
+    #[cfg(test)]
+    bucket_visits: usize,
 }
 #[derive(Default)]
 struct Bucket {
@@ -70,23 +73,27 @@ impl Candidates {
             }
             Err(_) => return,
         }
-        bucket.count += dir.len() - previous;
-        let mut preceding = 0usize;
-        let mut cutoff = None;
-        for (&disk, dirs) in self.buckets.iter().rev() {
+        let added = dir.len() - previous;
+        bucket.count += added;
+        self.total += added;
+        // The smallest retained size is the cutoff. Only it can lose eligibility:
+        // all larger buckets already survived the previous insertion. Ties remain
+        // intact until enough strictly larger candidates fill their size's limit.
+        while let Some((&disk, bucket)) = self.buckets.first_key_value() {
+            #[cfg(test)]
+            {
+                self.bucket_visits += 1;
+            }
             let limit = if disk >= cfg.big_file_threshold {
                 cfg.max_notable
             } else {
                 cfg.top_files.min(cfg.max_notable)
             };
-            if preceding >= limit {
-                cutoff = Some(disk);
+            if self.total - bucket.count < limit {
                 break;
             }
-            preceding = preceding.saturating_add(dirs.count);
-        }
-        if let Some(cutoff) = cutoff {
-            self.buckets = self.buckets.split_off(&cutoff.saturating_add(1));
+            self.total -= bucket.count;
+            self.buckets.pop_first();
         }
     }
     pub(super) fn select(self, ids: &[u32], cfg: &AggConfig) -> Result<Vec<FileRow>, AggError> {
@@ -129,7 +136,11 @@ impl Candidates {
     }
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.buckets.values().map(|d| d.count).sum()
+        assert_eq!(
+            self.total,
+            self.buckets.values().map(|d| d.count).sum::<usize>()
+        );
+        self.total
     }
 }
 
@@ -192,6 +203,26 @@ mod tests {
         let selected = pool.select(&ids, &cfg).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].ino, 499_999 * 4);
+    }
+    #[test]
+    fn distinct_sizes_have_linear_bucket_work_at_default_top_files() {
+        let cfg = cfg(10_000, 200_000, u64::MAX);
+        for reverse in [false, true] {
+            let mut pool = Candidates::default();
+            for n in 0..30_000 {
+                let size = if reverse { 30_000 - n } else { n + 1 };
+                pool.insert(file(size, 0, size), &cfg);
+            }
+            assert!(
+                pool.bucket_visits <= 60_000,
+                "{} bucket visits",
+                pool.bucket_visits
+            );
+            let selected = pool.select(&[0], &cfg).unwrap();
+            assert_eq!(selected.len(), 10_000);
+            assert_eq!(selected.first().unwrap().disk, 30_000);
+            assert_eq!(selected.last().unwrap().disk, 20_001);
+        }
     }
     #[test]
     fn cutoff_ties_keep_each_directorys_smallest_inodes() {

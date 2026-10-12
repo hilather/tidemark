@@ -248,3 +248,90 @@ fn vm_ncdu_import_reexport() {
         .unwrap()
         .success());
 }
+
+#[test]
+fn scanned_symlink_other_count_through_cli() {
+    let (fixture, temp, snap) = scan(
+        r#"
+[[entry]]
+path = "regular"
+kind = "file"
+size = 4096
+[[entry]]
+path = "symlink"
+kind = "symlink"
+target = "regular"
+"#,
+    );
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
+        .arg("--config")
+        .arg(temp.path().join("missing"))
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .args(["export", "ncdu"])
+        .arg(&fixture.root)
+        .arg("--utf8-lossy")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let entries = doc[3].as_array().unwrap();
+    let individual = entries.len() as u64 - 2;
+    let expected = snap.root().unwrap().own_files - individual;
+    assert_eq!(
+        entries.last().unwrap()["name"],
+        format!("[other files: {expected}]")
+    );
+}
+
+#[test]
+fn scanned_outside_subroot_hardlink_apparent_matches_at_all_depths() {
+    let (_fixture, _temp, snap) = scan(
+        r#"
+[[entry]]
+path = "a/d/e/shared"
+kind = "file"
+size = 4096
+[[entry]]
+path = "b/alias"
+kind = "hardlink"
+target = "a/d/e/shared"
+"#,
+    );
+    fn apparent(v: &serde_json::Value) -> u64 {
+        if let Some(a) = v.as_array() {
+            a.iter().map(apparent).sum()
+        } else {
+            v["asize"].as_u64().unwrap_or(0)
+        }
+    }
+    let under = snap
+        .meta()
+        .root
+        .join(&tidemark_core::path::RawName::new(b"a".to_vec()).unwrap());
+    let mut full = None;
+    for depth in [None, Some(0), Some(1), Some(2), Some(3)] {
+        let mut out = vec![];
+        tidemark_store::export_ncdu(
+            &snap,
+            &under,
+            &mut out,
+            &tidemark_store::NcduOptions {
+                utf8_lossy: true,
+                max_depth: depth,
+            },
+        )
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let size = apparent(&doc[3]);
+        if let Some(full) = full {
+            assert_eq!(size, full, "depth {depth:?}");
+        } else {
+            full = Some(size);
+        }
+    }
+}

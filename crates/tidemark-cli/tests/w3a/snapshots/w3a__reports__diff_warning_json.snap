@@ -1,0 +1,12 @@
+---
+source: crates/tidemark-cli/tests/w3a/reports.rs
+expression: doc
+---
+{
+  "data": {
+    "diff": [],
+    "explanation": null,
+    "notice": "WARNING: to snapshot new is partial (degraded); deltas may reflect incomplete coverage.\nNotice: comparison snapshot actual age: 2h"
+  },
+  "schema": "tidemark.diff.v1"
+}

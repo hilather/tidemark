@@ -103,7 +103,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         catalog.nearest_before(&entry.root, now.saturating_sub(seconds))?
     }
     .ok_or_else(|| crate::CliError::Precondition("no matching old snapshot".into()))?;
-    let notice = args.since.and_then(|d| {
+    let age_notice = args.since.and_then(|d| {
         let age = now.abs_diff(old.started_at);
         (age.abs_diff(d.as_secs()) as f64 > d.as_secs_f64() * 0.25).then(|| {
             format!(
@@ -119,16 +119,18 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     }
     let old_file = old
         .file
+        .as_ref()
         .ok_or_else(|| crate::CliError::Precondition("old snapshot has no file".into()))?;
     let new_file = entry
         .file
+        .as_ref()
         .ok_or_else(|| crate::CliError::Precondition("new snapshot has no file".into()))?;
-    let new = tidemark_store::Snapshot::open(&new_file)?;
+    let new = tidemark_store::Snapshot::open(new_file)?;
     let depth = u32::try_from(args.depth)
         .map_err(|_| crate::CliError::Configuration("depth exceeds u32".into()))?;
     let rows = diff(
         &new,
-        &old_file,
+        old_file,
         &target,
         metric,
         depth,
@@ -139,7 +141,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         .then(|| {
             explain(
                 &new,
-                &old_file,
+                old_file,
                 &target,
                 metric,
                 args.explain_ratio,
@@ -148,6 +150,15 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             )
         })
         .transpose()?;
+    let warning = crate::render::diff::coverage_notice(&old, &entry);
+    let notice = match (warning, age_notice) {
+        (Some(warning), Some(age)) => Some(format!("{warning}\nNotice: {age}")),
+        (warning, age) => warning.or(age),
+    };
+    let mut out = std::io::stdout().lock();
+    if !context.json {
+        crate::render::diff::inputs_header(&old, &entry, now, &mut out)?;
+    }
     crate::render::diff::report(
         &target,
         &rows,
@@ -155,7 +166,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         matches!(metric, DiffMetric::Files),
         notice.as_deref(),
         context.json,
-        &mut std::io::stdout().lock(),
+        &mut out,
     )
 }
 fn query_path(path: &std::path::Path) -> anyhow::Result<tidemark_core::path::RawPath> {

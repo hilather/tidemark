@@ -31,6 +31,51 @@ fn row_json(row: &DiffRow) -> serde_json::Value {
     }
     value
 }
+/// Describe both catalog inputs with an injected observation time.
+/// Call before the text comparison; JSON keeps its existing payload shape.
+pub fn inputs_header(
+    old: &tidemark_store::catalog::ScanEntry,
+    new: &tidemark_store::catalog::ScanEntry,
+    now: i64,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    for (label, input) in [("From", old), ("To", new)] {
+        writeln!(
+            out,
+            "{label}: Snapshot {} · {:?} · {}s ago · {}{}",
+            input.scan_id,
+            input.mode,
+            now.saturating_sub(input.started_at).max(0),
+            input.status,
+            if input.degraded { " (degraded)" } else { "" }
+        )?;
+    }
+    Ok(())
+}
+/// Warn when either explicitly selected input has incomplete coverage.
+pub fn coverage_notice(
+    old: &tidemark_store::catalog::ScanEntry,
+    new: &tidemark_store::catalog::ScanEntry,
+) -> Option<String> {
+    let affected: Vec<_> = [("from", old), ("to", new)]
+        .into_iter()
+        .filter(|(_, input)| input.status == "partial" || input.degraded)
+        .map(|(label, input)| {
+            format!(
+                "{label} snapshot {} is {}{}",
+                input.scan_id,
+                input.status,
+                if input.degraded { " (degraded)" } else { "" }
+            )
+        })
+        .collect();
+    (!affected.is_empty()).then(|| {
+        format!(
+            "WARNING: {}; deltas may reflect incomplete coverage.",
+            affected.join("; ")
+        )
+    })
+}
 /// Render a comparison with optional descent and snapshot-age notice.
 pub fn report(
     target: &RawPath,
@@ -54,7 +99,11 @@ pub fn report(
         );
     }
     if let Some(notice) = notice {
-        writeln!(out, "Notice: {notice}")?;
+        if notice.starts_with("WARNING:") {
+            writeln!(out, "{notice}")?;
+        } else {
+            writeln!(out, "Notice: {notice}")?;
+        }
     }
     if rows
         .iter()
