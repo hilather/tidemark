@@ -26,6 +26,12 @@ fn command(temp: &Path) -> Command {
         .arg("--json");
     c
 }
+fn copied_binary(temp: &Path) -> std::path::PathBuf {
+    let binary = temp.join("tidemark");
+    fs::copy(env!("CARGO_BIN_EXE_tidemark"), &binary).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    binary
+}
 // A real-root CI runner must not bypass the fixture's mode-000 permissions.
 fn metadata_command(temp: &Path) -> Command {
     use std::os::unix::process::CommandExt;
@@ -37,8 +43,7 @@ fn metadata_command(temp: &Path) -> Command {
     let c = command(temp);
     if rustix::process::geteuid().is_root() && bypass {
         fs::set_permissions(temp, fs::Permissions::from_mode(0o777)).unwrap();
-        let binary = temp.join("tidemark");
-        fs::copy(env!("CARGO_BIN_EXE_tidemark"), &binary).unwrap();
+        let binary = copied_binary(temp);
         let mut dropped = Command::new(binary);
         dropped.args(c.get_args()).gid(65534).uid(65534);
         dropped
@@ -156,7 +161,10 @@ fn namespace_mounts_are_skipped() {
     fs::create_dir(&source).unwrap();
     fs::write(source.join("hidden"), b"bind payload").unwrap();
     let marker = t.path().join("entered");
-    let mut scan = command(t.path());
+    fs::set_permissions(t.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let original = command(t.path());
+    let mut scan = Command::new(copied_binary(t.path()));
+    scan.args(original.get_args());
     scan.arg("scan")
         .arg(&root)
         .args(["--mode", "walk", "--throttle", "max"]);

@@ -202,6 +202,13 @@ fn fid_mode_create_delete_rename() {
         mask::CREATE | mask::DELETE | mask::MOVED_FROM | mask::MOVED_TO
     );
 }
+struct WriterChild(std::process::Child);
+impl Drop for WriterChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 #[test]
 #[ignore = "scale"]
 fn watcher_sixty_second_load_and_ten_minute_fd_stability() {
@@ -260,23 +267,29 @@ fn watcher_sixty_second_load_and_ten_minute_fd_stability() {
     let before = count();
     let cpu_before = cpu_ticks();
     let started = Instant::now();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "privileged::paced_writer_child",
-            "--test-threads=1",
-        ])
-        .env("TIDEMARK_W5A_LOAD_PATH", &fs.mountpoint)
-        .spawn()
-        .unwrap();
+    // Watcher Drop stops and joins its thread; both guards precede fixture cleanup.
+    let mut child = WriterChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "privileged::paced_writer_child",
+                "--test-threads=1",
+            ])
+            .env("TIDEMARK_W5A_LOAD_PATH", &fs.mountpoint)
+            .spawn()
+            .unwrap(),
+    );
+    let mut failures = Vec::new();
+    let mut progress_failed = false;
+    let mut mode_failed = false;
     let mut measured = false;
     let mut previous = watch.stats().events_total;
     while started.elapsed() < Duration::from_secs(600) {
         std::thread::sleep(Duration::from_secs(1));
         let current = watch.stats().events_total;
-        assert!(current > previous, "watcher stopped processing");
+        progress_failed |= current <= previous;
         previous = current;
-        assert_ne!(watch.mode(), tidemark_live::watch::WatchMode::Failed);
+        mode_failed |= watch.mode() == tidemark_live::watch::WatchMode::Failed;
         if !measured && started.elapsed() >= Duration::from_secs(60) {
             let cpu_pct =
                 (cpu_ticks() - cpu_before) as f64 / hz / started.elapsed().as_secs_f64() * 100.0;
@@ -285,21 +298,47 @@ fn watcher_sixty_second_load_and_ten_minute_fd_stability() {
                 watch.stats().events_total,
                 started.elapsed()
             );
-            assert!(cpu_pct < 2.0, "watcher exceeds CPU budget");
+            if cpu_pct >= 2.0 {
+                failures.push(format!("watcher exceeds CPU budget: {cpu_pct:.3}% >= 2%"));
+            }
             measured = true;
         }
     }
-    assert!(child.wait().unwrap().success());
+    if !child.0.wait().unwrap().success() {
+        failures.push("writer child failed (including first-minute rate check)".into());
+    }
     let achieved = 1_200_000.0 / started.elapsed().as_secs_f64();
     println!("generated close-write rate={achieved:.2}/s");
-    assert!(
-        achieved >= 1960.0,
-        "VM cannot sustain calibrated 2,000 closes/s"
-    );
-    assert!(measured);
+    if achieved < 1960.0 {
+        failures.push(format!(
+            "VM cannot sustain calibrated 2,000 closes/s: {achieved:.2}/s < 1960/s"
+        ));
+    }
+    if !measured {
+        failures.push("CPU measurement missing".into());
+    }
+    if progress_failed {
+        failures.push("watcher stopped processing".into());
+    }
+    if mode_failed || watch.mode() == tidemark_live::watch::WatchMode::Failed {
+        failures.push("watcher mode Failed".into());
+    }
     std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(count(), before);
+    let after = count();
+    println!(
+        "descriptor count before={before}, after={after}; watcher mode={:?}",
+        watch.mode()
+    );
+    if after != before {
+        failures.push(format!("descriptor count before={before}, after={after}"));
+    }
+    drop(child);
     watch.stop();
+    assert!(
+        failures.is_empty(),
+        "load/stability checks failed:\n{}",
+        failures.join("\n")
+    );
 }
 #[test]
 fn paced_writer_child() {
@@ -308,6 +347,7 @@ fn paced_writer_child() {
     };
     let path = std::path::PathBuf::from(path);
     let started = Instant::now();
+    let mut first_rate = None;
     for n in 0..1_200_000 {
         let due = started + Duration::from_micros(n * 500);
         if let Some(delay) = due.checked_duration_since(Instant::now()) {
@@ -317,7 +357,11 @@ fn paced_writer_child() {
         if n == 119_999 {
             let achieved = 120_000.0 / started.elapsed().as_secs_f64();
             println!("first 60 seconds generated {achieved:.2} closes/s");
-            assert!(achieved >= 1960.0, "VM cannot sustain calibrated load");
+            first_rate = Some(achieved);
         }
     }
+    assert!(
+        first_rate.unwrap() >= 1960.0,
+        "VM cannot sustain calibrated load"
+    );
 }
