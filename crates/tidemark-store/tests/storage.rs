@@ -395,9 +395,11 @@ fn catalog_selection_rebuild_and_nonutf8_file_paths() {
     c.record_finish(&entry("late", b"/data", 30, "partial"))
         .unwrap();
     let mut e = entry("other", b"/other", 40, "complete");
-    e.file = Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
-        b"/state/\xff.db".to_vec(),
-    )));
+    e.file = Some(
+        state
+            .path()
+            .join(std::ffi::OsString::from_vec(b"\xff.db".to_vec())),
+    );
     c.record_finish(&e).unwrap();
     assert_eq!(c.get("other").unwrap().unwrap().file, e.file);
     assert_eq!(c.list(None).unwrap().len(), 3);
@@ -1349,4 +1351,154 @@ fn finish_cancels_at_every_publication_checkpoint() {
         assert!(!temporary.exists());
         assert_eq!(std::fs::read(&existing).unwrap(), old_bytes);
     }
+}
+
+#[test]
+fn catalog_paths_are_relative_and_resolve_for_each_reader() {
+    use std::os::{
+        fd::AsRawFd,
+        unix::ffi::{OsStrExt, OsStringExt},
+    };
+    let state = tempfile::tempdir().unwrap();
+    let handle = std::fs::File::open(state.path()).unwrap();
+    let anchored = std::path::PathBuf::from(format!("/proc/self/fd/{}/.", handle.as_raw_fd()));
+    let plain = Catalog::open(state.path(), true).unwrap();
+    let bound = Catalog::open(&anchored, true).unwrap();
+    let tail = std::path::PathBuf::from("snapshots")
+        .join(std::ffi::OsString::from_vec(b"root-\xff".to_vec()))
+        .join(std::ffi::OsString::from_vec(b"scan-\xfe.db".to_vec()));
+    std::fs::create_dir_all(state.path().join(&tail).parent().unwrap()).unwrap();
+    let (_fixture, snapshot) = write_fixture(3);
+    std::fs::copy(snapshot, state.path().join(&tail)).unwrap();
+    let sql = Connection::open(state.path().join("timeseries.db")).unwrap();
+    for (id, writer, base) in [
+        ("plain", &plain, state.path()),
+        ("bound", &bound, anchored.as_path()),
+    ] {
+        let mut e = entry(id, b"/data", 10, "complete");
+        e.file = Some(base.join(".").join(&tail));
+        writer.record_start(&e).unwrap();
+        writer.record_finish(&e).unwrap();
+        let raw: Vec<u8> = sql
+            .query_row(
+                "SELECT CAST(file AS BLOB) FROM scans WHERE scan_id=?",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, tail.as_os_str().as_bytes());
+        for (reader, base) in [(&plain, state.path()), (&bound, anchored.as_path())] {
+            for read in [
+                reader.get(id).unwrap().unwrap(),
+                reader.latest(&e.root).unwrap().unwrap(),
+                reader.nearest_before(&e.root, 10).unwrap().unwrap(),
+            ] {
+                assert_eq!(read.file, Some(base.join(&tail)));
+                let file = read.file.unwrap();
+                assert!(file.exists());
+                assert!(Snapshot::open(&file).is_ok());
+            }
+            assert!(reader
+                .list(None)
+                .unwrap()
+                .iter()
+                .all(|e| e.file.as_ref() == Some(&base.join(&tail))));
+        }
+    }
+}
+
+#[test]
+fn catalog_rejects_outside_and_parent_paths() {
+    let state = tempfile::tempdir().unwrap();
+    let c = Catalog::open(state.path(), true).unwrap();
+    for file in [
+        state.path().with_extension("outside").join("scan.db"),
+        state.path().join("snapshots/../scan.db"),
+        std::path::PathBuf::from("snapshots/scan.db"),
+    ] {
+        let mut e = entry("bad", b"/data", 10, "complete");
+        e.file = Some(file);
+        assert!(matches!(
+            c.record_start(&e),
+            Err(tidemark_store::StoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            c.record_finish(&e),
+            Err(tidemark_store::StoreError::Invalid(_))
+        ));
+    }
+    assert!(c.list(None).unwrap().is_empty());
+}
+
+#[test]
+fn catalog_legacy_paths_and_rebuild_repair() {
+    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+    let state = tempfile::tempdir().unwrap();
+    let c = Catalog::open(state.path(), true).unwrap();
+    let (_fixture, snapshot) = write_fixture(3);
+    let tail = std::path::PathBuf::from("snapshots/root/valid.db");
+    let published = state.path().join(&tail);
+    std::fs::create_dir_all(published.parent().unwrap()).unwrap();
+    std::fs::copy(snapshot, &published).unwrap();
+    let sql = Connection::open(state.path().join("timeseries.db")).unwrap();
+    let existing = state.path().join("legacy.db");
+    std::fs::copy(&published, &existing).unwrap();
+    for (id, legacy, expected) in [
+        ("existing", existing.clone(), existing),
+        (
+            "dead",
+            std::path::PathBuf::from("/proc/self/fd/999999/./snapshots/root/valid.db"),
+            published.clone(),
+        ),
+        (
+            "last",
+            std::path::PathBuf::from("/missing/snapshots/unused/snapshots/root/valid.db"),
+            published.clone(),
+        ),
+        (
+            "missing",
+            std::path::PathBuf::from("/missing/snapshots/root/absent.db"),
+            std::path::PathBuf::from("/missing/snapshots/root/absent.db"),
+        ),
+    ] {
+        c.record_start(&entry(id, b"/data", 10, "complete"))
+            .unwrap();
+        sql.execute(
+            "UPDATE scans SET file=CAST(? AS TEXT) WHERE scan_id=?",
+            rusqlite::params![legacy.as_os_str().as_bytes(), id],
+        )
+        .unwrap();
+        assert_eq!(c.get(id).unwrap().unwrap().file, Some(expected.clone()));
+        assert_eq!(
+            c.latest(&path(b"/data")).unwrap().unwrap().file,
+            Some(expected.clone())
+        );
+        assert_eq!(
+            c.nearest_before(&path(b"/data"), 10).unwrap().unwrap().file,
+            Some(expected.clone())
+        );
+        assert_eq!(c.list(None).unwrap()[0].file, Some(expected));
+        sql.execute("DELETE FROM scans", []).unwrap();
+    }
+    let handle = std::fs::File::open(state.path()).unwrap();
+    let anchored = std::path::PathBuf::from(format!("/proc/self/fd/{}/.", handle.as_raw_fd()));
+    c.record_start(&entry(
+        &meta().scan_id.to_string(),
+        b"/data",
+        10,
+        "complete",
+    ))
+    .unwrap();
+    sql.execute(
+        "UPDATE scans SET file='/proc/self/fd/999999/./snapshots/root/valid.db'",
+        [],
+    )
+    .unwrap();
+    let bound = Catalog::open(&anchored, true).unwrap();
+    assert_eq!(bound.rebuild_from_files().unwrap(), 1);
+    let raw: Vec<u8> = sql
+        .query_row("SELECT CAST(file AS BLOB) FROM scans", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(raw, tail.as_os_str().as_bytes());
+    assert!(Snapshot::open(c.list(None).unwrap()[0].file.as_ref().unwrap()).is_ok());
 }
