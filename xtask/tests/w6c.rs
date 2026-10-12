@@ -150,13 +150,14 @@ fn metadata_and_scriptlet_contract() {
     assert_eq!(post, "#!/bin/sh\nsystemd-tmpfiles --create /usr/lib/tmpfiles.d/tidemark.conf || :\nsystemctl daemon-reload || :\n");
     assert!(!post.contains("enable"));
     assert!(!post.contains("start"));
+    assert!(!post.contains("restart"));
     assert_eq!(
         read(m["pre_uninstall_script"].as_str().unwrap()),
         "#!/bin/sh\nif [ \"$1\" -eq 0 ]; then\n    systemctl stop tidemarkd.service || :\n    systemctl disable tidemarkd.service || :\nfi\n"
     );
     assert_eq!(
         read(m["post_uninstall_script"].as_str().unwrap()),
-        "#!/bin/sh\nsystemctl daemon-reload || :\n"
+        "#!/bin/sh\nsystemctl daemon-reload || :\nif [ \"$1\" -ge 1 ]; then\n    systemctl try-restart tidemarkd.service || :\nfi\n"
     );
 }
 #[test]

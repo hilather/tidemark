@@ -5,10 +5,36 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 phase=${TIDEMARK_INSTALL_PHASE:-install}
 config=/var/lib/tidemark-install/config.toml
+wait_for_status() {
+    local deadline=$((SECONDS + 60))
+    until tidemark status; do
+        (( SECONDS < deadline )) || return 1
+        sleep 1
+    done
+}
 if [[ $phase == verify ]]; then
     export TIDEMARK_DEPLOY_VM_PHASE=verify TIDEMARK_DEPLOY_VM_CONFIG=$config
     cargo test --offline -p tidemark-cli --features privileged --test w4b w4b::privileged::deploy_stage_reboot_verify -- --exact --nocapture
     tidemark deploy verify --wait 5m
+    : "${TIDEMARK_INSTALL_MOUNT:?Supply restored disposable loop-XFS mount}"
+    [[ $TIDEMARK_INSTALL_MOUNT =~ ^/[a-zA-Z0-9_/-]+$ && $TIDEMARK_INSTALL_MOUNT != / ]]
+    [[ $(findmnt -n -o FSTYPE --target "$TIDEMARK_INSTALL_MOUNT") == xfs ]]
+    [[ $(findmnt -n -o TARGET --target "$TIDEMARK_INSTALL_MOUNT") == "$TIDEMARK_INSTALL_MOUNT" ]]
+    [[ $(findmnt -n -o SOURCE --target "$TIDEMARK_INSTALL_MOUNT") == /dev/loop* ]]
+    # Until the daemon handles late mounts itself, the harness must restore the
+    # mount before daemon startup, or restart the daemon after restoring it.
+    if [[ ${TIDEMARK_INSTALL_RESTART_AFTER_MOUNT:-0} == 1 ]]; then
+        echo 'Restarting tidemarkd after mount restoration (TIDEMARK_INSTALL_RESTART_AFTER_MOUNT=1)'
+        systemctl restart tidemarkd
+        wait_for_status
+    fi
+    mkdir -p "$TIDEMARK_INSTALL_MOUNT/tidemark-install-reboot"
+    systemd-run --wait --unit=tidemark-install-reboot-writer /bin/sh -c 'dd if=/dev/zero of="$1/payload" bs=1M count=8 && sleep 5' sh "$TIDEMARK_INSTALL_MOUNT/tidemark-install-reboot"
+    deadline=$((SECONDS + 60))
+    until tidemark hot --window 5m | grep -F "$TIDEMARK_INSTALL_MOUNT/tidemark-install-reboot"; do
+        (( SECONDS < deadline )) || { journalctl -u tidemarkd; exit 1; }
+        sleep 1
+    done
     exit 0
 fi
 [[ $phase == install ]] || { echo 'phase must be install or verify' >&2; exit 1; }
@@ -70,11 +96,22 @@ CONFIG
 install -m 0600 "$config" /etc/tidemark/tidemark.toml
 # 4–5. Start and wait for API readiness with a deadline.
 systemctl start tidemarkd
-deadline=$((SECONDS + 60))
-until tidemark status; do
-    (( SECONDS < deadline )) || exit 1
-    sleep 1
-done
+wait_for_status
+# Assert parsed, effective settings; EL8 cgroup v1 may expose only MemoryLimit.
+properties=$(systemctl show tidemarkd -p MemoryMax -p MemoryLimit -p NoNewPrivileges -p User -p Type -p CapabilityBoundingSet)
+printf '%s\n' "$properties"
+grep -Eq '^(MemoryMax|MemoryLimit)=2147483648$' <<< "$properties"
+grep -Fxq 'NoNewPrivileges=yes' <<< "$properties"
+grep -Fxq 'User=root' <<< "$properties"
+grep -Fxq 'Type=notify' <<< "$properties"
+expected_caps=$(awk -F= '/^CapabilityBoundingSet=/ {print tolower($2)}' /usr/lib/systemd/system/tidemarkd.service | tr ' ' '\n' | LC_ALL=C sort)
+actual_caps=$(sed -n 's/^CapabilityBoundingSet=//p' <<< "$properties" | tr '[:upper:]' '[:lower:]' | tr ' ' '\n' | LC_ALL=C sort)
+[[ -n $expected_caps && $actual_caps == "$expected_caps" ]]
+systemd-analyze verify /usr/lib/systemd/system/tidemarkd.service > /var/lib/tidemark-install/unit-verify.txt 2>&1
+cat /var/lib/tidemark-install/unit-verify.txt
+if grep -Fi 'tidemarkd.service' /var/lib/tidemark-install/unit-verify.txt | grep -Ei 'ignoring|Invalid'; then
+    exit 1
+fi
 # 6. Host namespace write from a separate unit must appear in hot results.
 mkdir -p "$TIDEMARK_INSTALL_MOUNT/tidemark-install-namespace"
 systemd-run --wait --unit=tidemark-install-writer /bin/dd if=/dev/zero of="$TIDEMARK_INSTALL_MOUNT/tidemark-install-namespace/payload" bs=1M count=50
@@ -100,10 +137,21 @@ else
     exit 1
 fi
 systemd-analyze security tidemarkd > /var/lib/tidemark-install/security.txt
-# 8. Upgrade preserves edited bytes, owner and mode.
+# 8. Upgrade restarts a running daemon, preserves config, and leaves a stopped one stopped.
 echo '# W6-C preserve this edit' >> /etc/tidemark/tidemark.toml
 cp /etc/tidemark/tidemark.toml /var/lib/tidemark-install/edited.toml
+before_pid=$(systemctl show tidemarkd -p MainPID --value)
+[[ $before_pid =~ ^[0-9]+$ && $before_pid != 0 ]]
 dnf upgrade -y "$TIDEMARK_INSTALL_UPGRADE_RPM"
+systemctl is-active --quiet tidemarkd
+after_pid=$(systemctl show tidemarkd -p MainPID --value)
+[[ $after_pid =~ ^[0-9]+$ && $after_pid != 0 && $after_pid != "$before_pid" ]]
+wait_for_status
+systemctl stop tidemarkd
+dnf reinstall -y "$TIDEMARK_INSTALL_UPGRADE_RPM"
+[[ $(systemctl show tidemarkd -p ActiveState --value) == inactive ]]
+systemctl start tidemarkd
+wait_for_status
 [[ $(rpm -q --qf '%{VERSION}' tidemark) == 0.1.1 ]]
 cmp /etc/tidemark/tidemark.toml /var/lib/tidemark-install/edited.toml
 [[ $(stat -c '%a:%U:%G' /etc/tidemark/tidemark.toml) == 600:root:root ]]
@@ -119,6 +167,8 @@ if systemctl is-enabled --quiet tidemarkd; then
     exit 1
 fi
 [[ $(cat /var/lib/tidemark/install-retain) == retain ]]
+cmp /etc/tidemark/tidemark.toml.rpmsave /var/lib/tidemark-install/edited.toml
+[[ $(stat -c '%a' /etc/tidemark/tidemark.toml.rpmsave) == 600 ]]
 # 10. Reinstall, stage with the W4-B test; external harness reboots then runs verify.
 dnf install -y "$TIDEMARK_INSTALL_UPGRADE_RPM"
 export TIDEMARK_DEPLOY_VM_PHASE=stage TIDEMARK_DEPLOY_VM_CONFIG=$config
