@@ -469,10 +469,24 @@ impl LiveStateView {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let hot: Option<Vec<_>> = mounts
+        let hot: Vec<_> = v
+            .data
+            .watchers
             .iter()
-            .map(|m| Some((m.clone(), v.hot_dirs(m, Duration::from_secs(300))?)))
+            .filter(|(_, w)| w.mode() != tidemark_live::watch::WatchMode::Failed)
+            .map(|(m, w)| {
+                (
+                    m.clone(),
+                    w.hot(5, tidemark_live::watch::HotScope::Dir, MAX_INVENTORY),
+                )
+            })
             .collect();
+        let mut degraded = v.data.degraded.clone();
+        for mount in rates.as_deref().unwrap_or(&[]) {
+            if !hot.iter().any(|(m, _)| m == &mount.mount) {
+                degraded.push(format!("hot_dirs_5m {}: not measured", mount.mount));
+            }
+        }
         let phantom = v.phantom(&PhantomParams {
             mount: p.mount.clone(),
         });
@@ -535,7 +549,7 @@ impl LiveStateView {
                     .unwrap_or("unknown"),
                 mounts: rates.as_deref(),
                 lvm: v.data.lvm.as_ref().map(|r| r.mounts.as_slice()),
-                hot_dirs_5m: hot.as_deref(),
+                hot_dirs_5m: Some(&hot),
                 writers_5m: unit_hot.as_deref(),
                 phantom: phantom.as_deref(),
                 open_writers: grouped.as_deref(),
@@ -543,7 +557,7 @@ impl LiveStateView {
                 scans: scans.as_deref(),
                 watch_modes: modes.as_deref(),
                 unevaluable: &diagnostics,
-                degraded: &v.data.degraded,
+                degraded: &degraded,
             },
             now,
         ))
