@@ -15,6 +15,12 @@
 
 ---
 
+### Gate-review contracts to carry into hardening and rollout
+
+Read 13 R3-1–R3-15 and 12’s open risks before implementing or claiming gate acceptance. Preserve uid-0-only SO_PEERCRED authorization, labelled CLI status configuration, reduced daemon LVM fields, direct fallback notices and daemon scan override refusal. Watcher rules evaluate only supported whole-minute 1–60 windows with boundary samples; hot data is per-minute top lists and lossy/truncated windows are unavailable. Current A2b producer/state seams leave all watcher-rule measurements unavailable. Growth is computed in scan_finished before dir_series and retention; potentially truncated growth is unavailable. Do not pre-lock run_scan or equate queueing with persistence.
+
+W7-A/D preserve indexed notable-file ID paging and diff From/To headers plus the existing JSON notice, without schema or payload extensions. W7-C checks capability-based O_NOATIME fallback (uid 0 alone proves nothing), independently reviews syscall charging beyond counting-gate tests, and tests real peer credentials/listener behavior. W7-D explains stage-only local-state eligibility and blocking-preflight versus runtime compensation; unstage/purge remain usable on ineligible storage. W7-B/C/D must resolve or report 12’s open limitations, including finish timestamp, leaf no-follow, LVM cancellation, current-run alert history and duplicate deployment helper. No privileged test has run in the supplied evidence; execute Rocky/XFS/fanotify/service/reboot gates on disposable VMs and retain results rather than treating compile-only or socket-pair tests as acceptance.
+
 ## W7-A — TUI browser
 
 **Read first:** `03-link-semantics.md` §7, `05-storage.md` §3, `08-interfaces.md` (`tui`).

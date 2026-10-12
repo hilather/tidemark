@@ -106,6 +106,8 @@ Follow `13` R2-8: retry transient descriptor shortages, report failed workers, a
 
 ---
 
+Watcher window and dirty-root contracts follow 07 §3.3 and 13 R3-1/R3-2: supported whole minutes only, unavailable lossy/truncated hot windows, and independent post-publication dirty takes. No permission-error count is reported in v1 (R3-5).
+
 ## W5-B — Process scanner: phantom files and open writers
 
 **Read first:** `07-live-monitoring.md` §4, W1-D `procfs::scan_open_files` rustdoc.
@@ -114,7 +116,7 @@ Follow `13` R2-8: retry transient descriptor shortages, report failed workers, a
 
 ```rust
 pub struct ProcScannerOptions { pub mounts: Vec<(RawPath, DevId)>, pub open_writers: bool, pub exclude_prefixes: Vec<RawPath> }
-pub struct ProcScanResult { pub at: i64, pub fds_seen: u64, pub duration: Duration }
+pub struct ProcScanResult { pub at: i64, pub fds_seen: u64, pub writers_full: bool, pub writer_evictions: u64, pub duration: Duration }
 pub struct ProcScanner;
 impl ProcScanner {
     pub fn new(cfg: ProcScannerOptions, attribution: Arc<AttributionCache>) -> Self;

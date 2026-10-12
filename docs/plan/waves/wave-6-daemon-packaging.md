@@ -6,15 +6,20 @@
 
 | Task | Title | Owned paths | Depends on |
 |------|-------|-------------|------------|
-| W6-A | Daemon core, services, scheduler, API; CLI live commands | `tidemarkd/src/{main,api,state,scheduler}.rs`, `tidemarkd/src/services/**`, `tidemark-cli/src/cmd/{now,hot,alerts,status}.rs`, and the daemon-mode branches in `cmd/{scan,lvm,phantom,writers}.rs` (see note) | W2–W5 |
-| W6-B | Metrics exporter, dashboards, alert rules | `tidemarkd/src/metrics.rs`, `packaging/grafana/**`, `packaging/prometheus/**` | W6-A `state` API (skeleton first) |
-| W6-C | Packaging, systemd, RPM, install tests | `packaging/{systemd,tmpfiles.d,config}/**`, `packaging/rpm/**`, `xtask/src/rpm.rs`, `tests/install/**` | W6-A binary |
+| W6-A1 | Lifecycle, state, sampler, LVM, ts-writer | `tidemarkd/src/{lib,main,state}.rs`, `tidemarkd/src/services/{sampler,lvm,tswriter}.rs`, `tidemarkd/tests/w6a1.rs`, `tidemarkd/tests/w6a1/**` | W2–W5, W6-prep |
+| W6-A2a | Scheduler, scan control, post-scan, firstboot report | `tidemarkd/src/scheduler.rs`, `tidemarkd/tests/w6a2a.rs`, `tidemarkd/tests/w6a2a/**` | W6-A1, W2-C; W6-B cache |
+| W6-A2b | Watcher, process-scan, alert services | `tidemarkd/src/services/{watcher,procscan,alerts}.rs`, `tidemarkd/tests/w6a2b.rs`, `tidemarkd/tests/w6a2b/**` | W6-A1, W5-A/B/D |
+| W6-A3 | API server and CLI live commands | `tidemarkd/src/api.rs`, `tidemark-cli/src/cmd/{now,hot,alerts,status}.rs`, `tidemark-cli/src/render/{now,hot,alerts,status}.rs`, daemon branches in `cmd/{scan,lvm,phantom,writers}.rs`, both crates’ `tests/w6a3.rs` and `tests/w6a3/**` | W6-A1/A2a/A2b, W4-B client |
+| W6-B | Metrics exporter, dashboards, alert rules | `tidemarkd/src/metrics.rs`, `packaging/grafana/**`, `packaging/prometheus/**` | W6-A1 `state` API (skeleton first) |
+| W6-C | Packaging, systemd, RPM, install tests | `packaging/{systemd,tmpfiles.d,config}/**`, `packaging/rpm/**`, `xtask/src/rpm.rs`, `tests/install/**` | W6-A1/A2a/A2b/A3 binary |
 
-**Note on shared CLI files:** `scan.rs` (W2-C), `lvm.rs` (W4-A) and `phantom.rs`/`writers.rs` (W5-B) already exist. W6-A adds a "daemon first, direct fallback" branch at the top of each `run()` and **must not change their direct-mode code**. The reviewer checks the diff stays within that branch.
+**Note on shared CLI files:** `scan.rs` (W2-C), `lvm.rs` (W4-A) and `phantom.rs`/`writers.rs` (W5-B) already exist. W6-A3 adds a "daemon first, direct fallback" branch at the top of each `run()` and **must not change their direct-mode code**. The reviewer checks the diff stays within that branch.
 
-W6-A lands the `state` API skeleton (`LiveStateView` read methods) first, so W6-B can compile against it.
+W6-A1 lands the `state` API skeleton (`LiveStateView` read methods) first, so W6-B can compile against it.
 
-**Merge order:** W6-A → W6-B → W6-C.
+**Merge order:** W6-prep → W6-A1 state/services → W6-A2a and W6-A2b → W6-A3; W6-B builds against A1 and supplies A2a’s metrics cache; W6-C consumes the composed binary.
+
+**Ownership of the collective W6-A section:** lifecycle/startup/reload/shutdown, LiveState/View and sampler/LVM/ts-writer belong to A1; schedules, ScanControl, recorder/post-scan and firstboot composition to A2a; watcher/procscan/alerts to A2b; API and CLI live commands/renderers to A3. A2a calls existing W4-B firstboot helpers without owning firstboot.rs. Only A3’s daemon branches own the four shared CLI files; direct implementations remain intact. Test scopes follow the table; W6-B additionally owns `tidemarkd/tests/w6b.rs` and `tests/w6b/**`, W6-C `xtask/tests/w6c.rs` and `tests/w6c/**` (W6-prep/W6 implementation handoffs).
 
 ---
 
@@ -59,23 +64,23 @@ tidemarkd/src/
   - The alert engine's active set.
   - Scan statuses.
   - Degraded reasons.
-- **`LiveStateView`** implements W5-D's `AlertSource` (`07` §6, `13` R2-10), with complete bounded inventories and exact per-rule Duration windows; unavailable data is None, measured empty is Some(empty). Supply ScanAge effective cadence (at least 24h for windowed roots), build optional NowInputs sections and unevaluable diagnostics, and expose diagnostics in alerts/now. Metrics derive firing gauges from active(), not a removed render_metrics method.
-- Retain the `ScanGate` handle through each scan: pass gate() to I/O, observe stats(), stop() after acquisitions finish. Publication uses finish_with and cancellation publishes nothing.
-- Watcher services drain completed minutes only; enable_events/drain_events belong solely to foreground watch. Report WatchMode::Failed and transient recovery. State setup and firstboot obey the unsafe-state refusal/no-follow handle policy in `08` §5.
+- **`LiveStateView`** implements W5-D's `AlertSource` (`07` §6, `13` R2-10), with bounded inventories and exact per-rule Duration windows subject to the watcher top-list/window exception in 07 §3.3 and 13 R3-1; unavailable data is None, measured empty is Some(empty). Supply ScanAge effective cadence (at least 24h for windowed roots), build optional NowInputs sections and unevaluable diagnostics, and expose diagnostics in alerts/now. Metrics derive firing gauges from active(), not a removed render_metrics method.
+- `run_scan` owns the lock and `ScanGate`: pass gate() to I/O, observe stats(), cancel() wakes waiters within 250 ms, and stop_sampling() stops the sampler while retaining the handle. stop() is unchanged (04 §6.2/§8). Publication uses finish_with and cancellation publishes nothing.
+- Watcher services follow the exact 1–60 whole-minute window and boundary-overflow contract in 07 §3.3; missing boundary facts leave rules not evaluable (W6-A2b). Services drain completed minutes only; enable_events/drain_events belong solely to foreground watch. Report WatchMode::Failed and transient recovery. State setup and firstboot obey the unsafe-state refusal/no-follow handle policy in `08` §5.
 - **Scheduler:**
   - Parse `every <dur>` / `daily HH:MM` / `off` and windows `HH:MM-HH:MM` in local time (windows may wrap midnight).
-  - At most **one scan at a time across all roots** (protects the array). The scheduler holds the host-wide `state_dir/scan.lock` (W2-C) for each scan, so CLI scans are excluded too. It passes a `ScanRecorder` that forwards to the ts-writer thread.
+  - At most **one scan at a time across all roots** (protects the array). `run_scan` alone holds the host-wide `state_dir/scan.lock` and creates the gate; pre-locking by a caller returns Busy. The scheduler passes a `ScanRecorder` whose callbacks wait for persistence acknowledgements, not queue admission (13 R3-8; series acknowledgement gap remains open in 12).
   - A due scan outside its window waits for the window to open.
   - After a daemon restart, a root whose last complete scan is older than its interval is due immediately (window permitting).
   - The space guard runs before each scan.
   - **Post-scan:**
-    1. Compute `dir_growth` between the last two snapshots at depth ≤ `series_depth` (via `tidemark_store::diff`), feeding the `dir_growth` rule.
-    2. Clear the watcher dirty set for that root.
-    3. Apply retention.
+    1. Inside `scan_finished`, compute `dir_growth` between the last two snapshots at depth ≤ `series_depth` (via `tidemark_store::diff`) before retention can remove the predecessor. Publish potentially truncated growth as unavailable. Successful metrics refresh/publication precedes that root’s dirty take.
+    2. `dir_series` follows `scan_finished`; persistence callbacks preserve predecessor availability.
+    3. `run_scan` then applies retention. Dirty loss coverage is acknowledged independently per root, only after its successful publication (13 R3-2/R3-9).
 - **API:**
   - One thread per connection; max 32 concurrent connections.
   - 1 MiB request line limit; 10 s handler timeout.
-  - `SO_PEERCRED` logged; every method accepts root or the daemon's own effective uid; other peers receive `forbidden`.
+  - `SO_PEERCRED` logged; every method accepts only peer uid 0, even for a nonroot daemon; other peers receive `forbidden`.
   - Methods and errors exactly as `08` §2.
 - **Self-protection:** `state_dir` is always added to watch and procscan excludes and to scan excludes. The space guard emits the `state_space` alert.
 - **Reload (SIGHUP / `config.reload`):** re-read config and validate. Apply changes to schedules, alert rules, thresholds, exclude lists and metrics settings live. Changes to mounts or the watch set restart only the affected service. Invalid config keeps the old one and reports the issues.
@@ -85,17 +90,19 @@ tidemarkd/src/
 
 ### CLI live commands (using W4-B's `client.rs`)
 
-- Use `tidemark_cli::client::Client` (W4-B) for every call. A connection failure maps to exit code 4 with "daemon unavailable — is tidemarkd running? (systemctl status tidemarkd)".
+- Use `tidemark_cli::client::Client` (W4-B) for every call. For now/hot/alerts/status, a connection failure maps to exit code 4 with "daemon unavailable — is tidemarkd running? (systemctl status tidemarkd)".
 - `now`: renders `NowReport` via `render_now_text` (terminal width from `TIOCGWINSZ`, default 100). `--json` gives the raw report.
-- `hot`, `alerts`, `status`: tables. `status` shows versions, uptime, each component's state and mode, last error per component, scan schedule and next run.
+- `hot`, `alerts`, `status`: tables. `status --show-config` labels the CLI’s effective config; there is no config.get API method. Alert history currently covers only this daemon run. `status` shows versions, uptime, each component's state and mode, last error per component, scan schedule and next run.
 - **Daemon branches:**
   - `lvm`, `writers`: try the daemon first, otherwise fall back to direct mode with a one-line notice.
-  - `scan`: if the daemon is up, `scan.start` + follow `scan.status` (and `--cancel` → `scan.cancel`); otherwise W2-C's direct mode.
+  - `scan`: if the daemon is up, `scan.start` + follow `scan.status` (and `--cancel` → `scan.cancel`); threads, extra excludes and keep-partial are refused while connected. Otherwise use W2-C’s direct mode.
   - `phantom`: same, but `--direct` forces direct mode.
+
+Contract details: daemon LVM omits segment type and other LVs; CLI trends remain store-derived. Procscan publishes writers_full/writer_evictions with no permission-error counts. Config parsing/hashing uses Config::from_toml_bytes on the actual loaded bytes. Rustix net/termios enable SO_PEERCRED and terminal width. See 13 R3-4/R3-5/R3-6/R3-14 and 12 for unresolved implementation risks.
 
 ### Tests
 
-- Unit: schedule/window parser and next-run computation (DST transitions, windows wrapping midnight); API framing (partial lines, oversize line, malformed JSON → `bad_request`); peer-uid check (root or the daemon's own uid accepted; others `forbidden`) for every method.
+- Unit: schedule/window parser and next-run computation (DST transitions, windows wrapping midnight); API framing (partial lines, oversize line, malformed JSON → `bad_request`); peer-uid check (only uid 0 accepted via kernel SO_PEERCRED; others `forbidden`) for every method.
 - Integration (unprivileged): start the daemon with a temp config (watcher/LVM disabled, walk-mode root on a fixture, socket in a temp dir) → `tidemark status`, `scan.start` via the CLI, `scan.status` until complete, then `now` renders.
 - Privileged `daemon_end_to_end` (`09` §5): start via `systemd-run` with the real unit's properties → write 50 MiB under a transient unit → within 60 s, `tidemark now` shows the hot directory and the unit; `tidemark now` shows both tracked mounts and, on a loop-LVM thin volume, the pool's data %.
 - Privileged `daemon_reload_and_shutdown`: SIGHUP with a changed alert rule is applied; an invalid config is rejected; SIGTERM mid-scan exits within 10 s with no `.db.tmp` left.

@@ -218,6 +218,8 @@ Example output:
 
 The same descent works on `dir_series` history (growth between any two scans), so `now` and `diff` share the explanation style.
 
+Recorder callbacks acknowledge persistence, not queue admission (13 R3-8). The series error-bearing acknowledgement gap in W6-A2a remains open; see 12 R3-L9.
+
 ## 6. Time-series database (`timeseries.db`, `PRAGMA user_version = 1`)
 
 `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`. One writer thread in the daemon; readers are the CLI and API handlers.
@@ -277,6 +279,8 @@ Downsampling inserts bucket rows (last value per bucket) with `INSERT OR IGNORE`
 
 ## 7. Snapshot retention
 
+Successful completion is ordered: `ScanRecorder::scan_finished(&self, e: &ScanEntry) -> Result<(), ScanError>`, then `ScanRecorder::dir_series(&self, root: &RawPath, scan_id: &str, ts: i64, rows: &[DirRow]) -> Result<(), ScanError>`, then retention. The previous snapshot remains available during both callbacks. The daemon computes directory growth inside `scan_finished`, before retention can delete the predecessor. Successful metric-cache refresh/publication precedes that root's dirty take. A growth list that may be truncated is unavailable (`None`), never measured empty or a complete inventory.
+
 Configured per root:
 
 ```toml
@@ -308,6 +312,8 @@ Before starting a scan, the daemon and CLI check the state filesystem:
 - `timeseries.db` is migrated forward in place by numbered migration functions inside a transaction, with a backup copy written first (`timeseries.db.bak-v<N>`).
 
 ## 10. ncdu export (W3-C, FR-22)
+
+Notable ncdu rows page by indexed `(dir_id, id > last)` key in ascending stored file ID, using the existing `files_dir` index's rowid suffix. Start at ID -1 so ID 0 is included; no schema/index change or per-page sort is needed. Directory order remains preorder. Diff provenance is a human From/To header containing snapshot ID, mode, age, status and degraded marker, plus the existing JSON `notice` field for incomplete-coverage and age warnings. The three-field JSON payload is unchanged; no new provenance fields (`W23-fix-queries.md`).
 
 `tidemark export ncdu [PATH] [-o FILE]` writes ncdu JSON format version `[1, 2, {metadata}, <root dir>]` (format documented at dev.yorhel.nl/ncdu/jsonfmt):
 

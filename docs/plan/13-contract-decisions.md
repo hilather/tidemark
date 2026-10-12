@@ -665,7 +665,7 @@ pub struct AlertDiagnostic { pub rule: String, pub reason: String }
 impl AlertEngine { pub fn diagnostics(&self) -> &[AlertDiagnostic]; }
 ```
 
-Query the source per rule and exact Duration window; dir_growth compares snapshots and has no window. Inventories must be complete and bounded: `Some(empty)` confirms absence, `None` means unavailable. A rule without data is not evaluable: preserve state, values and timers without starting, resolving or renotifying; pause continuity and restart pending/clearing evidence on the next known observation. Show diagnostic reasons in alerts and `NowInputs.unevaluable`, propagated through `NowReport.degraded`. Unknown thin-pool percentages cannot resolve an active alert. Healthy unseen subjects allocate no state; the private 10,000-pair cap reports admission failures and protects unavailable active states.
+Query the source per rule and exact Duration window; dir_growth compares snapshots and has no window. Inventories other than watcher hot top lists must be complete and bounded (superseded for watcher inputs by R3-1): `Some(empty)` confirms absence, `None` means unavailable. A rule without data is not evaluable: preserve state, values and timers without starting, resolving or renotifying; pause continuity and restart pending/clearing evidence on the next known observation. Show diagnostic reasons in alerts and `NowInputs.unevaluable`, propagated through `NowReport.degraded`. Unknown thin-pool percentages cannot resolve an active alert. Healthy unseen subjects allocate no state; the private 10,000-pair cap reports admission failures and protects unavailable active states.
 
 `older_than = "auto"` is twice effective cadence; windowed schedules supply at least 24h cadence, non-windowed short cadences remain valid. Unknown cadence is diagnostic; a known root with no complete scan breaches staleness. Measured NowInputs sections use Option: None is “not measured”, Some(empty) is measured empty. Preserve the frozen core report via degraded reasons and never display an unavailable phantom placeholder as measured zero.
 
@@ -676,3 +676,173 @@ Source notes: W5-D-fix (under docs/handoff/). Full AlertSource signatures were t
 Requests closed: scr-W5-D/SCR-1 (accepted source/availability; no separate redaction).
 
 Plan locations: 07 §6/§7; W5-D; W6-A/B. Affected tasks: W5-D, W6-A/B, W7-C/D.
+
+
+---
+
+## Gate review and Wave 6 decisions
+
+These coordinator decisions supersede conflicting earlier wording, especially R2-10’s complete-inventory/arbitrary-window requirement for watcher-backed inputs. All eighteen requested handoff notes exist. Sources: W45-gate (G3/G4/G6 and LVM/process gaps), W23-gate (B1/S7/S8/N1), W4-B-fix2/fix3 (bytes and stage), W5-A-fix2 (dirty coverage), W23-fix-gate/queries/scan (cancellation/order/paging/provenance/timestamp), CI-fix-daemon-state (shared state policy), W6-prep/A1/A2a/A2b/B/A3/A3-fix/C (ownership and runtime seams), and TEST-e2e-scan/deploy/rules (evidence limits). Implementation precision follows those notes; follow-up proposals remain proposals, and reported tests are historical evidence, not new verification.
+
+### R3-1 — Watcher-backed alert windows
+
+Minute buckets discard the event timing needed for arbitrary alert durations. Truncated hot lists cannot provide a complete inventory.
+
+**Decision: accepted.**
+
+Watcher-backed rules (`hot_dir_growth` and `watch_lossy`) accept only exact whole-minute windows from 1 through 60 minutes. Other durations are not evaluable, with a diagnostic; never round or clamp. Keep 60 whole-minute buckets and a cumulative overflow total. Sample that total at each completed-minute boundary; a window overflow count is the difference between its two boundary samples, unavailable if either sample is missing. Hot data consists of per-minute top lists, not a complete inventory. If any included minute overflowed or was truncated at its cap, hot data for the window is unavailable. The ordinary hot API retains its four ranked-list windows.
+
+Implementation evidence (`W6-A2b.md`) is more restrictive: row-only completed-minute drains omit empty-minute/loss/boundary facts, so no `WatchWindow` measurements are currently published. Watcher-backed rules remain not evaluable until that producer/state seam is resolved. The proposed `drain_minutes`/`CompletedMinute` and freshness reader in that note are follow-up proposals, not adopted signatures.
+
+Plan locations: 07 §3.3/§6.2; W5/W6/W7. Affected tasks: W5-A/D, W6-A1/A2b, W7-C/D.
+
+### R3-2 — Dirty roots after loss
+
+Overflow previously replaced nested-root hints with the mount root. A sibling scan must not clear another root’s loss coverage.
+
+**Decision: accepted.**
+
+`Watcher::take_dirty(&self, under: &RawPath) -> Vec<RawPath>` returns `under` itself after a loss, independently for every root, until that root has been taken. A parent, child or sibling take does not acknowledge another root. Loss acknowledgements use a FIFO capped at 1,024 roots; eviction conservatively makes a forgotten root dirty again, repeated loss resets acknowledgements, and clock rollback invalidates them. Ordinary ancestor dirty entries are retained for other callers; descendants are drained, sorted and deduplicated. The scheduler takes dirtiness only after that root's successful scan has published; failed/cancelled scans clear nothing.
+
+Plan locations: 07 §3.3; W5/W6. Affected tasks: W5-A, W6-A2a/A2b.
+
+### R3-3 — Deployment failure wording (G6)
+
+The operator example promised change-free failure for every non-zero result. That contradicted the detailed compensation contract.
+
+**Decision: accepted.**
+
+Blocking pre-flight failures change nothing. After pre-flight, runtime failures use best-effort compensation; downtime, timestamps and newly created empty directories may remain. Replace “non-zero = nothing changed” with this distinction, consistent with R2-7 and W45 G6.
+
+Plan locations: 08 §5; 11 P3. Affected tasks: W4-B, W7-D.
+
+### R3-4 — Reduced daemon LVM view
+
+The direct renderer needs fields absent from frozen LvmResult. Extending the wire payload is unnecessary for the decided reduced view.
+
+**Decision: accepted.**
+
+The daemon-served `lvm` report keeps `LvmResult { mounts: Vec<(String, LvmNow)>, vgs: Vec<VgInfo>, sampled_at: i64 }`. Compared with the direct command it omits segment type and the other/unmounted LV inventory and columns. No wire extension or new flag is added. `W6-A3.md` specifies that the CLI still reads 24-hour trends read-only from the store with the direct command's query/slope/window; missing segment/other-volume columns are omitted and a notice explains the reduced view.
+
+Plan locations: 07 §1; 08 §2; W6/W7. Affected tasks: W6-A1/A3, W7-D.
+
+### R3-5 — Process scan diagnostics
+
+Writer history admission can lose information under its cap. Permission-count reporting has no v1 source contract.
+
+**Decision: accepted.**
+
+`ProcScanResult { at: i64, fds_seen: u64, writers_full: bool, writer_evictions: u64, duration: Duration }` describes a completed pass. `writers_full` says writer candidates exceeded the history cap; `writer_evictions` counts histories evicted for admission during that pass. The daemon publishes these diagnostics with `fds_seen` and persistence drops in component health. Permission-error counts are not reported in v1; do not fabricate a zero or extend frozen report DTOs to add them.
+
+Plan locations: 07 §4; W5/W6. Affected tasks: W5-B, W6-A2b.
+
+### R3-6 — Parse the loaded configuration bytes
+
+Reopening a config pathname can parse bytes different from those installed or hashed. One bounded byte parser closes that seam.
+
+**Decision: accepted.**
+
+Add `Config::from_toml_bytes(bytes: &[u8]) -> Result<Config, CoreError>` in `tidemark-core`. It shares `Config::load`'s bounded UTF-8/TOML parsing, default merge and error precedence (`MAX_CONFIG_BYTES = 1 MiB`). The daemon hashes the bytes it actually loaded, and stage parses, installs and hashes one bounded no-follow read rather than reopening the pathname (`W4-B-fix2.md`).
+
+Plan locations: 08 §3; W6. Affected tasks: W4-B, W6-A1.
+
+### R3-7 — Scan cancellation
+
+Low-rate reservations could block cancellation for minutes. Stopping the controller alone does not cancel waiting acquisitions.
+
+**Decision: accepted.**
+
+`ScanGate::cancel(&self)` is permanent and idempotent: blocked token waiters return within 250 ms, statistics remain readable, and callers check cancellation after each acquisition before metadata I/O. `ScanGate::stop(self) -> GateStats` remains unchanged: it stops the controller and ordinary waiters continue at the last rate. The `Gate` trait and `gate_from_config` are unchanged. Add `ScanGate::stop_sampling(&self)` to stop sampling while retaining the borrowed cancellation handle and stats. The orchestrator's scoped cancellation monitor polls every 50 ms.
+
+```rust
+pub fn read_dir_entries_checked_cancellable(
+    root: &RawPath, dev: DevId, path: &RawPath, expect_ino: Option<Ino>,
+    gate: &dyn Gate, cancel: &AtomicBool,
+) -> io::Result<Vec<(RawName, Ino, FileKind)>>;
+```
+
+The existing checked reader remains unchanged; the additive reader checks cancellation through opens, retries, identity stats and refills. The 250 ms bound covers userspace gate waits, not an in-flight kernel syscall, index build, sync, recorder callback or retention operation. No universal kernel-I/O deadline follows from it (`W23-fix-gate.md`).
+
+Plan locations: 04 §3.3/§6.2/§8; W2/W6. Affected tasks: W1-D, W2-B/C, W6-A2a.
+
+### R3-8 — Orchestrator ownership and persistence
+
+Taking the scan lock in both caller and orchestrator makes the scan Busy. Queue acceptance alone cannot prove durable recorder completion.
+
+**Decision: accepted.**
+
+`run_scan(cfg: &Config, req: &ScanRequest, recorder: &dyn ScanRecorder, cancel: &AtomicBool, progress: &(dyn Fn(&Progress) + Sync)) -> Result<ScanOutcome, ScanError>` owns both `state_dir/scan.lock` and the `ScanGate`. A caller must not take the lock first: doing so makes `run_scan` return `ScanError::Busy`. Scheduler admission serializes scheduled/API requests but delegates host locking, gate creation, space admission and retention to `run_scan`. `ScanRecorder` callbacks return persistence success/errors, not enqueue success; daemon start/finish callbacks wait for error-bearing writer acknowledgements. `W6-A2a.md` reports that its unit Flush acknowledgement cannot attribute a particular series persistence error; its proposed `DirSeriesAck` is an unresolved implementation seam, not a new decided API.
+
+Plan locations: 04 §8; 05 §6; W2/W6. Affected tasks: W2-C, W6-A1/A2a.
+
+### R3-9 — Completion order
+
+Retention can delete the predecessor needed for growth. Post-return growth computation is therefore too late.
+
+**Decision: accepted.**
+
+Successful completion is ordered: `ScanRecorder::scan_finished(&self, e: &ScanEntry) -> Result<(), ScanError>`, then `ScanRecorder::dir_series(&self, root: &RawPath, scan_id: &str, ts: i64, rows: &[DirRow]) -> Result<(), ScanError>`, then retention. The previous snapshot remains available during both callbacks. The daemon computes directory growth inside `scan_finished`, before retention can delete the predecessor. Successful metric-cache refresh/publication precedes that root's dirty take. A growth list that may be truncated is unavailable (`None`), never measured empty or a complete inventory.
+
+Plan locations: 05 §7; W2/W6. Affected tasks: W2-C, W6-A2a/B.
+
+### R3-10 — Indexed notable paging and diff provenance
+
+Repeated sorting made notable export paging expensive. Partial/degraded diffs also concealed their input coverage.
+
+**Decision: accepted.**
+
+Notable ncdu rows page by indexed `(dir_id, id > last)` key in ascending stored file ID, using the existing `files_dir` index's rowid suffix. Start at ID -1 so ID 0 is included; no schema/index change or per-page sort is needed. Directory order remains preorder. Diff provenance is a human From/To header containing snapshot ID, mode, age, status and degraded marker, plus the existing JSON `notice` field for incomplete-coverage and age warnings. The three-field JSON payload is unchanged; no new provenance fields (`W23-fix-queries.md`).
+
+Plan locations: 05 §5.1/§10; W7. Affected tasks: W3-A/C, W7-A/B/D.
+
+### R3-11 — Wave 6 task split
+
+One W6-A task mixed lifecycle, scan scheduling, collectors and transport. The implementation notes divide those responsibilities into separate owners.
+
+**Decision: accepted.**
+
+W6-A is split into W6-A1 (lifecycle, state, sampler, LVM, ts-writer), W6-A2a (scheduler, scan control, post-scan, firstboot report), W6-A2b (watcher, process-scan and alerts), and W6-A3 (API and CLI live commands). The wave table and ownership lists below are authoritative; the collective W6-A section retains its structure. W6-prep’s old W6-A2 scope is divided between A2a and A2b.
+
+Plan locations: W6 task table/ownership. Affected tasks: W6-A1/A2a/A2b/A3, W6-B/C.
+
+### R3-12 — Local deployment state filesystem
+
+The fake-host deployment test exposed stage accepting NFS state. Tracked roots already required a local filesystem; state now has the same eligibility rule.
+
+**Decision: accepted.**
+
+A failed state-filesystem eligibility check reports the configured state path and filesystem type, exits with status 5, and makes no host changes. This check applies only to `deploy stage`; `deploy unstage` and `deploy purge` remain available for removing an installation whose state directory is on an ineligible filesystem. It does not add a daemon or first-boot check.
+
+The filesystem holding `general.state_dir`, or its longest existing ancestor when missing, must be allowlisted local: xfs, ext2, ext3, ext4, btrfs, tmpfs, zfs, f2fs, jfs, reiserfs; unknown types block. Use the blocking `state_filesystem` pre-flight result. W4-B-fix3’s proposed §5 wording is adopted verbatim.
+
+Plan locations: 08 §5; 11 P0/P3. Affected tasks: W4-B, W6-C, W7-D.
+
+### R3-13 — Capability-based O_NOATIME fallback
+
+Uid 0 does not imply CAP_FOWNER. Capability-free root tests observed a real fallback on foreign-owned directories.
+
+**Decision: accepted.**
+
+`O_NOATIME` permission depends on `CAP_FOWNER` or directory ownership, not uid 0. Without that capability, opening a directory owned by another uid falls back on EPERM, charging the retry and counting `noatime_fallbacks`. Root without capabilities can fall back; the measured fallback count is the evidence (`TEST-rules.md`).
+
+Plan locations: 04 §2.2; 12 risks; W7. Affected tasks: W1-B, W7-C/D.
+
+### R3-14 — Live command and peer contracts
+
+Own-uid authentication in earlier plan text allowed nonroot peers. CLI effective configuration and direct fallback behavior also needed explicit labels and boundaries.
+
+**Decision: accepted.**
+
+Every API method serves only peer uid 0, identified by kernel `SO_PEERCRED`, even if the daemon runs with another uid; all other peers receive `forbidden`. The workspace `rustix` dependency enables `net` and `termios`. `status --show-config` prints the CLI's effective configuration, explicitly labelled; the running daemon may retain an older config until reload. There is no `config.get` method in v1. With no daemon, `lvm`, `writers` and `phantom` fall back to direct mode with one stderr notice (including quiet mode); `now`, `hot`, `alerts` and `status` exit 4. Explicit direct mode bypasses the daemon. A connected daemon scan refuses threads, extra excludes and keep-partial options; its request carries only the frozen root/mode/throttle overrides.
+
+Plan locations: 02 §5; 08 §1/§2; 12 ADR-018; W6/W7. Affected tasks: W6-A3, W7-C/D.
+
+### R3-15 — Known limitations remain open
+
+Local tests and compile-only evidence leave runtime and interface gaps. Recording them as decided fixes would overstate the implementation.
+
+**Decision: record as open risks; no resolution decided.**
+
+Record the limitations in `12`’s open-risk register: N1 timestamp before indexes/sync; duplicate path-included deployment helper; uncancellable LVM worker; current-run alert history; SQLite pathname leaf opens; no privileged runtime evidence; counting-gate blind spot; socket-pair deployment fixtures. No new signatures are authorized to close these risks. Additional unresolved producer/writer/storage seams from A2a/A2b are identified there separately.
+
+Plan locations: 12 open risks; 11; W7 gates. Affected tasks: Store/FS/daemon owners, W7-B/C/D.

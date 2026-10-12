@@ -93,7 +93,7 @@ test-support   ◀── dev-dependencies only
 ## 5. Process model
 
 - **`tidemarkd`** runs as root under systemd. It owns all samplers, the watcher, the scan scheduler, the time-series DB writer, metrics output, the API socket and the first-boot report. It is **read-only** with respect to everything outside its own state directory.
-- **`tidemark`** (CLI) is used as root in an installed system because its files are root-only; administrators use `sudo`. Neither the CLI nor the daemon has a uid check; non-root runs against user-owned temporary config, state directory and socket work in the degraded mode below.
+- **`tidemark`** (CLI) is used as root in an installed system because its files are root-only; administrators use `sudo`. Neither binary has a startup uid check; non-root direct runs against user-owned temporary config and state work in the degraded mode below. The API accepts only peer uid 0 via SO_PEERCRED, including with a nonroot daemon (13 R3-14).
   - Snapshot queries open snapshot files directly, read-only and immutable.
   - Live queries (`now`, `hot`, `lvm`, …) go to the daemon socket. Where possible they fall back to doing the work directly (for example `phantom` scans `/proc` itself, `lvm` runs `lvs` itself).
   - `deploy stage|verify|unstage` manage the service for the hotfix pipeline (`§10`).

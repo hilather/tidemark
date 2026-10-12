@@ -21,6 +21,8 @@ LVM details:
 - **Do not use `--readonly`.** It stops LVM from querying the device-mapper kernel driver, so `data_percent`, `metadata_percent` and the kernel major/minor come back empty. Plain `lvs`/`vgs` are reporting commands: they take only a brief shared VG lock and never write metadata. The collector runs `lvs`/`vgs` with a 30 s timeout, and failures back off (5, 10, 20 … up to 60 minutes) without affecting other samplers.
 - Not on LVM, or `lvm2` not installed: the section reports `n/a`.
 
+The daemon-served `lvm` report keeps `LvmResult { mounts: Vec<(String, LvmNow)>, vgs: Vec<VgInfo>, sampled_at: i64 }`. Compared with the direct command it omits segment type and the other/unmounted LV inventory and columns. No wire extension or new flag is added. `W6-A3.md` specifies that the CLI still reads 24-hour trends read-only from the store with the direct command's query/slope/window; missing segment/other-volume columns are omitted and a notice explains the reduced view.
+
 ## 2. Rates and time-to-full (`tidemark-live::rates`, W5-D)
 
 - **Rate** = least-squares slope of `(ts, used)` over a window. Windows are 5 min, 15 min and 1 h, and need at least 3 samples. A slope is robust to the sawtooth of temp files being created and deleted, unlike first-minus-last.
@@ -99,7 +101,13 @@ Retry EMFILE/ENFILE/ENOMEM/ENOBUFS with shutdown-aware exponential 50–800 ms w
 - Map caps: the **current** minute's bucket holds up to 20,000 keys per scope (the smallest half by `bytes_delta` is evicted when full, marking it `approx`). When a minute completes it is **shrunk to its top 1,000 keys per scope**. Worst case is about 20k + 59 × 3k entries, which is well under 100 MB; typical use is far less.
 - Windows of 1, 5, 15 and 60 minutes are computed by summing buckets.
 - Each minute, the top 50 keys per scope are persisted to `hot_minutes`.
-- `dirty` is a set of directories with events since the last completed scan of their root, capped at 200,000 and cleared per root when a scan finishes. It drives `tidemark top --live` hints and future incremental refresh.
+- `dirty` is a set of directories with events since the last completed scan of their root, capped at 200,000 and taken independently per root only after its successful scan publishes. It drives `tidemark top --live` hints and future incremental refresh.
+
+Watcher-backed rules (`hot_dir_growth` and `watch_lossy`) accept only exact whole-minute windows from 1 through 60 minutes. Other durations are not evaluable, with a diagnostic; never round or clamp. Keep 60 whole-minute buckets and a cumulative overflow total. Sample that total at each completed-minute boundary; a window overflow count is the difference between its two boundary samples, unavailable if either sample is missing. Hot data consists of per-minute top lists, not a complete inventory. If any included minute overflowed or was truncated at its cap, hot data for the window is unavailable. The ordinary hot API retains its four ranked-list windows.
+
+Implementation evidence (`W6-A2b.md`) is more restrictive: row-only completed-minute drains omit empty-minute/loss/boundary facts, so no `WatchWindow` measurements are currently published. Watcher-backed rules remain not evaluable until that producer/state seam is resolved. The proposed `drain_minutes`/`CompletedMinute` and freshness reader in that note are follow-up proposals, not adopted signatures.
+
+`Watcher::take_dirty(&self, under: &RawPath) -> Vec<RawPath>` returns `under` itself after a loss, independently for every root, until that root has been taken. A parent, child or sibling take does not acknowledge another root. Loss acknowledgements use a FIFO capped at 1,024 roots; eviction conservatively makes a forgotten root dirty again, repeated loss resets acknowledgements, and clock rollback invalidates them. Ordinary ancestor dirty entries are retained for other callers; descendants are drained, sorted and deduplicated. The scheduler takes dirtiness only after that root's successful scan has published; failed/cancelled scans clear nothing.
 
 ### 3.4 FID+name mode (only if the probe allows)
 
@@ -134,6 +142,8 @@ This catches log files and long-running writers, including runaway database temp
 
 - Exclude prefixes from `procscan.exclude_prefixes` (default: none).
 - Cost: one `readlink` + `stat` per fd and one small read per candidate. Expect well under a second for tens of thousands of fds. Ignore `ENOENT`/`ESRCH` from exiting processes.
+
+`ProcScanResult { at: i64, fds_seen: u64, writers_full: bool, writer_evictions: u64, duration: Duration }` describes a completed pass. `writers_full` says writer candidates exceeded the history cap; `writer_evictions` counts histories evicted for admission during that pass. The daemon publishes these diagnostics with `fds_seen` and persistence drops in component health. Permission-error counts are not reported in v1; do not fabricate a zero or extend frozen report DTOs to add them.
 
 ### 4.3 Attribution helper (shared with the watcher)
 
@@ -194,7 +204,7 @@ pub struct AlertDiagnostic { pub rule: String, pub reason: String }
 impl AlertEngine { pub fn diagnostics(&self) -> &[AlertDiagnostic]; }
 ```
 
-Query the source per rule and exact Duration window; dir_growth compares snapshots and has no window. Inventories must be complete and bounded: `Some(empty)` confirms absence, `None` means unavailable. A rule without data is not evaluable: preserve state, values and timers without starting, resolving or renotifying; pause continuity and restart pending/clearing evidence on the next known observation. Show diagnostic reasons in alerts and `NowInputs.unevaluable`, propagated through `NowReport.degraded`. Unknown thin-pool percentages cannot resolve an active alert. Healthy unseen subjects allocate no state; the private 10,000-pair cap reports admission failures and protects unavailable active states.
+Query the source per rule and exact Duration window; dir_growth compares snapshots and has no window. Inventories other than watcher hot top lists must be complete and bounded (watcher inputs follow R3-1 and §3.3): `Some(empty)` confirms absence, `None` means unavailable. A rule without data is not evaluable: preserve state, values and timers without starting, resolving or renotifying; pause continuity and restart pending/clearing evidence on the next known observation. Show diagnostic reasons in alerts and `NowInputs.unevaluable`, propagated through `NowReport.degraded`. Unknown thin-pool percentages cannot resolve an active alert. Healthy unseen subjects allocate no state; the private 10,000-pair cap reports admission failures and protects unavailable active states.
 
 `older_than = "auto"` is twice effective cadence; windowed schedules supply at least 24h cadence, non-windowed short cadences remain valid. Unknown cadence is diagnostic; a known root with no complete scan breaches staleness. Measured NowInputs sections use Option: None is “not measured”, Some(empty) is measured empty. Preserve the frozen core report via degraded reasons and never display an unavailable phantom placeholder as measured zero.
 
