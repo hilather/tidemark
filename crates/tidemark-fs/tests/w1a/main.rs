@@ -1,5 +1,6 @@
 //! Owned by: W1-A
 //! VM-only mount, loop-XFS and loop-LVM acceptance tests.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(feature = "privileged")]
 mod privileged {
     use std::{os::unix::fs::MetadataExt, process::Command};
