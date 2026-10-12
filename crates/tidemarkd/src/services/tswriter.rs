@@ -1,8 +1,8 @@
 //! Owned by: W6-A1
-//! Single bounded time-series writer interface.
+//! Single bounded time-series writer and persistence barriers.
 
 use tidemark_core::live::*;
-/// Persistence work; producers must bound batches by configured caps. Shape proposed by W6-prep; the owning task may refine it inside its own file.
+/// Persistence work; producers must bound batches by MAX_BATCH_ROWS.
 pub enum Message {
     /// Record scan start and acknowledge persistence to the scheduler recorder.
     ScanStarted(
@@ -38,10 +38,9 @@ pub enum Message {
     /// Flush queued inserts before acknowledging shutdown.
     Flush(crossbeam_channel::Sender<()>),
 }
-/// Sender from a bounded channel created by the writer. Shape proposed by W6-prep; the owning task may refine it inside its own file.
+/// Sender from the writer's CHANNEL_CAPACITY bounded queue.
 pub type Sender = crossbeam_channel::Sender<Message>;
-/// Start the writer; returned sender has bounded capacity from configuration.
-/// Shape proposed by W6-prep; the owning task may refine it inside its own file.
+/// Start the writer with CHANNEL_CAPACITY queued messages.
 pub fn start(
     config: std::sync::Arc<tidemark_core::config::Config>,
     state: crate::state::LiveState,
