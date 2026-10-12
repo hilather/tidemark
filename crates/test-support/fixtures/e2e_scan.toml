@@ -1,0 +1,50 @@
+generate = "hardlink_web"
+[[entry]]
+path = 'weird/\xff\xfe-name'
+kind = "file"
+size = 10
+[[entry]]
+path = 'weird/new\x0Aline'
+kind = "file"
+size = 0
+[[entry]]
+path = 'weird/slash\x5Cquote"'
+kind = "file"
+size = 0
+[[entry]]
+path = "sparse"
+kind = "file"
+sparse = "1GiB"
+[[entry]]
+path = "empty"
+kind = "file"
+size = 0
+
+[[entry]]
+path = "loop-a"
+kind = "symlink"
+target = "loop-b"
+[[entry]]
+path = "loop-b"
+kind = "symlink"
+target = "loop-a"
+[[entry]]
+path = "up"
+kind = "symlink"
+target = "."
+[[entry]]
+path = "dangling"
+kind = "symlink"
+target = "absent"
+[[entry]]
+path = "escaping"
+kind = "symlink"
+target = "../outside"
+[[entry]]
+path = "locked"
+kind = "dir"
+mode = 0
+[[outside]]
+path = "s2"
+kind = "hardlink"
+target = "d00/s2"
