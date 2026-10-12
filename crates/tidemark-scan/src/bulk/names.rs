@@ -76,12 +76,13 @@ pub(super) fn resolve(
         let mut found = vec![false; end - pos];
         let identity = lookup(&cfg.root, path, identities);
         let entries = match identity {
-            Some(identity) => tidemark_fs::walk::read_dir_entries_checked(
+            Some(identity) => tidemark_fs::walk::read_dir_entries_checked_cancellable(
                 &cfg.root,
                 identity.dev,
                 path,
                 Some(identity.ino),
                 gate,
+                cancel,
             ),
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::CrossesDevices,

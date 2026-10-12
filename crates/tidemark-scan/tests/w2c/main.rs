@@ -369,11 +369,97 @@ fn automatic_retention_rebuilds_catalog_after_deleting_old_files() {
     entry.started_at -= 172800;
     catalog.record_finish(&entry).unwrap();
     drop(catalog);
-    let second = run_scan(&cfg, &req, &recorder, &AtomicBool::new(false), &|_| {}).unwrap();
+    struct BeforeRetention<'a> {
+        inner: &'a Recorder,
+        previous: &'a Path,
+        finished: std::sync::atomic::AtomicBool,
+    }
+    impl ScanRecorder for BeforeRetention<'_> {
+        fn scan_started(&self, e: &ScanEntry) -> Result<(), ScanError> {
+            self.inner.scan_started(e)
+        }
+        fn scan_finished(&self, e: &ScanEntry) -> Result<(), ScanError> {
+            assert!(
+                self.previous.exists(),
+                "growth predecessor removed before completion"
+            );
+            self.finished
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.inner.scan_finished(e)
+        }
+        fn dir_series(
+            &self,
+            root: &RawPath,
+            id: &str,
+            ts: i64,
+            rows: &[DirRow],
+        ) -> Result<(), ScanError> {
+            assert!(self.finished.load(std::sync::atomic::Ordering::Acquire));
+            assert!(self.previous.exists(), "retention ran before series");
+            self.inner.dir_series(root, id, ts, rows)
+        }
+    }
+    let observer = BeforeRetention {
+        inner: &recorder,
+        previous: first.file.as_ref().unwrap(),
+        finished: AtomicBool::new(false),
+    };
+    let second = run_scan(&cfg, &req, &observer, &AtomicBool::new(false), &|_| {}).unwrap();
     assert!(!first.file.as_ref().unwrap().exists());
     let catalog = Catalog::open(state.path(), false).unwrap();
     assert!(catalog.get(&first.scan_id).unwrap().is_none());
     assert!(catalog.get(&second.scan_id).unwrap().is_some());
     let remaining = Snapshot::open(second.file.as_ref().unwrap()).unwrap();
     assert!(remaining.dir_by_path(&req.root).unwrap().is_some());
+}
+
+#[test]
+fn low_rate_walk_cancellation_cleans_up_and_releases_lock() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let fixture = test_support::materialize("[[entry]]\npath='child/file'\nkind='file'\nsize=8\n");
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = config(state.path());
+    cfg.throttle.min_ops_per_sec = 1;
+    cfg.throttle.max_ops_per_sec = 1;
+    let mut req = request(&fixture.root, ModeRequest::Walk);
+    req.throttle = Some("gentle".into());
+    req.threads = Some(1);
+    let cancel = AtomicBool::new(false);
+    let cancelled_at = std::sync::Mutex::new(None);
+    let result = run_scan(
+        &cfg,
+        &req,
+        &Recorder(state.path().to_owned()),
+        &cancel,
+        &|p| {
+            if p.dirs > 0 && !cancel.swap(true, Ordering::AcqRel) {
+                *cancelled_at.lock().unwrap() = Some(Instant::now());
+            }
+        },
+    );
+    assert!(matches!(result, Err(ScanError::Cancelled)));
+    assert!(cancelled_at.lock().unwrap().unwrap().elapsed() < Duration::from_secs(2));
+    let rows = Catalog::open(state.path(), false)
+        .unwrap()
+        .list(None)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    assert!(rows[0].file.is_none());
+    fn no_snapshots(path: &Path) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                no_snapshots(&entry.path());
+            } else {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                assert!(!name.ends_with(".db.tmp"));
+                assert!(name == "timeseries.db" || !name.ends_with(".db"));
+            }
+        }
+    }
+    no_snapshots(state.path());
+    assert!(tidemark_scan::orchestrator::ScanLock::acquire(state.path()).is_ok());
 }

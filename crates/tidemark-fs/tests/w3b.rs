@@ -301,3 +301,25 @@ fn filtered_examples_apply_limit_after_classification() {
     assert_eq!(r.examples.len(), 1);
     assert_eq!(r.examples[0].2, SymlinkClass::Dangling);
 }
+
+#[test]
+fn long_target_retries_are_charged() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = RawPath::from_path(temp.path()).unwrap();
+    let link = temp.path().join("link");
+    let opts = SymlinkOpts {
+        check_targets: false,
+        limit: 1,
+    };
+    let cancel = AtomicBool::new(false);
+    let gate = CountingGate::default();
+    symlink("short", &link).unwrap();
+    analyze(&root, &gate, &cancel, &opts).unwrap();
+    let short = gate.0.swap(0, Ordering::Relaxed);
+    std::fs::remove_file(&link).unwrap();
+    let target = "x".repeat(300);
+    symlink(&target, &link).unwrap();
+    let report = analyze(&root, &gate, &cancel, &opts).unwrap();
+    assert_eq!(report.examples[0].1, target.as_bytes());
+    assert_eq!(gate.0.load(Ordering::Relaxed), short + 1);
+}

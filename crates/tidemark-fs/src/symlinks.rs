@@ -61,8 +61,30 @@ pub struct SymlinkReport {
     /// Byte-preserving link paths and target text with classifications.
     pub examples: Vec<(RawPath, Vec<u8>, SymlinkClass)>,
 }
-fn sx(fd: &OwnedFd, gate: &dyn Gate) -> io::Result<fs::Statx> {
+// One charged syscall per attempt; at most 64 KiB retained and reused across links.
+fn read_target(
+    fd: &OwnedFd,
+    name: &[u8],
+    gate: &dyn Gate,
+    cancel: &AtomicBool,
+    buffer: &mut Vec<u8>,
+) -> io::Result<Vec<u8>> {
+    loop {
+        gate.acquire(1);
+        cancelled(cancel)?;
+        let len = fs::readlinkat_raw(fd, name, buffer.as_mut_slice())?;
+        if len < buffer.len() {
+            return Ok(buffer[..len].to_vec());
+        }
+        if buffer.len() == 65_536 {
+            return Err(io::Error::other("symlink target cap reached"));
+        }
+        buffer.resize((buffer.len() * 2).min(65_536), 0);
+    }
+}
+fn sx(fd: &OwnedFd, gate: &dyn Gate, cancel: &AtomicBool) -> io::Result<fs::Statx> {
     gate.acquire(1);
+    cancelled(cancel)?;
     Ok(fs::statx(
         fd,
         &b""[..],
@@ -70,12 +92,19 @@ fn sx(fd: &OwnedFd, gate: &dyn Gate) -> io::Result<fs::Statx> {
         StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
     )?)
 }
-fn open_one(fd: impl std::os::fd::AsFd, name: &[u8], gate: &dyn Gate) -> io::Result<OwnedFd> {
+fn open_one(
+    fd: impl std::os::fd::AsFd,
+    name: &[u8],
+    gate: &dyn Gate,
+    cancel: &AtomicBool,
+) -> io::Result<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     gate.acquire(1);
+    cancelled(cancel)?;
     match fs::openat(fd.as_fd(), name, flags | OFlags::NOATIME, Mode::empty()) {
         Err(rustix::io::Errno::PERM) => {
             gate.acquire(1);
+            cancelled(cancel)?;
             Ok(fs::openat(fd, name, flags, Mode::empty())?)
         }
         r => Ok(r?),
@@ -93,12 +122,13 @@ fn open_path(
     root: &RawPath,
     identity: Option<&fs::Statx>,
     gate: &dyn Gate,
+    cancel: &AtomicBool,
 ) -> io::Result<OwnedFd> {
-    let mut fd = open_one(CWD, b"/", gate)?;
+    let mut fd = open_one(CWD, b"/", gate, cancel)?;
     let mut bytes = vec![b'/'];
     if root.as_bytes() == b"/" {
         if let Some(id) = identity {
-            if !same_fs(id, &sx(&fd, gate)?) {
+            if !same_fs(id, &sx(&fd, gate, cancel)?) {
                 return Err(io::Error::other("root mount changed"));
             }
         }
@@ -108,13 +138,13 @@ fn open_path(
         .split(|&b| b == b'/')
         .filter(|p| !p.is_empty())
     {
-        fd = open_one(&fd, part, gate)?;
+        fd = open_one(&fd, part, gate, cancel)?;
         if bytes.len() > 1 {
             bytes.push(b'/');
         }
         bytes.extend_from_slice(part);
         if let Some(id) = identity {
-            if bytes.len() >= root.as_bytes().len() && !same_fs(id, &sx(&fd, gate)?) {
+            if bytes.len() >= root.as_bytes().len() && !same_fs(id, &sx(&fd, gate, cancel)?) {
                 return Err(io::Error::other("mount changed during analysis"));
             }
         }
@@ -144,6 +174,7 @@ fn lexical(root: &RawPath, dir: &RawPath, target: &[u8]) -> io::Result<SymlinkCl
 /// Root paths are capped at 1 MiB. Pending directories are capped at 65,536
 /// and 64 MiB of paths, directory names
 /// at one million entries and 64 MiB, and examples at one million and 64 MiB.
+/// The reusable target buffer grows from 256 bytes to at most 64 KiB.
 /// Cancellation returns Interrupted rather than a deceptively complete report.
 pub fn analyze(
     root: &RawPath,
@@ -172,9 +203,10 @@ pub fn analyze_matching(
         return Err(io::Error::other("example limit exceeds one million"));
     }
     cancelled(cancel)?;
-    let fd = open_path(root, root, None, gate)?;
-    let identity = sx(&fd, gate)?;
+    let fd = open_path(root, root, None, gate, cancel)?;
+    let identity = sx(&fd, gate, cancel)?;
     gate.acquire(1);
+    cancelled(cancel)?;
     let mounts = crate::mount::read_mountinfo()?;
     let mut mounts = crate::mount::submounts_under(&mounts, root);
     mounts.sort_unstable();
@@ -189,12 +221,13 @@ pub fn analyze_matching(
         relative: 0,
         examples: Vec::new(),
     };
+    let mut target_buffer = vec![0; 256];
     let mut buffer = vec![MaybeUninit::uninit(); 256 * 1024];
     while let Some((dir, ino)) = tasks.pop() {
         cancelled(cancel)?;
         task_bytes -= dir.as_bytes().len();
-        let fd = open_path(&dir, root, Some(&identity), gate)?;
-        let info = sx(&fd, gate)?;
+        let fd = open_path(&dir, root, Some(&identity), gate, cancel)?;
+        let info = sx(&fd, gate, cancel)?;
         if info.stx_ino != ino || !same_fs(&identity, &info) {
             return Err(io::Error::other("directory changed during analysis"));
         }
@@ -205,6 +238,7 @@ pub fn analyze_matching(
             cancelled(cancel)?;
             if iter.is_buffer_empty() {
                 gate.acquire(1);
+                cancelled(cancel)?;
             }
             let Some(entry) = iter.next() else { break };
             let entry = entry?;
@@ -228,6 +262,7 @@ pub fn analyze_matching(
                 continue;
             }
             gate.acquire(1);
+            cancelled(cancel)?;
             let stat = fs::statx(
                 &fd,
                 name.as_bytes(),
@@ -244,40 +279,45 @@ pub fn analyze_matching(
                 }
                 FileType::Symlink => {
                     report.total += 1;
-                    gate.acquire(1);
-                    let (target, class) = match fs::readlinkat(&fd, name.as_bytes(), Vec::new()) {
-                        Ok(text) => {
-                            let target = text.into_bytes();
-                            if target.starts_with(b"/") {
-                                report.absolute += 1;
-                            } else {
-                                report.relative += 1;
+                    let (target, class) =
+                        match read_target(&fd, name.as_bytes(), gate, cancel, &mut target_buffer) {
+                            Ok(target) => {
+                                if target.starts_with(b"/") {
+                                    report.absolute += 1;
+                                } else {
+                                    report.relative += 1;
+                                }
+                                let mut class = lexical(root, &dir, &target)?;
+                                if opts.check_targets {
+                                    gate.acquire(1);
+                                    cancelled(cancel)?;
+                                    class = match fs::statat(
+                                        &fd,
+                                        target.as_slice(),
+                                        AtFlags::empty(),
+                                    ) {
+                                        Ok(st)
+                                            if st.st_dev
+                                                != libc::makedev(
+                                                    identity.stx_dev_major,
+                                                    identity.stx_dev_minor,
+                                                ) =>
+                                        {
+                                            SymlinkClass::OtherFs
+                                        }
+                                        Ok(_) => class,
+                                        Err(
+                                            rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR,
+                                        ) => SymlinkClass::Dangling,
+                                        Err(rustix::io::Errno::LOOP) => SymlinkClass::Loop,
+                                        Err(_) => SymlinkClass::Unreadable,
+                                    };
+                                }
+                                (target, class)
                             }
-                            let mut class = lexical(root, &dir, &target)?;
-                            if opts.check_targets {
-                                gate.acquire(1);
-                                class = match fs::statat(&fd, target.as_slice(), AtFlags::empty()) {
-                                    Ok(st)
-                                        if st.st_dev
-                                            != libc::makedev(
-                                                identity.stx_dev_major,
-                                                identity.stx_dev_minor,
-                                            ) =>
-                                    {
-                                        SymlinkClass::OtherFs
-                                    }
-                                    Ok(_) => class,
-                                    Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => {
-                                        SymlinkClass::Dangling
-                                    }
-                                    Err(rustix::io::Errno::LOOP) => SymlinkClass::Loop,
-                                    Err(_) => SymlinkClass::Unreadable,
-                                };
-                            }
-                            (target, class)
-                        }
-                        Err(_) => (Vec::new(), SymlinkClass::Unreadable),
-                    };
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(e),
+                            Err(_) => (Vec::new(), SymlinkClass::Unreadable),
+                        };
                     for (c, count) in &mut report.by_class {
                         if *c == class {
                             *count += 1;

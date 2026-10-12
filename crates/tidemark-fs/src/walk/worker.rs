@@ -83,8 +83,8 @@ pub(super) fn run(
     }
     let start = Instant::now();
     let falls = 0;
-    let root = getdents::open_path(&cfg.root, gate)?;
-    gate.acquire(1);
+    let root = getdents::open_path(&cfg.root, gate, cancel).map_err(cancel_error)?;
+    getdents::charge(gate, cancel).map_err(cancel_error)?;
     let sx = fs::statx(
         &root,
         &b""[..],
@@ -95,7 +95,7 @@ pub(super) fn run(
     let dev = libc::makedev(sx.stx_dev_major, sx.stx_dev_minor);
     drop(root);
     let mut mounts = cfg.skip_mounts.clone();
-    gate.acquire(1);
+    getdents::charge(gate, cancel).map_err(cancel_error)?;
     match crate::mount::read_mountinfo() {
         Ok(table) => mounts.extend(crate::mount::submounts_under(&table, &cfg.root)),
         Err(e) => {
@@ -321,7 +321,10 @@ fn directory(
     buffer: &mut [MaybeUninit<u8>],
 ) -> Result<WalkOutput, WalkError> {
     let errors_before = c.errors;
-    let opened = getdents::open(&t.path, s.gate, &mut c.falls);
+    let opened = getdents::open_directory(&t.path, s.gate, &mut c.falls, s.cancel);
+    if s.cancel.load(Ordering::Acquire) {
+        return Err(WalkError::Cancelled);
+    }
     if let Err(e) = &opened {
         if race(e) {
             return gone(
@@ -337,7 +340,7 @@ fn directory(
     }
     let sx_result = match &opened {
         Ok(fd) => {
-            s.gate.acquire(1);
+            getdents::charge(s.gate, s.cancel).map_err(cancel_error)?;
             fs::statx(
                 fd,
                 &b""[..],
@@ -356,8 +359,8 @@ fn directory(
                 .path
                 .file_name()
                 .ok_or_else(|| io::Error::other("missing root name"))?;
-            let fd = getdents::open_path(&parent, s.gate)?;
-            getdents::stat(&fd, name.as_bytes(), s.gate)
+            let fd = getdents::open_path(&parent, s.gate, s.cancel)?;
+            getdents::stat(&fd, name.as_bytes(), s.gate, s.cancel)
         })(),
     };
     let sx = match sx_result {
@@ -431,8 +434,11 @@ fn directory(
             }
             let prefix_len = path_bytes.len();
             loop {
+                if s.cancel.load(Ordering::Acquire) {
+                    return Err(WalkError::Cancelled);
+                }
                 if iter.is_buffer_empty() {
-                    s.gate.acquire(1);
+                    getdents::charge(s.gate, s.cancel).map_err(cancel_error)?;
                 }
                 let Some(entry) = iter.next() else { break };
                 let entry = match entry {
@@ -503,7 +509,7 @@ fn directory(
                 }
                 let mut attrs = None;
                 let kind = if entry.file_type() == FileType::Unknown {
-                    match getdents::stat(&fd, bytes, s.gate) {
+                    match getdents::stat(&fd, bytes, s.gate, s.cancel) {
                         Ok(st) => {
                             let k = getdents::kind(FileType::from_raw_mode(st.stx_mode.into()));
                             attrs = Some(st);
@@ -575,7 +581,7 @@ fn directory(
                 }
                 let st = match attrs
                     .map(Ok)
-                    .unwrap_or_else(|| getdents::stat(&fd, bytes, s.gate))
+                    .unwrap_or_else(|| getdents::stat(&fd, bytes, s.gate, s.cancel))
                 {
                     Ok(st) => st,
                     Err(e) => {
@@ -802,6 +808,14 @@ fn charge_record(
         )));
     }
     Ok(())
+}
+
+fn cancel_error(error: io::Error) -> WalkError {
+    if error.kind() == io::ErrorKind::Interrupted {
+        WalkError::Cancelled
+    } else {
+        WalkError::Io(error)
+    }
 }
 
 #[cfg(test)]
