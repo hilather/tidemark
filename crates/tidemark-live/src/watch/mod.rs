@@ -95,9 +95,14 @@ pub struct Watcher {
     thread: Option<JoinHandle<()>>,
     mount: RawPath,
 }
+// Acknowledgements are FIFO and scoped to the current loss. Eviction is conservative.
+const LOSS_ACK_CAP: usize = 1024;
 struct State {
     rings: rings::Rings,
     dirty: BTreeSet<RawPath>,
+    loss_pending: bool,
+    loss_taken: VecDeque<RawPath>,
+    last_at: Option<i64>,
     events: u64,
     overflows: u64,
     failed: bool,
@@ -105,6 +110,20 @@ struct State {
     read_errors: u64,
     stream: Option<VecDeque<WatchEvent>>,
     dropped_events: u64,
+}
+impl State {
+    fn mark_loss(&mut self) {
+        self.dirty.clear();
+        self.loss_pending = true;
+        self.loss_taken.clear();
+    }
+    fn observe_time(&mut self, at: i64) {
+        if self.last_at.is_some_and(|last| at < last) {
+            self.mark_loss();
+            self.rings.overflow(at);
+        }
+        self.last_at = Some(at);
+    }
 }
 fn now() -> i64 {
     tidemark_core::time::unix_now()
@@ -174,6 +193,9 @@ impl Watcher {
         let state = Arc::new(Mutex::new(State {
             rings: rings::Rings::new(),
             dirty: BTreeSet::new(),
+            loss_pending: false,
+            loss_taken: VecDeque::new(),
+            last_at: None,
             events: 0,
             overflows: 0,
             failed: false,
@@ -233,10 +255,12 @@ impl Watcher {
                     }
                     {
                         let mut state = worker_state.lock();
+                        let at = now();
+                        state.observe_time(at);
                         if state.recovering {
-                            state.rings.overflow(now());
+                            state.rings.overflow(at);
                         } else {
-                            state.rings.advance(now());
+                            state.rings.advance(at);
                         }
                     }
                     if poll[0].revents().is_empty() {
@@ -289,15 +313,17 @@ impl Watcher {
     /// Sum the most recent 1–60 minute buckets and return ranked entries.
     pub fn hot(&self, window_min: u32, scope: HotScope, limit: usize) -> Vec<HotEntry> {
         let mut state = self.state.lock();
-        state.rings.advance(now());
-        state.rings.hot(now(), window_min, scope, limit)
+        let at = now();
+        state.observe_time(at);
+        state.rings.advance(at);
+        state.rings.hot(at, window_min, scope, limit)
     }
     /// Return each retained completed minute once, with at most top_k rows per scope.
     pub fn drain_completed_minutes(&self, top_k: usize) -> Vec<HotMinute> {
-        self.state
-            .lock()
-            .rings
-            .drain(now(), &self.mount.display_lossy(), top_k)
+        let mut state = self.state.lock();
+        let at = now();
+        state.observe_time(at);
+        state.rings.drain(at, &self.mount.display_lossy(), top_k)
     }
     /// Enable the optional 1,000-event foreground buffer. Daemon watchers do not allocate it.
     pub fn enable_events(&self) {
@@ -314,10 +340,26 @@ impl Watcher {
         };
         stream.drain(..limit.min(stream.len())).collect()
     }
-    /// Remove and return dirty directories underneath a component-wise root prefix.
+    /// Remove dirty entries at or below `under`, returning them in byte order.
+    /// Ancestor entries remain retained and also report `under` as dirty. After loss,
+    /// each root within the mount is reported once independently; the oldest of at
+    /// most 1,024 acknowledgements is forgotten when full and may be reported again.
     pub fn take_dirty(&self, under: &RawPath) -> Vec<RawPath> {
         let mut state = self.state.lock();
-        let paths: Vec<_> = state
+        let ancestor = state
+            .dirty
+            .iter()
+            .any(|p| p != under && under.starts_with(p));
+        let lost = under.starts_with(&self.mount)
+            && state.loss_pending
+            && !state.loss_taken.contains(under);
+        if lost {
+            if state.loss_taken.len() == LOSS_ACK_CAP {
+                state.loss_taken.pop_front();
+            }
+            state.loss_taken.push_back(under.clone());
+        }
+        let mut paths: Vec<_> = state
             .dirty
             .iter()
             .filter(|p| p.starts_with(under))
@@ -326,12 +368,18 @@ impl Watcher {
         for path in &paths {
             state.dirty.remove(path);
         }
+        if ancestor || lost {
+            paths.push(under.clone());
+            paths.sort();
+            paths.dedup();
+        }
         paths
     }
     /// Read counters and the loss indicator for the latest fifteen minute buckets.
     pub fn stats(&self) -> WatchStats {
         let mut state = self.state.lock();
         let at = now();
+        state.observe_time(at);
         if state.failed || state.recovering {
             state.rings.overflow(at);
         } else {
@@ -440,9 +488,9 @@ impl Processor<'_> {
         self.handles.clear();
         self.paths.clear();
         let mut state = state.lock();
+        state.observe_time(at);
         state.rings.overflow(at);
-        state.dirty.clear();
-        state.dirty.insert(self.cfg.mount.clone());
+        state.mark_loss();
     }
     fn transport_error(&mut self, error: &io::Error, at: i64, state: &Mutex<State>) -> bool {
         self.loss(at, state);
@@ -557,6 +605,7 @@ impl Processor<'_> {
             .unwrap_or_else(|| cfg.mount.clone());
         let key = dir_key(&parent, &cfg.mount, cfg.hot_depth);
         let mut state = state.lock();
+        state.observe_time(at);
         state.events = state.events.saturating_add(1);
         if let Some(stream) = &mut state.stream {
             let full = stream.len() == 1000;
@@ -653,6 +702,9 @@ mod tests {
         Mutex::new(State {
             rings: rings::Rings::new(),
             dirty: BTreeSet::new(),
+            loss_pending: false,
+            loss_taken: VecDeque::new(),
+            last_at: None,
             events: 0,
             overflows: 0,
             failed: false,
@@ -661,6 +713,144 @@ mod tests {
             stream: None,
             dropped_events: 0,
         })
+    }
+    fn dirty_watcher() -> Watcher {
+        Watcher {
+            mode: WatchMode::FdMount,
+            state: Arc::new(empty_state()),
+            shutdown: Arc::new(
+                rustix::event::eventfd(0, rustix::event::EventfdFlags::NONBLOCK).unwrap(),
+            ),
+            stopping: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            mount: raw("/data"),
+        }
+    }
+    fn raw(path: &str) -> RawPath {
+        RawPath::new(path.as_bytes().to_vec()).unwrap()
+    }
+    fn overflow(watcher: &Watcher) {
+        let temp = tempfile::tempdir().unwrap();
+        let mount_fd = std::fs::File::open(temp.path()).unwrap();
+        let cfg = WatcherOptions {
+            mount: watcher.mount.clone(),
+            events: vec![],
+            hot_depth: 6,
+            exclude_prefixes: vec![],
+            lru_entries: 10,
+        };
+        let attribution = AttributionCache::new(std::time::Duration::from_secs(60), 10);
+        let mut processor = Processor {
+            cfg: &cfg,
+            attribution: &attribution,
+            mount_fd: mount_fd.as_fd(),
+            sizes: fdmode::Sizes::new(10, 120),
+            paths: fidmode::PathSizes::new(10),
+            handles: fidmode::HandlePaths::new(10),
+        };
+        processor.process(RawEvent::Overflow, 120, &watcher.state);
+    }
+    #[test]
+    fn overflow_keeps_nested_scan_root_dirty() {
+        let watcher = dirty_watcher();
+        let root = raw("/data/reports");
+        watcher.state.lock().dirty.insert(root.clone());
+        overflow(&watcher);
+        assert_eq!(watcher.take_dirty(&root), vec![root.clone()]);
+        assert!(watcher.take_dirty(&root).is_empty());
+    }
+    #[test]
+    fn loss_acknowledgements_are_independent_in_both_orders() {
+        for (a, b) in [
+            ("/data/reports", "/data/logs"),
+            ("/data", "/data/reports"),
+            ("/data/reports", "/data/reports/nested"),
+        ] {
+            for (first, second) in [(a, b), (b, a)] {
+                let watcher = dirty_watcher();
+                overflow(&watcher);
+                for root in [raw(first), raw(second)] {
+                    assert_eq!(watcher.take_dirty(&root), vec![root.clone()]);
+                    assert!(watcher.take_dirty(&root).is_empty());
+                }
+                assert!(watcher.take_dirty(&raw(first)).is_empty());
+                overflow(&watcher);
+                assert_eq!(watcher.take_dirty(&raw(first)), vec![raw(first)]);
+                assert_eq!(watcher.take_dirty(&raw(second)), vec![raw(second)]);
+            }
+        }
+    }
+    #[test]
+    fn ancestor_dirty_entry_is_retained_and_descendants_are_removed() {
+        let watcher = dirty_watcher();
+        let ancestor = raw("/data/reports");
+        let root = raw("/data/reports/nested");
+        let child = raw("/data/reports/nested/z");
+        watcher
+            .state
+            .lock()
+            .dirty
+            .extend([ancestor.clone(), root.clone(), child.clone()]);
+        assert_eq!(watcher.take_dirty(&root), vec![root.clone(), child]);
+        assert_eq!(watcher.take_dirty(&root), vec![root]);
+        assert_eq!(
+            watcher.take_dirty(&raw("/data/reports/other")),
+            vec![raw("/data/reports/other")]
+        );
+        assert_eq!(watcher.take_dirty(&ancestor), vec![ancestor]);
+        assert!(watcher.state.lock().dirty.is_empty());
+    }
+    #[test]
+    fn loss_acknowledgements_are_bounded_and_forgetting_is_conservative() {
+        let watcher = dirty_watcher();
+        overflow(&watcher);
+        assert!(watcher.take_dirty(&raw("/database")).is_empty());
+        for n in 0..=LOSS_ACK_CAP {
+            let root = raw(&format!("/data/{n}"));
+            assert_eq!(watcher.take_dirty(&root), vec![root.clone()]);
+            assert!(watcher.take_dirty(&root).is_empty());
+            assert!(watcher.state.lock().loss_taken.len() <= LOSS_ACK_CAP);
+        }
+        assert_eq!(
+            watcher.state.lock().loss_taken.front(),
+            Some(&raw("/data/1"))
+        );
+        assert_eq!(watcher.take_dirty(&raw("/data/0")), vec![raw("/data/0")]);
+        for _ in 0..10 {
+            overflow(&watcher);
+            assert!(watcher.state.lock().loss_taken.is_empty());
+            assert_eq!(watcher.take_dirty(&raw("/data/0")), vec![raw("/data/0")]);
+        }
+    }
+    #[test]
+    fn no_loss_preserves_sorted_descendant_drain() {
+        let watcher = dirty_watcher();
+        let root = raw("/data/reports");
+        let sibling = raw("/data/reports-other");
+        let paths = vec![root.clone(), raw("/data/reports/a"), raw("/data/reports/z")];
+        watcher
+            .state
+            .lock()
+            .dirty
+            .extend(paths.iter().cloned().chain([sibling.clone()]));
+        assert_eq!(watcher.take_dirty(&root), paths);
+        assert!(watcher.take_dirty(&root).is_empty());
+        assert_eq!(watcher.take_dirty(&raw("/data")), vec![sibling]);
+        assert!(watcher.state.lock().loss_taken.is_empty());
+    }
+    #[test]
+    fn rollback_invalidates_each_root_again() {
+        let watcher = dirty_watcher();
+        overflow(&watcher);
+        let root = raw("/data/reports");
+        assert_eq!(watcher.take_dirty(&root), vec![root.clone()]);
+        watcher.state.lock().observe_time(60);
+        assert_eq!(watcher.take_dirty(&root), vec![root.clone()]);
+        assert!(watcher.take_dirty(&root).is_empty());
+        assert_eq!(
+            watcher.take_dirty(&raw("/data/logs")),
+            vec![raw("/data/logs")]
+        );
     }
     #[test]
     fn synthetic_event_processing_exclusions_attribution_and_cleanup() {
