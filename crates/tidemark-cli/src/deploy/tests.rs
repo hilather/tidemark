@@ -127,7 +127,11 @@ impl Env for FakeEnv {
     fn local_directory(&self, path: &Path) -> io::Result<()> {
         self.probe("roots")?;
         real::local_filesystem(
-            if self.filesystem_path.as_deref().is_none_or(|p| p == path) {
+            if self
+                .filesystem_path
+                .as_deref()
+                .is_none_or(|p| real::existing_ancestor(p).is_ok_and(|ancestor| ancestor == path))
+            {
                 self.filesystem
             } else {
                 "xfs"
@@ -262,7 +266,7 @@ fn preflight_all_environment_checks_and_config_validation() {
                 CheckStatus::Fail
             }
         );
-        assert_eq!(checks.len(), 8);
+        assert_eq!(checks.len(), 9);
     }
     cfg.general.state_dir = PathBuf::from("relative");
     assert_eq!(

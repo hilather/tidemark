@@ -28,6 +28,9 @@ enum Setup {
     Mode(u32),
     ForeignOwner,
     NonLocal,
+    MissingState(&'static str),
+    StateFilesystem(&'static str),
+    NonLocalData,
     Full,
     MissingArtifact(usize),
     ProbeFailure(&'static str),
@@ -59,6 +62,54 @@ struct Row {
 // 08 §1.3/§5: success 0, runtime/compensation failure 1, blocking
 // pre-flight/unsafe unstage 5, verify unhealthy (including absent API) 6.
 const ROWS: &[Row] = &[
+    Row {
+        name: "existing NFS state",
+        command: Command::Stage,
+        setup: Setup::StateFilesystem("nfs"),
+        code: 5,
+        calls: &[],
+        effects: Effects::Unchanged,
+    },
+    Row {
+        name: "missing state local",
+        command: Command::Stage,
+        setup: Setup::MissingState("ext4"),
+        code: 0,
+        calls: &["enable"],
+        effects: Effects::Installed,
+    },
+    Row {
+        name: "missing state NFS ancestor",
+        command: Command::Stage,
+        setup: Setup::MissingState("nfs"),
+        code: 5,
+        calls: &[],
+        effects: Effects::Unchanged,
+    },
+    Row {
+        name: "unknown state filesystem",
+        command: Command::Stage,
+        setup: Setup::StateFilesystem("unknown-test-fs"),
+        code: 5,
+        calls: &[],
+        effects: Effects::Unchanged,
+    },
+    Row {
+        name: "unstage NFS state",
+        command: Command::Unstage(false),
+        setup: Setup::NonLocalData,
+        code: 0,
+        calls: &["disable_now"],
+        effects: Effects::Retained,
+    },
+    Row {
+        name: "purge NFS state",
+        command: Command::Unstage(true),
+        setup: Setup::NonLocalData,
+        code: 0,
+        calls: &["disable_now"],
+        effects: Effects::Purged,
+    },
     Row {
         name: "valid backup",
         command: Command::Stage,
@@ -417,6 +468,26 @@ fn run_row(row: &Row) {
             f.env.filesystem = "nfs";
             f.env.filesystem_path = Some(f.state.clone());
         }
+        Setup::MissingState(kind) => {
+            // Two absent components ensure the probe uses the longest existing ancestor.
+            f.state = f._dir.path().join("missing/state");
+            fs::write(
+                &f.source,
+                format!(
+                    "[general]\nstate_dir = {:?}\n[[roots]]\npath = {:?}\n",
+                    f.state, root
+                ),
+            )
+            .unwrap();
+            f.env.filesystem = kind;
+            f.env.filesystem_path = Some(f._dir.path().to_path_buf());
+        }
+        Setup::StateFilesystem(kind) => {
+            fs::create_dir(&f.state).unwrap();
+            fs::set_permissions(&f.state, fs::Permissions::from_mode(0o700)).unwrap();
+            f.env.filesystem = kind;
+            f.env.filesystem_path = Some(f.state.clone());
+        }
         Setup::Full => f.env.capacity = (0, 10 << 30),
         Setup::MissingArtifact(index) => fs::remove_file(&f.env.required[index]).unwrap(),
         Setup::ProbeFailure(name) => f.env.failures = vec![name],
@@ -437,7 +508,7 @@ fn run_row(row: &Row) {
         }
         Setup::PublicationFailure => f.env.fail_record.set(true),
         Setup::EnableFailure => f.sys.fail_enable.set(true),
-        Setup::Staged | Setup::Disabled | Setup::Data => {
+        Setup::Staged | Setup::Disabled | Setup::Data | Setup::NonLocalData => {
             let record = f.stage();
             if matches!(row.command, Command::Verify(_)) {
                 f.report(&record.config_sha256, true);
@@ -446,7 +517,7 @@ fn run_row(row: &Row) {
             if matches!(row.setup, Setup::Disabled) {
                 f.sys.enabled.set(false);
             }
-            if matches!(row.setup, Setup::Data) {
+            if matches!(row.setup, Setup::Data | Setup::NonLocalData) {
                 fs::write(f.state.join("keep.db"), b"own data").unwrap();
                 fs::create_dir(f.state.join("nested")).unwrap();
                 fs::write(f.state.join("nested/file"), b"own data").unwrap();
@@ -457,6 +528,10 @@ fn run_row(row: &Row) {
                 f.sys.active.set(true);
             }
         }
+    }
+    if matches!(row.setup, Setup::NonLocalData) {
+        f.env.filesystem = "nfs";
+        f.env.filesystem_path = Some(f.state.clone());
     }
     f.sys.calls.borrow_mut().clear();
     f.sys.queries.set(0);
@@ -516,6 +591,22 @@ fn run_row(row: &Row) {
                     record.config_sha256,
                     format!("{:x}", Sha256::digest(fs::read(&f.source).unwrap()))
                 );
+            }
+            if matches!(
+                row.setup,
+                Setup::NonLocal | Setup::MissingState("nfs") | Setup::StateFilesystem(_)
+            ) {
+                let DeployError::Preflight(checks) = result.as_ref().unwrap_err() else {
+                    panic!("expected filesystem pre-flight refusal");
+                };
+                let check = checks
+                    .iter()
+                    .find(|check| check.name == "state_filesystem")
+                    .unwrap();
+                assert_eq!(check.status, CheckStatus::Fail);
+                assert!(check.detail.contains(&f.state.display().to_string()));
+                assert!(check.detail.contains(f.env.filesystem));
+                assert_eq!(f.env.mutations.get(), 0);
             }
             command_code(result)
         }
@@ -638,7 +729,6 @@ fn deployment_scenario_table() {
 }
 
 #[test]
-#[ignore = "bug: stage does not reject a non-local state filesystem"]
 fn deployment_scenario_nonlocal_state() {
     // No tracked roots on nfs: only the state filesystem is non-local. The
     // injected classifier would reject it if production queried that path.

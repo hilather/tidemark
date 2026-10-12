@@ -17,7 +17,7 @@ pub struct RealEnv {
     /// Injected Unix timestamp.
     pub now: i64,
 }
-fn existing_ancestor(path: &Path) -> io::Result<&Path> {
+pub(super) fn existing_ancestor(path: &Path) -> io::Result<&Path> {
     for parent in path.ancestors() {
         match std::fs::metadata(parent) {
             Ok(_) => return Ok(parent),

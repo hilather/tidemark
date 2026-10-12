@@ -50,6 +50,7 @@ impl<'de> Deserialize<'de> for CheckResult {
             "roots",
             "mounts",
             "state_space",
+            "state_filesystem",
             "fanotify",
             "bulkstat",
             "lvm",
@@ -269,6 +270,7 @@ fn preflight_with_skips(cfg: &Config, env: &dyn Env, skips: &[String]) -> Vec<Ch
         outcome("installation", false, state_guard(&cfg.general.state_dir, Some(cfg)).and_then(|()| files::inspect(env.config_path())).and_then(|()| env.installation(cfg))),
         check("config", if issues.is_empty() { CheckStatus::Pass } else { CheckStatus::Fail }, if issues.is_empty() { "valid".into() } else { issues.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ") }),
         outcome("roots", false, all_paths(cfg.roots.iter().map(|root| &root.path), |path| env.local_directory(path))),
+        outcome("state_filesystem", false, all_paths(std::iter::once(&cfg.general.state_dir), |path| real::existing_ancestor(path).and_then(|ancestor| env.local_directory(ancestor)))),
         outcome("mounts", false, all_paths(cfg.sampler.mounts.iter().chain(&cfg.watch.mounts), |path| env.mount_point(path))),
         outcome("state_space", false, env.capacity(&cfg.general.state_dir).and_then(|(available, total)| {
             if total > 0 && available >= 2 * 1024 * 1024 * 1024 && (available as f64 / total as f64 * 100.0) >= cfg.retention.min_free_pct { Ok(()) }
