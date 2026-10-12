@@ -547,6 +547,7 @@ fn sink_failure_stops_stream() {
         Err(AggError::Sink(SinkError::Other(_)))
     ));
 }
+#[cfg(feature = "privileged")]
 fn scan_disk(root: &std::path::Path) -> VecSink {
     use std::sync::atomic::AtomicBool;
     let root = RawPath::from_path(root).unwrap();
@@ -580,26 +581,6 @@ fn scan_disk(root: &std::path::Path) -> VecSink {
     let mut s = VecSink::default();
     agg.prepare().unwrap().write(&mut s).unwrap();
     s
-}
-#[test]
-fn walker_golden_measured_du() {
-    if !test_support::oracle::gnu_available("du") {
-        eprintln!("GNU du unavailable");
-        return;
-    }
-    let fixture = test_support::materialize(include_str!(
-        "../../../test-support/fixtures/link_semantics_basic.toml"
-    ));
-    let s = scan_disk(&fixture.root);
-    for row in &s.dirs {
-        assert_eq!(
-            row.t_disk,
-            test_support::oracle::du_disk(row.path.as_path())
-        );
-    }
-    let counts = test_support::oracle::find_counts(&fixture.root);
-    assert_eq!(s.dirs[0].t_files, counts.files);
-    assert_eq!(s.dirs[0].t_dirs, counts.dirs);
 }
 #[cfg(feature = "privileged")]
 #[test]

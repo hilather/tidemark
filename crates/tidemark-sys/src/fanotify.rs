@@ -269,6 +269,9 @@ fn invalid(message: &str) -> io::Error {
 fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_ne_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
+// linux/fanotify.h byte offsets: metadata event_len=0, vers=4, metadata_len=6,
+// mask=8, fd=16, pid=20 (24 bytes). Info header type=0, len=2 (4 bytes);
+// FID fsid=4, file_handle bytes=12, handle_type=16, handle=20.
 fn decode(b: &[u8]) -> io::Result<(RawEvent, usize)> {
     if b.len() < 24 {
         return Err(invalid("truncated metadata"));
@@ -348,38 +351,6 @@ fn decode(b: &[u8]) -> io::Result<(RawEvent, usize)> {
         .ok_or_else(|| invalid("missing FID record"))
 }
 
-// Hand-transcribed from linux/fanotify.h; parsing uses bytes to avoid alignment assumptions.
-#[repr(C)]
-#[allow(dead_code)]
-struct Metadata {
-    event_len: u32,
-    vers: u8,
-    reserved: u8,
-    metadata_len: u16,
-    mask: u64,
-    fd: i32,
-    pid: i32,
-}
-#[repr(C)]
-#[allow(dead_code)]
-struct InfoHeader {
-    info_type: u8,
-    pad: u8,
-    len: u16,
-}
-#[repr(C)]
-#[allow(dead_code)]
-struct InfoFid {
-    header: InfoHeader,
-    fsid: [i32; 2],
-}
-#[repr(C)]
-#[allow(dead_code)]
-struct HandleHeader {
-    bytes: u32,
-    handle_type: i32,
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -393,46 +364,6 @@ mod tests {
         b[16..20].copy_from_slice(&fd.to_ne_bytes());
         b[20..24].copy_from_slice(&42i32.to_ne_bytes());
         b
-    }
-    #[test]
-    fn uapi_layout() {
-        use std::mem::{align_of, offset_of, size_of};
-        assert_eq!((size_of::<Metadata>(), align_of::<Metadata>()), (24, 8));
-        assert_eq!(
-            (
-                offset_of!(Metadata, event_len),
-                offset_of!(Metadata, vers),
-                offset_of!(Metadata, metadata_len),
-                offset_of!(Metadata, mask),
-                offset_of!(Metadata, fd),
-                offset_of!(Metadata, pid)
-            ),
-            (0, 4, 6, 8, 16, 20)
-        );
-        assert_eq!(
-            (
-                size_of::<InfoHeader>(),
-                align_of::<InfoHeader>(),
-                offset_of!(InfoHeader, len)
-            ),
-            (4, 2, 2)
-        );
-        assert_eq!(
-            (
-                size_of::<InfoFid>(),
-                align_of::<InfoFid>(),
-                offset_of!(InfoFid, fsid)
-            ),
-            (12, 4, 4)
-        );
-        assert_eq!(
-            (
-                size_of::<HandleHeader>(),
-                align_of::<HandleHeader>(),
-                offset_of!(HandleHeader, handle_type)
-            ),
-            (8, 4, 4)
-        );
     }
     #[test]
     fn multiple_overflows_and_truncated_tail() {

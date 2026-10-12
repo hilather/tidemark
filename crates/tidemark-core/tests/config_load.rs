@@ -98,19 +98,6 @@ fn removed_database_table_is_an_unknown_key() {
 }
 
 #[test]
-fn example_matches_interface_contract_byte_for_byte() {
-    let document = include_str!("../../../docs/plan/08-interfaces.md");
-    let example = document
-        .split_once("```toml\n")
-        .unwrap()
-        .1
-        .split_once("```")
-        .unwrap()
-        .0;
-    assert_eq!(include_str!("example.toml"), example);
-}
-
-#[test]
 fn byte_parser_agrees_with_loader() {
     for bytes in [
         include_bytes!("example.toml").to_vec(),

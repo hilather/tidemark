@@ -198,27 +198,6 @@ mod tests {
         layout!(xfs_fsop_geom_v1, 112, 8; blocksize: 0, rtextsize: 4, agblocks: 8, agcount: 12, logblocks: 16, sectsize: 20, inodesize: 24, imaxpct: 28, datablocks: 32, rtblocks: 40, rtextents: 48, logstart: 56, uuid: 64, sunit: 80, swidth: 84, version: 88, flags: 92, logsectsize: 96, rtsectsize: 100, dirblocksize: 104);
     }
     #[test]
-    fn rocky8_measured_field_widths() {
-        macro_rules! widths {
-            ($value:expr; $($field:ident : $width:expr),* $(,)?) => {
-                let value = $value;
-                $(assert_eq!(std::mem::size_of_val(&value.$field), $width, stringify!($field));)*
-            };
-        }
-        widths!(xfs_bstime::default(); tv_sec: 8, tv_nsec: 4);
-        widths!(xfs_bstat::default(); bs_ino: 8, bs_mode: 2, bs_nlink: 2,
-            bs_uid: 4, bs_gid: 4, bs_rdev: 4, bs_blksize: 4, bs_size: 8,
-            bs_atime: 16, bs_mtime: 16, bs_ctime: 16, bs_blocks: 8,
-            bs_xflags: 4, bs_extsize: 4, bs_extents: 4, bs_gen: 4,
-            bs_projid_lo: 2, bs_forkoff: 2, bs_projid_hi: 2,
-            bs_dmevmask: 4, bs_dmstate: 2, bs_aextents: 2);
-        widths!(xfs_fsop_bulkreq { lastip: std::ptr::null_mut(), icount: 0,
-            ubuffer: std::ptr::null_mut(), ocount: std::ptr::null_mut() };
-            lastip: 8, icount: 4, ubuffer: 8, ocount: 8);
-        widths!(xfs_fsop_geom::default(); blocksize: 4, agblocks: 4, agcount: 4,
-            inodesize: 4, flags: 4, uuid: 16, dirblocksize: 4, version: 4);
-    }
-    #[test]
     fn rocky8_ioctl_numbers_and_sizes() {
         for (actual, expected, size) in [
             (

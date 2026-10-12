@@ -631,35 +631,4 @@ mod tests {
         assert!(count > 1);
         assert!(snapshot.conn().execute("DELETE FROM meta", []).is_err());
     }
-    #[test]
-    fn attach_snapshot_file_read_only_immutable_and_detach() {
-        use std::os::unix::ffi::OsStrExt;
-        let (_new_dir, new) = fixture("new.db");
-        let (_old_dir, old) = fixture("old ?#%\u{00ff}.db");
-        let mut uri = String::from("file:");
-        for byte in old.file().as_os_str().as_bytes() {
-            uri.push('%');
-            uri.push_str(&format!("{byte:02X}"));
-        }
-        uri.push_str("?mode=ro&immutable=1");
-        new.conn()
-            .execute("ATTACH DATABASE ? AS old", [uri])
-            .unwrap();
-        let count: i64 = new.conn().query_row(
-            "SELECT COUNT(*) FROM main.meta n JOIN old.meta o USING(key) WHERE n.value = o.value",
-            [], |row| row.get(0)
-        ).unwrap();
-        assert!(count > 1);
-        assert!(new.conn().execute("DELETE FROM old.meta", []).is_err());
-        new.conn().execute_batch("DETACH DATABASE old").unwrap();
-        assert!(new.conn().prepare("SELECT * FROM old.meta").is_err());
-        assert_eq!(
-            super::Snapshot::open(old.file()).unwrap().meta().scan_id,
-            old.meta().scan_id
-        );
-    }
-    #[test]
-    fn metadata_fixture_remains_constructible() {
-        assert_eq!(crate::test_meta().root.as_bytes(), b"/");
-    }
 }

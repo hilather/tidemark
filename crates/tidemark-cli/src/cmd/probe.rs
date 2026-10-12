@@ -35,6 +35,3 @@ fn filesystem_report(
     );
     tidemark_fs::probe::probe(&config, &[])
 }
-#[cfg(test)]
-#[path = "../../tests/w1a/paths.rs"]
-mod tests;

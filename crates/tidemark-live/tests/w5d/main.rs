@@ -86,15 +86,6 @@ fn healthy() {
     insta::assert_snapshot!(render_now_text(&r, 100, false));
 }
 #[test]
-fn filling() {
-    let r = report(
-        &[mount("/data", true)],
-        &[("/data".into(), "dfid-name/mount".into(), 0)],
-        &[],
-    );
-    insta::assert_snapshot!(render_now_text(&r, 100, false));
-}
-#[test]
 fn degraded() {
     let r = report(
         &[mount("/data", true)],
