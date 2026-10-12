@@ -141,6 +141,7 @@ fn matched(dents: &[DentRef], inode: Option<BulkInode>) -> Result<Joined, BulkEr
         kind: kind(i.mode),
         nlink: i.nlink,
         disk: i.disk_bytes,
+        // Regular-file size follows the on-disk inode and can lag until data writeback.
         apparent: i.size,
         mtime: i.mtime,
         projid: Some(i.projid),

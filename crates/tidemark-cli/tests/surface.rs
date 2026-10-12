@@ -91,6 +91,9 @@ fn complete_command_and_flag_tree() {
         assert!(help.contains(name));
         let command = tree.find_subcommand_mut(name).unwrap();
         let help = command.render_long_help().to_string();
+        if name == "scan" {
+            assert!(help.contains("apparent sizes of files still being written may lag"));
+        }
         for flag in flags {
             let argument = command
                 .get_arguments()

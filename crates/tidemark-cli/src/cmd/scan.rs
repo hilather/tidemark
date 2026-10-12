@@ -7,7 +7,7 @@ pub struct Args {
     /// Root path to scan or select.
     #[arg(value_name = "ROOT")]
     pub root: Option<std::path::PathBuf>,
-    /// Scan mode: auto, walk or bulk.
+    /// Scan mode: auto, walk or bulk; bulk apparent sizes of files still being written may lag.
     #[arg(long, value_parser = ["auto", "walk", "bulk"])]
     pub mode: Option<String>,
     /// Scan throttle preset.
