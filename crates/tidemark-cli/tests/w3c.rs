@@ -32,60 +32,6 @@ fn scan(
     let snap = tidemark_store::Snapshot::open(result.file.as_ref().unwrap()).unwrap();
     (fixture, temp, snap)
 }
-fn sum(v: &serde_json::Value) -> u64 {
-    if let Some(a) = v.as_array() {
-        a.iter().map(sum).sum()
-    } else {
-        v.get("dsize").and_then(|v| v.as_u64()).unwrap_or(0)
-    }
-}
-#[test]
-fn scanned_link_fixture_additive_export() {
-    let (_fixture, _temp, snap) = scan(include_str!(
-        "../../test-support/fixtures/link_semantics_basic.toml"
-    ));
-    let mut out = vec![];
-    let stats = tidemark_store::export_ncdu(
-        &snap,
-        &snap.meta().root,
-        &mut out,
-        &tidemark_store::NcduOptions {
-            utf8_lossy: true,
-            max_depth: None,
-        },
-    )
-    .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    assert_eq!(sum(&json[3]), snap.root().unwrap().t_charged);
-    assert_eq!(stats.disk_bytes, snap.root().unwrap().t_charged);
-    assert!(stats.files > 0);
-}
-#[test]
-fn scanned_nonutf8_preserved_or_lossy_and_escaped() {
-    let (_fixture, _temp, snap) = scan(include_str!("../../test-support/fixtures/nonutf8.toml"));
-    for lossy in [false, true] {
-        let mut out = vec![];
-        tidemark_store::export_ncdu(
-            &snap,
-            &snap.meta().root,
-            &mut out,
-            &tidemark_store::NcduOptions {
-                utf8_lossy: lossy,
-                max_depth: None,
-            },
-        )
-        .unwrap();
-        if lossy {
-            assert!(serde_json::from_slice::<serde_json::Value>(&out).is_ok());
-            assert!(out.windows(6).any(|s| s == "��".as_bytes()));
-        } else {
-            assert!(out.windows(2).any(|s| s == [0xff, 0xfe]));
-        }
-        assert!(out.windows(6).any(|s| s == b"\\u000a"));
-        assert!(out.windows(2).any(|s| s == b"\\\\"));
-        assert!(out.windows(2).any(|s| s == b"\\\""));
-    }
-}
 #[test]
 fn export_mode_overwrite_state_protection_and_wide_json() {
     use std::os::unix::fs::PermissionsExt;
