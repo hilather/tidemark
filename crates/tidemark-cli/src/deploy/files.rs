@@ -388,6 +388,14 @@ fn marker_authorizes(state: &OwnedFd, path: &Path) -> io::Result<bool> {
 }
 fn eligible(fd: &OwnedFd, path: &Path, marked: bool) -> io::Result<()> {
     let stat = fs::fstat(fd)?;
+    #[cfg(test)]
+    let stat = FOREIGN_OWNER.with(|owner| {
+        let mut stat = stat;
+        if owner.borrow().as_deref() == Some(path) {
+            stat.st_uid = rustix::process::geteuid().as_raw().wrapping_add(1);
+        }
+        stat
+    });
     if !marked && (stat.st_uid != rustix::process::geteuid().as_raw() || stat.st_mode & 0o077 != 0)
     {
         return Err(io::Error::other(format!("unsafe directory {}: owner {}, mode {:04o}; requires effective-uid ownership and no group/world permissions", path.display(), stat.st_uid, stat.st_mode & 0o7777)));
@@ -433,4 +441,10 @@ pub(crate) fn optional_at(parent: Option<&OwnedFd>, name: &str) -> io::Result<Op
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+// Test-only installation metadata injection; default metadata is untouched.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FOREIGN_OWNER: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
 }
