@@ -49,3 +49,18 @@ pub fn start(
 ) -> Result<(Sender, crate::ServiceHandle), crate::DaemonError> {
     Err(crate::DaemonError::NotYetImplemented)
 }
+
+/// Maximum queued persistence messages. Producers use try_send and report loss on full.
+pub const CHANNEL_CAPACITY: usize = 64;
+/// Maximum rows accepted in a single message (dir-series permits 20,000).
+pub const MAX_BATCH_ROWS: usize = 20_000;
+/// Injectable-time writer entry point; all other signatures remain compatible.
+pub fn start_with_clock(
+    config: std::sync::Arc<tidemark_core::config::Config>,
+    state: crate::state::LiveState,
+    shutdown: crate::Shutdown,
+    clock: crate::Clock,
+) -> Result<(Sender, crate::ServiceHandle), crate::DaemonError> {
+    let _ = (config, state, shutdown, clock);
+    Err(crate::DaemonError::NotYetImplemented)
+}
