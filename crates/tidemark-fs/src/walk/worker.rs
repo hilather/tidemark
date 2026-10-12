@@ -379,10 +379,14 @@ fn directory(
         Err(e) => return Err(e.into()),
     };
     let dev = libc::makedev(sx.stx_dev_major, sx.stx_dev_minor);
-    if dev != s.dev {
-        return gone(t, GoneReason::OtherFs, c);
-    }
-    if t.parent.is_some() && s.mount_id != 0 && sx.stx_mnt_id != s.mount_id {
+    if super::boundary_reason(
+        s.dev,
+        if t.parent.is_some() { s.mount_id } else { 0 },
+        dev,
+        sx.stx_mnt_id,
+    )
+    .is_some()
+    {
         return gone(t, GoneReason::OtherFs, c);
     }
     if t.ino.is_some_and(|ino| ino != sx.stx_ino)
@@ -602,7 +606,7 @@ fn directory(
                     }
                 };
                 let entry_dev = libc::makedev(st.stx_dev_major, st.stx_dev_minor);
-                if entry_dev != s.dev || (s.mount_id != 0 && st.stx_mnt_id != s.mount_id) {
+                if super::boundary_reason(s.dev, s.mount_id, entry_dev, st.stx_mnt_id).is_some() {
                     charge_record(
                         s.cfg,
                         &t.path,

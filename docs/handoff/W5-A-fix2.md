@@ -36,7 +36,7 @@ All new tests are unit tests in the owned watcher module, with injected times an
 
 ## Shared-file edits and deviations
 
-No shared-file edits, dependencies, manifest/lockfile changes, unsafe code, or uid/group checks. Only the watcher module and this handoff changed. The handoff is at `7055/W5-A-fix2.md` because the canonical submission script explicitly allows and requires that path, superseding the task prose's `docs/handoff/` destination.
+No shared-file edits, dependencies, manifest/lockfile changes, unsafe code, or uid/group checks. Only the watcher module and this handoff changed.
 
 ## Validation
 

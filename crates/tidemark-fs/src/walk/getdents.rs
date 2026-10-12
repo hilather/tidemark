@@ -52,18 +52,20 @@ pub(super) fn open_path(
     open_flags(path, gate, &mut 0, true, cancel)
 }
 
-fn open_attempts<T>(
+/// Inject a directory-open attempt; flags include NOATIME first and omit it only after EPERM.
+#[doc(hidden)]
+pub fn open_attempts<T>(
     gate: &dyn Gate,
     cancel: &AtomicBool,
     falls: &mut u64,
-    mut attempt: impl FnMut(bool) -> rustix::io::Result<T>,
+    mut attempt: impl FnMut(OFlags) -> rustix::io::Result<T>,
 ) -> io::Result<T> {
     charge(gate, cancel)?;
-    match attempt(true) {
+    match attempt(OFlags::NOATIME) {
         Err(rustix::io::Errno::PERM) => {
             *falls += 1;
             charge(gate, cancel)?;
-            Ok(attempt(false)?)
+            Ok(attempt(OFlags::empty())?)
         }
         result => Ok(result?),
     }
@@ -100,17 +102,7 @@ fn open_flags(
         cancel: &AtomicBool,
     ) -> io::Result<OwnedFd> {
         open_attempts(gate, cancel, falls, |noatime| {
-            fs::openat(
-                fd.as_fd(),
-                name,
-                flags
-                    | if noatime {
-                        OFlags::NOATIME
-                    } else {
-                        OFlags::empty()
-                    },
-                Mode::empty(),
-            )
+            fs::openat(fd.as_fd(), name, flags | noatime, Mode::empty())
         })
     }
     let mut parts = path
@@ -303,7 +295,7 @@ mod checked_tests {
         let mut attempts = 0;
         super::open_attempts(&gate, &cancel, &mut falls, |noatime| {
             attempts += 1;
-            if noatime {
+            if noatime.contains(rustix::fs::OFlags::NOATIME) {
                 Err(rustix::io::Errno::PERM)
             } else {
                 Ok(())
