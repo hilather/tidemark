@@ -703,10 +703,12 @@ pub fn reload_callback(path: std::path::PathBuf, state: state::LiveState) -> api
     })
 }
 #[path = "../../tidemark-cli/src/deploy/files.rs"]
-// The firstboot module independently includes this private helper. Reuse avoids policy drift.
+// firstboot::files is private; both inclusions share the CLI-owned policy source.
 #[allow(dead_code, clippy::duplicate_mod)]
 mod state_files;
-fn validate_state_paths(c: &tidemark_core::config::Config) -> Result<(), DaemonError> {
+fn validate_state_paths(
+    c: &tidemark_core::config::Config,
+) -> Result<(Option<std::os::fd::OwnedFd>, Option<std::os::fd::OwnedFd>), DaemonError> {
     state_files::validate_state(
         &c.general.state_dir,
         c.roots
@@ -752,48 +754,28 @@ fn validate_state_paths(c: &tidemark_core::config::Config) -> Result<(), DaemonE
             )?;
         }
     }
-    // A present marker must identify this directory and a safe config/root set.
-    if c.general.state_dir.join(".tidemark-state.json").exists() {
-        state_files::validate_marker_roots(&c.general.state_dir).map_err(|source| {
+    // Check eligibility without creating anything, and retain the checked handles.
+    let (state, deploy) =
+        state_files::state_handles(&c.general.state_dir, false).map_err(|source| {
             DaemonError::Io {
-                context: "validate state marker".into(),
+                context: "open eligible state directories".into(),
                 source,
             }
         })?;
-    }
-    Ok(())
+    state_files::validate_marker_roots_at(&c.general.state_dir, state.as_ref()).map_err(
+        |source| DaemonError::Io {
+            context: "validate state marker".into(),
+            source,
+        },
+    )?;
+    Ok((state, deploy))
 }
 fn prepare_state(c: &tidemark_core::config::Config) -> Result<std::os::fd::OwnedFd, DaemonError> {
     use rustix::fs::{self, AtFlags, FileType};
-    validate_state_paths(c)?;
-    if c.general.state_dir.exists() {
-        let fd = state_files::directory(&c.general.state_dir, false).map_err(|source| {
-            DaemonError::Io {
-                context: "open state_dir".into(),
-                source,
-            }
-        })?;
-        let stat = fs::fstat(&fd).map_err(|e| DaemonError::Io {
-            context: "stat state_dir".into(),
-            source: e.into(),
-        })?;
-        if stat.st_mode & 0o7777 != 0o700
-            || stat.st_uid != rustix::process::geteuid().as_raw()
-            || stat.st_gid
-                != if rustix::process::geteuid().is_root() {
-                    0
-                } else {
-                    rustix::process::getegid().as_raw()
-                }
-        {
-            return Err(DaemonError::Config(
-                "existing state_dir must be private 0700 and owned by daemon uid/gid".into(),
-            ));
-        }
-    }
-    let fd =
-        state_files::directory(&c.general.state_dir, true).map_err(|source| DaemonError::Io {
-            context: "create private state_dir".into(),
+    let (state, deploy) = validate_state_paths(c)?;
+    let (fd, _deploy) = state_files::complete_handles(&c.general.state_dir, state, deploy)
+        .map_err(|source| DaemonError::Io {
+            context: "complete private state directories".into(),
             source,
         })?;
     for name in [

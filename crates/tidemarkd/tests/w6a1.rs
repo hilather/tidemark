@@ -537,6 +537,103 @@ fn unsafe_state_refused_without_creation() {
     assert!(!forbidden.exists());
 }
 #[test]
+fn nonprivate_state_directories_refused_without_creation() {
+    use std::os::unix::fs::PermissionsExt;
+    for mode in [0o777, 0o750] {
+        let (dir, path, cfg) = fixture();
+        std::fs::create_dir(&cfg.general.state_dir).unwrap();
+        std::fs::set_permissions(
+            &cfg.general.state_dir,
+            std::fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
+        let error = tidemarkd::run_controlled(
+            cfg.clone(),
+            tidemarkd::RunOptions {
+                config_path: path,
+                now: 1,
+            },
+            LiveState::new(&cfg, 1),
+            Shutdown::default(),
+            Shutdown::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("no group/world permissions"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&cfg.general.state_dir).unwrap().count(),
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(&cfg.general.state_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            mode
+        );
+        assert!(!dir.path().join("api.sock").exists());
+        assert!(!dir.path().join("metrics.prom").exists());
+    }
+}
+
+#[test]
+fn private_and_missing_state_directories_start() {
+    use std::os::unix::fs::PermissionsExt;
+    for existing in [true, false] {
+        let (_dir, path, cfg) = fixture();
+        if existing {
+            std::fs::create_dir(&cfg.general.state_dir).unwrap();
+            std::fs::set_permissions(
+                &cfg.general.state_dir,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        let state = LiveState::new(&cfg, 1);
+        let stop = Shutdown::default();
+        let handle = {
+            let state = state.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                tidemarkd::run_controlled(
+                    cfg,
+                    tidemarkd::RunOptions {
+                        config_path: path,
+                        now: 1,
+                    },
+                    state,
+                    stop,
+                    Shutdown::default(),
+                )
+            })
+        };
+        wait(|| {
+            state
+                .view()
+                .status(1)
+                .unwrap()
+                .components
+                .iter()
+                .any(|c| c.name == "daemon" && c.state == "ok")
+        });
+        stop.store(true, Ordering::Release);
+        wait(|| handle.is_finished());
+        handle.join().unwrap().unwrap();
+        assert_eq!(
+            std::fs::metadata(_dir.path().join("state"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+}
+
+#[test]
 fn binary_ready_and_stopping() {
     use std::os::unix::net::UnixDatagram;
     let (dir, path, _) = fixture();
