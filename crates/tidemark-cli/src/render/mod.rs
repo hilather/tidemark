@@ -50,3 +50,15 @@ pub mod lvm;
 
 /// deploy report rendering.
 pub mod deploy;
+
+/// Live now output.
+pub mod now;
+
+/// Live hot output.
+pub mod hot;
+
+/// Live alerts output.
+pub mod alerts;
+
+/// Live status output.
+pub mod status;
