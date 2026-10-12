@@ -52,8 +52,12 @@ pub(crate) fn write(report: &Report, json: bool, output: &mut impl Write) -> any
     if json {
         return super::json("tidemark.lvm.v1", report, output);
     }
+    let destination = output;
+    let mut buffer = Vec::new();
+    let output = &mut buffer;
     if report.status == "n/a" {
         writeln!(output, "LVM: n/a")?;
+        destination.write_all(&buffer)?;
         return Ok(());
     }
     for row in &report.tracked {
@@ -106,6 +110,13 @@ pub(crate) fn write(report: &Report, json: bool, output: &mut impl Write) -> any
             display(&lv.segtype)
         )?;
     }
+    destination.write_all(
+        crate::render::table::wrap(
+            &String::from_utf8(buffer)?,
+            crate::render::table::terminal_width(),
+        )
+        .as_bytes(),
+    )?;
     Ok(())
 }
 fn pct(v: Option<f64>) -> String {

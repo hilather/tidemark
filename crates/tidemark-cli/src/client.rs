@@ -206,7 +206,13 @@ fn connect_deadline(socket: &Path, timeout: Duration) -> Result<UnixStream, Clie
             mpsc::RecvTimeoutError::Timeout => ClientError::Timeout,
             mpsc::RecvTimeoutError::Disconnected => ClientError::Unavailable,
         })?
-        .map_err(map_io)
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                ClientError::Unavailable
+            }
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => ClientError::Timeout,
+            _ => ClientError::Io(error),
+        })
 }
 fn deadline(timeout: Duration, started: Instant) -> Result<Duration, ClientError> {
     timeout

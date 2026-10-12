@@ -7,6 +7,16 @@ pub fn write(
     json: bool,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
+    write_width(rows, json, crate::render::table::terminal_width(), out)
+}
+
+/// Render using an injected terminal width.
+pub fn write_width(
+    rows: &[tidemark_core::live::HotEntry],
+    json: bool,
+    width: usize,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
     let mut rows: Vec<_> = rows.iter().collect();
     rows.sort_by(|a, b| b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key)));
     if json {
@@ -29,6 +39,6 @@ pub fn write(
             r.lossy.to_string(),
         ]);
     }
-    out.write_all(crate::render::table::aligned(&table).as_bytes())?;
+    out.write_all(crate::render::table::aligned_width(&table, width).as_bytes())?;
     Ok(())
 }

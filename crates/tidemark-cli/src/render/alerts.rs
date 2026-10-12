@@ -7,6 +7,16 @@ use tidemark_core::{
 };
 /// Render active alerts in rule/subject order.
 pub fn active(rows: &[AlertSummary], json: bool, out: &mut impl Write) -> anyhow::Result<()> {
+    active_width(rows, json, crate::render::table::terminal_width(), out)
+}
+
+/// Render using an injected terminal width.
+pub fn active_width(
+    rows: &[AlertSummary],
+    json: bool,
+    width: usize,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
     let mut rows: Vec<_> = rows.iter().collect();
     rows.sort_by(|a, b| (&a.rule, &a.subject).cmp(&(&b.rule, &b.subject)));
     if json {
@@ -24,11 +34,21 @@ pub fn active(rows: &[AlertSummary], json: bool, out: &mut impl Write) -> anyhow
             display(r.message.as_bytes()),
         ]);
     }
-    out.write_all(crate::render::table::aligned(&table).as_bytes())?;
+    out.write_all(crate::render::table::aligned_width(&table, width).as_bytes())?;
     Ok(())
 }
 /// Render history, explicitly limited to the current daemon run.
 pub fn history(rows: &[AlertEvent], json: bool, out: &mut impl Write) -> anyhow::Result<()> {
+    history_width(rows, json, crate::render::table::terminal_width(), out)
+}
+
+/// Render using an injected terminal width.
+pub fn history_width(
+    rows: &[AlertEvent],
+    json: bool,
+    width: usize,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
     let mut rows: Vec<_> = rows.iter().collect();
     rows.sort_by(|a, b| {
         b.ts.cmp(&a.ts)
@@ -50,7 +70,7 @@ pub fn history(rows: &[AlertEvent], json: bool, out: &mut impl Write) -> anyhow:
             display(r.message.as_bytes()),
         ]);
     }
-    out.write_all(crate::render::table::aligned(&table).as_bytes())?;
+    out.write_all(crate::render::table::aligned_width(&table, width).as_bytes())?;
     writeln!(out, "History covers the current daemon run only.")?;
     Ok(())
 }

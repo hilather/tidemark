@@ -55,26 +55,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     if context.json {
         return crate::render::json("tidemark.phantom.v1", rows, &mut out);
     }
-    for row in rows {
-        writeln!(
-            out,
-            "{}: {} bytes in {} deleted open files",
-            row.mount, row.total_bytes, row.files
-        )?;
-        for h in row.holders {
-            writeln!(
-                out,
-                "  {} {} {} {} {} bytes",
-                h.pid,
-                tidemark_core::path::display_lossy_bytes(h.comm.as_bytes()),
-                tidemark_core::path::display_lossy_bytes(
-                    h.unit.as_deref().unwrap_or("?").as_bytes()
-                ),
-                tidemark_core::path::display_lossy_bytes(&h.path),
-                h.bytes
-            )?;
-        }
-    }
+    crate::render::now::phantom(&rows, false, &mut out)?;
     writeln!(
         out,
         "Root provides full /proc coverage; other users see the readable subset."

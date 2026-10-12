@@ -11,9 +11,31 @@ pub fn write(
     show_config: bool,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
+    write_width(
+        report,
+        scans,
+        context,
+        show_config,
+        crate::render::table::terminal_width(),
+        out,
+    )
+}
+
+/// Render using an injected terminal width.
+pub fn write_width(
+    report: &StatusResult,
+    scans: &[ScanStatus],
+    context: &crate::Context,
+    show_config: bool,
+    width: usize,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
     if context.json {
         return crate::render::json("tidemark.status.v1", report, out);
     }
+    let destination = out;
+    let mut buffer = Vec::new();
+    let out = &mut buffer;
     writeln!(
         out,
         "tidemarkd {} · uptime {}s",
@@ -29,7 +51,7 @@ pub fn write(
             display(r.detail.as_bytes()),
         ]);
     }
-    out.write_all(crate::render::table::aligned(&table).as_bytes())?;
+    out.write_all(crate::render::table::aligned_width(&table, width).as_bytes())?;
     let mut modes = report.watch_modes.clone();
     modes.sort();
     for (mount, mode) in modes {
@@ -72,6 +94,8 @@ pub fn write(
         serde_json::to_writer_pretty(&mut *out, &context.config)?;
         writeln!(out)?;
     }
+    destination
+        .write_all(crate::render::table::wrap(&String::from_utf8(buffer)?, width).as_bytes())?;
     Ok(())
 }
 
