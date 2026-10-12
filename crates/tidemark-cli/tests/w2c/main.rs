@@ -495,7 +495,7 @@ fn interrupt_scan(keep_partial: bool) -> (std::process::Output, tempfile::TempDi
     let config = state.path().join("config.toml");
     std::fs::write(
         &config,
-        "[throttle]\nmin_ops_per_sec=10\nmax_ops_per_sec=10\n",
+        "[throttle]\nmin_ops_per_sec=1\nmax_ops_per_sec=1\n",
     )
     .unwrap();
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"));
@@ -571,6 +571,7 @@ fn interrupt_scan(keep_partial: bool) -> (std::process::Output, tempfile::TempDi
         rustix::process::Signal::INT,
     )
     .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         if guard.0.as_mut().unwrap().try_wait().unwrap().is_some() {
             break;

@@ -5,7 +5,7 @@ use parking_lot::{Condvar, Mutex};
 use std::{
     io,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread::{self, JoinHandle},
@@ -42,6 +42,7 @@ struct Bucket {
     state: Mutex<TokenState>,
     wake: Condvar,
     blocked_ns: AtomicU64,
+    cancelled: AtomicBool,
 }
 // Exact nano-token reservations. Rebase only after every target has retired.
 // Admission pauses before overflow, so outstanding targets never change.
@@ -107,6 +108,7 @@ impl Bucket {
             }),
             wake: Condvar::new(),
             blocked_ns: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
         }
     }
     fn rate(&self) -> f64 {
@@ -120,16 +122,28 @@ impl Bucket {
         state.earned = state.earned.min(state.issued + state.burst());
         self.wake.notify_all();
     }
+    fn cancel(&self) {
+        // Serialize with the condition-variable wait to avoid a lost wakeup.
+        let _state = self.state.lock();
+        self.cancelled.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
     fn acquire(&self, cost: u32) {
         if cost == 0 {
             return;
         }
         let before = Instant::now();
         let mut state = self.state.lock();
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
         state.account(Instant::now());
         let cost = u128::from(cost) * UNIT;
         let mut blocked = false;
         loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return;
+            }
             state.rebase();
             if state.issued <= RESERVATION_LIMIT - cost && state.waiters < usize::MAX {
                 break;
@@ -144,7 +158,7 @@ impl Bucket {
         loop {
             state.account(Instant::now());
             let debt = target.saturating_sub(state.earned);
-            if debt == 0 {
+            if debt == 0 || self.cancelled.load(Ordering::Acquire) {
                 break;
             }
             blocked = true;
@@ -175,6 +189,10 @@ pub struct FixedGate {
     bucket: Bucket,
 }
 impl FixedGate {
+    /// Permanently release current and future acquisitions.
+    pub fn cancel(&self) {
+        self.bucket.cancel();
+    }
     /// Construct a bucket. Invalid/nonpositive rates are normalized to one unit/s.
     fn new(rate: f64) -> Self {
         Self {
@@ -220,6 +238,10 @@ pub struct AdaptiveGate {
     controller: Mutex<Option<JoinHandle<()>>>,
 }
 impl AdaptiveGate {
+    /// Permanently release acquisitions without stopping the controller.
+    pub fn cancel(&self) {
+        self.state.bucket.cancel();
+    }
     /// Start at the maximum rate. The sampler must finish within one interval.
     pub fn start(mut p: AdaptiveParams, mut sampler: StatSampler) -> Arc<AdaptiveGate> {
         p.min_ops = p.min_ops.max(1);
@@ -408,6 +430,16 @@ pub struct ScanGate {
     kind: ScanGateKind,
 }
 impl ScanGate {
+    /// Permanently wake all acquisitions; statistics remain readable.
+    /// Callers must check their cancellation flag before issuing metadata I/O.
+    pub fn cancel(&self) {
+        match &self.kind {
+            ScanGateKind::Adaptive(gate) => gate.cancel(),
+            ScanGateKind::Fixed(gate) => gate.cancel(),
+            ScanGateKind::Max => {}
+        }
+    }
+
     /// The gate to pass to the walker and the bulk pipeline.
     pub fn gate(&self) -> Arc<dyn Gate> {
         match &self.kind {
@@ -435,6 +467,10 @@ impl ScanGate {
     pub fn stop(self) -> GateStats {
         self.stop_controller();
         self.stats()
+    }
+    /// Stop the sampler while retaining the cancellation handle and statistics.
+    pub fn stop_sampling(&self) {
+        self.stop_controller();
     }
     fn stop_controller(&self) {
         if let ScanGateKind::Adaptive(gate) = &self.kind {
@@ -536,6 +572,83 @@ pub fn gate_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn adaptive_cancel_wakes_all_waiters_and_preserves_stats() {
+        let gate = AdaptiveGate::start(
+            AdaptiveParams {
+                min_ops: 1,
+                max_ops: 1,
+                max_util_pct: 100.0,
+                target_latency_ms: 10.0,
+                interval: Duration::from_secs(60),
+            },
+            Box::new(|| Ok(vec![])),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let gate = gate.clone();
+                let barrier = barrier.clone();
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    gate.acquire(129);
+                    tx.send(()).unwrap();
+                })
+            })
+            .collect();
+        barrier.wait();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while gate.state.bucket.state.lock().waiters != 4 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        gate.cancel();
+        gate.cancel();
+        for _ in 0..4 {
+            rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        gate.acquire(129);
+        assert_eq!(gate.stats().min_rate, 1.0);
+        gate.stop();
+        assert_eq!(gate.stats().min_rate, 1.0);
+    }
+
+    #[test]
+    fn cancellation_releases_reserved_bulk_wait() {
+        let gate = Arc::new(FixedGate::new(1.0));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker_gate = gate.clone();
+        let worker_barrier = barrier.clone();
+        let worker = thread::spawn(move || {
+            worker_barrier.wait();
+            worker_gate.acquire(129);
+            tx.send(()).unwrap();
+        });
+        barrier.wait();
+        // Observe a real reservation under the bucket lock, rather than guessing
+        // when the worker is blocked using a sleep.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while gate.bucket.state.lock().waiters == 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        gate.cancel();
+        gate.cancel();
+        let released = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        gate.bucket.set_rate(10000.0);
+        worker.join().unwrap();
+        let start = Instant::now();
+        gate.acquire(129);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(released, "cancelled reservation did not return");
+    }
+
     #[test]
     fn exact_reservations_near_float_limit_and_integer_limit() {
         for seed in [(1_u128 << 53) * UNIT, RESERVATION_LIMIT] {
