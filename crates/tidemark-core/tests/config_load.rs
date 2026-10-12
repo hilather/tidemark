@@ -109,3 +109,20 @@ fn example_matches_interface_contract_byte_for_byte() {
         .0;
     assert_eq!(include_str!("example.toml"), example);
 }
+
+#[test]
+fn byte_parser_agrees_with_loader() {
+    for bytes in [
+        include_bytes!("example.toml").to_vec(),
+        vec![b' '; MAX_CONFIG_BYTES as usize + 1],
+        vec![0xff],
+    ] {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        match (Config::load(file.path()), Config::from_toml_bytes(&bytes)) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b),
+            (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+            other => panic!("loader/parser disagree: {other:?}"),
+        }
+    }
+}

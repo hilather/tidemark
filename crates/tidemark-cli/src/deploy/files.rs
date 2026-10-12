@@ -40,10 +40,19 @@ pub(crate) fn directory_at(
         Ok(fd) => Ok(fd),
         Err(rustix::io::Errno::NOENT) if create => {
             fs::mkdirat(parent, name, Mode::from_raw_mode(0o700))?;
-            match fs::openat(parent, name, FLAGS | OFlags::NOATIME, Mode::empty()) {
-                Err(rustix::io::Errno::PERM) => Ok(fs::openat(parent, name, FLAGS, Mode::empty())?),
-                result => result.map_err(Into::into),
-            }
+            let fd = match fs::openat(parent, name, FLAGS | OFlags::NOATIME, Mode::empty()) {
+                Err(rustix::io::Errno::PERM) => fs::openat(parent, name, FLAGS, Mode::empty())?,
+                result => result?,
+            };
+            eligible(&fd, Path::new(name), false)?;
+            // Normalize only the directory just created, through its no-follow fd.
+            fs::fchown(
+                &fd,
+                Some(rustix::process::geteuid()),
+                Some(rustix::process::getegid()),
+            )?;
+            fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
+            Ok(fd)
         }
         Err(e) => Err(e.into()),
     }
@@ -113,8 +122,11 @@ pub(crate) fn validate_state(
     }
     Ok(())
 }
-pub(crate) fn validate_marker_roots(path: &Path) -> io::Result<()> {
-    let bytes = match read(&path.join(MARKER)) {
+pub(crate) fn validate_marker_roots_at(path: &Path, state: Option<&OwnedFd>) -> io::Result<()> {
+    let bytes = match state.map_or_else(
+        || Err(io::ErrorKind::NotFound.into()),
+        |fd| read_at(fd, std::ffi::OsStr::new(MARKER)),
+    ) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let cfg = tidemark_core::config::Config::default();
@@ -150,9 +162,8 @@ pub(crate) fn validate_marker_roots(path: &Path) -> io::Result<()> {
             .ok_or_else(|| io::Error::other("state marker config missing"))?,
     )
     .map_err(io::Error::other)?;
-    inspect(config_path.as_path())?;
-    let cfg =
-        tidemark_core::config::Config::load(config_path.as_path()).map_err(io::Error::other)?;
+    let bytes = read(config_path.as_path())?;
+    let cfg = tidemark_core::config::Config::from_toml_bytes(&bytes).map_err(io::Error::other)?;
     validate_state(
         path,
         cfg.roots
@@ -176,10 +187,16 @@ pub(crate) fn read(path: &Path) -> io::Result<Vec<u8>> {
             .ok_or_else(|| io::Error::other("missing parent"))?,
         false,
     )?;
-    let fd = fs::openat(
+    read_at(
         &parent,
         path.file_name()
             .ok_or_else(|| io::Error::other("missing name"))?,
+    )
+}
+pub(crate) fn read_at(parent: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
+    let fd = fs::openat(
+        parent,
+        name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     )?;
@@ -238,6 +255,7 @@ pub(crate) fn private_dir(path: &Path, root: bool) -> io::Result<()> {
                             .is_some_and(|p| p.as_path() == path)
                 });
             if !marked {
+                eligible(&fd, path, false)?;
                 return Ok(());
             }
             fd
@@ -326,4 +344,93 @@ pub(crate) fn write_at(
         let _ = fs::unlinkat(parent, temp.as_str(), AtFlags::empty());
     }
     result
+}
+
+// Only a marker identifying this exact state root authorizes normalization.
+pub(crate) fn state_handles(
+    path: &Path,
+    create: bool,
+) -> io::Result<(Option<OwnedFd>, Option<OwnedFd>)> {
+    let state = match directory(path, false) {
+        Ok(fd) => fd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !create => return Ok((None, None)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => directory(path, true)?,
+        Err(e) => return Err(e),
+    };
+    let marked = marker_authorizes(&state, path)?;
+    eligible(&state, path, marked)?;
+    let deploy = match directory_at(&state, std::ffi::OsStr::new("deploy"), create) {
+        Ok(fd) => {
+            eligible(&fd, &path.join("deploy"), false)?;
+            Some(fd)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !create => None,
+        Err(e) => return Err(e),
+    };
+    Ok((Some(state), deploy))
+}
+fn marker_authorizes(state: &OwnedFd, path: &Path) -> io::Result<bool> {
+    match read_at(state, std::ffi::OsStr::new(MARKER)) {
+        Ok(bytes) => {
+            let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            Ok(
+                v.get("format").and_then(|v| v.as_str()) == Some("tidemark-state-v1")
+                    && v.get("state_dir")
+                        .and_then(|v| {
+                            serde_json::from_value::<tidemark_core::path::RawPath>(v.clone()).ok()
+                        })
+                        .is_some_and(|p| p.as_path() == path),
+            )
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+fn eligible(fd: &OwnedFd, path: &Path, marked: bool) -> io::Result<()> {
+    let stat = fs::fstat(fd)?;
+    if !marked && (stat.st_uid != rustix::process::geteuid().as_raw() || stat.st_mode & 0o077 != 0)
+    {
+        return Err(io::Error::other(format!("unsafe directory {}: owner {}, mode {:04o}; requires effective-uid ownership and no group/world permissions", path.display(), stat.st_uid, stat.st_mode & 0o7777)));
+    }
+    Ok(())
+}
+
+pub(crate) fn complete_handles(
+    path: &Path,
+    state: Option<OwnedFd>,
+    deploy: Option<OwnedFd>,
+) -> io::Result<(OwnedFd, OwnedFd)> {
+    let state = match state {
+        Some(fd) => fd,
+        None => {
+            let fd = directory(path, true)?;
+            eligible(&fd, path, false)?;
+            fd
+        }
+    };
+    let deploy = match deploy {
+        Some(fd) => fd,
+        None => directory_at(&state, std::ffi::OsStr::new("deploy"), true)?,
+    };
+    eligible(&deploy, &path.join("deploy"), false)?;
+    // Existing directories are normalized only when their marker authorizes it.
+    if marker_authorizes(&state, path)? {
+        fs::fchown(
+            &state,
+            Some(rustix::process::geteuid()),
+            Some(rustix::process::getegid()),
+        )?;
+        fs::fchmod(&state, Mode::from_raw_mode(0o700))?;
+    }
+    Ok((state, deploy))
+}
+pub(crate) fn optional_at(parent: Option<&OwnedFd>, name: &str) -> io::Result<Option<Vec<u8>>> {
+    let Some(parent) = parent else {
+        return Ok(None);
+    };
+    match read_at(parent, std::ffi::OsStr::new(name)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }

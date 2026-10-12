@@ -84,23 +84,10 @@ impl Env for RealEnv {
                 .ok_or_else(|| io::Error::other("config path has no parent"))?,
         )?;
         ensure_writable(&cfg.general.state_dir)?;
-        match super::files::directory(&cfg.general.state_dir, false) {
-            Ok(fd) => {
-                // Unmarked existing directories cannot be chmod/chowned by deployment.
-                if super::files::read(&cfg.general.state_dir.join(super::MARKER)).is_err() {
-                    let stat = rustix::fs::fstat(&fd)?;
-                    if stat.st_uid != 0 || stat.st_gid != 0 || stat.st_mode & 0o777 != 0o700 {
-                        return Err(io::Error::other(
-                            "existing unmarked state_dir must already be 0700 root:root",
-                        ));
-                    }
-                }
-                Ok(())
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
+        super::files::state_handles(&cfg.general.state_dir, false)?;
+        Ok(())
     }
+
     fn local_directory(&self, path: &Path) -> io::Result<()> {
         if !std::fs::metadata(path)?.is_dir() {
             return Err(io::Error::other("not a directory"));

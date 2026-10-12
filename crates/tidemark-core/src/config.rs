@@ -685,14 +685,27 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, CoreError> {
         use std::io::Read;
         let file = std::fs::File::open(path)?;
-        let mut text = String::new();
-        file.take(MAX_CONFIG_BYTES + 1).read_to_string(&mut text)?;
-        if text.len() as u64 > MAX_CONFIG_BYTES {
+        let mut bytes = Vec::new();
+        file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+        Self::from_toml_bytes(&bytes)
+    }
+    /// Parse bounded UTF-8 TOML bytes and merge the configured default rules.
+    pub fn from_toml_bytes(bytes: &[u8]) -> Result<Self, CoreError> {
+        // Match load's bounded read and UTF-8 error precedence, including its
+        // one-byte lookahead, without processing an unbounded caller buffer.
+        let bounded = &bytes[..bytes.len().min(MAX_CONFIG_BYTES as usize + 1)];
+        let text = std::str::from_utf8(bounded).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })?;
+        if bytes.len() as u64 > MAX_CONFIG_BYTES {
             return Err(CoreError::Parse(
                 "configuration exceeds the 1 MiB limit".into(),
             ));
         }
-        let mut config: Self = toml::from_str(&text)?;
+        let mut config: Self = toml::from_str(text)?;
         config.merge_default_rules();
         Ok(config)
     }

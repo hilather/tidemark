@@ -41,83 +41,131 @@ impl Client {
         method: &str,
         params: &P,
     ) -> Result<R, ClientError> {
-        if self.poisoned {
-            return Err(ClientError::Protocol(
-                "connection unusable after failed call",
-            ));
-        }
-        self.poisoned = true;
-        let result = self.exchange(method, params);
-        if result.is_ok() || matches!(result, Err(ClientError::Remote(_))) {
-            self.poisoned = false;
-        }
-        result
+        call_io(
+            &mut self.stream,
+            &mut self.sequence,
+            &mut self.poisoned,
+            self.timeout,
+            method,
+            params,
+        )
     }
-    fn exchange<P: Serialize, R: DeserializeOwned>(
-        &mut self,
-        method: &str,
-        params: &P,
-    ) -> Result<R, ClientError> {
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or(ClientError::Protocol("request id exhausted"))?;
-        let id = format!("c{}", self.sequence);
-        let request = Request {
-            v: 1,
-            id: id.clone(),
-            method: method.into(),
-            params: serde_json::to_value(params)?,
+}
+fn call_io<T: TimedIo, P: Serialize, R: DeserializeOwned>(
+    stream: &mut BufReader<T>,
+    sequence: &mut u64,
+    poisoned: &mut bool,
+    timeout: Duration,
+    method: &str,
+    params: &P,
+) -> Result<R, ClientError> {
+    if *poisoned {
+        return Err(ClientError::Protocol(
+            "connection unusable after failed call",
+        ));
+    }
+    *poisoned = true;
+    let result = exchange_io(stream, sequence, timeout, method, params);
+    if result.is_ok() || matches!(result, Err(ClientError::Remote(_))) {
+        *poisoned = false;
+    }
+    result
+}
+
+trait TimedIo: std::io::Read + Write {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+impl TimedIo for UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_read_timeout(self, timeout)
+    }
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_write_timeout(self, timeout)
+    }
+}
+fn exchange_io<T: TimedIo, P: Serialize, R: DeserializeOwned>(
+    stream: &mut BufReader<T>,
+    sequence: &mut u64,
+    timeout: Duration,
+    method: &str,
+    params: &P,
+) -> Result<R, ClientError> {
+    let started = Instant::now();
+    exchange_with_deadline(stream, sequence, method, params, || {
+        deadline(timeout, started)
+    })
+}
+fn exchange_with_deadline<T: TimedIo, P: Serialize, R: DeserializeOwned>(
+    stream: &mut BufReader<T>,
+    sequence: &mut u64,
+    method: &str,
+    params: &P,
+    mut remaining_time: impl FnMut() -> Result<Duration, ClientError>,
+) -> Result<R, ClientError> {
+    *sequence = (*sequence)
+        .checked_add(1)
+        .ok_or(ClientError::Protocol("request id exhausted"))?;
+    let id = format!("c{}", *sequence);
+    let request = Request {
+        v: 1,
+        id: id.clone(),
+        method: method.into(),
+        params: serde_json::to_value(params)?,
+    };
+    let mut bytes = serde_json::to_vec(&request)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(ClientError::Protocol("request exceeds 1 MiB"));
+    }
+    let mut remaining = bytes.as_slice();
+    while !remaining.is_empty() {
+        stream
+            .get_mut()
+            .set_write_timeout(Some(remaining_time()?))
+            .map_err(map_io)?;
+        let count = match stream.get_mut().write(remaining) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result.map_err(map_io)?,
         };
-        let mut bytes = serde_json::to_vec(&request)?;
-        bytes.push(b'\n');
-        if bytes.len() > MAX_FRAME_BYTES {
-            return Err(ClientError::Protocol("request exceeds 1 MiB"));
+        if count == 0 {
+            return Err(ClientError::Unavailable);
         }
-        let started = Instant::now();
-        let mut remaining = bytes.as_slice();
-        while !remaining.is_empty() {
-            self.stream
-                .get_mut()
-                .set_write_timeout(Some(deadline(self.timeout, started)?))
-                .map_err(map_io)?;
-            let count = self.stream.get_mut().write(remaining).map_err(map_io)?;
-            if count == 0 {
-                return Err(ClientError::Unavailable);
-            }
-            remaining = &remaining[count..];
+        remaining = &remaining[count..];
+    }
+    bytes.clear();
+    // Buffer transport reads, retaining any coalesced next frame on this connection.
+    loop {
+        stream
+            .get_ref()
+            .set_read_timeout(Some(remaining_time()?))
+            .map_err(map_io)?;
+        let available = match stream.fill_buf() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result.map_err(map_io)?,
+        };
+        if available.is_empty() {
+            return Err(ClientError::Unavailable);
         }
-        bytes.clear();
-        // Buffer transport reads, retaining any coalesced next frame on this connection.
-        loop {
-            self.stream
-                .get_ref()
-                .set_read_timeout(Some(deadline(self.timeout, started)?))
-                .map_err(map_io)?;
-            let available = self.stream.fill_buf().map_err(map_io)?;
-            if available.is_empty() {
-                return Err(ClientError::Unavailable);
-            }
-            let newline = available.iter().position(|byte| *byte == b'\n');
-            let count = newline.unwrap_or(available.len());
-            if count > MAX_FRAME_BYTES - 1 - bytes.len() {
-                return Err(ClientError::Protocol("response exceeds 1 MiB"));
-            }
-            bytes.extend_from_slice(&available[..count]);
-            self.stream.consume(count + usize::from(newline.is_some()));
-            if newline.is_some() {
-                break;
-            }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.unwrap_or(available.len());
+        if count > MAX_FRAME_BYTES - 1 - bytes.len() {
+            return Err(ClientError::Protocol("response exceeds 1 MiB"));
         }
-        let response: Response = serde_json::from_slice(&bytes)?;
-        if response.v != 1 || response.id != id {
-            return Err(ClientError::Protocol("response version or id mismatch"));
+        bytes.extend_from_slice(&available[..count]);
+        stream.consume(count + usize::from(newline.is_some()));
+        if newline.is_some() {
+            break;
         }
-        match (response.ok, response.result, response.error) {
-            (true, Some(value), None) => Ok(serde_json::from_value(value)?),
-            (false, None, Some(error)) => Err(ClientError::Remote(error)),
-            _ => Err(ClientError::Protocol("invalid response envelope")),
-        }
+    }
+    let response: Response = serde_json::from_slice(&bytes)?;
+    if response.v != 1 || response.id != id {
+        return Err(ClientError::Protocol("response version or id mismatch"));
+    }
+    match (response.ok, response.result, response.error) {
+        (true, Some(value), None) => Ok(serde_json::from_value(value)?),
+        (false, None, Some(error)) => Err(ClientError::Remote(error)),
+        _ => Err(ClientError::Protocol("invalid response envelope")),
     }
 }
 // std exposes no nonblocking Unix connect constructor. Bound both caller waiting and
@@ -238,6 +286,100 @@ mod tests {
         reader.read_line(&mut line).unwrap();
         stream.write_all(response).unwrap();
     }
+    struct InterruptedIo {
+        read: std::io::Cursor<Vec<u8>>,
+        reads: usize,
+        read_attempts: usize,
+        writes: usize,
+        forever: bool,
+        timed_out: bool,
+    }
+    impl std::io::Read for InterruptedIo {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            self.read_attempts += 1;
+            if self.timed_out {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            if self.forever || self.reads > 0 {
+                self.reads = self.reads.saturating_sub(1);
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            std::io::Read::read(&mut self.read, bytes)
+        }
+    }
+    impl Write for InterruptedIo {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.writes > 0 {
+                self.writes -= 1;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            Ok(if self.forever {
+                bytes.len()
+            } else {
+                bytes.len().min(3)
+            })
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl TimedIo for InterruptedIo {
+        fn set_read_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn set_write_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn interrupted_io_recovers_and_reuses_connection() {
+        let io = InterruptedIo {
+            read: std::io::Cursor::new(b"{\"v\":1,\"id\":\"c1\",\"ok\":true,\"result\":1}\n{\"v\":1,\"id\":\"c2\",\"ok\":true,\"result\":2}\n".to_vec()),
+            reads: 3, read_attempts: 0, writes: 3, forever: false, timed_out: false,
+        };
+        let mut stream = BufReader::new(io);
+        let mut sequence = 0;
+        let mut poisoned = false;
+        for expected in 1..=2 {
+            let result: u32 = call_io(
+                &mut stream,
+                &mut sequence,
+                &mut poisoned,
+                Duration::MAX,
+                "status",
+                &(),
+            )
+            .unwrap();
+            assert_eq!(result, expected);
+            assert!(!poisoned);
+        }
+    }
+    #[test]
+    fn endless_interruptions_obey_total_deadline() {
+        let io = InterruptedIo {
+            read: std::io::Cursor::new(Vec::new()),
+            reads: 0,
+            read_attempts: 0,
+            writes: 0,
+            forever: true,
+            timed_out: false,
+        };
+        let mut stream = BufReader::new(io);
+        let mut ticks = 0;
+        assert!(matches!(
+            exchange_with_deadline::<_, _, u32>(&mut stream, &mut 0, "status", &(), || {
+                ticks += 1;
+                if ticks < 5 {
+                    Ok(Duration::from_millis(5 - ticks))
+                } else {
+                    Err(ClientError::Timeout)
+                }
+            }),
+            Err(ClientError::Timeout)
+        ));
+        assert_eq!(ticks, 5);
+        assert_eq!(stream.get_ref().read_attempts, 3);
+    }
     #[test]
     fn framing_and_repeated_calls() {
         let (mut client, mut stream) = pair(Duration::from_secs(2));
@@ -321,16 +463,42 @@ mod tests {
     }
     #[test]
     fn deadline_and_poisoned_connection() {
-        // Keep the peer open until both assertions finish. A sleeping peer that
-        // closes can race a delayed test thread and turn timeout into EOF.
-        let (mut client, _peer) = pair(Duration::from_millis(20));
-        let error = client.call::<_, u32>("status", &()).unwrap_err();
-        assert!(matches!(error, ClientError::Timeout), "{error:?}");
+        let io = InterruptedIo {
+            read: std::io::Cursor::new(Vec::new()),
+            reads: 0,
+            read_attempts: 0,
+            writes: 0,
+            forever: false,
+            timed_out: true,
+        };
+        let mut stream = BufReader::new(io);
+        let mut sequence = 0;
+        let mut poisoned = false;
         assert!(matches!(
-            client.call::<_, u32>("status", &()),
+            call_io::<_, _, u32>(
+                &mut stream,
+                &mut sequence,
+                &mut poisoned,
+                Duration::from_secs(1),
+                "status",
+                &()
+            ),
+            Err(ClientError::Timeout)
+        ));
+        assert!(poisoned);
+        assert!(matches!(
+            call_io::<_, _, u32>(
+                &mut stream,
+                &mut sequence,
+                &mut poisoned,
+                Duration::from_secs(1),
+                "status",
+                &()
+            ),
             Err(ClientError::Protocol(_))
         ));
     }
+
     #[test]
     fn mismatched_id_version_and_invalid_envelope_rejected() {
         for response in [
