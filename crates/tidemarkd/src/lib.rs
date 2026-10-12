@@ -107,8 +107,11 @@ pub fn main_entry() -> std::process::ExitCode {
     };
     if !args.check_config {
         use tracing_subscriber::prelude::*;
+        let configured_level = load_config(&args.config)
+            .map(|(c, _)| c.general.log_level)
+            .unwrap_or_else(|_| "info".into());
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(configured_level));
         if std::env::var_os("INVOCATION_ID").is_some() {
             match tracing_journald::layer() {
                 Ok(layer) => {
