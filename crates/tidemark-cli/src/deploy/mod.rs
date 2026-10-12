@@ -118,17 +118,9 @@ pub trait Env {
     fn lvm(&self, cfg: &Config) -> io::Result<()>;
     /// Read and validate the same source bytes that will be installed.
     fn source(&self, path: &Path) -> Result<(Config, Vec<u8>), DeployError> {
-        let before = read_bytes(path).map_err(|error| {
-            DeployError::Preflight(vec![check("config", CheckStatus::Fail, io_detail(&error))])
-        })?;
-        let cfg = Config::load(path).map_err(|error| {
-            DeployError::Preflight(vec![check("config", CheckStatus::Fail, error.to_string())])
-        })?;
-        if before != read_bytes(path)? {
-            return Err(DeployError::Guard("source changed while parsing".into()));
-        }
-        Ok((cfg, before))
+        source_from_read(path, |path| self.read(path))
     }
+
     /// Read one bounded deployment record or configuration.
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         read_bytes(path)
@@ -154,6 +146,18 @@ pub trait Env {
     fn remove(&self, path: &Path) -> io::Result<()> {
         remove_if_exists(path)
     }
+}
+fn source_from_read(
+    path: &Path,
+    read: impl FnOnce(&Path) -> io::Result<Vec<u8>>,
+) -> Result<(Config, Vec<u8>), DeployError> {
+    let bytes = read(path).map_err(|error| {
+        DeployError::Preflight(vec![check("config", CheckStatus::Fail, io_detail(&error))])
+    })?;
+    let cfg = Config::from_toml_bytes(&bytes).map_err(|error| {
+        DeployError::Preflight(vec![check("config", CheckStatus::Fail, error.to_string())])
+    })?;
+    Ok((cfg, bytes))
 }
 /// Status ping boundary used by verification.
 pub trait ApiPing {
@@ -308,10 +312,11 @@ pub fn stage(
     {
         return Err(DeployError::Preflight(checks));
     }
+    let (existing_state, existing_deploy) = files::state_handles(&cfg.general.state_dir, false)?;
+    files::optional_at(existing_deploy.as_ref(), "firstboot.json")?;
     let installed = env.config_path();
     let old_config = optional_read(env, installed)?;
-    let record_path = cfg.general.state_dir.join("deploy/staged.json");
-    let old_record = optional_read(env, &record_path)?;
+    let old_record = files::optional_at(existing_deploy.as_ref(), "staged.json")?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
     let enabled = sys.is_enabled(UNIT)?;
     let active = sys.is_active(UNIT)?;
@@ -345,8 +350,7 @@ pub fn stage(
         checks,
         start_now: opts.start_now,
     };
-    let marker_path = cfg.general.state_dir.join(MARKER);
-    let old_marker = optional_read(env, &marker_path)?;
+    let old_marker = files::optional_at(existing_state.as_ref(), MARKER)?;
     let marker = Marker {
         format: "tidemark-state-v1".into(),
         state_dir: tidemark_core::path::RawPath::from_path(&cfg.general.state_dir)
@@ -364,9 +368,8 @@ pub fn stage(
     if differing && optional_read(env, &backup)?.is_some() {
         return Err(DeployError::Guard("config backup already exists".into()));
     }
-    env.private_dir(&cfg.general.state_dir)?;
-    let state_fd = files::directory(&cfg.general.state_dir, false)?;
-    let deploy_fd = files::directory_at(&state_fd, std::ffi::OsStr::new("deploy"), true)?;
+    let (state_fd, deploy_fd) =
+        files::complete_handles(&cfg.general.state_dir, existing_state, existing_deploy)?;
     let result = (|| -> Result<(), DeployError> {
         if differing {
             if let Some(old) = &old_config {
@@ -631,6 +634,7 @@ pub(crate) fn state_guard(path: &Path, cfg: Option<&Config>) -> io::Result<()> {
         }),
     )?;
     files::validate_state(&path.join("deploy"), std::iter::empty::<&Path>())?;
+    files::state_handles(path, false)?;
     match files::read(&path.join(MARKER)) {
         Ok(bytes) => {
             let marker: Marker = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
@@ -660,17 +664,20 @@ pub fn unstage(
     sys: &dyn Systemctl,
 ) -> Result<(), DeployError> {
     state_guard(state_dir, None).map_err(|e| DeployError::Guard(e.to_string()))?;
-    files::validate_marker_roots(state_dir).map_err(|e| DeployError::Guard(e.to_string()))?;
+    let (state, deploy) =
+        files::state_handles(state_dir, false).map_err(|e| DeployError::Guard(e.to_string()))?;
+    files::validate_marker_roots_at(state_dir, state.as_ref())
+        .map_err(|e| DeployError::Guard(e.to_string()))?;
+    files::optional_at(deploy.as_ref(), "staged.json")
+        .map_err(|e| DeployError::Guard(e.to_string()))?;
+    files::optional_at(deploy.as_ref(), "firstboot.json")
+        .map_err(|e| DeployError::Guard(e.to_string()))?;
     let guarded = if purge_state {
         Some(purge_guard(state_dir)?)
     } else {
         None
     };
-    let deploy = match files::directory(&state_dir.join("deploy"), false) {
-        Ok(fd) => Some(fd),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
+
     sys.disable_now(UNIT)?;
     if sys.is_active(UNIT)? {
         return Err(DeployError::Guard(

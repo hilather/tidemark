@@ -106,22 +106,20 @@ fn build_with_boot(inputs: &FirstbootInputs, now: i64, booted_at: i64) -> Firstb
 /// Publish a private report atomically and sync both the file and its parent.
 pub fn write(state_dir: &Path, r: &FirstbootReport) -> io::Result<()> {
     files::validate_state(state_dir, std::iter::empty::<&Path>())?;
-    files::validate_marker_roots(state_dir)?;
+    let (state, deploy) = files::state_handles(state_dir, false)?;
+    files::validate_marker_roots_at(state_dir, state.as_ref())?;
     files::validate_state(&state_dir.join("deploy"), std::iter::empty::<&Path>())?;
-    for name in [
-        ".tidemark-state.json",
-        "deploy/staged.json",
-        "deploy/firstboot.json",
-    ] {
-        files::inspect(&state_dir.join(name))?;
-    }
+    files::optional_at(deploy.as_ref(), "staged.json")?;
+    files::optional_at(deploy.as_ref(), "firstboot.json")?;
     let mut bytes = serde_json::to_vec(r).map_err(io::Error::other)?;
     bytes.push(b'\n');
     if bytes.len() > 1024 * 1024 {
         return Err(io::Error::other("report exceeds 1 MiB"));
     }
-    files::write(
-        &state_dir.join("deploy/firstboot.json"),
+    let (_state, deploy) = files::complete_handles(state_dir, state, deploy)?;
+    files::write_at(
+        &deploy,
+        std::ffi::OsStr::new("firstboot.json"),
         &bytes,
         rustix::process::geteuid().is_root(),
     )?;
@@ -135,6 +133,12 @@ mod files;
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
     fn inputs() -> FirstbootInputs {
         FirstbootInputs {
             version: "test".into(),
@@ -152,6 +156,70 @@ mod tests {
             first_fs_sample: Some(11),
             first_lvm_sample: None,
             next_scans: vec![("/data".into(), 100)],
+        }
+    }
+    #[test]
+    fn unsafe_existing_directory_permissions_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o777, 0o750] {
+            for child in [false, true] {
+                let dir = private_tempdir();
+                std::fs::create_dir(dir.path().join("deploy")).unwrap();
+                let bad = if child {
+                    dir.path().join("deploy")
+                } else {
+                    dir.path().to_path_buf()
+                };
+                std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(mode)).unwrap();
+                let outside = dir.path().join("outside");
+                std::fs::write(&outside, b"outside").unwrap();
+                std::fs::write(dir.path().join("deploy/staged.json"), b"original").unwrap();
+                assert!(write(dir.path(), &build_with_boot(&inputs(), 20, 5)).is_err());
+                assert_eq!(std::fs::read(outside).unwrap(), b"outside");
+                assert_eq!(
+                    std::fs::read(dir.path().join("deploy/staged.json")).unwrap(),
+                    b"original"
+                );
+                assert!(!dir.path().join("deploy/firstboot.json").exists());
+            }
+        }
+    }
+    #[cfg(feature = "privileged")]
+    #[test]
+    fn foreign_owned_directory_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::env::var("TIDEMARK_DEPLOY_TEST_VM").as_deref(),
+            Ok("1"),
+            "disposable VM only"
+        );
+        for child in [false, true] {
+            let dir = private_tempdir();
+            std::fs::create_dir(dir.path().join("deploy")).unwrap();
+            std::fs::set_permissions(
+                dir.path().join("deploy"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let bad = if child {
+                dir.path().join("deploy")
+            } else {
+                dir.path().to_path_buf()
+            };
+            let fd = files::directory(&bad, false).unwrap();
+            rustix::fs::fchown(&fd, Some(rustix::process::Uid::from_raw(65534)), None).unwrap();
+            std::fs::write(dir.path().join("deploy/staged.json"), b"original").unwrap();
+            let error = write(dir.path(), &build_with_boot(&inputs(), 20, 5))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("65534"));
+            assert!(error.contains("0700"));
+            assert!(error.contains(&bad.display().to_string()));
+            assert!(!dir.path().join("deploy/firstboot.json").exists());
+            assert_eq!(
+                std::fs::read(dir.path().join("deploy/staged.json")).unwrap(),
+                b"original"
+            );
         }
     }
     #[test]
@@ -180,10 +248,12 @@ mod tests {
     #[test]
     fn report_lifecycle_and_atomic_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path();
         assert!(!needs_report(path, "abc"));
         std::fs::create_dir(path.join("deploy")).unwrap();
+        std::fs::set_permissions(path.join("deploy"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         std::fs::write(path.join("deploy/staged.json"), b"{}").unwrap();
         assert!(needs_report(path, "abc"));
         let report = build_with_boot(&inputs(), 20, 5);
@@ -214,7 +284,7 @@ mod tests {
     #[test]
     fn failed_write_preserves_report_and_symlink_directory_is_rejected() {
         use std::os::unix::fs::symlink;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let report = build_with_boot(&inputs(), 20, 5);
         write(dir.path(), &report).unwrap();
         let original = std::fs::read(dir.path().join("deploy/firstboot.json")).unwrap();
@@ -237,7 +307,7 @@ mod tests {
     }
     #[test]
     fn maximum_report_is_readable_after_atomic_write() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let mut report = build_with_boot(&inputs(), 20, 5);
         let base_size = serde_json::to_vec(&report).unwrap().len();
         report.version = "x".repeat(1024 * 1024 - 1 - base_size + report.version.len());
@@ -281,7 +351,7 @@ mod tests {
             "deploy/staged.json",
             "deploy/firstboot.json",
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = private_tempdir();
             let state = dir.path().join("state");
             let outside = dir.path().join("outside");
             std::fs::create_dir_all(state.join("deploy")).unwrap();

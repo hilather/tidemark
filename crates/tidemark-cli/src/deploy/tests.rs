@@ -10,6 +10,7 @@ use std::{
 #[derive(Default)]
 struct FakeSystemctl {
     calls: RefCell<Vec<String>>,
+    queries: Cell<usize>,
     enabled: Cell<bool>,
     active: Cell<bool>,
     fail_enable: Cell<bool>,
@@ -18,9 +19,11 @@ struct FakeSystemctl {
 }
 impl Systemctl for FakeSystemctl {
     fn is_enabled(&self, _: &str) -> io::Result<bool> {
+        self.queries.set(self.queries.get() + 1);
         Ok(self.enabled.get())
     }
     fn is_active(&self, _: &str) -> io::Result<bool> {
+        self.queries.set(self.queries.get() + 1);
         Ok(self.active.get())
     }
     fn enable(&self, _: &str) -> io::Result<()> {
@@ -58,6 +61,7 @@ struct FakeEnv {
     fail_name: RefCell<Option<String>>,
     fail_restore: Cell<bool>,
     mutations: Cell<usize>,
+    source_replacement: RefCell<Option<(PathBuf, Vec<u8>)>>,
 }
 impl FakeEnv {
     fn write_probe(&self, name: &std::ffi::OsStr, bytes: &[u8]) -> io::Result<()> {
@@ -85,6 +89,20 @@ impl FakeEnv {
     }
 }
 impl Env for FakeEnv {
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let bytes = read_bytes(path)?;
+        if self
+            .source_replacement
+            .borrow()
+            .as_ref()
+            .is_some_and(|(source, _)| source == path)
+        {
+            if let Some((_, replacement)) = self.source_replacement.borrow_mut().take() {
+                fs::write(path, replacement)?;
+            }
+        }
+        Ok(bytes)
+    }
     fn config_path(&self) -> &Path {
         &self.installed
     }
@@ -157,6 +175,7 @@ impl Fixture {
             fail_name: RefCell::new(None),
             fail_restore: Cell::new(false),
             mutations: Cell::new(0),
+            source_replacement: RefCell::new(None),
         };
         Self {
             _dir: dir,
@@ -887,7 +906,8 @@ fn existing_unmarked_directory_permissions_are_untouched() {
     let f = Fixture::new();
     fs::create_dir(&f.state).unwrap();
     fs::set_permissions(&f.state, fs::Permissions::from_mode(0o750)).unwrap();
-    f.stage();
+    assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+    assert!(f.sys.calls.borrow().is_empty());
     assert_eq!(
         fs::metadata(&f.state).unwrap().permissions().mode() & 0o777,
         0o750
@@ -925,4 +945,248 @@ fn service_compensation_failure_is_reported_and_verified() {
     assert!(message.contains("injected record write failure"));
     assert!(message.contains("injected restart failure"));
     assert!(message.contains("service compensation active=false, expected true"));
+}
+
+#[test]
+fn unsafe_existing_directories_refuse_stage_and_unstage() {
+    for mode in [0o777, 0o750] {
+        for child in [false, true] {
+            let f = Fixture::new();
+            fs::create_dir(&f.state).unwrap();
+            fs::set_permissions(&f.state, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::create_dir(f.state.join("deploy")).unwrap();
+            let bad = if child {
+                f.state.join("deploy")
+            } else {
+                f.state.clone()
+            };
+            fs::set_permissions(&bad, fs::Permissions::from_mode(mode)).unwrap();
+            fs::write(f.state.join("deploy/staged.json"), b"original").unwrap();
+            let outside = f._dir.path().join("outside");
+            fs::write(&outside, b"outside").unwrap();
+            assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+            assert!(unstage(&f.state, false, &f.sys).is_err());
+            assert!(f.sys.calls.borrow().is_empty());
+            assert_eq!(f.sys.queries.get(), 0);
+            assert_eq!(
+                fs::metadata(&bad).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert_eq!(
+                fs::read(f.state.join("deploy/staged.json")).unwrap(),
+                b"original"
+            );
+            assert!(!f.env.installed.exists());
+            assert!(!f.state.join("deploy/firstboot.json").exists());
+            assert_eq!(fs::read(outside).unwrap(), b"outside");
+        }
+    }
+}
+
+#[test]
+fn source_replacement_does_not_change_parsed_or_installed_bytes() {
+    let f = Fixture::new();
+    let original = fs::read(&f.source).unwrap();
+    let (cfg, bytes) = source_from_read(&f.source, |path| {
+        let bytes = files::read(path)?;
+        fs::write(path, b"[general]\nstate_dir = '/different'\n")?;
+        Ok(bytes)
+    })
+    .unwrap();
+    assert_eq!(cfg.general.state_dir, f.state);
+    assert_eq!(bytes, original);
+    f.env.atomic_write(&f.env.installed, &bytes).unwrap();
+    assert_eq!(fs::read(&f.env.installed).unwrap(), original);
+    assert_eq!(
+        Config::from_toml_bytes(&bytes).unwrap().general.state_dir,
+        cfg.general.state_dir
+    );
+}
+#[test]
+fn source_fifo_and_symlink_are_refused() {
+    let f = Fixture::new();
+    let original = fs::read(&f.source).unwrap();
+    let outside = f._dir.path().join("outside");
+    fs::write(&outside, &original).unwrap();
+    fs::remove_file(&f.source).unwrap();
+    symlink(&outside, &f.source).unwrap();
+    assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+    fs::remove_file(&f.source).unwrap();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &f.source,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+    assert!(f.sys.calls.borrow().is_empty());
+    assert_eq!(fs::read(outside).unwrap(), original);
+}
+
+#[cfg(feature = "privileged")]
+#[test]
+fn foreign_owned_directories_refuse_stage_and_unstage() {
+    assert_eq!(
+        std::env::var("TIDEMARK_DEPLOY_TEST_VM").as_deref(),
+        Ok("1"),
+        "disposable VM only"
+    );
+    for child in [false, true] {
+        let f = Fixture::new();
+        fs::create_dir(&f.state).unwrap();
+        fs::set_permissions(&f.state, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(f.state.join("deploy")).unwrap();
+        fs::set_permissions(f.state.join("deploy"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(f.state.join("deploy/staged.json"), b"original").unwrap();
+        let outside = f._dir.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        let bad = if child {
+            f.state.join("deploy")
+        } else {
+            f.state.clone()
+        };
+        let fd = files::directory(&bad, false).unwrap();
+        rustix::fs::fchown(&fd, Some(rustix::process::Uid::from_raw(65534)), None).unwrap();
+        assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+        let error = unstage(&f.state, false, &f.sys).unwrap_err().to_string();
+        assert!(error.contains("65534"));
+        assert!(error.contains("0700"));
+        assert!(error.contains(&bad.display().to_string()));
+        assert!(f.sys.calls.borrow().is_empty());
+        assert_eq!(f.sys.queries.get(), 0);
+        assert_eq!(
+            fs::read(f.state.join("deploy/staged.json")).unwrap(),
+            b"original"
+        );
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
+        assert!(!f.state.join("deploy/firstboot.json").exists());
+    }
+}
+
+#[test]
+fn marker_and_purge_config_fifo_or_symlink_are_refused() {
+    for fifo in [false, true] {
+        let f = Fixture::new();
+        f.stage();
+        f.sys.calls.borrow_mut().clear();
+        let outside = f._dir.path().join("outside");
+        fs::write(&outside, fs::read(&f.env.installed).unwrap()).unwrap();
+        fs::remove_file(&f.env.installed).unwrap();
+        if fifo {
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &f.env.installed,
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::RUSR,
+                0,
+            )
+            .unwrap();
+        } else {
+            symlink(&outside, &f.env.installed).unwrap();
+        }
+        let record = fs::read(f.state.join("deploy/staged.json")).unwrap();
+        assert!(unstage(&f.state, false, &f.sys).is_err());
+        assert!(purge_guard(&f.state).is_err());
+        assert!(f.sys.calls.borrow().is_empty());
+        assert_eq!(
+            fs::read(f.state.join("deploy/staged.json")).unwrap(),
+            record
+        );
+        assert_eq!(Config::load(&outside).unwrap().general.state_dir, f.state);
+    }
+}
+
+#[test]
+fn unsafe_existing_directories_refuse_unstage_without_marker() {
+    for mode in [0o777, 0o750] {
+        for child in [false, true] {
+            let f = Fixture::new();
+            fs::create_dir(&f.state).unwrap();
+            fs::set_permissions(&f.state, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::create_dir(f.state.join("deploy")).unwrap();
+            fs::set_permissions(f.state.join("deploy"), fs::Permissions::from_mode(0o700)).unwrap();
+            let bad = if child {
+                f.state.join("deploy")
+            } else {
+                f.state.clone()
+            };
+            fs::set_permissions(&bad, fs::Permissions::from_mode(mode)).unwrap();
+            fs::write(f.state.join("deploy/staged.json"), b"original").unwrap();
+            let outside = f._dir.path().join("outside");
+            fs::write(&outside, b"outside").unwrap();
+            let error = unstage(&f.state, false, &f.sys).unwrap_err().to_string();
+            assert!(error.contains(&bad.display().to_string()));
+            assert!(error.contains(&format!("{:04o}", mode)));
+            assert!(error.contains(&format!("owner {}", rustix::process::geteuid().as_raw())));
+            assert!(f.sys.calls.borrow().is_empty());
+            assert_eq!(f.sys.queries.get(), 0);
+            assert_eq!(
+                fs::metadata(&bad).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert_eq!(
+                fs::read(f.state.join("deploy/staged.json")).unwrap(),
+                b"original"
+            );
+            assert_eq!(fs::read(outside).unwrap(), b"outside");
+            assert!(!f.state.join("deploy/firstboot.json").exists());
+        }
+    }
+}
+
+#[test]
+fn stage_installs_and_hashes_the_config_parsed_before_replacement() {
+    let f = Fixture::new();
+    let original = fs::read(&f.source).unwrap();
+    let other = f._dir.path().join("other-state");
+    *f.env.source_replacement.borrow_mut() = Some((
+        f.source.clone(),
+        format!("[general]\nstate_dir = {:?}\n", other).into_bytes(),
+    ));
+    let record = f.stage();
+    assert_eq!(fs::read(&f.env.installed).unwrap(), original);
+    assert_eq!(
+        record.config_sha256,
+        format!("{:x}", Sha256::digest(&original))
+    );
+    assert_eq!(
+        Config::load(&f.env.installed).unwrap().general.state_dir,
+        f.state
+    );
+    assert!(f.state.join("deploy/staged.json").exists());
+    assert!(!other.exists());
+    assert_ne!(fs::read(&f.source).unwrap(), original);
+}
+
+#[test]
+fn marker_authorizes_state_normalization_only_after_deploy_is_eligible() {
+    let f = Fixture::new();
+    f.stage();
+    fs::set_permissions(&f.state, fs::Permissions::from_mode(0o750)).unwrap();
+    fs::write(
+        &f.source,
+        format!(
+            "{}\n# changed\n",
+            String::from_utf8(fs::read(&f.source).unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    f.stage();
+    assert_eq!(
+        fs::metadata(&f.state).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    f.sys.calls.borrow_mut().clear();
+    f.sys.queries.set(0);
+    fs::set_permissions(&f.state, fs::Permissions::from_mode(0o750)).unwrap();
+    fs::set_permissions(f.state.join("deploy"), fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+    assert_eq!(
+        fs::metadata(&f.state).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+    assert!(f.sys.calls.borrow().is_empty());
+    assert_eq!(f.sys.queries.get(), 0);
 }

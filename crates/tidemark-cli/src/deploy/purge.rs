@@ -107,11 +107,10 @@ pub(super) fn purge_guard(state_dir: &Path) -> Result<GuardedRoot, DeployError> 
     if marker.format != "tidemark-state-v1" || marker.state_dir.as_path() != state_dir {
         return Err(DeployError::Guard("state marker path mismatch".into()));
     }
-    super::reject_symlink_ancestors(marker.config_path.as_path())?;
-    let cfg =
-        tidemark_core::config::Config::load(marker.config_path.as_path()).map_err(|error| {
-            DeployError::Guard(format!("cannot validate installed configuration: {error}"))
-        })?;
+    let config_bytes = super::files::read(marker.config_path.as_path())?;
+    let cfg = tidemark_core::config::Config::from_toml_bytes(&config_bytes).map_err(|error| {
+        DeployError::Guard(format!("cannot validate installed configuration: {error}"))
+    })?;
     if cfg.general.state_dir != state_dir || !cfg.validate().is_empty() {
         return Err(DeployError::Guard(
             "path differs from configured state_dir".into(),
