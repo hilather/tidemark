@@ -77,10 +77,17 @@ pub fn parse_stat_starttime(stat: &str) -> Option<u64> {
 }
 /// Read the kernel starttime (clock ticks since boot).
 pub fn read_starttime(pid: u32) -> io::Result<u64> {
-    parse_stat_starttime(&String::from_utf8_lossy(&bytes(format!(
-        "/proc/{pid}/stat"
-    ))?))
-    .ok_or_else(invalid)
+    read_starttime_from(fs::File::open(format!("/proc/{pid}/stat"))?)
+}
+fn read_starttime_from(mut reader: impl Read) -> io::Result<u64> {
+    let mut buffer = [0; 512];
+    let count = reader.read(&mut buffer)?;
+    // A complete procfs stat record ends in newline. Full/short incomplete
+    // records fail closed rather than parsing a truncated identity.
+    if count == buffer.len() || !buffer[..count].ends_with(b"\n") {
+        return Err(invalid());
+    }
+    parse_stat_starttime(&String::from_utf8_lossy(&buffer[..count])).ok_or_else(invalid)
 }
 /// Select the systemd hierarchy and its last unit; user sessions become user-UID.
 pub fn parse_cgroup_unit(cgroup: &str) -> Option<String> {
@@ -256,6 +263,35 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn starttime_single_read_and_oversize_failure() {
+        struct Counted<'a> {
+            bytes: &'a [u8],
+            calls: usize,
+        }
+        impl Read for Counted<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                self.bytes.read(out)
+            }
+        }
+        let stat = format!("1 (worker) S {} 42 0\n", "0 ".repeat(18));
+        let mut reader = Counted {
+            bytes: stat.as_bytes(),
+            calls: 0,
+        };
+        assert_eq!(read_starttime_from(&mut reader).unwrap(), 42);
+        assert_eq!(reader.calls, 1);
+        let oversized = [b' '; 512];
+        let mut reader = Counted {
+            bytes: &oversized,
+            calls: 0,
+        };
+        assert!(read_starttime_from(&mut reader).is_err());
+        assert_eq!(reader.calls, 1);
+        assert!(read_starttime_from(&b"1 (incomplete) S 0"[..]).is_err());
+    }
     #[test]
     fn uid_parser_and_error_policy() {
         assert_eq!(

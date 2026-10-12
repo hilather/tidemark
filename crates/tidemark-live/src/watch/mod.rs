@@ -251,6 +251,7 @@ impl Watcher {
             .spawn(move || {
                 let mut buffer = vec![0; 65536];
                 let mut processor = Processor {
+                    own_pid: std::process::id() as i32,
                     cfg: &cfg,
                     attribution: &attribution,
                     mount_fd: mount_fd.as_fd(),
@@ -512,6 +513,7 @@ pub fn namespace_ok() -> io::Result<bool> {
 }
 
 struct Processor<'a> {
+    own_pid: i32,
     cfg: &'a WatcherOptions,
     attribution: &'a AttributionCache,
     mount_fd: std::os::fd::BorrowedFd<'a>,
@@ -562,10 +564,10 @@ impl Processor<'_> {
         }
         let resolved = match event {
             RawEvent::Fd { pid, fd, .. } => {
-                if pid == std::process::id() as i32 {
+                if pid == self.own_pid {
                     return;
                 }
-                fdmode::resolve(fd.as_fd()).map(|(p, s, created)| (pid, p, Some(s), created))
+                fdmode::resolve_event(fd.as_fd()).map(|(p, s, created)| (pid, p, Some(s), created))
             }
             RawEvent::Fid {
                 pid,
@@ -575,7 +577,7 @@ impl Processor<'_> {
                 mask,
                 ..
             } => {
-                if pid == std::process::id() as i32 {
+                if pid == self.own_pid {
                     return;
                 }
                 fidmode::resolve(
@@ -586,7 +588,7 @@ impl Processor<'_> {
                     mask,
                     &mut self.handles,
                 )
-                .map(|(p, s, created)| (pid, p, s, created))
+                .map(|(p, s, created)| (pid, p, s.map(Into::into), created))
             }
             RawEvent::Overflow => return,
         };
@@ -598,7 +600,7 @@ impl Processor<'_> {
     }
     fn record(
         &mut self,
-        resolved: (i32, RawPath, Option<rustix::fs::Stat>, i64),
+        resolved: (i32, RawPath, Option<fdmode::EventStat>, i64),
         event_mask: u64,
         is_fid: bool,
         at: i64,
@@ -634,7 +636,7 @@ impl Processor<'_> {
                     (disk.saturating_neg(), id)
                 })
         };
-        let who = attribution.lookup(u32::try_from(pid).unwrap_or(0));
+        let who = attribution.lookup_watcher(u32::try_from(pid).unwrap_or(0));
         let parent = path
             .parent()
             .filter(|p| p.starts_with(&cfg.mount))
@@ -777,6 +779,7 @@ mod tests {
         };
         let attribution = AttributionCache::new(std::time::Duration::from_secs(60), 10);
         let mut processor = Processor {
+            own_pid: std::process::id() as i32,
             cfg: &cfg,
             attribution: &attribution,
             mount_fd: mount_fd.as_fd(),
@@ -911,6 +914,7 @@ mod tests {
         };
         let attribution = AttributionCache::new(std::time::Duration::from_secs(60), 10);
         let mut processor = Processor {
+            own_pid: std::process::id() as i32,
             cfg: &cfg,
             attribution: &attribution,
             mount_fd: mount_fd.as_fd(),
@@ -974,7 +978,7 @@ mod tests {
         );
         let stat = rustix::fs::stat(&file).unwrap();
         processor.record(
-            (0, to_path.clone(), Some(stat), at),
+            (0, to_path.clone(), Some(stat.into()), at),
             mask::MOVED_TO,
             true,
             at,
@@ -1190,6 +1194,7 @@ mod tests {
         let attribution = AttributionCache::new(std::time::Duration::from_secs(60), 10);
         let at = now();
         let mut processor = Processor {
+            own_pid: std::process::id() as i32,
             cfg: &cfg,
             attribution: &attribution,
             mount_fd: mount_fd.as_fd(),
