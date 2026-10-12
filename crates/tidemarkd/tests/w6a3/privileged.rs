@@ -110,7 +110,7 @@ fn daemon_end_to_end() {
             "--",
             "python3",
             "-c",
-            "import sys; f=open(sys.argv[1],'wb'); f.write(b'x'*(50*1024*1024)); f.close()"
+            "import sys,time; f=open(sys.argv[1],'wb'); f.write(b'x'*(50*1024*1024)); f.close(); time.sleep(5)"
         ])
         .arg(hotdir.join("file"))
         .status()
@@ -137,7 +137,7 @@ fn daemon_end_to_end() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "hot directory, transient unit and thin-pool measurements missing"
+            "hot directory, transient unit and thin-pool measurements missing; last now: {report:?}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }

@@ -130,6 +130,42 @@ fn now() -> i64 {
 }
 
 impl Watcher {
+    /// Build a kernel-free watcher from attributed metadata events for integration tests.
+    /// Events are `(timestamp, directory/unit/command keys, signed delta, unit, identity)`.
+    #[doc(hidden)]
+    pub fn from_injected_events(
+        mount: RawPath,
+        events: impl IntoIterator<Item = (i64, [Vec<u8>; 3], i64, Option<String>, (u64, u64))>,
+    ) -> io::Result<Self> {
+        let mut rings = rings::Rings::new();
+        for (at, keys, delta, unit, identity) in events {
+            rings.add(at, keys, delta, unit, identity);
+        }
+        Ok(Self {
+            mode: WatchMode::FdMount,
+            state: Arc::new(Mutex::new(State {
+                rings,
+                dirty: BTreeSet::new(),
+                loss_pending: false,
+                loss_taken: VecDeque::new(),
+                last_at: None,
+                events: 0,
+                overflows: 0,
+                failed: false,
+                recovering: false,
+                read_errors: 0,
+                stream: None,
+                dropped_events: 0,
+            })),
+            shutdown: Arc::new(rustix::event::eventfd(
+                0,
+                rustix::event::EventfdFlags::NONBLOCK,
+            )?),
+            stopping: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            mount,
+        })
+    }
     /// Check the host namespace, negotiate reporting, and spawn one worker.
     pub fn start(
         cfg: WatcherOptions,

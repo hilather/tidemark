@@ -926,3 +926,83 @@ fn repeated_gauge_keys_and_restart_do_not_poison_writer() {
     assert_eq!(rows.iter().map(|r| r.used).collect::<Vec<_>>(), vec![1, 4]);
     assert_eq!(db.query_lvm("vg", "lv", 100, 100).unwrap().len(), 1);
 }
+
+#[test]
+fn now_uses_watcher_directories_without_exact_alert_windows() {
+    let mut config = Config::default();
+    config.sampler.mounts = vec!["/fixture".into(), "/unwatched".into()];
+    let at = tidemark_core::time::unix_now();
+    let state = LiveState::new(&config, at);
+    publish(&state, Publication::Fs(sample(at, 100)));
+    let mut other = sample(at, 100);
+    other.mount = "/unwatched".into();
+    publish(&state, Publication::Fs(other));
+    let events = [("a.service", 2), ("b.service", -9)].map(|(unit, delta)| {
+        (
+            at,
+            [
+                b"/fixture/hot".to_vec(),
+                unit.as_bytes().to_vec(),
+                b"writer".to_vec(),
+            ],
+            delta,
+            Some(unit.to_owned()),
+            (1, 1),
+        )
+    });
+    let watcher = tidemark_live::watch::Watcher::from_injected_events(
+        RawPath::new(b"/fixture".to_vec()).unwrap(),
+        events,
+    )
+    .unwrap();
+    publish(
+        &state,
+        Publication::Watcher(("/fixture".into(), Arc::new(watcher))),
+    );
+    let report = state
+        .view_at(at)
+        .now(&NowParams { mount: None }, at)
+        .unwrap();
+    let row = &report
+        .mounts
+        .iter()
+        .find(|m| m.mount == "/fixture")
+        .unwrap()
+        .hot_dirs_5m[0];
+    assert_eq!(row.key, b"/fixture/hot");
+    assert_eq!(row.top_unit.as_deref(), Some("b.service"));
+    assert_eq!(row.bytes_delta, -7);
+    assert!(!report
+        .degraded
+        .iter()
+        .any(|d| d == "hot_dirs_5m: not measured" || d == "hot_dirs_5m /fixture: not measured"));
+    assert!(report
+        .degraded
+        .iter()
+        .any(|d| d == "hot_dirs_5m /unwatched: not measured"));
+    assert!(state
+        .view_at(at)
+        .hot_dirs("/fixture", Duration::from_secs(300))
+        .is_none());
+    state.remove_watcher("/fixture");
+    let watcher = tidemark_live::watch::Watcher::from_injected_events(
+        RawPath::new(b"/fixture".to_vec()).unwrap(),
+        [],
+    )
+    .unwrap();
+    publish(
+        &state,
+        Publication::Watcher(("/fixture".into(), Arc::new(watcher))),
+    );
+    let report = state
+        .view_at(at)
+        .now(
+            &NowParams {
+                mount: Some("/fixture".into()),
+            },
+            at,
+        )
+        .unwrap();
+    assert!(report.mounts[0].hot_dirs_5m.is_empty());
+    assert!(!report.degraded.iter().any(|d| d.starts_with("hot_dirs_5m")));
+}
