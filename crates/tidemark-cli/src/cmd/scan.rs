@@ -29,6 +29,89 @@ pub struct Args {
 
 /// Execute the command using direct state and snapshot APIs.
 pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
+    // W6-A3: daemon-first forwarding; direct implementation below is retained.
+    if let Ok(mut client) = crate::client::Client::connect(
+        &context.config.general.socket,
+        std::time::Duration::from_secs(11),
+    ) {
+        use tidemark_core::api::*;
+        if args.threads.is_some() || !args.exclude.is_empty() || args.keep_partial {
+            return Err(crate::CliError::Configuration("daemon scans use configured threads/excludes and discard partial scans; stop the daemon to use direct overrides".into()).into());
+        }
+        let root = tidemark_fs::canon::canonicalize(
+            args.root
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("/data")),
+        )?;
+        if args.cancel {
+            let result: ScanCancelResult =
+                super::now::call(&mut client, "scan.cancel", &ScanCancelParams { root })?;
+            return crate::render::status::scan_cancel(
+                &result,
+                context.json,
+                &mut std::io::stdout().lock(),
+            );
+        }
+        let mode = args
+            .mode
+            .as_deref()
+            .map(|s| serde_json::from_value(serde_json::Value::String(s.into())))
+            .transpose()?;
+        let throttle = args
+            .throttle
+            .as_deref()
+            .map(|s| serde_json::from_value(serde_json::Value::String(s.into())))
+            .transpose()?;
+        let interrupt = super::now::Interrupt::new()?;
+        let started: ScanStartResult = super::now::call(
+            &mut client,
+            "scan.start",
+            &ScanStartParams {
+                root: root.clone(),
+                mode,
+                throttle,
+            },
+        )?;
+        loop {
+            if interrupt.flag.load(std::sync::atomic::Ordering::Acquire) {
+                let _: ScanCancelResult = super::now::call(
+                    &mut client,
+                    "scan.cancel",
+                    &ScanCancelParams { root: root.clone() },
+                )?;
+                return Err(
+                    crate::CliError::Partial("daemon scan cancellation requested".into()).into(),
+                );
+            }
+            let statuses: ScanStatusResult = super::now::call(
+                &mut client,
+                "scan.status",
+                &ScanStatusParams {
+                    root: Some(root.clone()),
+                },
+            )?;
+            if let Some(status) = statuses.first() {
+                if status.running.is_none() {
+                    if status
+                        .last_complete
+                        .as_ref()
+                        .is_some_and(|s| s.scan_id == started.scan_id)
+                    {
+                        return crate::render::status::scan_complete(
+                            status,
+                            context.json,
+                            &mut std::io::stdout().lock(),
+                        );
+                    }
+                    return Err(crate::CliError::Partial(
+                        "daemon scan failed or was cancelled".into(),
+                    )
+                    .into());
+                }
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(100));
+        }
+    }
     use std::sync::{atomic::AtomicBool, Arc};
     use tidemark_scan::{
         mode::ModeRequest,

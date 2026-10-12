@@ -11,6 +11,52 @@ pub struct Args {
 }
 /// Collect metadata directly and render current LVM and optional 24-hour pool trends.
 pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
+    // W6-A3: daemon-first forwarding; retain the direct collector below.
+    match crate::client::Client::connect(
+        &context.config.general.socket,
+        std::time::Duration::from_secs(11),
+    ) {
+        Ok(mut client) => {
+            let report: tidemark_core::api::LvmResult = super::now::call(
+                &mut client,
+                "lvm",
+                &tidemark_core::api::LvmParams {
+                    mount: super::now::mount(args.mount.as_deref())?,
+                },
+            )?;
+            let db = context.config.general.state_dir.join("timeseries.db");
+            let history = if db.try_exists()? {
+                tidemark_store::timeseries::TimeSeries::open(&db, false)
+                    .map_err(|e| tracing::warn!(%e, "LVM history unavailable"))
+                    .ok()
+            } else {
+                None
+            };
+            let now = super::phantom::timestamp()?;
+            let mut trends = Vec::new();
+            for (mount, lv) in &report.mounts {
+                if lv.thin_pool.is_some() {
+                    if let Some(db) = &history {
+                        match db.query_lvm(&lv.vg, &lv.lv, now.saturating_sub(86400), now) {
+                            Ok(samples) => trends.push((
+                                mount.clone(),
+                                slope(&samples, |s| s.data_pct),
+                                slope(&samples, |s| s.meta_pct),
+                            )),
+                            Err(e) => tracing::warn!(%e, "LVM trend unavailable"),
+                        }
+                    }
+                }
+            }
+            return crate::render::now::lvm(
+                &report,
+                &trends,
+                context.json,
+                &mut std::io::stdout().lock(),
+            );
+        }
+        Err(_) => crate::render::now::fallback("lvm")?,
+    }
     let now = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?

@@ -1,4 +1,4 @@
-//! Owned by: W6-A
+//! Owned by: W6-A3
 //! Command surface and shared CLI support.
 
 /// Final arguments for this command.
@@ -18,7 +18,25 @@ pub struct Args {
     pub limit: Option<usize>,
 }
 
-/// Execute this command (implemented by its later owner).
-pub fn run(_args: &Args, _context: &crate::Context) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!("not implemented yet (W6-A)"))
+/// Execute the command through the daemon API.
+pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
+    use tidemark_core::api::{HotBy, HotParams, HotWindow};
+    let params = HotParams {
+        mount: super::now::mount(args.mount.as_deref())?,
+        window: match args.window.as_deref().unwrap_or("5m") {
+            "1m" => HotWindow::OneMinute,
+            "15m" => HotWindow::FifteenMinutes,
+            "60m" => HotWindow::SixtyMinutes,
+            _ => HotWindow::FiveMinutes,
+        },
+        by: match args.by.as_deref().unwrap_or("dir") {
+            "unit" => HotBy::Unit,
+            "comm" => HotBy::Comm,
+            _ => HotBy::Dir,
+        },
+        limit: args.limit.unwrap_or(20),
+    };
+    let mut client = super::now::connect(context)?;
+    let rows: Vec<tidemark_core::live::HotEntry> = super::now::call(&mut client, "hot", &params)?;
+    crate::render::hot::write(&rows, context.json, &mut std::io::stdout().lock())
 }
