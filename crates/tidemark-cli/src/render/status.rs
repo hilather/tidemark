@@ -39,7 +39,8 @@ pub fn write_width(
     writeln!(
         out,
         "tidemarkd {} · uptime {}s",
-        report.version, report.uptime_s
+        display(report.version.as_bytes()),
+        report.uptime_s
     )?;
     let mut rows: Vec<_> = report.components.iter().collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -69,7 +70,7 @@ pub fn write_width(
             out,
             "last error {} at {}: {}",
             display(name.as_bytes()),
-            ts,
+            crate::render::size::timestamp(ts),
             display(message.as_bytes())
         )?;
     }
@@ -79,11 +80,16 @@ pub fn write_width(
     for s in scans {
         writeln!(
             out,
-            "{}  {}  {:?}  {:?}",
+            "{}  {}  {}  {}",
             display(s.root.as_bytes()),
-            s.running.is_some(),
-            s.next_due,
-            s.last_complete.as_ref().map(|s| s.finished_at)
+            if s.running.is_some() { "yes" } else { "no" },
+            s.next_due
+                .map(crate::render::size::timestamp)
+                .unwrap_or_else(|| "-".into()),
+            s.last_complete
+                .as_ref()
+                .map(|s| crate::render::size::timestamp(s.finished_at))
+                .unwrap_or_else(|| "-".into())
         )?;
     }
     if show_config {

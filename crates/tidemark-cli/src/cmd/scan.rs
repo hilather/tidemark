@@ -77,7 +77,9 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     root: Some(root.clone()),
                 },
             )?;
-            let status = statuses.iter().find(|s| s.root == root.display_lossy());
+            let status = statuses
+                .iter()
+                .find(|s| s.root.as_bytes() == root.as_bytes() || s.root == root.display_lossy());
             let completed = status.is_some_and(|s| {
                 s.last_complete
                     .as_ref()
@@ -89,10 +91,31 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     .is_some_and(|running| running.scan_id == started.scan_id)
             });
             if completed || !ours_running {
-                completed_outcome(context, &root, &started.scan_id)?;
+                let entry = completed_outcome(context, &root, &started.scan_id)?;
                 if let Some(status) = status.filter(|_| completed) {
                     crate::render::status::scan_complete(
                         status,
+                        context.json,
+                        &mut std::io::stdout().lock(),
+                    )?;
+                } else {
+                    let status = tidemark_core::live::ScanStatus {
+                        root: root.display_lossy(),
+                        running: None,
+                        next_due: None,
+                        last_complete: Some(tidemark_core::live::LastScan {
+                            scan_id: entry.scan_id,
+                            finished_at: entry.finished_at.unwrap_or(entry.started_at),
+                            mode: match entry.mode {
+                                tidemark_core::scan::ScanMode::Walk => "walk",
+                                tidemark_core::scan::ScanMode::Bulk => "bulk",
+                            }
+                            .into(),
+                            duration_ms: entry.duration_ms.unwrap_or(0),
+                        }),
+                    };
+                    crate::render::status::scan_complete(
+                        &status,
                         context.json,
                         &mut std::io::stdout().lock(),
                     )?;
@@ -246,6 +269,22 @@ impl tidemark_scan::orchestrator::ScanRecorder for DirectRecorder {
 }
 
 fn daemon_connection(context: &crate::Context) -> anyhow::Result<Option<crate::client::Client>> {
+    // A definitively absent endpoint needs no socket syscall. Recheck under the scan lock.
+    match std::fs::symlink_metadata(&context.config.general.socket) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            let hint = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                format!("\n{}", crate::ACCESS_HINT)
+            } else {
+                String::new()
+            };
+            return Err(
+                crate::CliError::Unavailable(format!("daemon unavailable: {error}{hint}")).into(),
+            );
+        }
+        Ok(_) => {}
+    }
+
     match crate::client::Client::connect(
         &context.config.general.socket,
         std::time::Duration::from_secs(11),
@@ -253,7 +292,13 @@ fn daemon_connection(context: &crate::Context) -> anyhow::Result<Option<crate::c
         Ok(client) => Ok(Some(client)),
         Err(crate::client::ClientError::Unavailable) => Ok(None),
         Err(error) => {
-            Err(crate::CliError::Unavailable(format!("daemon unavailable: {error}")).into())
+            let hint = if matches!(&error, crate::client::ClientError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+            {
+                format!("\n{}", crate::ACCESS_HINT)
+            } else {
+                String::new()
+            };
+            Err(crate::CliError::Unavailable(format!("daemon unavailable: {error}{hint}")).into())
         }
     }
 }
@@ -270,7 +315,7 @@ fn completed_outcome(
     context: &crate::Context,
     root: &tidemark_core::path::RawPath,
     id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<tidemark_store::catalog::ScanEntry> {
     let outcome = tidemark_store::catalog::Catalog::open(&context.config.general.state_dir, false)
         .and_then(|catalog| catalog.get(id));
     match outcome {
@@ -280,7 +325,7 @@ fn completed_outcome(
                 && entry.status == "complete"
                 && !entry.degraded =>
         {
-            Ok(())
+            Ok(entry)
         }
         Ok(Some(entry)) if entry.root == *root && (entry.degraded || entry.status == "partial") => {
             Err(

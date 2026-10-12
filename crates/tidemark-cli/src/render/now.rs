@@ -192,29 +192,6 @@ pub fn fallback(command: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-fn select_width(is_terminal: bool, query: impl FnOnce() -> Option<u16>) -> usize {
-    if is_terminal {
-        query().filter(|width| *width > 0).map_or(100, usize::from)
-    } else {
-        100
-    }
-}
-
-#[cfg(test)]
-mod width_tests {
-    #[test]
-    fn terminal_width_selection() {
-        assert_eq!(
-            super::select_width(false, || panic!("nonterminal queried")),
-            100
-        );
-        assert_eq!(super::select_width(true, || Some(132)), 132);
-        assert_eq!(super::select_width(true, || Some(0)), 100);
-        assert_eq!(super::select_width(true, || None), 100);
-    }
-}
-
 /// Render the report at an injected width without changing machine quantities.
 pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
     use tidemark_core::units::{fmt_bytes, fmt_rate};
@@ -288,7 +265,7 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
                     bytes_display(&e.key),
                     signed_bytes(e.bytes_delta),
                     e.files,
-                    escape(e.top_unit.as_deref().unwrap_or("unknown")),
+                    escape(e.top_unit.as_deref().unwrap_or("?")),
                     if e.lossy { " [lossy]" } else { "" }
                 ));
             }
@@ -307,7 +284,7 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
                 "    {} (pid {}, {}) {} {}",
                 escape(&h.comm),
                 h.pid,
-                escape(h.unit.as_deref().unwrap_or("unknown")),
+                escape(h.unit.as_deref().unwrap_or("?")),
                 bytes_display(&h.path),
                 fmt_bytes(h.bytes)
             ));

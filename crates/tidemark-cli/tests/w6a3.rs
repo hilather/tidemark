@@ -60,8 +60,21 @@ fn fake(
 ) -> std::thread::JoinHandle<()> {
     let socket = p.parent().unwrap().join("api.sock");
     let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
     std::thread::spawn(move || {
-        let (s, _) = listener.accept().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let s = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(error) => panic!("fake daemon accept deadline: {error}"),
+            }
+        };
         s.set_read_timeout(Some(std::time::Duration::from_secs(3)))
             .unwrap();
         let mut s = BufReader::new(s);
@@ -475,5 +488,197 @@ fn scan_full_backlog_expires_without_direct_state_writes() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
+    assert!(!dir.path().join("state").exists());
+}
+
+fn example_now() -> tidemark_core::live::NowReport {
+    serde_json::from_value(serde_json::json!({
+        "generated_at":1791845576,"host":"fixture","alerts_firing":[],"scans":[{"root":"/data","running":null,"next_due":null,"last_complete":{"scan_id":"a","finished_at":1791845576,"mode":"walk","duration_ms":5}}],"degraded":[],
+        "mounts":[{"mount":"/data","size":1000000000,"used":50000000,"avail":950000000,"rate_15m":2362647.27,"rate_1h":500.0,"ttf_secs":189,"lvm":null,"hot_dirs_5m":[{"path":"/data/hot","events":3,"files":2,"bytes_delta":50000000,"top_unit":"writer.service","lossy":false},{"path_b64":"L2JhZP8=","events":1,"files":1,"bytes_delta":1,"top_unit":null,"lossy":false}],"writers_5m":[],"phantom":{"mount":"/data","total_bytes":0,"files":0,"holders":[],"limited":false},"open_writers_top":[],"watch_mode":"fd/mount","lossy_minutes_15m":0}]
+    })).unwrap()
+}
+#[test]
+fn now_uses_report_rates_hot_directories_units_and_utc() {
+    let report = example_now();
+    for width in [80, 100, 200] {
+        let text = tidemark_cli::render::now::render_text(&report, width);
+        assert!(text.lines().all(|line| line.chars().count() <= width));
+        assert!(text.contains("2026-10-12 22:52:56Z"));
+        assert!(text.contains("7.92 GiB/h (15m)"), "{text}");
+        assert!(text.contains("full in ~3m 9s (1h trend)"), "{text}");
+        assert!(text.contains("hot dirs (5m) /data/hot") && text.contains("writer.service"));
+        assert!(
+            text.contains("/bad\\xFF") && text.contains("1 files  ?"),
+            "{text}"
+        );
+    }
+    let mut out = Vec::new();
+    tidemark_cli::render::json("tidemark.now.v1", &report, &mut out).unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(doc["data"]["mounts"][0]["rate_15m"], 2362647.27);
+    assert_eq!(doc["data"]["mounts"][0]["ttf_secs"], 189);
+    assert_eq!(doc["data"]["generated_at"], 1791845576);
+}
+#[test]
+fn status_schedules_are_human_readable_and_fit_widths() {
+    let context = tidemark_cli::Context {
+        config: tidemark_core::config::Config::default(),
+        config_path: "/fixture".into(),
+        json: false,
+        color: false,
+    };
+    let report: tidemark_core::api::StatusResult = serde_json::from_value(serde_json::json!({"version":"fixture","uptime_s":1,"components":[{"name":"api","state":"ok","detail":"a".repeat(200)}],"watch_modes":[],"last_errors":[["api",1791845576,"bad\nmessage"]]})).unwrap();
+    let scans = vec![tidemark_core::live::ScanStatus {
+        root: "/data".into(),
+        running: None,
+        next_due: Some(1791845576),
+        last_complete: None,
+    }];
+    for width in [80, 100, 200] {
+        let mut out = Vec::new();
+        tidemark_cli::render::status::write_width(
+            &report, &scans, &context, false, width, &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.lines().all(|line| line.chars().count() <= width));
+        assert!(
+            text.contains("/data  no  2026-10-12 22:52:56Z  -"),
+            "{text}"
+        );
+        assert!(text.contains("bad\\x0Amessage"), "{text}");
+        assert!(!text.contains("Some(") && !text.contains("None"));
+    }
+    assert_eq!(
+        tidemark_cli::render::size::timestamp(0),
+        "1970-01-01 00:00:00Z"
+    );
+    assert_eq!(
+        tidemark_cli::render::size::timestamp(-1),
+        "1969-12-31 23:59:59Z"
+    );
+}
+#[test]
+fn hot_units_are_visible_without_repeating_unit_group_keys() {
+    let mut rows = example_now().mounts.remove(0).hot_dirs_5m;
+    rows[0].key = b"writer.service".to_vec();
+    for width in [80, 100, 200] {
+        let mut out = Vec::new();
+        tidemark_cli::render::hot::write_grouped(&rows, false, width, true, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("writer.service").count(), 1);
+        assert!(!text.contains("TOP UNIT"));
+        let mut out = Vec::new();
+        tidemark_cli::render::hot::write_width(&rows, false, width, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out)
+                .unwrap()
+                .matches("writer.service")
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn every_live_renderer_fits_long_byte_paths_and_controls() {
+    let mut key = format!("/begin/{}/last", "a".repeat(200)).into_bytes();
+    key.extend_from_slice("é".as_bytes());
+    key.extend_from_slice(b"\xff\n");
+    let row = tidemark_core::live::HotEntry {
+        key: key.clone(),
+        events: 1,
+        files: 1,
+        bytes_delta: 1,
+        top_unit: Some("unit\nname".into()),
+        lossy: false,
+    };
+    let phantom: tidemark_core::live::PhantomSummary = serde_json::from_value(serde_json::json!({"mount":"/data","total_bytes":1,"files":1,"limited":false,"holders":[{"pid":1,"comm":"writer","unit":null,"path":"/placeholder","dev":1,"ino":1,"bytes":1}]})).unwrap();
+    let mut phantom = phantom;
+    phantom.holders[0].path = key.clone();
+    let mut writer: tidemark_core::live::OpenWriter = serde_json::from_value(serde_json::json!({"mount":"/data","pid":1,"comm":"writer","unit":null,"path":"/placeholder","dev":1,"ino":1,"size":1,"disk":1,"growth":1,"window_secs":1})).unwrap();
+    writer.path = key.clone();
+    let alerts = vec![tidemark_core::live::AlertSummary {
+        rule: "rule".into(),
+        subject: tidemark_core::path::display_lossy_bytes(&key),
+        since: 0,
+        value: Some(1.0),
+        message: "m".repeat(200),
+    }];
+    let lvm: tidemark_core::api::LvmResult = serde_json::from_value(serde_json::json!({"mounts":[["/data",{"vg":"v".repeat(200),"lv":"lv","lv_size":1,"vg_free":1,"thin_pool":null,"data_pct":null,"meta_pct":null,"sampled_at":0}]],"vgs":[],"sampled_at":0})).unwrap();
+    for width in [40, 80, 100, 200] {
+        let mut outputs = Vec::new();
+        let mut out = Vec::new();
+        tidemark_cli::render::hot::write_width(std::slice::from_ref(&row), false, width, &mut out)
+            .unwrap();
+        outputs.push(out);
+        let mut out = Vec::new();
+        tidemark_cli::render::alerts::active_width(&alerts, false, width, &mut out).unwrap();
+        outputs.push(out);
+        let mut out = Vec::new();
+        tidemark_cli::render::now::phantom_width(
+            std::slice::from_ref(&phantom),
+            false,
+            width,
+            &mut out,
+        )
+        .unwrap();
+        outputs.push(out);
+        let mut out = Vec::new();
+        tidemark_cli::render::now::writers_width(
+            std::slice::from_ref(&writer),
+            false,
+            width,
+            &mut out,
+        )
+        .unwrap();
+        outputs.push(out);
+        let mut out = Vec::new();
+        tidemark_cli::render::now::lvm_width(&lvm, &[], false, width, &mut out).unwrap();
+        outputs.push(out);
+        let mut report = example_now();
+        report.mounts[0].hot_dirs_5m = vec![row.clone()];
+        outputs.push(tidemark_cli::render::now::render_text(&report, width).into_bytes());
+        for out in outputs {
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.lines().all(|line| line.chars().count() <= width),
+                "{text}"
+            );
+            assert!(text.contains("..."));
+        }
+        let mut out = Vec::new();
+        tidemark_cli::render::hot::write_width(std::slice::from_ref(&row), true, width, &mut out)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let decoded: Vec<tidemark_core::live::HotEntry> =
+            serde_json::from_value(value["data"].clone()).unwrap();
+        assert_eq!(decoded[0].key, key);
+    }
+}
+
+#[test]
+fn scan_permission_error_never_falls_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let p = config(&dir);
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let text = std::fs::read_to_string(&p)
+        .unwrap()
+        .replace("api.sock'", "locked/api.sock'");
+    std::fs::write(&p, text).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let denied = std::fs::symlink_metadata(locked.join("api.sock"))
+        .err()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+    if !denied {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!("permission coverage unavailable: process can traverse mode-000 directory");
+        return;
+    }
+    let out = cli(&p, &["scan", "/"]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(out.status.code(), Some(4));
     assert!(!dir.path().join("state").exists());
 }

@@ -54,11 +54,15 @@ mod tests {
 pub fn terminal_width() -> usize {
     use std::io::IsTerminal;
     let stdout = std::io::stdout();
-    if stdout.is_terminal() {
+    select_width(stdout.is_terminal(), || {
         rustix::termios::tcgetwinsize(&stdout)
             .ok()
-            .filter(|s| s.ws_col > 0)
-            .map_or(100, |s| usize::from(s.ws_col))
+            .map(|s| s.ws_col)
+    })
+}
+fn select_width(is_terminal: bool, query: impl FnOnce() -> Option<u16>) -> usize {
+    if is_terminal {
+        query().filter(|width| *width > 0).map_or(100, usize::from)
     } else {
         100
     }
@@ -83,12 +87,21 @@ pub fn shorten(cell: &str, width: usize) -> String {
         return ".".repeat(width);
     }
     let budget = width - 3;
+    let last_component = cell
+        .rsplit_once('/')
+        .map_or(0, |(_, last)| last.chars().count() + 1);
+    let right_budget = if last_component < budget {
+        (budget - budget / 2).max(last_component)
+    } else {
+        budget - budget / 2
+    };
+    let left_budget = budget - right_budget;
     let mut left = String::new();
     let mut right = String::new();
     let mut used = 0;
     for token in &tokens {
         let n = token.chars().count();
-        if used + n > budget / 2 {
+        if used + n > left_budget {
             break;
         }
         left.push_str(token);
@@ -171,4 +184,32 @@ pub fn wrap(text: &str, width: usize) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod fitting_tests {
+    #[test]
+    fn terminal_selection_uses_positive_width_or_default() {
+        assert_eq!(
+            super::select_width(false, || panic!("nonterminal queried")),
+            100
+        );
+        assert_eq!(super::select_width(true, || Some(132)), 132);
+        assert_eq!(super::select_width(true, || Some(0)), 100);
+        assert_eq!(super::select_width(true, || None), 100);
+    }
+
+    #[test]
+    fn suffix_and_escape_tokens_survive_shortening() {
+        let cell = format!("/begin/{}/last-component", "long".repeat(50));
+        let text = super::shorten(&cell, 30);
+        assert!(text.starts_with("/begin/") && text.ends_with("/last-component"));
+        for width in 3..40 {
+            let text = super::shorten("\\xFF".repeat(20).as_str(), width);
+            assert!(text.chars().count() <= width);
+            for chunk in text.split("...") {
+                assert!(chunk.len().is_multiple_of(4));
+            }
+        }
+    }
 }

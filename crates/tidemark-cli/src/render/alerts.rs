@@ -29,7 +29,7 @@ pub fn active_width(
         table.push(vec![
             display(r.rule.as_bytes()),
             display(r.subject.as_bytes()),
-            r.since.to_string(),
+            crate::render::size::timestamp(r.since),
             r.value.map_or_else(|| "?".into(), |v| v.to_string()),
             display(r.message.as_bytes()),
         ]);
@@ -62,7 +62,7 @@ pub fn history_width(
         .to_vec()];
     for r in rows {
         table.push(vec![
-            r.ts.to_string(),
+            crate::render::size::timestamp(r.ts),
             display(r.rule.as_bytes()),
             display(r.subject.as_bytes()),
             format!("{:?}", r.state).to_lowercase(),

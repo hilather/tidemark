@@ -199,7 +199,7 @@ pub fn files(rows: &[FileHit], json: bool, out: &mut impl Write) -> anyhow::Resu
                 if hit.row.nlink > 1 { " (shared)" } else { "" }
             ),
             super::size::bytes(hit.row.disk),
-            hit.row.mtime.to_string(),
+            crate::render::size::timestamp(hit.row.mtime),
             hit.row.nlink.to_string(),
         ]);
     }

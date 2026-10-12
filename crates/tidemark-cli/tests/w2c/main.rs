@@ -155,6 +155,7 @@ fn file_rendering_shared_and_unresolved() {
     let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
     insta::with_settings!({snapshot_path => "snapshots"}, {insta::assert_json_snapshot!("files_json",doc);});
     assert_eq!(doc["schema"], "tidemark.files.v1");
+    assert_eq!(doc["data"][0]["row"]["mtime"], 100);
     assert_eq!(doc["data"][0]["path_b64"], "L2ZpeHR1cmUvYf8=");
     assert!(doc["data"][0].get("path").is_none());
     assert!(doc["data"][1].get("path").is_none());
