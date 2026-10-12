@@ -183,12 +183,13 @@ impl LiveState {
         self.0.write().storage = Some(Arc::new(fd));
     }
     /// Storage path anchored to the retained directory descriptor, or configured test path.
+    /// The final `.` names the directory itself for consumers using `O_NOFOLLOW`.
     pub fn storage_path(&self) -> std::path::PathBuf {
         use std::os::fd::AsRawFd;
         let d = self.0.read();
         d.storage
             .as_ref()
-            .map(|f| format!("/proc/self/fd/{}", f.as_raw_fd()).into())
+            .map(|f| format!("/proc/self/fd/{}/.", f.as_raw_fd()).into())
             .unwrap_or_else(|| d.config.general.state_dir.clone())
     }
     /// Publish a complete bounded result and health atomically.

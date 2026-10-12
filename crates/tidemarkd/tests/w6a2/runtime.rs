@@ -32,10 +32,20 @@ struct Harness {
 }
 impl Harness {
     fn new(schedule: &str, throttle: &str) -> Self {
+        Self::with_nested_storage(schedule, throttle, false)
+    }
+    fn with_nested_storage(schedule: &str, throttle: &str, nested: bool) -> Self {
+        Self::with_clock(schedule, throttle, nested, Arc::new(tidemarkd::unix_now))
+    }
+    fn with_clock(schedule: &str, throttle: &str, nested: bool, clock: tidemarkd::Clock) -> Self {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("child")).unwrap();
         std::fs::write(root.path().join("child/file"), b"fixture").unwrap();
-        let storage = tempfile::tempdir().unwrap();
+        let storage = if nested {
+            tempfile::tempdir_in(root.path()).unwrap()
+        } else {
+            tempfile::tempdir().unwrap()
+        };
         let mut cfg = Config::default();
         cfg.general.state_dir = storage.path().to_owned();
         cfg.roots = vec![RootConfig {
@@ -48,12 +58,19 @@ impl Harness {
         }];
         cfg.scan.threads = 1;
         let state = LiveState::new(&cfg, tidemarkd::unix_now());
+        state.bind_storage(std::fs::File::open(storage.path()).unwrap().into());
         let stop = Arc::new(AtomicBool::new(false));
         let writer_stop = Arc::new(AtomicBool::new(false));
         let (writer, wh) =
             tswriter::start(Arc::new(cfg.clone()), state.clone(), writer_stop.clone()).unwrap();
-        let (control, sh) =
-            scheduler::start(Arc::new(cfg.clone()), state.clone(), writer, stop.clone()).unwrap();
+        let (control, sh) = scheduler::start_with_clock(
+            Arc::new(cfg.clone()),
+            state.clone(),
+            writer,
+            stop.clone(),
+            clock,
+        )
+        .unwrap();
         Self {
             _root: root,
             _state: storage,
@@ -297,4 +314,380 @@ fn failed_root_does_not_starve_another_due_root() {
             .iter()
             .any(|s| s.last_complete.is_some())
     });
+}
+
+#[test]
+fn bound_storage_scheduled_then_api_scan_publishes_and_excludes_state() {
+    let h = Harness::with_nested_storage("off", "max", true);
+    let mut cfg = h.cfg.clone();
+    cfg.roots[0].schedule = "every 1h".into();
+    cfg.retention.snapshots.recent = 1;
+    cfg.retention.snapshots.daily = 0;
+    cfg.retention.snapshots.weekly = 0;
+    h.state.replace_config(cfg).unwrap();
+    wait(|| {
+        h.control
+            .status(&ScanStatusParams { root: None })
+            .unwrap()
+            .iter()
+            .any(|s| s.last_complete.is_some())
+    });
+    h.idle();
+    let catalog = tidemark_store::catalog::Catalog::open(&h.cfg.general.state_dir, false).unwrap();
+    let first = catalog.latest(&h.root()).unwrap().unwrap();
+    let first_file = first.file.as_ref().unwrap();
+    assert!(first_file.exists());
+    assert!(std::fs::canonicalize(first_file)
+        .unwrap()
+        .starts_with(&h.cfg.general.state_dir));
+    let snapshot = tidemark_store::reader::Snapshot::open(first_file).unwrap();
+    assert!(snapshot
+        .dir_by_path(&RawPath::from_path(&h.cfg.general.state_dir).unwrap())
+        .unwrap()
+        .is_none());
+    assert_no_tmp(&h.cfg.general.state_dir);
+    let context = tidemarkd::api::Context {
+        state: h.state.clone(),
+        scans: h.control.clone(),
+        reload: Arc::new(|| {
+            Ok(tidemark_core::api::ConfigReloadResult {
+                reloaded: true,
+                warnings: vec![],
+            })
+        }),
+    };
+    let request = tidemark_core::api::Request {
+        v: 1,
+        id: "bound-storage".into(),
+        method: "scan.start".into(),
+        params: serde_json::to_value(h.params()).unwrap(),
+    };
+    // Separate catalog/series timestamps for the two snapshots.
+    wait(|| tidemarkd::unix_now() > first.started_at);
+    let api_stop = Arc::new(AtomicBool::new(false));
+    let mut api_cfg = h.cfg.clone();
+    api_cfg.general.socket = h.cfg.general.state_dir.join("api.sock");
+    let api_handle = match std::os::unix::net::UnixListener::bind(&api_cfg.general.socket) {
+        Ok(probe) => {
+            drop(probe);
+            std::fs::remove_file(&api_cfg.general.socket).unwrap();
+            Some(
+                tidemarkd::api::start_with_peer(
+                    Arc::new(api_cfg.clone()),
+                    tidemarkd::api::Context {
+                        state: context.state.clone(),
+                        scans: context.scans.clone(),
+                        reload: context.reload.clone(),
+                    },
+                    api_stop.clone(),
+                    Arc::new(|_| Ok((0, 1))),
+                )
+                .unwrap(),
+            )
+        }
+        Err(e) if e.raw_os_error() == Some(1) => {
+            eprintln!("Unix socket denied: exercising scan.start dispatch with injected root uid");
+            None
+        }
+        Err(e) => panic!("socket probe: {e}"),
+    };
+    wait(|| {
+        let response = if api_handle.is_some() {
+            use std::io::{BufRead, Write};
+            let mut stream =
+                std::os::unix::net::UnixStream::connect(&api_cfg.general.socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(11)))
+                .unwrap();
+            serde_json::to_writer(&mut stream, &request).unwrap();
+            stream.write_all(b"\n").unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream)
+                .read_line(&mut line)
+                .unwrap();
+            serde_json::from_str::<tidemark_core::api::Response>(&line).unwrap()
+        } else {
+            tidemarkd::api::dispatch(&request, 0, &context, tidemarkd::unix_now()).unwrap()
+        };
+        if response
+            .error
+            .as_ref()
+            .is_some_and(|e| e.code == tidemark_core::api::ApiErrorCode::Busy)
+        {
+            return false;
+        }
+        assert!(response.ok, "{response:?}");
+        true
+    });
+    api_stop.store(true, Ordering::Release);
+    if let Some(handle) = api_handle {
+        handle.join().unwrap().unwrap();
+    }
+    wait(|| {
+        catalog
+            .latest(&h.root())
+            .unwrap()
+            .is_some_and(|s| s.scan_id != first.scan_id)
+    });
+    h.idle();
+    let second = catalog.latest(&h.root()).unwrap().unwrap();
+    assert!(second.file.as_ref().unwrap().exists());
+    assert!(std::fs::canonicalize(second.file.as_ref().unwrap())
+        .unwrap()
+        .starts_with(&h.cfg.general.state_dir));
+    assert!(h
+        .control
+        .status(&ScanStatusParams {
+            root: Some(h.root())
+        })
+        .unwrap()[0]
+        .last_complete
+        .as_ref()
+        .is_some_and(|s| s.scan_id == second.scan_id));
+    let snapshot = tidemark_store::reader::Snapshot::open(second.file.as_ref().unwrap()).unwrap();
+    assert!(snapshot
+        .dir_by_path(&RawPath::from_path(&h.cfg.general.state_dir).unwrap())
+        .unwrap()
+        .is_none());
+    wait(|| !first_file.exists());
+    assert!(tidemark_live::alerts::AlertSource::dir_growth(
+        &h.state.view(),
+        &h.root().display_lossy(),
+        0
+    )
+    .is_some());
+    let series = tidemark_store::timeseries::TimeSeries::open(
+        &h.cfg.general.state_dir.join("timeseries.db"),
+        false,
+    )
+    .unwrap();
+    assert!(!series
+        .query_dir_series(&h.root(), &h.root(), 0, i64::MAX)
+        .unwrap()
+        .is_empty());
+    assert_no_tmp(&h.cfg.general.state_dir);
+}
+
+#[test]
+fn failure_health_survives_idle_other_root_and_reload_until_recovery() {
+    let h = Harness::new("off", "max");
+    let missing = h.cfg.roots[0].path.join("missing");
+    let mut cfg = h.cfg.clone();
+    let mut root = cfg.roots[0].clone();
+    root.path = missing.clone();
+    root.schedule = "every 1h".into();
+    cfg.roots.insert(0, root);
+    h.state.replace_config(cfg.clone()).unwrap();
+    let degraded = || {
+        h.state
+            .view()
+            .status(tidemarkd::unix_now())
+            .unwrap()
+            .components
+            .into_iter()
+            .find(|c| c.name == "scheduler")
+            .is_some_and(|c| c.state == "degraded" && c.detail.contains("missing"))
+    };
+    wait(degraded);
+    let raw = RawPath::from_path(&missing).unwrap();
+    wait(|| {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(raw.clone()),
+            })
+            .unwrap()[0]
+            .next_due
+            .is_some_and(|due| due > tidemarkd::unix_now())
+    });
+    let due = h
+        .control
+        .status(&ScanStatusParams {
+            root: Some(raw.clone()),
+        })
+        .unwrap()[0]
+        .next_due
+        .unwrap();
+    assert!(due > tidemarkd::unix_now());
+    // Another root's successful requested scan must leave this failure visible.
+    wait(|| match h.control.start(&h.params()) {
+        Ok(_) => true,
+        Err(e) if e.to_string().contains("Busy") => false,
+        Err(e) => panic!("{e}"),
+    });
+    wait(|| {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(h.root()),
+            })
+            .unwrap()[0]
+            .last_complete
+            .is_some()
+    });
+    h.idle();
+    assert!(degraded());
+    h.state.replace_config(cfg.clone()).unwrap();
+    assert!(degraded());
+    let mut removed = cfg.clone();
+    removed.roots.clear();
+    h.state.replace_config(removed).unwrap();
+    wait(|| !degraded());
+    h.state.replace_config(cfg).unwrap();
+    wait(degraded);
+    wait(|| {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(raw.clone()),
+            })
+            .unwrap()[0]
+            .next_due
+            .is_some_and(|due| due > tidemarkd::unix_now())
+    });
+    std::fs::create_dir(&missing).unwrap();
+    let params = ScanStartParams {
+        root: raw.clone(),
+        mode: Some(RootMode::Walk),
+        throttle: Some(ThrottlePreset::Max),
+    };
+    wait(|| match h.control.start(&params) {
+        Ok(_) => true,
+        Err(e) if e.to_string().contains("Busy") => false,
+        Err(e) => panic!("{e}"),
+    });
+    wait(|| {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(raw.clone()),
+            })
+            .unwrap()[0]
+            .last_complete
+            .is_some()
+    });
+    wait(|| !degraded());
+    let mut cfg = h.cfg.clone();
+    cfg.roots.clear();
+    h.state.replace_config(cfg).unwrap();
+}
+
+#[test]
+fn bound_storage_api_request_publishes_first_snapshot() {
+    let h = Harness::with_nested_storage("off", "max", true);
+    let context = tidemarkd::api::Context {
+        state: h.state.clone(),
+        scans: h.control.clone(),
+        reload: Arc::new(|| {
+            Ok(tidemark_core::api::ConfigReloadResult {
+                reloaded: true,
+                warnings: vec![],
+            })
+        }),
+    };
+    let request = tidemark_core::api::Request {
+        v: 1,
+        id: "first-request".into(),
+        method: "scan.start".into(),
+        params: serde_json::to_value(h.params()).unwrap(),
+    };
+    let response = tidemarkd::api::dispatch(&request, 0, &context, tidemarkd::unix_now()).unwrap();
+    assert!(response.ok, "{response:?}");
+    let id = response.result.unwrap()["scan_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait(|| {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(h.root()),
+            })
+            .unwrap()[0]
+            .last_complete
+            .as_ref()
+            .is_some_and(|s| s.scan_id == id)
+    });
+    h.idle();
+    let catalog = tidemark_store::catalog::Catalog::open(&h.cfg.general.state_dir, false).unwrap();
+    let entry = catalog.get(&id).unwrap().unwrap();
+    assert!(entry.file.as_ref().unwrap().exists());
+    assert!(std::fs::canonicalize(entry.file.as_ref().unwrap())
+        .unwrap()
+        .starts_with(&h.cfg.general.state_dir));
+    let snapshot = tidemark_store::reader::Snapshot::open(entry.file.as_ref().unwrap()).unwrap();
+    assert!(snapshot
+        .dir_by_path(&RawPath::from_path(&h.cfg.general.state_dir).unwrap())
+        .unwrap()
+        .is_none());
+    assert_no_tmp(&h.cfg.general.state_dir);
+}
+
+#[test]
+fn scheduled_failures_back_off_with_injected_clock_and_reload_resets() {
+    use std::sync::atomic::AtomicI64;
+    let now = Arc::new(AtomicI64::new(tidemarkd::unix_now()));
+    let clock = {
+        let now = now.clone();
+        Arc::new(move || now.load(Ordering::Acquire))
+    };
+    let h = Harness::with_clock("off", "max", false, clock);
+    let mut cfg = h.cfg.clone();
+    cfg.roots[0].path = h.cfg.roots[0].path.join("absent");
+    cfg.roots[0].schedule = "every 1h".into();
+    let raw = RawPath::from_path(&cfg.roots[0].path).unwrap();
+    h.state.replace_config(cfg.clone()).unwrap();
+    let next_due = || {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(raw.clone()),
+            })
+            .unwrap()
+            .first()
+            .and_then(|s| s.next_due)
+    };
+    for delay in [30, 60, 120, 240, 480, 960, 1920, 3600, 3600] {
+        let expected = now.load(Ordering::Acquire) + delay;
+        wait(|| next_due() == Some(expected));
+        now.store(expected, Ordering::Release);
+    }
+    h.state.replace_config(cfg).unwrap();
+    let expected = now.load(Ordering::Acquire) + 30;
+    wait(|| next_due() == Some(expected));
+}
+
+#[test]
+fn busy_keeps_fixed_deferral_and_does_not_increment_failure_attempts() {
+    use std::sync::atomic::AtomicI64;
+    let base = tidemarkd::unix_now();
+    let now = Arc::new(AtomicI64::new(base));
+    let clock = {
+        let now = now.clone();
+        Arc::new(move || now.load(Ordering::Acquire))
+    };
+    let h = Harness::with_clock("off", "max", false, clock);
+    let lock = tidemark_scan::orchestrator::ScanLock::acquire(&h.cfg.general.state_dir).unwrap();
+    let mut cfg = h.cfg.clone();
+    cfg.roots[0].schedule = "every 1h".into();
+    h.state.replace_config(cfg).unwrap();
+    let next_due = || {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(h.root()),
+            })
+            .unwrap()
+            .first()
+            .and_then(|s| s.next_due)
+    };
+    wait(|| next_due() == Some(base + 30));
+    let component = h
+        .state
+        .view()
+        .status(base)
+        .unwrap()
+        .components
+        .into_iter()
+        .find(|c| c.name == "scheduler")
+        .unwrap();
+    assert_eq!(component.state, "ok");
+    drop(lock);
+    std::fs::remove_dir_all(&h.cfg.roots[0].path).unwrap();
+    now.store(base + 30, Ordering::Release);
+    // First actual failure gets 30 seconds, rather than the second-attempt minute.
+    wait(|| next_due() == Some(base + 60));
 }

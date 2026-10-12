@@ -175,3 +175,67 @@ fn real_operator_status_scan_top_now_reload_cancel_and_sigterm() {
     assert!(start.elapsed() < Duration::from_secs(10));
     assert!(!socket.exists());
 }
+
+#[test]
+fn real_binary_scheduled_scan_publishes_then_exits_cleanly() {
+    if !socket_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("tree");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("file"), b"fixture").unwrap();
+    let state = dir.path().join("state");
+    let config = dir.path().join("config.toml");
+    let stderr_path = dir.path().join("daemon.stderr");
+    let text = format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='1h'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[[roots]]\npath='{}'\nmode='walk'\nthrottle='max'\nschedule='every 1h'\n", state.display(), dir.path().join("api.sock").display(), root.display(), dir.path().join("metrics.prom").display(), root.display());
+    std::fs::write(&config, text).unwrap();
+    let diagnostics = || std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let mut daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_tidemarkd"))
+            .arg("--config")
+            .arg(&config)
+            .env_remove("INVOCATION_ID")
+            .env("RUST_LOG", "info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn: {e}; {}", diagnostics())),
+    );
+    let snapshots = state
+        .join("snapshots")
+        .join(tidemark_store::catalog::root_slug(
+            &tidemark_core::path::RawPath::from_path(&root).unwrap(),
+        ));
+    wait(&stderr_path, || {
+        assert!(
+            daemon
+                .0
+                .try_wait()
+                .unwrap_or_else(|e| panic!("poll: {e}; {}", diagnostics()))
+                .is_none(),
+            "daemon exited before snapshot: {}",
+            diagnostics()
+        );
+        std::fs::read_dir(&snapshots).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "db"))
+        })
+    });
+    let pid = rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+        .unwrap_or_else(|e| panic!("SIGTERM: {e}; {}", diagnostics()));
+    wait(&stderr_path, || {
+        daemon
+            .0
+            .try_wait()
+            .unwrap_or_else(|e| panic!("poll shutdown: {e}; {}", diagnostics()))
+            .is_some()
+    });
+    let status = daemon
+        .0
+        .wait()
+        .unwrap_or_else(|e| panic!("wait: {e}; {}", diagnostics()));
+    assert_eq!(status.code(), Some(0), "{}", diagnostics());
+}

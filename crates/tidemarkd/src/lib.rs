@@ -367,7 +367,7 @@ pub fn run_controlled(
             }
         }
     }
-    match tidemark_store::space_guard::space_check(&storage.join("."), 0, &config.retention) {
+    match tidemark_store::space_guard::space_check(&storage, 0, &config.retention) {
         Ok(verdict) => state.publish(
             state::Publication::StateSpaceRefused(matches!(
                 verdict,
