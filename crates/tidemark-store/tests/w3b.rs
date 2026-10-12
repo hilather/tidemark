@@ -377,3 +377,84 @@ fn streamed_selection_matches_reader_order_and_subtree_scope() {
         }
     }
 }
+
+fn increasing_sets(regions: u32, sets: u64) -> (tempfile::TempDir, Snapshot) {
+    let tmp = tempfile::tempdir().unwrap();
+    let m = meta();
+    let mut writer = SnapshotWriter::create(tmp.path(), &m).unwrap();
+    let mut root = dir(0);
+    root.subtree_end = regions;
+    writer.put_dirs(&[root]).unwrap();
+    writer
+        .put_dirs(&(1..=regions).map(dir).collect::<Vec<_>>())
+        .unwrap();
+    for ino in 0..sets {
+        writer
+            .put_link_sets(&[LinkSetRow {
+                ino,
+                nlink: regions,
+                found: regions,
+                disk: ino + 1,
+                apparent: ino + 1,
+                lca_dir_id: 0,
+                complete: true,
+                mtime: 0,
+            }])
+            .unwrap();
+        writer
+            .put_link_instances(
+                &(1..=regions)
+                    .map(|dir_id| LinkInstanceRow {
+                        ino,
+                        dir_id,
+                        name: None,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+    }
+    let file = writer.finish(&m).unwrap();
+    (tmp, Snapshot::open(&file).unwrap())
+}
+
+#[test]
+fn crossing_sets_replaces_at_exact_sample_cap() {
+    let (_tmp, snap) = increasing_sets(1000, 1001);
+    let regions = Regions::build(&snap, &snap.meta().root, &RegionSpec::Depth(1)).unwrap();
+    let (sets, totals) = crossing_sets(&snap, &regions, 1000).unwrap();
+    assert_eq!(totals.sets, 1001);
+    assert_eq!(sets.len(), 1000);
+    assert_eq!(sets.first().unwrap().ino, 1000);
+    assert_eq!(sets.last().unwrap().ino, 1);
+    assert_eq!(
+        sets.iter().map(|set| set.sample_dirs.len()).sum::<usize>(),
+        1_000_000
+    );
+}
+
+#[test]
+fn increasing_stream_selection_preserves_order_at_large_limits() {
+    let (_tmp, snap) = increasing_sets(2, 5000);
+    let regions = Regions::build(&snap, &snap.meta().root, &RegionSpec::Depth(1)).unwrap();
+    for top in [0, 25, 5000, 1_000_000] {
+        let (sets, totals) = crossing_sets(&snap, &regions, top).unwrap();
+        let report =
+            link_report(&snap, &snap.meta().root, Some(&RegionSpec::Depth(1)), top).unwrap();
+        let expected: Vec<_> = (0..5000).rev().take(top).collect();
+        assert_eq!(sets.iter().map(|s| s.ino).collect::<Vec<_>>(), expected);
+        assert_eq!(
+            report.crossing.iter().map(|s| s.ino).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            report
+                .largest_sets
+                .iter()
+                .map(|s| s.row.ino)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(totals.sets, 5000);
+        assert_eq!(report.totals.sets, 5000);
+    }
+}
