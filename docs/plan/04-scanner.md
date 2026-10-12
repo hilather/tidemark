@@ -143,7 +143,7 @@ SCR-008 (`13`, Wave 2) approves only these two `errors_total` additions to core.
 ```
 gate.acquire(COST_OPEN_GETDENTS)
 fd = openat(AT_FDCWD, path, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC|O_NOATIME)
-     EPERM with O_NOATIME → retry without it and count `noatime_fallbacks` (non-root runs)
+     EPERM with O_NOATIME → retry without it and count `noatime_fallbacks` (without CAP_FOWNER on directories not owned by the caller)
      ENOENT/ENOTDIR/ELOOP → race: emit WalkOutput::Gone{reason: Vanished|Replaced}; return
      EACCES/EIO          → error: statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW) for ino/mtime/blocks (stat needs only
                            search permission on the parent); emit a DirRecord with entries = 0 and the error, so
@@ -177,7 +177,7 @@ out.send(WalkOutput::Dir(rec))
 
 Notes:
 
-- **`O_NOATIME` matters on RAID 5.** `getdents` counts as a read access. Under `relatime`, the first scan touching a directory more than 24 h after its last access updates its atime: a metadata **write** per directory, which turns a read-only scan into millions of small random writes on parity RAID. Root (`CAP_FOWNER`) can always use `O_NOATIME`. `statx` never updates atime.
+- **`O_NOATIME` matters on RAID 5.** `getdents` counts as a read access. Under `relatime`, the first scan touching a directory more than 24 h after its last access updates its atime: a metadata **write** per directory, which turns a read-only scan into millions of small random writes on parity RAID. `CAP_FOWNER`, not uid 0, permits `O_NOATIME` on foreign-owned directories; without it an EPERM retry is counted. `statx` never updates atime.
 - Only one directory fd per worker is open at a time, so fd usage is bounded by `threads + small constant`.
 - If the mount id, parent id, device and mount point can be decoded, retain the record as a boundary even when later fields are malformed: set those fields to empty and log the line with `tracing::warn!`. If any line’s mount point cannot be decoded, return `Err` for the whole table so callers fail closed. Valid nsfs records are unaffected. When mount discovery returns `Err` and the kernel reports no mount ids, the walker refuses to run.
 - `mount_points` is built once from `/proc/self/mountinfo`. It is the set of mount targets strictly under the root; mountinfo octal escapes such as `\040` must be decoded. It catches same-device bind mounts, which `st_dev` cannot.
@@ -340,6 +340,10 @@ impl ScanGate {
     pub fn gate(&self) -> Arc<dyn Gate>;
     /// Statistics so far.
     pub fn stats(&self) -> GateStats;
+    /// Permanently wake waiting acquisitions; callers check cancellation before I/O.
+    pub fn cancel(&self);
+    /// Stop sampling while retaining the cancellation handle and statistics.
+    pub fn stop_sampling(&self);
     /// Stop the controller thread (joined within one interval) and return the final statistics.
     pub fn stop(self) -> GateStats;
 }
@@ -392,6 +396,19 @@ Bulk worker admission reserves at most 32 MiB of the existing 64 MiB overhead es
 The walk-mode base estimate remains `dirs × 320 + link_entries × 72 + 64 MiB`, plus candidate storage. Log the working-set estimate and process peak RSS after publication, series and retention; VmHWM includes earlier/concurrent work and is not isolated scan RSS. Explicit bulk without v5 fails with exit code 5 and a missing-v5 diagnostic; never fall back to v1 metadata.
 
 ## 8. Cancellation, failures and partial snapshots
+
+`ScanGate::cancel(&self)` is permanent and idempotent: blocked token waiters return within 250 ms, statistics remain readable, and callers check cancellation after each acquisition before metadata I/O. `ScanGate::stop(self) -> GateStats` remains unchanged: it stops the controller and ordinary waiters continue at the last rate. The `Gate` trait and `gate_from_config` are unchanged. Add `ScanGate::stop_sampling(&self)` to stop sampling while retaining the borrowed cancellation handle and stats. The orchestrator's scoped cancellation monitor polls every 50 ms.
+
+```rust
+pub fn read_dir_entries_checked_cancellable(
+    root: &RawPath, dev: DevId, path: &RawPath, expect_ino: Option<Ino>,
+    gate: &dyn Gate, cancel: &AtomicBool,
+) -> io::Result<Vec<(RawName, Ino, FileKind)>>;
+```
+
+The existing checked reader remains unchanged; the additive reader checks cancellation through opens, retries, identity stats and refills. The 250 ms bound covers userspace gate waits, not an in-flight kernel syscall, index build, sync, recorder callback or retention operation. No universal kernel-I/O deadline follows from it (`W23-fix-gate.md`).
+
+`run_scan(cfg: &Config, req: &ScanRequest, recorder: &dyn ScanRecorder, cancel: &AtomicBool, progress: &(dyn Fn(&Progress) + Sync)) -> Result<ScanOutcome, ScanError>` owns both `state_dir/scan.lock` and the `ScanGate`. A caller must not take the lock first: doing so makes `run_scan` return `ScanError::Busy`. Scheduler admission serializes scheduled/API requests but delegates host locking, gate creation, space admission and retention to `run_scan`. `ScanRecorder` callbacks return persistence success/errors, not enqueue success; daemon start/finish callbacks wait for error-bearing writer acknowledgements. `W6-A2a.md` reports that its unit Flush acknowledgement cannot attribute a particular series persistence error; its proposed `DirSeriesAck` is an unresolved implementation seam, not a new decided API.
 
 - SIGINT/SIGTERM or an API `scan.cancel` sets an `AtomicBool`. Workers stop taking tasks, finish their current directory and exit.
 - A cancelled or failed scan deletes its `.db.tmp`; walk `--keep-partial` may retain valid collected records after cancellation, I/O or resource-limit failure with status partial (never default latest). Worker panic/disconnection fails closed. Cancellation observed during finish_with discards every unpublished candidate, including partial output (05 §2, 13 R2-4).

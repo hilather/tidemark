@@ -195,18 +195,20 @@ pub fn run_scan(cfg: &Config, req: &ScanRequest, recorder: &dyn ScanRecorder, ca
                 progress: &(dyn Fn(&Progress) + Sync)) -> Result<ScanOutcome, ScanError>;
 ```
 
+Recorder callback success means persistence, not enqueueing. Completion order is scan_finished → dir_series → retention; compute daemon growth within scan_finished while the predecessor remains available (13 R3-8/R3-9). Gate cancellation uses cancel/stop_sampling without changing Gate or gate_from_config (04 §6.2/§8).
+
 ### `run_scan` sequence
 
 1. The CLI canonicalizes the original path before constructing `ScanRequest.root` as `RawPath`; never lexically normalize before realpath. Require a directory; find its mount (W1-A); compute `skip_mounts`.
 2. Look up the root's `[[roots]]` config, or defaults when scanning an unconfigured path.
-3. **Host-wide scan lock:** take an exclusive `flock` on `state_dir/scan.lock` (non-blocking). If it's held, return `ScanError::Busy` (ADR-015). The daemon scheduler takes the same lock, so a CLI scan and a daemon scan can never overlap.
+3. **Host-wide scan lock:** take an exclusive `flock` on `state_dir/scan.lock` (non-blocking). If it's held, return `ScanError::Busy` (ADR-015). `run_scan` alone owns this lock for CLI and daemon scans; the scheduler must not pre-lock it or the call returns Busy (13 R3-8).
 4. **Space guard** (`05` §8). If refused, return `ScanError::NoSpace`.
 5. **Gate:** retain the `ScanGate` returned by `gate_from_config(profile_name, &cfg.throttle, &leaves, sampler)` with `leaves = resolve_leaves(dev)` (empty on unavailable discovery) and a bounded sampler built from ordered, all-or-error `read_disk_stats(&leaves)`.
 6. Fallible `ScanId::new(now)` (propagate invalid UTC-year errors; retry a writer-creation collision with a fresh id, never replace an existing snapshot); `recorder.scan_started`.
 7. Choose the mode (`choose_mode`, `04` §7): auto requires v5. Explicit `--mode bulk` without v5 fails with exit code 5 and a reason naming missing v5 bulkstat. Auto falls back only on `BulkError::Unsupported` or `BeforePhase2`, with a fresh aggregator and updated mode and `mode_reason`; cancellation takes precedence and other bulk errors fail the scan.
 8. Derive `WalkConfig.max_record_bytes` and channel capacity with `04` §7 (13 R2-1 replaces D3); refuse insufficient budgets, including fallback. Run walk or bulk with `scan_gate.gate()`; report progress every 2 s. Check summed record errors_total against WalkSummary.errors, preserving record totals and marking mismatches degraded.
 9. `prepared.annotate(…)` for every request annotation.
-10. `SnapshotWriter::create` → `prepared.write(&mut WriterSink)` → `finish_with(meta, cancelled)` (13 R2-4; publication cancellation keeps nothing). Fill `meta` per `05` §1, including phase timings and final gate stats from `scan_gate.stop()` after all scan acquisitions finish. Use `scan_gate.stats()` for observations during the scan; Drop also stops the controller. Profile `max` with rate 0 means unthrottled (`13` G2). A collision from `SnapshotWriter::finish` returns typed `ScanError::PublicationCollision`, fails the scan without retry and leaves the existing snapshot untouched; publication never replaces an existing file.
+10. `SnapshotWriter::create` → `prepared.write(&mut WriterSink)` → `finish_with(meta, cancelled)` (13 R2-4; publication cancellation keeps nothing). Fill `meta` per `05` §1, including phase timings and final gate stats from `scan_gate.stop_sampling()` followed by `scan_gate.stats()` while retaining the cancellation handle after all scan acquisitions finish. Use `scan_gate.stats()` for observations during the scan; Drop also stops the controller. Profile `max` with rate 0 means unthrottled (`13` G2). A collision from `SnapshotWriter::finish` returns typed `ScanError::PublicationCollision`, fails the scan without retry and leaves the existing snapshot untouched; publication never replaces an existing file.
 11. `recorder.scan_finished`; `recorder.dir_series` for directories at depth ≤ `series_depth` (capped at `MAX_SERIES_ROWS = 20_000`, largest first); apply `retention_plan` for this root and delete the files it names and globally rebuild the catalog from remaining files.
 12. Log the working-set estimate and observed process peak RSS after publication, series and retention work (process VmHWM includes earlier or concurrent work). Return the outcome. The exit code is 3 if degraded or partial.
 

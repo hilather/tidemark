@@ -60,7 +60,7 @@ Machine output uses `JsonDoc<T> { schema: Cow<'static, str>, data: T }`, with ow
 | `deploy verify` | Post-reboot pass/fail for the pipeline (FR-25) | `--wait DUR` (poll until healthy or timeout); machine output via the global `--json` | root |
 | `deploy unstage` | Stop and disable the service; keep state (FR-25) | `--purge-state` (also delete `state_dir`), `--yes` | root |
 | `watch` | Foreground event stream for debugging | `--mount`, `--events close_write,modify` | root |
-| `status` | Daemon health, versions, component states | `--show-config` (print the effective config including default alert rules) | root |
+| `status` | Daemon health, versions, component states | `--show-config` (print the CLI’s effective config, labelled, including default alert rules) | root |
 | `tui [PATH]` | Interactive browser (FR-21) | `--snapshot` | root |
 | `completions <SHELL>` | Shell completions | | — |
 
@@ -101,7 +101,7 @@ The `Δ24h` column appears when a snapshot about 24 h older exists.
 
 - **Transport:** Unix stream socket `/run/tidemark/api.sock`, mode `0600 root:root`.
 - **Framing:** newline-delimited JSON. One request per line, one response per line; the connection may carry several requests.
-- **Authentication:** socket permissions. Every request is logged with the peer's `SO_PEERCRED` uid/pid. Every method accepts peer uid 0 or a peer uid equal to the daemon's own effective uid; other peers receive `forbidden`. In production the daemon runs as root, so only root is accepted.
+- **Authentication:** socket permissions. Every request is logged with the peer's `SO_PEERCRED` uid/pid. Every method accepts only peer uid 0, identified by kernel SO_PEERCRED; other peers receive `forbidden`, even when the daemon runs as another uid.
 
 ```json
 {"v":1,"id":"c1","method":"now","params":{"mount":"/data"}}
@@ -122,6 +122,12 @@ The `Δ24h` column appears when a snapshot about 24 h older exists.
 | `scan.status` | at most one of `root`/`root_b64` | `Vec<ScanStatus>` |
 | `scan.cancel` | exactly one of `root`/`root_b64` | `{cancelled: bool}` |
 | `config.reload` | — | `{reloaded: bool, warnings: Vec<String>}` |
+
+Every API method serves only peer uid 0, identified by kernel `SO_PEERCRED`, even if the daemon runs with another uid; all other peers receive `forbidden`. The workspace `rustix` dependency enables `net` and `termios`. `status --show-config` prints the CLI's effective configuration, explicitly labelled; the running daemon may retain an older config until reload. There is no `config.get` method in v1. With no daemon, `lvm`, `writers` and `phantom` fall back to direct mode with one stderr notice (including quiet mode); `now`, `hot`, `alerts` and `status` exit 4. Explicit direct mode bypasses the daemon. A connected daemon scan refuses threads, extra excludes and keep-partial options; its request carries only the frozen root/mode/throttle overrides.
+
+The daemon-served `lvm` report keeps `LvmResult { mounts: Vec<(String, LvmNow)>, vgs: Vec<VgInfo>, sampled_at: i64 }`. Compared with the direct command it omits segment type and the other/unmounted LV inventory and columns. No wire extension or new flag is added. `W6-A3.md` specifies that the CLI still reads 24-hour trends read-only from the store with the direct command's query/slope/window; missing segment/other-volume columns are omitted and a notice explains the reduced view.
+
+`alerts.history` currently covers persisted events from the current daemon run only; the store has no history reader (12 R3-L3).
 
 ### Wire types and adapters (SCR-002)
 
@@ -241,6 +247,8 @@ min_free_pct   = 5
   hot_minutes = "7d"
 ```
 
+Add `Config::from_toml_bytes(bytes: &[u8]) -> Result<Config, CoreError>` in `tidemark-core`. It shares `Config::load`'s bounded UTF-8/TOML parsing, default merge and error precedence (`MAX_CONFIG_BYTES = 1 MiB`). The daemon hashes the bytes it actually loaded, and stage parses, installs and hashes one bounded no-follow read rather than reopening the pathname (`W4-B-fix2.md`).
+
 ### Effective config contracts (SCR-003)
 
 `ConfigIssue { field: String, message: String }` reports validation errors at dotted field locations. Config/table structs deny unknown fields; paths use `PathBuf`, sizes `ByteSize`, ordinary durations `Duration` with humantime serde, bounded counts `u32`/`usize`, percentages/latencies `f64`. Root mode/link_instances use enums. Root `throttle: String` may name `gentle`, `normal`, `max` or a configured custom profile. `throttle.profiles: BTreeMap<String, ThrottleProfile>` merges overrides with gentle/normal defaults; reject a profile definition named `max` with an actionable error (reserved `NoopGate` selector).
@@ -306,7 +314,7 @@ Designed for the hotfix pipeline. Nothing here touches fstab, LVM or the kernel 
 ```bash
 # During the hotfix deploy (no reboot needed yet)
 dnf install -y ./tidemark-<ver>-1.el8.x86_64.rpm
-tidemark deploy stage --from ./tidemark.toml      # exit 0 = staged; non-zero = nothing changed
+tidemark deploy stage --from ./tidemark.toml      # exit 0 = staged; blocking pre-flight failure = nothing changed; later failure = best-effort compensation
 # … the hotfix's normal reboot …
 tidemark deploy verify --wait 5m                    # exit 0 = healthy; 6 = not healthy (details printed)
 ```
@@ -319,12 +327,15 @@ tidemark deploy verify --wait 5m                    # exit 0 = healthy; 6 = not 
 | Safe state_dir and no-follow state artifacts, as specified below | yes |
 | Config parses and validates (`Config::validate`) | yes |
 | Every `[[roots]]` path exists, is a directory, and sits on an allowlisted local filesystem (xfs, ext2, ext3, ext4, btrfs, tmpfs, zfs, f2fs, jfs, reiserfs; unknown types block; subtree roots allowed) | yes |
+| The filesystem holding `general.state_dir`, or its longest existing ancestor when the directory does not exist yet, is an allowlisted local filesystem (xfs, ext2, ext3, ext4, btrfs, tmpfs, zfs, f2fs, jfs, reiserfs; unknown types block) | yes |
 | Every `sampler.mounts` and `watch.mounts` entry is a mount point | yes |
 | `state_dir` filesystem has ≥ 2 GiB free (plus the `min_free_pct` floor) | yes |
 | fanotify available (`probe`), mount namespace OK | warning (watcher would be disabled) |
 | XFS + v5 bulkstat available on `/data` | warning (walk mode would be used) |
 | LVM visible (`lvs` succeeds) | warning |
 | A previous version staged/running | info (config backed up, service restarted only with `--start-now`) |
+
+A failed state-filesystem eligibility check reports the configured state path and filesystem type, exits with status 5, and makes no host changes. This check applies only to `deploy stage`; `deploy unstage` and `deploy purge` remain available for removing an installation whose state directory is on an ineligible filesystem. It does not add a daemon or first-boot check.
 
 On success, `deploy stage`:
 

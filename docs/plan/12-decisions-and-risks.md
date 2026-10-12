@@ -92,7 +92,7 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 
 **ADR-018 — Root-only access; no `tidemark` group.**
 - *Context:* path names in snapshots and API responses are sensitive. The owner wants no group granting access without sudo.
-- *Decision:* no `tidemark` group. All installed Tidemark files are `root:root`: the API socket, config, snapshots and their `.db.tmp` files are `0600`; state and runtime directories are `0700`. Access control is by ownership, file modes and socket peer uid: every API method accepts uid 0 or the daemon's own effective uid; other peers receive `forbidden`. In production the daemon is root, so only root is accepted. Neither the CLI nor the daemon has a uid gate. Remove the socket-group configuration key and group creation from packaging; no group-specific service setting or account-definition file is shipped.
+- *Decision:* no `tidemark` group. All installed Tidemark files are `root:root`: the API socket, config, snapshots and their `.db.tmp` files are `0600`; state and runtime directories are `0700`. Access control is by ownership, file modes and socket peer uid: every API method accepts only peer uid 0, identified by kernel SO_PEERCRED; other peers receive `forbidden`, even with a nonroot daemon (13 R3-14). Neither binary has a startup uid gate; API dispatch does. Remove the socket-group configuration key and group creation from packaging; no group-specific service setting or account-definition file is shipped.
 - *Consequences:* operators use `sudo`; one less packaging step and no group membership to manage. A non-root command that cannot read the root-only config, state directory, snapshot or socket retains the exit code for that failure and adds the hint: `Tidemark's files are root-only; run this command with sudo.` No new exit code is added; exit code 5 retains its precondition-failure meaning. Unprivileged tests keep working with their own temporary config, state directory and socket. Non-root daemon and scan runs use the existing degraded mode (readable-subset walk mode, no watcher or procscan of other users).
 
 **ADR-019 — No PostgreSQL tracking in v1.**
@@ -127,3 +127,20 @@ L = likelihood, I = impact (H/M/L).
 | R20 | Scans of `/` and `/data` share the same RAID and both hit it | M | M | One scan at a time per host; separate windows; adaptive throttle | ADR-015 |
 | R21 | Fleet hosts differ from the pilot layout (no `/data`, not LVM) | M | L | `deploy stage` pre-flight blocks or warns per host; per-host-type configs | `08` §5, P5 |
 | R9, R10, R16 | *(removed: quota tagging ctime, quotacheck boot delay, auditd volume — no longer applicable)* | — | — | — | — |
+
+### Gate review / Wave 6 open risks (R3-15)
+
+These are open risks, not accepted implementation guarantees. Historical handoff test results do not establish VM or release acceptance.
+
+| Risk | Remaining limitation and follow-up | Evidence / owners |
+|------|------------------------------------|-------------------|
+| N1 | Snapshot finish timestamp is after rows but before index build and sync because `SnapshotWriter::finish_with` takes `&SnapshotMeta`; needs a storage-owned finalization clock/metadata seam. | W23-fix-scan; store/scan owners |
+| R3-L1 | `deploy/files.rs` is compiled through `#[path]` from both daemon `lib.rs` and `firstboot.rs`; consolidate into one crate-visible module. | CI-fix-daemon-state, W6-A1; daemon/deploy owners |
+| R3-L2 | `tidemark_fs::lvm::collect` has no cancellation hook; shutdown can abandon an in-flight LVM worker after the join deadline. | W6-A1; FS/lifecycle owners |
+| R3-L3 | Store has no alert-history reader; `LiveStateView::alerts_history` covers only successfully persisted events in the current daemon run. | W6-A1/W6-A3; store/daemon owners |
+| R3-L4 | SQLite leaves are opened by pathname; retained directory descriptors and inspections do not guarantee leaf-level no-follow against same-uid substitution. | W6-A1; store owner |
+| R3-L5 | No privileged test has ever run in the supplied evidence. Compile-only and sandbox skips do not establish Rocky/XFS/fanotify/deploy acceptance. | All supplied test/implementation handoffs; W7 gate |
+| R3-L6 | A counting gate detects removed charges for existing syscalls, but cannot detect a newly added uncharged syscall. | TEST-rules mutation evidence; W7-C review |
+| R3-L7 | Deployment scenarios use socket pairs rather than a real listener; production bind/connect/credential/service/reboot behavior needs VM execution. | TEST-e2e-deploy, W6-A3-fix; W6/W7 gates |
+| R3-L8 | Completed watcher rows lack empty-minute/boundary-loss facts; current services publish no WatchWindow measurements. Resolve producer/freshness seams before claiming exact watcher-rule evaluation. | W6-A2b; live/state owners |
+| R3-L9 | Series Flush unit acknowledgement cannot report a particular write error; pinned storage paths need durable logical catalog-path mapping. Follow-up proposals in W6-A2a remain unresolved. | W6-A2a; writer/store/scan owners |

@@ -14,6 +14,10 @@ Tidemark is read-only and makes no fstab, LVM, kernel or file-metadata changes. 
 
 ---
 
+Gate-review contracts: stage requires allowlisted local state storage (or its longest existing ancestor); refusal exits 5 without changes. Unstage/purge remain available on an ineligible filesystem. Blocking pre-flight failure is change-free; later failure has best-effort compensation and may leave downtime, timestamps or empty directories. See 08 §5 and 13 R3-3/R3-12.
+
+Run live commands with sudo: API peers must be uid 0. `status --show-config` labels CLI configuration; `lvm` omits segment type/other LVs in daemon mode, while absent daemon causes lvm/writers/phantom direct fallback with one notice. now/hot/alerts/status exit 4. Watcher alerts require complete supported 1–60 whole-minute observations and otherwise report not evaluable; top-list truncation or overflow makes hot data unavailable. Review the open risks in 12, and require real VM/listener/credential/reboot tests before rollout; no supplied privileged runtime test has run.
+
 ## P0 — Preconditions and baseline
 
 1. **OS currency:** `cat /etc/rocky-release; uname -r`. Rocky supports only the latest minor; 8.10 (kernel `4.18.0-553.x`) is the final 8.x release. If the hosts are on 8.8, it's worth bundling the 8.10 update into the same hotfix cycle. Tidemark works on both.
