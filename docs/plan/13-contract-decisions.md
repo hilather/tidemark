@@ -846,3 +846,15 @@ Local tests and compile-only evidence leave runtime and interface gaps. Recordin
 Record the limitations in `12`’s open-risk register: N1 timestamp before indexes/sync; duplicate path-included deployment helper; uncancellable LVM worker; current-run alert history; SQLite pathname leaf opens; no privileged runtime evidence; counting-gate blind spot; socket-pair deployment fixtures. No new signatures are authorized to close these risks. Additional unresolved producer/writer/storage seams from A2a/A2b are identified there separately.
 
 Plan locations: 12 open risks; 11; W7 gates. Affected tasks: Store/FS/daemon owners, W7-B/C/D.
+
+### R3-16 — Bulk apparent size follows the on-disk inode
+
+On Rocky 8.8/8.10, freshly copied fixtures had zero bulk apparent sizes for regular files while disk usage and link metrics agreed with walk. The supplied Rocky 8.10 kernel 4.18.0-553.el8_10 experiment confirmed that XFS bulkstat `bs_size` follows the on-disk inode until data writeback; the decoder correctly copies it. Flushing the destination made all nine mandatory fixtures agree. Per-file fixture `sync_all` also made the 120,000-file fixture unnecessarily slow.
+
+**Decision: accepted.**
+
+In bulk mode regular-file `apparent` is the size XFS has recorded on disk. Data waiting for writeback can make it smaller than `stat`, down to zero for a new file or the last written-back size for a growing file (normally recent writes of about 30 seconds, without a guaranteed deadline). Disk usage, counts, link accounting and charged bytes are unaffected. Walk uses the in-memory size, exact at scan time. A quiescent tree means no changes during scans **and no data waiting for writeback**. Production bulk scans never call `sync`, `syncfs` or `fsync`, and never stat files to correct sizes; no schema or algorithm change follows.
+
+Tests flush fixture filesystems after writing/copying and before comparing modes or apparent-size oracles. Materialization performs one `rustix::fs::syncfs` on the fixture root after the whole fixture is written, replacing per-file syncs. A privileged writeback test permits spontaneous writeback: unflushed bulk apparent size must be no larger than walk, disk bytes must agree, and flushed rows must agree after ordinary mode-only normalization.
+
+Plan locations: 01 FR-3/NFR-1; 03 §2/§3 apparent definition/oracle/invariant 6; 04 mode table/output oracle, §5.1 and §10; 08 §1 scan modes; 09 §3/§5; 11 first-night mode choice; W2-B tests. Affected tasks: W0-C (fixture writer), W2-B/C, W7-B/D.

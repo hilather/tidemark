@@ -21,7 +21,7 @@ For every non-directory inode *i* reached through one or more directory entries 
 | Symbol | Meaning |
 |--------|---------|
 | `disk(i)` | Allocated bytes: `st_blocks × 512` (walk mode), or the bulkstat equivalent (bulk mode; must be validated equal, see `04-scanner.md` §5.4) |
-| `apparent(i)` | `st_size` |
+| `apparent(i)` | In-memory `st_size` in walk; XFS on-disk inode size in bulk for regular files (R3-16 in `13-contract-decisions.md`), which may lag until data writeback |
 | `nlink(i)` | Link count reported by the kernel |
 | `L(i)` | Multiset of directories inside R holding an entry for *i*. Two links in the same directory count twice. |
 | `found(i)` | `|L(i)|` |
@@ -47,7 +47,7 @@ Directory inodes contribute their own `disk`/`apparent` (directory blocks; small
 | `max_entries` | WIDEST | max direct-entry count of any directory in T(d) | — |
 | `t_errors` | ERR | Errors encountered in T(d) (permission, I/O). Values for *d* may be incomplete if > 0. | Yes |
 
-**Apparent-size oracle:** the definition includes directory `st_size` (§2) unchanged. GNU coreutils 8.30 (Rocky Linux 8) counts directory sizes in apparent mode, so direct equality holds on the target. Coreutils 9.2 and later count only regular files and symbolic links; their output differs by the subtree's directory sizes (and any other non-regular, non-symlink inode with non-zero `st_size`). Tests probe the local `du` with an empty directory, never branch on a version string, and when it omits directory sizes add those measured apparent sizes to the `du` figure before comparing, counting distinct inodes consistently with the metric. `t_disk` is compared directly with `du -sxB1` on every version. See `09-testing.md` §3.
+**Apparent-size oracle:** bulk equality requires a quiescent tree with no changes during scans and no data waiting for writeback (R3-16); test setup flushes fixtures, production scans never do. The definition includes directory `st_size` (§2) unchanged. GNU coreutils 8.30 (Rocky Linux 8) counts directory sizes in apparent mode, so direct equality holds on the target. Coreutils 9.2 and later count only regular files and symbolic links; their output differs by the subtree's directory sizes (and any other non-regular, non-symlink inode with non-zero `st_size`). Tests probe the local `du` with an empty directory, never branch on a version string, and when it omits directory sizes add those measured apparent sizes to the `du` figure before comparing, counting distinct inodes consistently with the metric. `t_disk` is compared directly with `du -sxB1` on every version. See `09-testing.md` §3.
 
 **Invariants** (checked by property tests and asserted in debug builds):
 
@@ -56,7 +56,7 @@ Directory inodes contribute their own `disk`/`apparent` (directory blocks; small
 3. `t_charged(d) = own_charged(d) + Σ t_charged(children)`; the same holds for `t_reclaimable`, `t_files`, `t_dirs`, `age*` and `t_errors`.
 4. `t_disk(d) ≥ max over children c of t_disk(c)` and `t_disk(d) ≤ own_disk(d) + Σ t_disk(children)`, where `own_disk(d)` = *d*'s directory-inode blocks + Σ disk of distinct inodes with an entry directly in *d*.
 5. `Σ age* (d) = t_charged(d)`.
-6. Running the scan twice on an unchanged tree yields identical rows (excluding timestamps).
+6. Running the scan twice on an unchanged tree with no data waiting for writeback yields identical rows (excluding timestamps and mode-only fields).
 
 ## 4. Algorithms (aggregator)
 

@@ -95,7 +95,8 @@ pub struct BulkInode {
     pub uid: u32,
     /// Owner group ID.
     pub gid: u32,
-    /// Apparent size in bytes.
+    /// Apparent size in bytes; regular files use the XFS on-disk inode size,
+    /// which can lag the in-memory size until data writeback.
     pub size: u64,
     /// Allocated bytes, including attributed shared extents.
     pub disk_bytes: u64,

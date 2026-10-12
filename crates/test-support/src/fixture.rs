@@ -447,8 +447,6 @@ pub fn try_materialize(spec: &str) -> io::Result<Fixture> {
                         left -= n as u64;
                     }
                 }
-                // Resolve delayed allocation before tests measure stat or du.
-                f.sync_all()?;
             }
             "symlink" => {
                 let target = decode_bytes(
@@ -529,6 +527,9 @@ pub fn try_materialize(spec: &str) -> io::Result<Fixture> {
         }
         pending = next;
     }
+    // Resolve delayed allocation for the whole fixture (including outside links)
+    // before tests measure stat or du, without one writeback per regular file.
+    let root = open_directory(&fixture.storage.owner, std::ffi::OsStr::new("r"), false)?;
     // Apply directory modes last so descendants can be populated. Retain handles for identity-based cleanup.
     let mut modes: Vec<_> = entries
         .iter()
@@ -542,6 +543,7 @@ pub fn try_materialize(spec: &str) -> io::Result<Fixture> {
     for (e, path) in modes.into_iter().rev() {
         fs::set_permissions(path, Permissions::from_mode(e.mode.unwrap_or(0o755)))?;
     }
+    rustix::fs::syncfs(&root)?;
     Ok(fixture)
 }
 /// Materialize a test fixture, panicking with context on invalid input or I/O failure.

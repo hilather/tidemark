@@ -1,14 +1,14 @@
 # 04 — Scanner design (L1)
 
-The scanner turns a directory tree into per-directory records with the aggregator inputs defined in `03-link-semantics.md`. It has two modes with an identical output contract.
+The scanner turns a directory tree into per-directory records with the aggregator inputs defined in `03-link-semantics.md`. It has two modes with the same row schema; regular-file apparent size follows the mode-specific contract in R3-16 (`13-contract-decisions.md`).
 
 | Mode | How | Needs | Best when |
 |------|-----|-------|-----------|
-| **walk** | Parallel `getdents64` + `statx(AT_SYMLINK_NOFOLLOW)` per entry | Read access (root for full coverage) | Any filesystem; scan root is a small part of the filesystem; reference implementation |
-| **bulk** | Phase 1: parallel `getdents64` only (names → inode numbers). Phase 2: XFS bulkstat per allocation group, merge-joined by inode number. Phase 3: name lookup for notable files only. | XFS with v5 bulkstat, `CAP_SYS_ADMIN`, memory for the join | The scan root covers most of an XFS filesystem; cold caches on HDD RAID |
+| **walk** | Parallel `getdents64` + `statx(AT_SYMLINK_NOFOLLOW)` per entry | Read access (root for full coverage) | Any filesystem; scan root is a small part of the filesystem; reference implementation; in-memory apparent size exact at scan time |
+| **bulk** | Phase 1: parallel `getdents64` only (names → inode numbers). Phase 2: XFS bulkstat per allocation group, merge-joined by inode number. Phase 3: name lookup for notable files only. | XFS with v5 bulkstat, `CAP_SYS_ADMIN`, memory for the join | The scan root covers most of an XFS filesystem; cold caches on HDD RAID; regular-file apparent size follows the on-disk inode and may lag writeback |
 | **auto** (default) | Chooses using §7 | — | — |
 
-Walk mode is the **oracle** for bulk mode: on a quiescent tree, both must produce byte-identical snapshot rows.
+Walk mode is the **oracle** for bulk mode: on a quiescent tree (no changes during scans and no data waiting for writeback), both must produce identical metric rows, except bulk-only `projid` and unresolved link-instance names. This definition also applies to §1’s output contract.
 
 ---
 
@@ -279,6 +279,8 @@ Bindings are hand-transcribed, not bindgen output, and pinned by layout tests to
 
 Charge the `Gate` before every call to the bulkstat iterator, including terminal and error calls. Use a conservative per-batch cost, never the returned record count after I/O; the first charge also covers the geometry read. W2-C resolves leaf devices and constructs the gate; W2-B receives it.
 
+For regular files, v5 `bs_size` is the size XFS has recorded in the on-disk inode. Until data is written back, a new file may report zero and a growing file its last written-back size, normally lagging recent writes by about 30 seconds; this is not a guaranteed deadline. `stat`/`statx` used by walk report the in-memory size, exact at scan time. Bulk block counts already include delayed allocations: disk usage, counts, link accounting and charged bytes are unaffected by this apparent-size lag. Production scans never call `sync`, `syncfs` or `fsync`, nor stat files to correct bulk sizes (R3-16).
+
 ### 5.2 Iteration ranges
 
 v5 starts inclusively at the requested inode, uses the per-AG request flag, advances from the returned cursor, and stops at the exclusive end or an empty batch. Never fall back to v1 records.
@@ -427,5 +429,7 @@ There are deliberately no promised numbers until the pilot measures the real arr
 - **Cold walk mode** reads every directory's blocks plus the inode cluster holding each inode. XFS allocates inodes in chunks near their parent directory, so `statx` in `getdents` order often hits clusters already read. Parallelism (`threads`) keeps several spindles busy.
 - **Cold bulk mode** reads inode clusters in on-disk order per AG (large, mostly sequential reads), plus directory blocks. This is the closest thing to "read the MFT". It should win most on HDD RAID with cold caches.
 - **Warm caches**: both are CPU-bound. Bulk avoids millions of path lookups and syscalls.
+
+Mode-equivalence performance measurements use quiescent, flushed fixtures: writeback is completed by test/benchmark setup before timing, never by the production scanner. Recent unflushed writes can make bulk apparent sizes smaller while disk metrics agree.
 
 `xtask bench` (W7-B) measures `du -sx`, walk and bulk, each cold (staging only: `echo 3 > /proc/sys/vm/drop_caches`) and warm. It records leaf-device utilisation and average-wait series from `/sys/block/*/stat` with and without a scan, using the adaptive gate's samples, plus gate statistics (mean rate, minimum rate, time throttled, number of decreases). With the `normal` profile, those device measurements stay within the profile's configured targets, apart from short excursions the controller corrects. Defaults (threads, batch sizes, costs, profiles) are set from those results.

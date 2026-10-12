@@ -63,6 +63,8 @@ After verify:
 - `tidemark now` shows both filesystems, LVM.
 - `tidemark hot --window 5m` during normal activity shows writing services.
 
+Choose walk when current apparent sizes matter: bulk (including auto-selected bulk) can show smaller regular-file apparent sizes until XFS writes data back; Tidemark never forces writeback.
+
 **First night:** both roots scan in their windows (`/data` in `bulk` if eligible, `/` in walk). Next morning:
 
 - Check `tidemark snapshots list`, scan durations (`tidemark status`), and the `iostat`/Postgres graphs for the scan window against the P0 baseline.

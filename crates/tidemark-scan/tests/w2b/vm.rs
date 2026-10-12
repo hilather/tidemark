@@ -3,6 +3,11 @@
 use super::*;
 use std::{fs::File, os::fd::AsFd, time::Instant};
 use test_support::xfs::LoopXfs;
+// Test setup only: production scans must never force writeback.
+fn flush_fixture(mount: &std::path::Path) {
+    let fd = File::open(mount).unwrap();
+    rustix::fs::syncfs(&fd).unwrap();
+}
 fn walk_sink(root: RawPath) -> VecSink {
     let cfg = config(root.clone());
     let mut agg = aggregator(root);
@@ -73,6 +78,7 @@ fn bulk_equals_walk_mandatory_fixtures() {
             .status()
             .unwrap()
             .success());
+        flush_fixture(&fs.mountpoint);
         let root =
             RawPath::from_path(&fs.mountpoint.join(source.root.file_name().unwrap())).unwrap();
         let mut expected = walk_sink(root.clone());
@@ -82,6 +88,39 @@ fn bulk_equals_walk_mandatory_fixtures() {
         compare(&mut expected, &mut actual);
     }
 }
+#[test]
+fn bulk_apparent_size_follows_writeback() {
+    use std::io::Write;
+    let fs = LoopXfs::new(1024 * 1024 * 1024, &[], "");
+    {
+        let mut file = File::create(fs.mountpoint.join("new-file")).unwrap();
+        let chunk = [0x5a; 64 * 1024];
+        for _ in 0..16 {
+            file.write_all(&chunk).unwrap();
+        }
+        // Close without fsync: the kernel is free to write back at any moment.
+    }
+    let root = RawPath::from_path(&fs.mountpoint).unwrap();
+    let expected = walk_sink(root.clone());
+    let (actual, stats) = bulk_sink(root.clone(), &fs.mountpoint);
+    assert_eq!(stats.races, 0);
+    assert_eq!(stats.names_missing, 0);
+    assert_eq!(expected.files.len(), 1);
+    assert_eq!(actual.files.len(), 1);
+    assert_eq!(expected.files[0].apparent, 1024 * 1024);
+    assert_eq!(actual.files[0].disk, expected.files[0].disk);
+    assert!(actual.files[0].apparent <= expected.files[0].apparent);
+    assert_eq!(actual.dirs[0].t_disk, expected.dirs[0].t_disk);
+    assert!(actual.dirs[0].t_apparent <= expected.dirs[0].t_apparent);
+
+    flush_fixture(&fs.mountpoint);
+    let mut expected = walk_sink(root.clone());
+    let (mut actual, stats) = bulk_sink(root, &fs.mountpoint);
+    assert_eq!(stats.races, 0);
+    assert_eq!(stats.names_missing, 0);
+    compare(&mut expected, &mut actual);
+}
+
 #[test]
 fn bulk_refuses_ftype_zero() {
     let fs = LoopXfs::new(1024 * 1024 * 1024, &["-m", "crc=0", "-n", "ftype=0"], "");
@@ -118,6 +157,7 @@ fn bulk_equals_walk_million_file_timing_smoke() {
             File::create(dir.join(format!("f{f:05}"))).unwrap();
         }
     }
+    flush_fixture(&fs.mountpoint);
     // A fresh copy of this already compiled test executable measures bulk alone.
     // The parent owns/cleans the fixture; the child never mounts or compiles.
     let measured = std::process::Command::new(std::env::current_exe().unwrap())

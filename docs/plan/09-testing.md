@@ -99,11 +99,13 @@ Shared fixtures live in `test-support/fixtures/*.toml`. Mandatory ones:
 | Distinct inodes | `find <dir> -xdev -not -type d -printf '%i\n' \| sort -u \| wc -l` | `t_inodes` |
 | LVM | `lvs --units b --nosuffix -o lv_size,data_percent,metadata_percent`, `vgs -o vg_free` (plain text) | LVM collector values |
 | Filesystem totals | `df -B1 --output=size,used,avail` | Sampler values |
-| Bulk vs walk | Walk-mode snapshot | Bulk-mode snapshot: all `dirs` columns except `projid` must be equal |
+| Bulk vs walk | Walk-mode snapshot of a flushed, unchanged fixture | Bulk-mode snapshot: all `dirs` columns except `projid` must be equal |
 
 `t_disk` is compared directly with `du -sxB1` on every version. The normative `t_apparent` includes directory `st_size` (`03` §2–3). In a `rockylinux:8` container, `du (GNU coreutils) 8.30` was measured to count directory sizes in apparent mode, so equality holds directly on the target. Coreutils 9.2 and later count only regular files and symbolic links in apparent mode.
 
 For apparent-size comparisons, probe the local `du -sxB1 --apparent-size` with an empty directory and compare its output with the measured directory `st_size` to learn whether it counts directory sizes. When it does not, normalize by adding the measured `st_size` of every directory in the compared subtree (including its root), and of any other non-regular, non-symlink inode with non-zero `st_size`, to the `du` figure before comparing with `t_apparent`. Count distinct inodes and use the same subtree boundaries as the metric. The probe decides; never branch on a version string.
+
+Bulk/walk and bulk/apparent-size oracle tests must flush the destination fixture filesystem with `rustix::fs::syncfs` after all writes/copies and before scanning. The fixture writer flushes once after the whole fixture, rather than syncing each file. Production scans never force writeback. `bulk_apparent_size_follows_writeback` writes a 1 MiB file without syncing, checks equal disk bytes and bulk apparent size no greater than walk, then flushes and compares all rows (with the usual mode-only normalization); it must not require the unflushed size to be zero because writeback can happen at any moment.
 
 Oracle helpers live in `test-support::oracle` and return parsed numbers. Tests skip with a clear message if `du`/`find` are not GNU.
 
@@ -127,7 +129,7 @@ Mandatory privileged tests:
 | Test | Asserts |
 |------|---------|
 | `bulkstat_blocks_match_statx` | Bulk disk-bytes conversion equals `statx` for 10,000 random inodes (`04` §5.4) |
-| `bulk_equals_walk_*` | Identical snapshots on every mandatory fixture on loop XFS |
+| `bulk_equals_walk_*` | Identical snapshots on every mandatory fixture on loop XFS after flushing the destination filesystem |
 | `lvm_maps_mounts_to_lvs` | Loop VG with a linear LV and a thin LV: each mount maps to the right LV; the thin LV maps to its pool |
 | `lvm_thin_pool_usage_tracks_writes` | Write data to the thin LV; `data_percent` rises and matches `lvs`; the `thin_pool_pct` alert fires above a test threshold |
 | `lvm_absent_is_na` | With `lvm.enabled = true` on a non-LVM loop filesystem, the section reports n/a and nothing errors |

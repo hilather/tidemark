@@ -153,7 +153,7 @@ pub fn run_bulk(p: &BulkParams, mount_fd: BorrowedFd<'_>, geo: &XfsGeometry, gat
 ### Tests
 
 - Unit: the merge-join on synthetic sorted inputs (gaps, duplicates, missing inodes on both sides, AG boundaries); `estimate_memory` arithmetic.
-- **Privileged (VM, loop XFS): `bulk_equals_walk_*`.** For every mandatory fixture, run the walk path (W1-B + W2-A) and the bulk path into `VecSink`s and assert equality of all `dirs` rows (except `projid`), `files`, `link_sets`, `skipped` and `errors`. `link_instances` must be equal ignoring `name`.
+- **Privileged (VM, loop XFS): `bulk_equals_walk_*`.** For every mandatory fixture, flush the destination filesystem after copying/writing (R3-16), then run the walk path (W1-B + W2-A) and the bulk path into `VecSink`s and assert equality of all `dirs` rows (except `projid`), `files`, `link_sets`, `skipped` and `errors`. `link_instances` must be equal ignoring `name`.
 - Privileged: a mount with `ftype=0` → `run_bulk` refuses with a typed error (the orchestrator falls back to walk).
 - Privileged performance smoke: 1M-file generated tree; bulk and walk times recorded (no gate yet).
 
