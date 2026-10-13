@@ -259,7 +259,7 @@ fn thirty_two_connections_then_rejects_without_queueing() {
     let c = socket_config(&dir);
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = crossbeam_channel::bounded(32);
-    let handle = api::start_with_peer(
+    let handle = api::start_with_peer_timeout(
         Arc::new(c.clone()),
         context(&c),
         stop.clone(),
@@ -267,6 +267,7 @@ fn thirty_two_connections_then_rejects_without_queueing() {
             tx.send(()).unwrap();
             Ok((0, 1))
         }),
+        Duration::from_millis(700),
     )
     .unwrap();
     let mut clients = Vec::new();
@@ -280,6 +281,16 @@ fn thirty_two_connections_then_rejects_without_queueing() {
         .unwrap();
     let mut byte = [0];
     assert_eq!(std::io::Read::read(&mut rejected, &mut byte).unwrap(), 0);
+    // All idle slots must expire; credentials on a fresh connection prove admission.
+    std::thread::sleep(Duration::from_millis(850));
+    let mut recovered = BufReader::new(UnixStream::connect(&c.general.socket).unwrap());
+    recovered
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    write(&mut recovered, &request("status", "{}"));
+    assert!(read(&mut recovered).ok);
     stop.store(true, Ordering::Release);
     handle.join().unwrap().unwrap();
 }
@@ -321,11 +332,9 @@ fn injected_nonroot_peer_is_forbidden_over_real_socket() {
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
     let mut stream = BufReader::new(stream);
-    write(&mut stream, &request("status", "{}"));
-    assert_eq!(
-        read(&mut stream).error.unwrap().code,
-        ApiErrorCode::Forbidden
-    );
+    // Refused before even a malformed frame is supplied.
+    let mut line = String::new();
+    assert_eq!(stream.read_line(&mut line).unwrap(), 0);
     stop.store(true, Ordering::Release);
     handle.join().unwrap().unwrap();
 }
@@ -344,12 +353,13 @@ fn lifecycle_start_uses_kernel_credentials_over_real_socket() {
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
     let mut stream = BufReader::new(stream);
-    write(&mut stream, &request("status", "{}"));
-    let response = read(&mut stream);
     if rustix::process::geteuid().as_raw() == 0 {
+        write(&mut stream, &request("status", "{}"));
+        let response = read(&mut stream);
         assert!(response.ok, "{response:?}");
     } else {
-        assert_eq!(response.error.unwrap().code, ApiErrorCode::Forbidden);
+        let mut line = String::new();
+        assert_eq!(stream.read_line(&mut line).unwrap(), 0);
     }
     stop.store(true, Ordering::Release);
     handle.join().unwrap().unwrap();

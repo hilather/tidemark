@@ -149,7 +149,12 @@ impl Write for Frame {
         Ok(())
     }
 }
-fn send(stream: &mut UnixStream, response: &Response) -> std::io::Result<()> {
+fn send(
+    stream: &mut UnixStream,
+    response: &Response,
+    shutdown: &crate::Shutdown,
+    timeout: Duration,
+) -> std::io::Result<()> {
     let mut bytes = Frame(Vec::with_capacity(8192));
     if serde_json::to_writer(&mut bytes, response).is_err() {
         bytes.0.clear();
@@ -163,8 +168,32 @@ fn send(stream: &mut UnixStream, response: &Response) -> std::io::Result<()> {
         )
         .map_err(std::io::Error::other)?;
     }
-    stream.write_all(&bytes.0)?;
-    stream.write_all(b"\n")
+    bytes.0.push(b'\n');
+    let deadline = Instant::now() + timeout;
+    let mut offset = 0;
+    while offset < bytes.0.len() {
+        if shutdown.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        stream.set_write_timeout(Some(remaining.min(Duration::from_millis(50))))?;
+        match stream.write(&bytes.0[offset..]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => offset += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 fn connection(
     mut stream: UnixStream,
@@ -173,17 +202,27 @@ fn connection(
     permit: Permit,
     peer: PeerCredentials,
     timeout: Duration,
+    accepted: Instant,
 ) {
     let (uid, pid) = match peer(&stream) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    if uid != 0 {
+        return;
+    }
+    let mut read_deadline = accepted + timeout;
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .is_err()
+    {
+        return;
+    }
     let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
     let mut line = Vec::with_capacity(8192);
     let mut buffer = [0; 8192];
     let permit = Arc::new(permit);
-    while !shutdown.load(Ordering::Acquire) {
+    while !shutdown.load(Ordering::Acquire) && Instant::now() < read_deadline {
         let n = match stream.read(&mut buffer) {
             Ok(0) => return,
             Ok(n) => n,
@@ -200,13 +239,15 @@ fn connection(
             Err(_) => return,
         };
         for &b in &buffer[..n] {
-            if shutdown.load(Ordering::Acquire) {
+            if shutdown.load(Ordering::Acquire) || Instant::now() >= read_deadline {
                 return;
             }
             if line.len() + 1 > LIMIT {
                 let _ = send(
                     &mut stream,
                     &error("", ApiErrorCode::BadRequest, "request line exceeds 1 MiB"),
+                    &shutdown,
+                    timeout,
                 );
                 return;
             }
@@ -221,11 +262,14 @@ fn connection(
                     if send(
                         &mut stream,
                         &error("", ApiErrorCode::BadRequest, e.to_string()),
+                        &shutdown,
+                        timeout,
                     )
                     .is_err()
                     {
                         return;
                     }
+                    read_deadline = Instant::now() + timeout;
                     continue;
                 }
             };
@@ -263,13 +307,14 @@ fn connection(
                     Err(_) => break error(&id, ApiErrorCode::Internal, "handler disconnected"),
                 }
             };
-            if send(&mut stream, &response).is_err() {
+            if send(&mut stream, &response, &shutdown, timeout).is_err() {
                 return;
             }
             // Do not admit more handlers on a connection with a stuck callback.
             if timed_out {
                 return;
             }
+            read_deadline = Instant::now() + timeout;
         }
     }
 }
@@ -343,6 +388,7 @@ pub fn start_with_peer_timeout(
                 clients.retain(|h: &std::thread::JoinHandle<()>| !h.is_finished());
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        let accepted = Instant::now();
                         if active.load(Ordering::Acquire) >= CONNECTIONS {
                             drop(stream);
                             continue;
@@ -352,9 +398,12 @@ pub fn start_with_peer_timeout(
                         let ctx = context.clone();
                         let stop = shutdown.clone();
                         let peer = peer.clone();
-                        if let Ok(h) = std::thread::Builder::new()
-                            .name("api-client".into())
-                            .spawn(move || connection(stream, ctx, stop, permit, peer, timeout))
+                        if let Ok(h) =
+                            std::thread::Builder::new()
+                                .name("api-client".into())
+                                .spawn(move || {
+                                    connection(stream, ctx, stop, permit, peer, timeout, accepted)
+                                })
                         {
                             clients.push(h);
                         }
@@ -410,6 +459,7 @@ mod tests {
                 Permit(Arc::new(AtomicUsize::new(1))),
                 Arc::new(|_| Ok((0, 1))),
                 timeout,
+                Instant::now(),
             )
         });
         (BufReader::new(client), stop, h)
@@ -450,6 +500,43 @@ mod tests {
         );
         stop.store(true, Ordering::Release);
         h.join().unwrap();
+    }
+    #[test]
+    fn idle_and_drip_frames_have_absolute_deadlines() {
+        for drip in [false, true] {
+            let reload: Reload = Arc::new(|| unreachable!("incomplete frame dispatched"));
+            let (mut stream, _stop, handle) = pair(reload, Duration::from_millis(120));
+            let began = Instant::now();
+            if drip {
+                for _ in 0..4 {
+                    if stream.get_mut().write_all(b"x").is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(45));
+                }
+            }
+            let mut byte = [0];
+            assert_eq!(stream.get_mut().read(&mut byte).unwrap(), 0);
+            handle.join().unwrap();
+            assert!(began.elapsed() < Duration::from_secs(1));
+        }
+    }
+    #[test]
+    fn response_write_deadline_and_shutdown_interrupt_stalled_reader() {
+        for stopping in [false, true] {
+            let (mut server, _client) = UnixStream::pair().unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(stopping));
+            let response = Response {
+                v: 1,
+                id: "x".into(),
+                ok: true,
+                result: Some(serde_json::json!("x".repeat(900_000))),
+                error: None,
+            };
+            let began = Instant::now();
+            assert!(send(&mut server, &response, &stop, Duration::from_millis(120)).is_err());
+            assert!(began.elapsed() < Duration::from_secs(1));
+        }
     }
     #[test]
     fn pair_controllable_timeout_and_shutdown() {
