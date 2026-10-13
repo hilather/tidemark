@@ -11,31 +11,36 @@ setup
 trap cleanup EXIT
 write_config true
 start_daemon
-# Ensure the mark is installed before stopping consumption. No kernel tuning.
-deadline=$((SECONDS + 60))
-until cli_json status > "$work/status.json" && python3 - "$work/status.json" "$work/fs" <<'PYCODE'
-import json, sys
-modes = dict(json.load(open(sys.argv[1]))['data']['watch_modes'])
-assert modes.get(sys.argv[2]) in ('fd_mount', 'dfid_name_mount', 'dfid_name_filesystem'), modes
-PYCODE
- do
-    (( SECONDS < deadline )) || { fail 'watcher did not negotiate a mode'; exit 1; }
-    sleep 1
-done
+# Recognize every public mode, but a failed transport is not ready.
+watch_ready() {
+    deadline=$((SECONDS + 60))
+    until cli_json status > "$work/status.json" &&
+        python3 tests/fault/check.py watch-mode "$work/status.json" "$work/fs" > "$work/mode.log" 2>&1; do
+        (( SECONDS < deadline )) || { cat "$work/mode.log"; fail 'watcher did not negotiate a mode'; return 1; }
+        sleep 1
+    done
+    cat "$work/mode.log"
+}
+watch_ready || exit 1
 burst() {
-    local label=$1 writer_pid deadline writer_rc
+    local label=$1 kind=${2:-burst} writer_pid deadline writer_rc
+    local distinct=20000 health=watch-clean
+    if [[ $kind == distinct-cap ]]; then distinct=100000; health=watch-cap; fi
     # Capture published cumulative counters before starting each independent burst.
     deadline=$((SECONDS + 30))
     until python3 tests/fault/check.py watch-counters "$work/metrics/metrics.prom" > "$work/before.json" 2> "$work/counters.err"; do
         (( SECONDS < deadline )) || { fail 'watch counters unavailable'; return 1; }
         sleep 0.1
     done
-    setsid python3 - "$root" "$label" <<'PYCODE' &
-import pathlib, sys
+    setsid python3 - "$root" "$distinct" "$kind" <<'PYCODE' &
+import pathlib, sys, time
 p = pathlib.Path(sys.argv[1])
+started = int(time.time()) // 60
 for n in range(100000):
-    with (p / f'burst-{sys.argv[2]}-{n:06d}').open('wb') as f:
+    with (p / f'burst-{n % int(sys.argv[2]):06d}').open('wb') as f:
         f.write(b'x')
+if sys.argv[3] == 'distinct-cap':
+    assert int(time.time()) // 60 == started, 'distinct-cap workload crossed minute boundary'
 PYCODE
     writer_pid=$!
     children+=("$writer_pid")
@@ -52,22 +57,16 @@ PYCODE
     [[ $writer_rc == 0 ]] || { fail "writer exit $writer_rc"; return 1; }
     deadline=$((SECONDS + 150))
     until cli_json now > "$work/now.json" 2> "$work/now.err" &&
-        python3 tests/fault/check.py burst "$work/metrics/metrics.prom" "$work/before.json" 100000 "$work/now.json" "$work/fs" > "$work/burst-check.log" 2>&1; do
+        python3 tests/fault/check.py "$kind" "$work/metrics/metrics.prom" "$work/before.json" 100000 "$work/now.json" "$work/fs" > "$work/burst-check.log" 2>&1 &&
+        cli_json status > "$work/burst-status.json" &&
+        python3 tests/fault/check.py "$health" "$work/burst-status.json" "$work/fs" >> "$work/burst-check.log" 2>&1; do
         kill -0 "$daemon_pid" 2>/dev/null || { fail 'daemon exited after burst'; return 1; }
         (( SECONDS < deadline )) || { fail "burst $label lacks complete no-loss events"; return 1; }
         sleep 0.1
     done
-    check "burst $label no-loss events" python3 tests/fault/check.py burst "$work/metrics/metrics.prom" "$work/before.json" 100000 "$work/now.json" "$work/fs"
-    check "status after burst $label" cli_json status
-    mkdir "$root/recovered-$label"
-    printf 'recovery' > "$root/recovered-$label/after-overflow"
-    deadline=$((SECONDS + 90))
-    until cli_json now > "$work/recovery.json" 2> "$work/recovery.err" &&
-        python3 tests/fault/check.py activity "$work/recovery.json" "$root/recovered-$label" > "$work/recovery-check.log" 2>&1; do
-        (( SECONDS < deadline )) || { fail "watcher did not recover after burst $label"; return 1; }
-        sleep 0.1
-    done
-    check "watcher records activity after burst $label" python3 tests/fault/check.py activity "$work/recovery.json" "$root/recovered-$label"
+    check "burst $label no-loss events" python3 tests/fault/check.py "$kind" "$work/metrics/metrics.prom" "$work/before.json" 100000 "$work/now.json" "$work/fs"
+    cli_json status > "$work/burst-status.json"
+    check "status after burst $label" python3 tests/fault/check.py "$health" "$work/burst-status.json" "$work/fs"
     pass "daemon survived burst $label: pid=$daemon_pid"
 }
 for trial in 1 2 3; do
@@ -75,9 +74,27 @@ for trial in 1 2 3; do
 done
 stop_daemon
 start_daemon 256
+watch_ready || exit 1
 # A fresh daemon's metrics must replace the previous run's counters before baseline.
 sleep 2
 burst low-limit || exit 1
+
+# Isolate aggregation truncation from both the clean and queue-overflow passes.
+stop_daemon
+start_daemon
+watch_ready || exit 1
+sleep 2
+# Begin near a minute boundary so 100,000 distinct identities hit one bucket.
+run_helper 65 python3 - <<'PYCODE'
+import time
+while time.time() % 60 > 2:
+    time.sleep(0.1)
+PYCODE
+burst distinct-cap distinct-cap || exit 1
+stop_daemon
+start_daemon
+watch_ready || exit 1
+sleep 2
 
 # Keep the no-loss bursts above; force the separate loss path without kernel tuning.
 # cleanup also resumes every tracked process group before terminating it.
@@ -114,6 +131,7 @@ for n in range(int(sys.argv[2])):
         f.write(b'x')
 PYCODE
 kill -CONT "$daemon_pid"
+resumed_at=$SECONDS
 deadline=$((SECONDS + 60))
 # Share the remaining deadline across requests, rather than granting each 20s.
 cli_before_deadline() {
@@ -142,20 +160,48 @@ done
 check 'forced overflow counted, current minute and hot window lossy, missing events' python3 tests/fault/check.py forced-overflow "$work/metrics/metrics.prom" "$work/forced-before.json" "$writes" "$work/forced-now.json" "$work/fs" "$work/forced-hot.json" "$work/forced-hot.rc"
 check 'daemon alive after forced overflow' kill -0 "$daemon_pid"
 check 'status after forced overflow' cli_json status
+# Let the already-queued forced events finish before taking the new-write baseline.
+deadline=$((resumed_at + 90))
 python3 tests/fault/check.py watch-counters "$work/metrics/metrics.prom" > "$work/forced-loss-counters.json"
-# Two further complete minutes without another overflow; do not restart to clear health.
-recovery_at=$((SECONDS + 120))
-while (( SECONDS < recovery_at )); do
-    kill -0 "$daemon_pid" 2>/dev/null || { fail 'daemon exited during quiet recovery'; exit 1; }
-    sleep 1
+while :; do
+    sleep 3
+    python3 tests/fault/check.py watch-counters "$work/metrics/metrics.prom" > "$work/settled-counters.json"
+    if cmp -s "$work/forced-loss-counters.json" "$work/settled-counters.json"; then break; fi
+    cp "$work/settled-counters.json" "$work/forced-loss-counters.json"
+    (( SECONDS < deadline )) || { fail 'forced counters did not settle'; exit 1; }
 done
-cli_json status > "$work/forced-recovery.json"
-check 'watcher ok after two quiet minutes' python3 tests/fault/check.py watch-ok "$work/forced-recovery.json" "$work/fs"
-python3 tests/fault/check.py watch-counters "$work/metrics/metrics.prom" > "$work/forced-after.json"
-check 'no further overflow during recovery' python3 - "$work/forced-loss-counters.json" "$work/forced-after.json" <<'PYCODE'
-import json, sys
-# Compare the post-loss snapshot to the quiet-period snapshot below.
-a = json.load(open(sys.argv[1]))
-b = json.load(open(sys.argv[2]))
-assert b['overflows'] == a['overflows'], (a, b)
+# Transport recovery is independent of the retained fifteen-minute loss history.
+deadline=$((resumed_at + 120))
+run_helper 20 python3 - "$root" <<'PYCODE'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / 'resumed'
+p.mkdir()
+for n in range(100):
+    with (p / f'write-{n:03d}').open('wb') as f:
+        f.write(b'x')
 PYCODE
+until cli_before_deadline now > "$work/resumed-now.json" &&
+    cli_before_deadline status > "$work/resumed-status.json" &&
+    python3 tests/fault/check.py resumed "$work/metrics/metrics.prom" "$work/forced-loss-counters.json" 100 "$work/resumed-now.json" "$work/fs" > "$work/resumed-check.log" 2>&1 &&
+    python3 tests/fault/check.py watch-resumed "$work/resumed-status.json" "$work/fs" >> "$work/resumed-check.log" 2>&1; do
+    kill -0 "$daemon_pid" 2>/dev/null || { fail 'daemon exited during transport recovery'; exit 1; }
+    (( SECONDS < deadline )) || { fail 'new writes not observed within 120 seconds after SIGCONT'; exit 1; }
+    sleep 0.1
+done
+(( SECONDS <= deadline )) || { fail 'transport recovery exceeded 120 seconds'; exit 1; }
+check '100 new writes observed without new overflow within 120 seconds' python3 tests/fault/check.py resumed "$work/metrics/metrics.prom" "$work/forced-loss-counters.json" 100 "$work/resumed-now.json" "$work/fs"
+check 'transport recovered with retained overflow reason allowed' python3 tests/fault/check.py watch-resumed "$work/resumed-status.json" "$work/fs"
+if [[ ${TIDEMARK_FAULT_SLOW:-0} == 1 ]]; then
+    # Poll the real history expiry; allow fifteen buckets, minute alignment and publication.
+    deadline=$((resumed_at + 1020))
+    until cli_before_deadline status > "$work/forced-recovery.json" &&
+        python3 tests/fault/check.py watch-ok "$work/forced-recovery.json" "$work/fs" > "$work/history-check.log" 2>&1; do
+        kill -0 "$daemon_pid" 2>/dev/null || { fail 'daemon exited during history recovery'; exit 1; }
+        (( SECONDS < deadline )) || { fail 'watcher loss history did not expire within 17 minutes'; exit 1; }
+        sleep 1
+    done
+    check 'watcher ok after affected minute leaves fifteen-minute window' python3 tests/fault/check.py watch-ok "$work/forced-recovery.json" "$work/fs"
+    check 'no further overflow during history recovery' python3 tests/fault/check.py resumed "$work/metrics/metrics.prom" "$work/forced-loss-counters.json" 100 "$work/resumed-now.json" "$work/fs"
+else
+    echo 'SKIP: long fifteen-minute history recovery check needs TIDEMARK_FAULT_SLOW=1'
+fi
