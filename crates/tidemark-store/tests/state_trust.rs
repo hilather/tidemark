@@ -149,3 +149,41 @@ fn retained_directory_survives_rename_and_sqlite_nofollow_refuses_proc_path() {
     StateDir::snapshot_dir(&anchor.join("snapshots/root"), true).unwrap();
     assert!(parent.path().join("renamed/snapshots/root").is_dir());
 }
+
+#[cfg(feature = "privileged")]
+#[test]
+fn root_refuses_foreign_owned_ancestry_and_preseeded_regular_database() {
+    assert!(
+        rustix::process::geteuid().is_root(),
+        "requires root in a disposable guest"
+    );
+    let work = test_support::private_tempdir().unwrap();
+    let ancestor = work.path().join("foreign");
+    test_support::private_dir(&ancestor).unwrap();
+    let state = ancestor.join("state");
+    test_support::private_dir(&state).unwrap();
+    let uid = rustix::process::Uid::from_raw(1000);
+    rustix::fs::chown(&ancestor, Some(uid), None).unwrap();
+    let refusal = Catalog::open(&state, true).err().unwrap().to_string();
+    assert!(refusal.contains("uid 1000"), "{refusal}");
+    assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::metadata(&ancestor).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    let safe = work.path().join("safe");
+    test_support::private_dir(&safe).unwrap();
+    let file = safe.join("timeseries.db");
+    test_support::private_write(&file, b"sentinel").unwrap();
+    rustix::fs::chown(&file, Some(uid), None).unwrap();
+    let refusal = Catalog::open(&safe, true).err().unwrap().to_string();
+    assert!(refusal.contains("uid 1000"), "{refusal}");
+    assert_eq!(std::fs::read(&file).unwrap(), b"sentinel");
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), 8);
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(std::fs::read_dir(&safe).unwrap().count(), 1);
+}
