@@ -258,7 +258,13 @@ impl Catalog {
         self.rebuild(true)
     }
     fn rebuild(&self, preserve_lifecycle: bool) -> Result<usize, StoreError> {
+        let state = crate::state_dir::StateDir::open(&self.state_dir, false)?;
         let snapshots = self.state_dir.join("snapshots");
+        let snapshot_dir = match state.subdir(std::ffi::OsStr::new("snapshots"), false) {
+            Ok(dir) => Some(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             if preserve_lifecycle {
@@ -268,7 +274,7 @@ impl Catalog {
             },
             [],
         )?;
-        if !snapshots.try_exists()? {
+        if snapshot_dir.is_none() {
             tx.commit()?;
             return Ok(0);
         }
@@ -278,11 +284,13 @@ impl Catalog {
             if !root.file_type()?.is_dir() {
                 continue;
             }
+            let root_dir = snapshot_dir.as_ref().ok_or_else(|| StoreError::Invalid("snapshot directory missing".into()))?.subdir(&root.file_name(), false)?;
             for file in fs::read_dir(root.path())? {
                 let file = file?;
                 if !file.file_type()?.is_file() || !file.file_name().as_bytes().ends_with(b".db") {
                     continue;
                 }
+                root_dir.check_leaf(&file.file_name())?;
                 let path = file.path();
                 let loaded = Snapshot::open(&path).and_then(|s| Ok((s.root()?, s.meta().clone())));
                 let (d, m) = match loaded {
@@ -446,7 +454,7 @@ fn repair_running(state_dir: &Path, now: i64) -> Result<(), StoreError> {
 }
 
 fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
-    use rustix::fs::{self as sys, AtFlags, Dir, FileType, Mode, OFlags};
+    use rustix::fs::{self as sys, Dir, FileType, Mode, OFlags};
     fn directory(
         fd: impl std::os::fd::AsFd,
         name: impl rustix::path::Arg + Copy,
@@ -459,12 +467,14 @@ fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
     }
     // A proc-fd path ending in /. is intentional: the final component is a
     // directory, while the already retained ancestor descriptor binds the state.
-    let state = directory(sys::CWD, state_dir)?;
+    let verified = crate::state_dir::StateDir::open(state_dir, false)?;
+    let state = rustix::io::dup(verified.fd())?;
     let mount = crate::space_guard::mount_id(&state)?;
-    let snapshots = match directory(&state, "snapshots") {
+    let snapshot_dir = match verified.subdir(std::ffi::OsStr::new("snapshots"), false) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         result => result?,
     };
+    let snapshots = rustix::io::dup(snapshot_dir.fd())?;
     if crate::space_guard::mount_id(&snapshots)? != mount {
         return Ok(());
     }
@@ -487,6 +497,7 @@ fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
             {
                 return Ok(());
             }
+            let root_dir = snapshot_dir.subdir(std::ffi::OsStr::from_bytes(name.to_bytes()), false)?;
             let mut files = Dir::new(directory(&bound, ".")?)?;
             while let Some(file) = files.next() {
                 let file = file?;
@@ -507,7 +518,7 @@ fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
                     {
                         return Ok(());
                     }
-                    sys::unlinkat(files.fd()?, filename, AtFlags::empty())?;
+                    root_dir.unlink_leaf(std::ffi::OsStr::from_bytes(filename.to_bytes()))?;
                     tracing::warn!(root=%name.to_string_lossy(), scan_id=%String::from_utf8_lossy(&filename.to_bytes()[..filename.to_bytes().len()-7]), "removed abandoned snapshot temporary");
                     Ok(())
                 })();
