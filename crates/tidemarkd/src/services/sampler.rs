@@ -259,7 +259,7 @@ mod tests {
             Arc::new(move || now.load(Ordering::Acquire))
         };
         let mut config = Config::default();
-        config.sampler.mounts = vec![path.clone()];
+        config.sampler.mounts = vec![path.clone(), dir.path().join("absent")];
         config.sampler.interval = std::time::Duration::from_millis(20);
         config.watch.mounts.clear();
         let state = LiveState::new(&config, 100);
@@ -281,6 +281,7 @@ mod tests {
                 std::thread::yield_now();
             }
         };
+        let missing_path = format!("not mounted: {}", path.display());
         let degraded = || {
             state
                 .view_at(100)
@@ -288,7 +289,9 @@ mod tests {
                 .unwrap()
                 .components
                 .iter()
-                .any(|c| c.name == "sampler" && c.state == "degraded")
+                .any(|c| {
+                    c.name == "sampler" && c.state == "degraded" && c.detail.contains(&missing_path)
+                })
         };
         wait(&degraded);
         assert!(state.view_at(100).fs_samples().is_none());
