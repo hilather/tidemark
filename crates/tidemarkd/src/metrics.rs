@@ -660,15 +660,6 @@ pub fn start(
             let mut last_log: Option<Instant> = None;
             while !shutdown.load(Ordering::Acquire) {
                 let (config, g) = state.config();
-                if config.metrics.textfile.as_os_str().is_empty() {
-                    state.publish_component(crate::component(
-                        "metrics",
-                        "disabled",
-                        "not configured: metrics textfile path is empty",
-                    ))?;
-                    crate::wait_service(&state, g, &shutdown, config.metrics.interval);
-                    continue;
-                }
                 if generation != Some(g) {
                     generation = Some(g);
                     next = if Instant::now()
@@ -684,6 +675,15 @@ pub fn start(
                         ))?;
                         None
                     };
+                }
+                if next.is_some() && config.metrics.textfile.as_os_str().is_empty() {
+                    state.publish_component(crate::component(
+                        "metrics",
+                        "disabled",
+                        "not configured: metrics textfile path is empty",
+                    ))?;
+                    crate::wait_service(&state, g, &shutdown, config.metrics.interval);
+                    continue;
                 }
                 if next.is_some_and(|deadline| Instant::now() >= deadline) {
                     // Compare catalog identities at each export to repair startup/reload
