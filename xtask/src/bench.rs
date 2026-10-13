@@ -38,6 +38,8 @@ pub struct Options {
     pub duration: u64,
     /// Watcher workload logical operations per second.
     pub rate: u64,
+    /// Prebuilt CLI to measure; default is the release CLI in the cargo target directory.
+    pub tidemark: Option<PathBuf>,
 }
 /// Parse without running any command or touching host configuration.
 pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
@@ -52,6 +54,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
         watcher: false,
         duration: 10,
         rate: 1_000_000,
+        tidemark: None,
     };
     let mut args = args;
     let mut seen = BTreeSet::new();
@@ -73,6 +76,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
                     "--throttle" => o.throttle = v,
                     "--duration" => o.duration = v.parse()?,
                     "--mutate-rate" => o.rate = v.parse()?,
+                    "--tidemark" => o.tidemark = Some(v.into()),
                     _ => bail!("unknown bench argument {a}"),
                 }
             }
@@ -97,7 +101,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
         || o.rate == 0
         || o.rate > 1_000_000
     {
-        bail!("invalid bench options; --root DIR --modes du,walk,bulk --cache warm[,cold] [--out DIR] [--throttle max|normal|gentle]");
+        bail!("invalid bench options; --root DIR --modes du,walk,bulk --cache warm[,cold] [--out DIR] [--throttle max|normal|gentle] [--tidemark PATH]");
     }
     if o.caches.iter().any(|c| c == "cold") && !o.drop_caches {
         bail!("cold cache requires --drop-caches-on-this-host: dropping page caches affects the entire host and requires root");
@@ -151,7 +155,7 @@ pub fn commands(
             .collect()
     } else {
         vec![Invocation {
-            program: workspace.join("target/release/tidemark").into_os_string(),
+            program: cli(workspace, o).into_os_string(),
             args: vec![
                 "--config".into(),
                 config.as_os_str().into(),
@@ -168,10 +172,16 @@ pub fn commands(
         }]
     }
 }
+/// Measured CLI: the explicit or resolved `--tidemark`, else the workspace default.
+fn cli(workspace: &Path, o: &Options) -> PathBuf {
+    o.tidemark
+        .clone()
+        .unwrap_or_else(|| workspace.join("target/release/tidemark"))
+}
 /// Build a standalone watcher command for the overhead experiment.
-pub fn watcher_command(workspace: &Path, root: &Path, config: &Path) -> Invocation {
+pub fn watcher_command(program: &Path, root: &Path, config: &Path) -> Invocation {
     Invocation {
-        program: workspace.join("target/release/tidemark").into_os_string(),
+        program: program.as_os_str().into(),
         args: vec![
             "--config".into(),
             config.as_os_str().into(),
@@ -479,8 +489,13 @@ fn private_config(out: &Path) -> Result<PathBuf> {
     )?;
     Ok(config)
 }
-fn ensure_binary(workspace: &Path) -> Result<()> {
-    if !workspace.join("target/release/tidemark").is_file() {
+fn ensure_binary(workspace: &Path) -> Result<PathBuf> {
+    // Cargo writes to CARGO_TARGET_DIR when set; a relative value is resolved
+    // against the build's working directory, which is the workspace.
+    let binary = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace.join("target"), |dir| workspace.join(dir))
+        .join("release/tidemark");
+    if !binary.is_file() {
         let status = Command::new("cargo")
             .current_dir(workspace)
             .args([
@@ -496,7 +511,13 @@ fn ensure_binary(workspace: &Path) -> Result<()> {
             bail!("release CLI build failed");
         }
     }
-    Ok(())
+    if !binary.is_file() {
+        bail!(
+            "release CLI not found at {}; pass --tidemark PATH",
+            binary.display()
+        );
+    }
+    Ok(binary)
 }
 /// Execute benchmark measurements; privileged paths require explicit flags.
 pub fn run(workspace: &Path, args: impl Iterator<Item = OsString>) -> Result<()> {
@@ -545,7 +566,12 @@ pub fn run(workspace: &Path, args: impl Iterator<Item = OsString>) -> Result<()>
     fs::create_dir(&run_dir)?;
     let config = private_config(&run_dir)?;
     if o.watcher || o.modes.iter().any(|m| m != "du") {
-        ensure_binary(workspace)?;
+        o.tidemark = Some(match &o.tidemark {
+            Some(path) => {
+                fs::canonicalize(path).with_context(|| format!("--tidemark {}", path.display()))?
+            }
+            None => ensure_binary(workspace)?,
+        });
     }
     let leaf = leaves(&o.root)?;
     let mut disks = Disks {
@@ -654,7 +680,7 @@ fn watcher_experiment(
         inv.args.push("--dense".into());
     }
     let baseline = measure(&inv, out, "writer-alone", disks, series)?;
-    let watch = watcher_command(workspace, &o.root, config);
+    let watch = watcher_command(&cli(workspace, o), &o.root, config);
     let mut child = watch
         .command()
         .stdout(File::create(out.join("watcher.stdout"))?)
@@ -745,7 +771,7 @@ mod tests {
         )
         .is_err());
         assert!(
-            watcher_command(Path::new("/repo"), Path::new("/f"), Path::new("/c"))
+            watcher_command(Path::new("/cli"), Path::new("/f"), Path::new("/c"))
                 .args
                 .contains(&"close_write".into())
         );

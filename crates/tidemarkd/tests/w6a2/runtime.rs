@@ -68,6 +68,13 @@ impl Harness {
         } else {
             tempfile::tempdir().unwrap()
         };
+        // An API socket may be bound below these directories. Under a sticky
+        // ancestor such as /tmp the daemon requires an owned 0700 descendant;
+        // tempfile yields 0755.
+        for dir in [root.path(), storage.path()] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let mut cfg = Config::default();
         cfg.general.state_dir = storage.path().to_owned();
         cfg.roots = vec![RootConfig {
