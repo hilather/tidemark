@@ -224,13 +224,12 @@ Query the source per rule and exact Duration window; dir_growth compares snapsho
 
 `older_than = "auto"` is twice effective cadence; windowed schedules supply at least 24h cadence, non-windowed short cadences remain valid. Unknown cadence is diagnostic; a known root with no complete scan breaches staleness. Measured NowInputs sections use Option: None is “not measured”, Some(empty) is measured empty. Preserve the frozen core report via degraded reasons and never display an unavailable phantom placeholder as measured zero.
 
-`WebhookDeliver::new(url, host)` has two arguments; there is no separate webhook redaction rule or config key in v1. Preserve escaped subjects and the documented fields/text. Only 2xx succeeds; redirects are disabled and failed deliveries, with the existing bounded queue, timeout and retries.
-
 ### 6.3 Delivery
+
+Journal delivery is the only alert delivery sink in v1 (ADR-020). Active alerts and history remain available through the Unix API and CLI.
 
 - **Always:** journald, with structured fields `TIDEMARK_RULE`, `TIDEMARK_SUBJECT`, `TIDEMARK_STATE` and `TIDEMARK_VALUE`.
 - **Always:** the metric `tidemark_alert_firing{rule,subject} 1`, so Alertmanager can route it.
-- **Optional:** `alerts.webhook`, a JSON POST (`{rule, subject, state, value, message, host, ts}` plus a `text` field so Slack/Teams-style incoming webhooks render it). 5 s timeout, 3 retries, never blocking the engine.
 - No arbitrary command hooks; that would be a root code-execution path.
 
 ### 6.4 Default rules

@@ -25,3 +25,5 @@ This package includes `07-live-monitoring.md`, `08-interfaces.md` and
 interfaces, deployment checks and operational rollout. Tidemark makes no fstab,
 LVM or boot configuration changes. Its daemon retains the host mount namespace
 so fanotify marks observe writers in other services.
+
+Tidemark v1 uses only its Unix API socket. Metrics are exported through the node_exporter textfile collector; alert delivery is through the journal. HTTP endpoints and webhooks were removed in ADR-020; old configuration keys are rejected.

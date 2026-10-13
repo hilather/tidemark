@@ -59,8 +59,8 @@ fn exact_normative_unit_and_config() {
     let config = read("packaging/config/tidemark.toml");
     assert_eq!(config, block("## 3.", "toml"));
     let parsed: toml::Value = toml::from_str(&config).unwrap();
-    assert_eq!(parsed["metrics"]["listen"].as_str(), Some(""));
-    assert_eq!(parsed["alerts"]["webhook"].as_str(), Some(""));
+    assert!(parsed["metrics"].get("listen").is_none());
+    assert!(parsed["alerts"].get("webhook").is_none());
     assert!(!config.contains("socket_group"));
     assert_eq!(
         read("packaging/tmpfiles.d/tidemark.conf"),
