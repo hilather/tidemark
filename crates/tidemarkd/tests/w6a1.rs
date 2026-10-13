@@ -419,6 +419,8 @@ fn compaction_uses_injected_clock() {
     elapsed.store(3599, Ordering::Release);
     now.store(7200, Ordering::Release);
     flush(&tx);
+    // The second barrier also waits for the prior iteration's compaction check.
+    flush(&tx);
     assert_eq!(
         tidemark_store::timeseries::TimeSeries::open(
             &c.general.state_dir.join("timeseries.db"),
@@ -432,7 +434,7 @@ fn compaction_uses_injected_clock() {
     );
     now.store(0, Ordering::Release);
     flush(&tx);
-    std::thread::sleep(Duration::from_millis(100));
+    flush(&tx);
     assert_eq!(
         tidemark_store::timeseries::TimeSeries::open(
             &c.general.state_dir.join("timeseries.db"),

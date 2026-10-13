@@ -1120,7 +1120,27 @@ fn scheduler(
     shared
         .state
         .publish_component(component("scheduler", "ok", "scheduler started"))?;
-    initialize_schedules(&shared.state, (shared.clock)())?;
+    initialize_schedules(&shared.state, started_wall)?;
+    // Seed startup history before accepting commands, including for off roots.
+    // A manual scan admitted immediately must be recognized as a runtime
+    // completion rather than translated from its later wall timestamp.
+    let initial_statuses = shared.state.view().scans().unwrap_or_default();
+    for root in &shared.state.config().0.roots {
+        let raw =
+            RawPath::from_path(&root.path).map_err(|e| DaemonError::Invalid(e.to_string()))?;
+        let label = root_label(&raw);
+        let last = initial_statuses
+            .iter()
+            .find(|s| s.root == label)
+            .and_then(|s| s.last_complete.as_ref());
+        completions.insert(
+            raw,
+            (
+                last.map(|e| e.scan_id.clone()),
+                last.map(|e| started.saturating_add(e.finished_at.saturating_sub(started_wall))),
+            ),
+        );
+    }
     while !shared.shutdown.load(Ordering::Acquire) {
         if job.as_ref().is_some_and(|j| j.is_finished()) {
             if let Some(j) = job.take() {

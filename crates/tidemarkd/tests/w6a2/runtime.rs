@@ -877,7 +877,9 @@ fn wall_steps_do_not_consume_retry_delay_or_suspend_polling() {
 #[test]
 fn successful_cadence_survives_wall_steps() {
     use std::sync::atomic::AtomicI64;
-    let base = tidemarkd::unix_now();
+    // The orchestrator owns its wall timestamps; a different injected startup
+    // wall time must not turn this new manual completion into restart history.
+    let base = tidemarkd::unix_now() + 7200;
     let wall = Arc::new(AtomicI64::new(base));
     let elapsed = Arc::new(AtomicI64::new(0));
     let clock = {
@@ -888,7 +890,8 @@ fn successful_cadence_survives_wall_steps() {
         let elapsed = elapsed.clone();
         Arc::new(move || elapsed.load(Ordering::Acquire))
     };
-    let h = Harness::with_clocks("every 1h", "max", false, clock, monotonic);
+    let h = Harness::with_clocks("off", "max", false, clock, monotonic);
+    h.control.start(&h.params()).unwrap();
     wait(|| {
         !h.control
             .status(&ScanStatusParams {
@@ -907,22 +910,30 @@ fn successful_cadence_survives_wall_steps() {
     };
     wait(|| status().last_complete.is_some() && status().running.is_none());
     let id = status().last_complete.unwrap().scan_id;
-    std::thread::sleep(Duration::from_millis(150));
     elapsed.store(1, Ordering::Release);
-    wait(|| status().next_due.is_some_and(|d| d >= base + 3600));
-    std::thread::sleep(Duration::from_millis(150));
+    let mut cfg = h.cfg.clone();
+    cfg.roots[0].schedule = "every 1h".into();
+    h.state.replace_config(cfg.clone()).unwrap();
+    wait(|| status().next_due.is_some());
     let remaining = status().next_due.unwrap() - base;
+    assert!(
+        (3599..=3600).contains(&remaining),
+        "remaining cadence: {remaining}"
+    );
     wall.store(base + 7200, Ordering::Release);
     elapsed.store(2, Ordering::Release);
 
     wait(|| status().next_due == Some(base + 7200 + remaining - 1));
     assert_eq!(status().last_complete.unwrap().scan_id, id);
-    h.state.replace_config(h.cfg.clone()).unwrap();
-    std::thread::sleep(Duration::from_millis(150));
-    assert_eq!(status().next_due, Some(base + 7200 + remaining - 1));
+    h.state.replace_config(cfg.clone()).unwrap();
+    cfg.roots[0].schedule = "every 2h".into();
+    h.state.replace_config(cfg).unwrap();
+    // A changed interval makes publication observable, without a sleep or
+    // confusing the recorder's preceding completion status with a fresh poll.
+    wait(|| status().next_due == Some(base + 7200 + remaining - 1 + 3600));
     assert_eq!(status().last_complete.unwrap().scan_id, id);
     wall.store(base - 7200, Ordering::Release);
     elapsed.store(3, Ordering::Release);
-    wait(|| status().next_due == Some(base - 7200 + remaining - 2));
+    wait(|| status().next_due == Some(base - 7200 + remaining - 2 + 3600));
     assert_eq!(status().last_complete.unwrap().scan_id, id);
 }
