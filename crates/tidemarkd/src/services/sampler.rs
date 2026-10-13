@@ -53,15 +53,66 @@ pub fn start(
         .name("sampler".into())
         .spawn(move || {
             let mut last_sample = std::collections::BTreeMap::new();
+            let mut identities = std::collections::BTreeMap::new();
+            let mut next_sample = std::time::Instant::now();
             while !shutdown.load(Ordering::Acquire) {
                 let (config, generation) = state.config();
                 let now = crate::unix_now();
                 let mut rows = Vec::new();
                 let mut errors = Vec::new();
                 last_sample.retain(|path, _| config.sampler.mounts.contains(path));
+                let mounts = match crate::mounts::read() {
+                    Ok(mounts) => mounts,
+                    Err(error) => {
+                        state.publish_component(crate::component(
+                            "sampler",
+                            "degraded",
+                            error.to_string(),
+                        ))?;
+                        crate::wait_service(
+                            &state,
+                            generation,
+                            &shutdown,
+                            config
+                                .sampler
+                                .interval
+                                .min(std::time::Duration::from_secs(10)),
+                        );
+                        continue;
+                    }
+                };
+                let changes =
+                    crate::mounts::reconcile(&config.sampler.mounts, &mut identities, &mounts)?;
+                crate::mounts::log(&changes, "sampler");
+                for change in &changes {
+                    last_sample.remove(&change.path);
+                }
+                if !changes.is_empty() {
+                    next_sample = std::time::Instant::now();
+                }
+                let due = std::time::Instant::now() >= next_sample;
+                // Include watch-only entries so the existing firstboot sampler
+                // health input cannot claim healthy while any entry is absent.
+                for path in config
+                    .watch
+                    .mounts
+                    .iter()
+                    .filter(|p| !config.sampler.mounts.contains(p))
+                {
+                    if crate::mounts::identity(&mounts, path)?.is_none() {
+                        errors.push(format!("not mounted: {}", path.display()));
+                    }
+                }
                 for path in &config.sampler.mounts {
                     if shutdown.load(Ordering::Acquire) {
                         break;
+                    }
+                    if identities.get(path) == Some(&None) {
+                        errors.push(format!("not mounted: {}", path.display()));
+                        continue;
+                    }
+                    if !due {
+                        continue;
                     }
                     match sample(path, now) {
                         Ok(s) => {
@@ -79,6 +130,9 @@ pub fn start(
                         Err(e) => errors.push(e.to_string()),
                     }
                 }
+                if due {
+                    next_sample = std::time::Instant::now() + config.sampler.interval;
+                }
                 if !rows.is_empty() && writer.try_send(super::tswriter::Message::Fs(rows)).is_err()
                 {
                     errors.push("writer queue full or disconnected; persistence dropped".into());
@@ -89,7 +143,14 @@ pub fn start(
                     crate::component("sampler", "degraded", errors.join("; "))
                 };
                 state.publish_component(health)?;
-                crate::wait_service(&state, generation, &shutdown, config.sampler.interval);
+                crate::wait_service(
+                    &state,
+                    generation,
+                    &shutdown,
+                    next_sample
+                        .saturating_duration_since(std::time::Instant::now())
+                        .min(std::time::Duration::from_secs(10)),
+                );
             }
             Ok(())
         })

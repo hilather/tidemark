@@ -659,7 +659,10 @@ fn launch(
                 failures: shared.failures.clone(),
                 clock: shared.clock.clone(),
             };
-            let result = run_scan(&config, &req, &recorder, &command.cancel, &|p| {
+            let presence = crate::mounts::read()
+                .and_then(|mounts| crate::mounts::check_scan(&config, &req.root, &mounts))
+                .map_err(scan_error);
+            let result = presence.and_then(|()| run_scan(&config, &req, &recorder, &command.cancel, &|p| {
                 if let Some(mut s) = shared
                     .state
                     .view()
@@ -677,7 +680,7 @@ fn launch(
                         scheduler_health(&shared.failures, "scan running"),
                     );
                 }
-            });
+            }));
             if let Err(e) = result {
                 if let Some(reply) = recorder.reply.lock().take() {
                     let _ = reply.try_send(Err(DaemonError::Scan(e.to_string())));

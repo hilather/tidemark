@@ -10,6 +10,8 @@ pub mod api;
 pub mod firstboot;
 /// metrics module skeleton.
 pub mod metrics;
+/// Configured mount presence and identity.
+pub mod mounts;
 /// scheduler module skeleton.
 pub mod scheduler;
 /// Daemon service modules.
