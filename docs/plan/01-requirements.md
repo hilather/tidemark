@@ -49,7 +49,7 @@ When a disk fills, operators need to know **immediately** where the space is, wh
 - **G4 — History.** Snapshots are kept, and "what grew between A and B" can be explained in one command.
 - **G5 — Hidden consumers.** Surface deleted-but-open files, growing open files and LVM thin-pool usage.
 - **G6 — Early warning.** Growth-rate, time-to-full and thin-pool alerts, delivered through existing monitoring.
-- **G7 — Strictly read-only.** Tidemark never changes filesystem metadata, never reads file contents, and makes no changes to mounts, fstab, LVM or the kernel command line.
+- **G7 — Strictly read-only.** Tidemark performs no intentional scanned-data mutation or regular-file payload reads, and makes no changes to mounts, fstab, LVM or kernel command line. Symbolic-link text inspection can update link atime under mount policy; directory O_NOATIME fallback and administrator-supplied path resolution are documented limits (R5-23/25).
 - **G8 — Hands-off deployment.** Deployable by the hotfix pipeline, active after the next reboot, with a verifiable result.
 
 ## 4. Non-goals (v1)
@@ -80,10 +80,10 @@ Wave files reference these IDs. FR-10 to FR-13 (project quotas) and FR-16 (colle
 | FR-14 | **Live write attribution**: fanotify watcher on `/` and `/data` (fd mode baseline, FID mode when available); per-minute hot directories, units and processes. | W5 |
 | FR-15 | **Hidden consumers**: deleted-but-open files and growing open-for-write files, attributed to process and unit. | W5 |
 | FR-16 | *(Deferred: PostgreSQL collector.)* | — |
-| FR-17 | **Rates and alerts**: least-squares growth rates, time-to-full, thin-pool thresholds, nine configurable rule kinds with hysteresis, delivery to journald/webhook/metrics. | W5 |
+| FR-17 | **Rates and alerts**: least-squares growth rates, time-to-full, thin-pool thresholds, nine configurable rule kinds with hysteresis, delivery to journald and textfile metrics. | W5 |
 | FR-18 | **`now` view**: a one-screen live report of filesystems, LVM, hot directories, writers, phantom files, alerts and scan status in under 1 s. | W5/W6 |
 | FR-19 | **Daemon**: filesystem/LVM samplers, watcher, process scanner, scan scheduler with windows, Unix-socket JSON API, self-protection. | W6 |
-| FR-20 | **Metrics**: node_exporter textfile (default) and optional localhost HTTP; cardinality caps. | W6 |
+| FR-20 | **Metrics**: node_exporter textfile only (ADR-020); cardinality caps. | W6 |
 | FR-21 | **TUI**: ncdu-style browser over snapshots, with diff overlay and on-demand live refresh of a subtree. Read-only. | W7 |
 | FR-22 | **ncdu export**: snapshot → ncdu JSON. | W3 |
 | FR-23 | **Packaging**: RPM for EL8, systemd unit, tmpfiles, default config for `/` + `/data`, SELinux sanity. | W6 |
@@ -98,7 +98,7 @@ Wave files reference these IDs. FR-10 to FR-13 (project quotas) and FR-16 (colle
 | NFR-2 | **Scan speed**: cold-cache full scan at least 3× faster than `du -sx` on the staging copy with throttling off. With the `normal` adaptive throttle profile, the leaf block devices' utilisation and average wait (from `/sys/block/*/stat`, using the adaptive gate's samples) stay within the profile's configured targets, apart from short excursions the controller corrects. Targets revisited after pilot measurements. | `xtask bench` (W7) |
 | NFR-3 | **Live latency**: filesystem samples every 30 s; hot-directory attribution visible ≤ 60 s after a file is closed. | Integration test (W5/W6) |
 | NFR-4 | **Footprint**: daemon steady-state RSS ≤ 300 MiB and ≤ 2% of one core when idle outside scans; active watcher budget is 5% of one core per 1,000 close-write events/s (50 µs/event; 13 R4-8). Scan memory within the configured budget (default 1.25 GiB, inside the service's 2 GiB cgroup limit). Watcher overhead on writers is measured with a generic write workload (the fixture generator in mutate mode), comparing throughput with and without the watcher. | Soak test (W7) |
-| NFR-5 | **Safety**: no symlink following; no file-content reads; no metadata writes; directories opened with `O_NOATIME`, so scans cause no atime write storms. | Code review checklist, tests, strace audit (W7-C) |
+| NFR-5 | **Safety**: scans never follow found symlinks or read regular-file payloads; no intentional scanned metadata writes. Request O_NOATIME for directories with charged EPERM fallback; symlink inspection/path-resolution atime limits are documented (R5-23/25). | Code review checklist, tests, strace audit (W7-C) |
 | NFR-6 | **Crash safety**: a crash never leaves a corrupt "latest" snapshot. The time-series DB survives power loss (SQLite WAL). | Fault-injection tests |
 | NFR-7 | **Self-protection**: Tidemark never fills a disk it monitors (state-size cap, free-space floor). It excludes its own state directory from scans and watches. | Tests (W6) |
 | NFR-8 | **Security**: root daemon with a minimal capability set; no network listeners by default; API socket `0600 root:root`; config and snapshot files `0600 root:root`; state and runtime directories `0700 root:root`; installed files are root-only, so administrators use `sudo` (path names are sensitive); no uid gate in the CLI or daemon. | Review (W7) |
@@ -111,3 +111,9 @@ Wave files reference these IDs. FR-10 to FR-13 (project quotas) and FR-16 (colle
 - No more ad-hoc `du` runs on production during business hours.
 - Every disk-full incident in the first quarter is explained by `tidemark now` or `tidemark diff --explain` without other tools.
 - Deployment to a new host is a pipeline step plus a reboot, with no manual follow-up.
+
+## Read-only and visibility limits (13 R5)
+
+The daemon has no network socket or HTTP/webhook transport; metrics use textfile and alerts journal. Read-only observation excludes regular-file payload reads and intentional scanned-data mutation. Reading found symbolic-link text is limited to symlinks and may update link atime under mount policy; resolving administrator-supplied paths may follow links. --check-targets stays inside the selected mount. Root capabilities do not provide a read-only sandbox.
+
+Watcher fd/filesystem covers all mounts on supported 8.10; fd/mount fallback on 8.8 misses other bind/private namespaces and warns in status. TUI paging/index responsiveness and owner staging/soak/fuzz/final guest gates remain open; see 12’s current hardening risks.

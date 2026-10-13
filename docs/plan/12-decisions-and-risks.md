@@ -39,7 +39,7 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 - *Consequences:* simpler code for agents to write and review; blocking syscalls are natural.
 
 **ADR-006 — Metrics through the node_exporter textfile collector by default.**
-- *Decision:* textfile is the default; an optional HTTP listener binds to loopback only.
+- *Decision:* textfile is the only v1 metrics transport (ADR-020; R5-1 supersedes the optional listener).
 - *Consequences:* no new network surface; works with the most common EL8 monitoring setup.
 
 **ADR-007 — No project quotas in v1** (supersedes the earlier "accounting-only, audit-gated quotas" decision).
@@ -48,7 +48,7 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 - *Consequences:* no instant per-tree totals between scans; the hot-directory view fills most of that gap. Far lower deployment risk: no filesystem or boot changes at all.
 
 **ADR-008 — Tidemark is strictly read-only.**
-- *Consequences:* no code path changes file metadata, mounts, LVM or boot configuration, so a bug or compromise can't corrupt data. The only writes are to its own state directory, its config (`deploy stage`), and the service's enablement.
+- *Consequences:* observation performs no intentional scanned-data mutation, mount/LVM/boot changes or regular-file payload reads. Writes are Tidemark state/config and explicit deployment/service operations. Link-text inspection may update symlink atime under mount policy; directory NOATIME fallback is also a limit (R5-23/25). Root capabilities are not a read-only sandbox; see `../security.md`.
 
 **ADR-009 — Build on a `rockylinux:8` container (glibc 2.28), not musl static.**
 - *Consequences:* the native allocator performs well under multithreading; normal debugging tools work. Binaries target EL8+ (they also run on EL9).
@@ -68,7 +68,7 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 **ADR-013 — The daemon runs in the host mount namespace.**
 - *Context:* fanotify mount marks attach to the specific mount object. systemd's `ProtectSystem=`/`ProtectHome=`/`PrivateTmp=`/`ReadWritePaths=` create a private mount namespace containing *copies* of the mounts, so marks would never fire for writes made through the host's mounts.
 - *Decision:* omit those options. Compensate with a capability bounding set, `NoNewPrivileges`, `RestrictNamespaces`, `SystemCallArchitectures`, `LockPersonality`, `RestrictAddressFamilies`, plus a startup namespace check and an install-time end-to-end test.
-- *Consequences:* weaker filesystem sandboxing than ideal. Revisit if `FAN_MARK_FILESYSTEM` proves available on the target kernels, since filesystem marks are per superblock. A watcher-only helper process outside the sandbox is a possible future split.
+- *Consequences:* weaker filesystem sandboxing than ideal. Revisit completed by R5-26: fd mode prefers filesystem marks on measured 8.10 and retains mount marks on 8.8; host namespace checks remain for scanning/sampling/path interpretation. A watcher-only helper process outside the sandbox is a possible future split.
 
 **ADR-014 — Self-throttling instead of relying on `ionice`.**
 - *Context:* the idle I/O class is only honoured by priority-aware schedulers such as BFQ; EL8 commonly uses `mq-deadline` for these devices.
@@ -92,7 +92,7 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 
 **ADR-018 — Root-only access; no `tidemark` group.**
 - *Context:* path names in snapshots and API responses are sensitive. The owner wants no group granting access without sudo.
-- *Decision:* no `tidemark` group. All installed Tidemark files are `root:root`: the API socket, config, snapshots and their `.db.tmp` files are `0600`; state and runtime directories are `0700`. Access control is by ownership, file modes and socket peer uid: every API method accepts only peer uid 0, identified by kernel SO_PEERCRED; other peers receive `forbidden`, even with a nonroot daemon (13 R3-14). Neither binary has a startup uid gate; API dispatch does. Remove the socket-group configuration key and group creation from packaging; no group-specific service setting or account-definition file is shipped.
+- *Decision:* no `tidemark` group. All installed Tidemark files are `root:root`: the API socket, config, snapshots and their `.db.tmp` files are `0600`; state and runtime directories are `0700`. Access control is by ownership, file modes and socket peer uid: every API method accepts only peer uid 0, identified by kernel SO_PEERCRED; other peers are closed before parsing, with zero response bytes (R5-20), even with a nonroot daemon (13 R3-14). Neither binary has a startup uid gate; API dispatch does. Remove the socket-group configuration key and group creation from packaging; no group-specific service setting or account-definition file is shipped.
 - *Consequences:* operators use `sudo`; one less packaging step and no group membership to manage. A non-root command that cannot read the root-only config, state directory, snapshot or socket retains the exit code for that failure and adds the hint: `Tidemark's files are root-only; run this command with sudo.` No new exit code is added; exit code 5 retains its precondition-failure meaning. Unprivileged tests keep working with their own temporary config, state directory and socket. Non-root daemon and scan runs use the existing degraded mode (readable-subset walk mode, no watcher or procscan of other users).
 
 **ADR-019 — No PostgreSQL tracking in v1.**
@@ -120,11 +120,11 @@ Owner decision: fd-mode watcher budget is 5% of one core per 1,000 close-write e
 
 ### First real runs: open risks (13 R4-16)
 
-Open, not new accepted behavior: watcher-backed alert rules remain unevaluable until daemon publishes exact CompletedMinute windows (R4-7); W6-A2b alert reconfiguration continuity, component removal and cancellable process scan; mount rate-ring reset/current now.degraded (R4-9); one intermittent cancellation deadline miss on 8.8 in scan_lifecycle::interrupted_cancelled_and_failed_scans; firstboot report rewritten on every start with changed config; LVM schema/cancel-id gaps (R4-12).
+Superseded by R5-2/8/9/11/19/21: writer supervision, collector availability, immutable process reports, monotonic scheduling, exact watcher windows, reload continuity, mount-rate reset/current degradation, API ownership/deadlines, crash cleanup and state trust have landed fix notes. Cancellation’s work bound excludes durable outcome sync (R5-3). Open: scan.cancel id conditioning, million-child paging/index decision, staging scale/soak, nightly fuzz execution/cumulative gate and R5-27 core/guest decisions. Implementation notes do not establish independent guest acceptance.
 
-Review findings without landed fix notes: core S1 writer rollover failure/supervision, S2 stale collector alert availability, S3 procscan published-lock contention, S4 LVM retry units/backpressure, S5 wall-clock operational deadlines, S7 late sampler generation resurrection, S8 internal alert capacity; edge F02 incomplete-request API deadline, F03 abandoned handler cancellation, F04 mutable API parent path operations. B1/B2/S6/S9 have CORE-fix-1; F05–F08 EDGE-cli; F09–F12 EDGE-metrics plus CORE-fix-1 validation; F13 INSTALL-assert. F01 has an EDGE-metrics fix note but HTTP removal/ADR-020 is separately assigned and not resolved by this plan task. Landed notes establish implementation evidence, not independent verification; unrestricted socket tests and guest gates remain required.
+Historical findings are superseded by R5-2/4/19/21/24. Unrestricted listener, final Rocky guest and owner sign-off gates remain required; see R5-18/27.
 
-Mount-presence unresolved state publications and mark verification are detailed in R4-9; do not claim rate reset or now.degraded recovery.
+Mount-state publication follow-ups are implemented (R5-8/19); privileged remount/race acceptance remains separate.
 
 
 L = likelihood, I = impact (H/M/L).
@@ -140,7 +140,7 @@ L = likelihood, I = impact (H/M/L).
 | R7 | EL8 kernel behaviour differs from upstream (bulkstat units, v5, fanotify FID) | M | M | EL8 5.0.0 headers lack v5; module inspection found v5 handlers in 477.27.1.el8_8 and 553.172.1.el8_10, followed by successful v5 first-run runtime probes on both releases. No statx mount ID or FID mode measured; filesystem marks only on 8.10. Hand-transcribed ABI pinned to gcc layouts (`04` §5.1); units and scale tests remain gates | W1-C, W5-A |
 | R8 | Tidemark's own state fills the disk or adds random writes to RAID 5 | L | M | Space guard; retention; state dir on another device; excluded from scans and watch | `05` §8, W1-E |
 | R11 | *(removed: collector deferred, ADR-019)* | — | — | — | — |
-| R12 | Path names exposed through metrics or webhooks | M | M | Root-only file and API permissions (ADR-018); loopback-only HTTP; cardinality caps; document escaped webhook payload exposure; no separate v1 redaction (13 R2-10) | W6-B, W7-C |
+| R12 | Sensitive names exposed through state, logs or metrics | M | M | Root-only installed access; trusted collector ancestry; metrics 0644 is deliberate; protect downstream exporter/journal; no v1 redaction or HTTP/webhook (R5-1/21) | W6-B, W7-C |
 | R13 | Inconsistent or low-quality code from parallel agents | M | M | Frozen contracts; owned paths; independent reviewers; gate reviews | `10` |
 | R14 | Host on unsupported Rocky 8.8 | H | M | Probe warns; P0 recommends updating to 8.10 | P0 |
 | R15 | SELinux denials in enforcing mode | L | M | Install test checks AVCs; runs as `unconfined_service_t` | W6-C |
@@ -161,9 +161,27 @@ These are open risks, not accepted implementation guarantees. Historical handoff
 | R3-L1 | `deploy/files.rs` is compiled through `#[path]` from both daemon `lib.rs` and `firstboot.rs`; consolidate into one crate-visible module. | CI-fix-daemon-state, W6-A1; daemon/deploy owners |
 | R3-L2 | `tidemark_fs::lvm::collect` has no cancellation hook; an in-flight LVM worker can exceed the shared join deadline; CORE-fix-1 retains/joins handles rather than abandoning them. | W6-A1; FS/lifecycle owners |
 | R3-L3 | Store has no alert-history reader; `LiveStateView::alerts_history` covers only successfully persisted events in the current daemon run. | W6-A1/W6-A3; store/daemon owners |
-| R3-L4 | SQLite leaves are opened by pathname; retained directory descriptors and inspections do not guarantee leaf-level no-follow against same-uid substitution. | W6-A1; store owner |
+| R3-L4 | Unprivileged state alias trust gap addressed by R5-21/24; SQLite pathname opens still assume no hostile root/same-euid leaf replacement. Real second-user guest acceptance remains pending. | STATE-trust-A/A2/B |
 | R3-L5 | First real guest runs establish R4-15 platform facts; remaining privileged gates are not established by compile-only or sandbox skips. | All supplied test/implementation handoffs; W7 gate |
 | R3-L6 | A counting gate detects removed charges for existing syscalls, but cannot detect a newly added uncharged syscall. | TEST-rules mutation evidence; W7-C review |
 | R3-L7 | Deployment scenarios use socket pairs rather than a real listener; production bind/connect/credential/service/reboot behavior needs VM execution. | TEST-e2e-deploy, W6-A3-fix; W6/W7 gates |
-| R3-L8 | CompletedMinute now supplies empty-minute/boundary-loss facts (R4-7); daemon consumption still publishes no exact WatchWindow measurements. Resolve consumer/freshness seams before claiming watcher-rule evaluation. | W6-A2b; live/state owners |
+| R3-L8 | Consumer/freshness implementation superseded by R5-9/19; exact available windows now evaluate watcher rules. Real guest hot-growth/overflow gates remain separate. | W6-watch-windows, RECHECK-edge |
 | R3-L9 | Series Flush unit acknowledgement cannot report a particular write error. R4-3 resolves catalog portability with relative bytes; the particular-write error seam remains open. | W6-A2a; writer/store/scan owners |
+
+## Current hardening open risks (13 R5)
+
+The first direct-state audit F01 and second-audit state/metrics trust findings have implementation fix notes; real second-user acceptance is pending. F04 symlink atime is an owner-accepted documented read-only limit, not an unresolved proposal; F05 deny is now required. See [security](../security.md) for retained root/same-euid, mount race and dependency limits.
+
+| Risk / gate | Remaining work |
+|---|---|
+| Million-child TUI page >100 ms | Measure sort indexes versus snapshot size/write time before schema decision |
+| Rocky 8.8 namespace blind spots | fd/mount misses database units with PrivateTmp=/ProtectSystem= and bind writes; status warns, 8.10 prefers filesystem marks |
+| Descriptor pressure | Historical 64 KiB/NOFILE 1,024 exhausted fds and API ended daemon in 3/13 Rocky 8.8 runs; capped reads/retry landed, final stress acceptance pending |
+| Aggregation cap health | Decide whether reached cap alone makes component degraded; facts already truncated/lossy |
+| Frozen core wire key | HotEntryWire non-path keys are byte arrays, paths use path/path_b64; owner/core sign-off pending |
+| Frozen cancellation method | scan.cancel cannot atomically condition on scan id; operator must avoid cancelling replacements |
+| Window semantics | HotMinute has no top_unit; multi-minute files sum per-minute distinct counts |
+| Performance / release | Owner staging 5M/20M, 72-hour soak, first nightly execution/cumulative 24-hour crash-free fuzz, final Rocky 8.8/8.10 guest gates |
+| Guest security behavior | Real second-user state rules, filesystem marks under packaged restrictions, symlink boundary and external-link atime preservation |
+
+W6-recheck and W7-C1-audit2 results are recorded only through their supplied reviews/fix notes, not anticipated or certified. Wave tags and tidemark-core sign-off are the owner’s.

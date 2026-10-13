@@ -328,3 +328,11 @@ Notable ncdu rows page by indexed `(dir_id, id > last)` key in ascending stored 
 | Hard-link sets | Not exported as files. Their bytes are inside the synthetic entry of the directory they are charged to (their LCA): the "charged" view. |
 
 ncdu then shows **charged** sizes, which add up, with a header note. Names are written as raw bytes, as ncdu itself does; `--utf8-lossy` replaces invalid sequences so strict JSON tools can read the output.
+
+## Verified storage, recovery and browser queries (13 R5-6/12/19/21/24)
+
+Storage requires euid-owned directories/leaves, no group/world writes, regular single-link leaves and trusted no-follow ancestry; readability warns once rather than refusing. Creation remains 0700/0600. Check DB main/WAL/SHM/journal/v0-backup sidecars, snapshot leaves and scan.lock before use; refuse unsafe preexisting objects without repair. The shared ancestor policy includes sticky chains and ancestor-only user-namespace overflow ownership; see [security](../security.md).
+
+The host scan-lock holder cleans regular snapshots/*/*.db.tmp without following links/crossing mounts and repairs every stale running row to failed with injected finish time and no file, before the next running record. Startup tries cleanup nonblockingly and skips Busy; individual cleanup errors warn and continue independently. Shared database rename/recreation requires the scan lock: missing/corrupt startup storage waits at most 30 s then exits; healthy storage need not wait. Automatic retention preserves failed no-file lifecycle rows. Offline prune/rebuild uses definitive daemon-absence checks before and under the lock.
+
+Snapshot::children_count, children_page and link_instances_page support whole-directory raw-byte substring filters and exclusive keysets. Children sort by metric/name bytes with reversible traversal; link cursors use dir_id, nullable name and rowid to preserve duplicate/unresolved instances. Cursors apply only to that immutable snapshot and query. No schema/index change: million-child sort page latency exceeds 100 ms, an open measured index decision. NoSpace publishes nothing partial; daemon Unavailable scan: NoSpace maps to CLI 5. Cancelled outcomes remain recorded after scan work stops, except shutdown/deadline can make persistence uncertain.
