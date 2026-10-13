@@ -318,8 +318,9 @@ fn watcher_sixty_second_load_and_ten_minute_fd_stability() {
                 watch.stats().events_total,
                 started.elapsed()
             );
-            if cpu_pct >= 2.0 {
-                failures.push(format!("watcher exceeds CPU budget: {cpu_pct:.3}% >= 2%"));
+            // R4-8: 5% of one core per 1,000 close-writes/s; 10% at 2,000/s.
+            if cpu_pct >= 10.0 {
+                failures.push(format!("watcher exceeds CPU budget: {cpu_pct:.3}% >= 10%"));
             }
             measured = true;
         }

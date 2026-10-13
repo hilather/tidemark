@@ -49,6 +49,18 @@ tidemarkd/src/
 
 ### Key behaviours
 
+The daemon addresses its retained verified state directory as `/proc/self/fd/<n>/.`, so no-follow directory opens address the directory rather than the final procfs symlink. Daemon tests bind storage as production does.
+
+Log one WARN per actual failed scan (root, mode, source, attempt and retry time), and INFO on admitted start and successful completion with scan id. Scheduler health remains degraded for each failed root until that root completes successfully or leaves configuration; waiting, another root’s success and reload do not establish recovery. Scheduled retries are 30, 60, 120, 240, 480, 960, 1920, then 3600 seconds, capped there. Completion and accepted reload reset retry delay/attempts. Busy and cancellation are not failures and use fixed 30-second deferral. Operator requests bypass backoff. Requested roots outside configuration retain failure health until recovery.
+
+A normalized sampler.mounts/watch.mounts path must exactly equal a mount point in the daemon namespace; identity is topmost mount id plus device major/minor. Absent entries produce no samples/persistence or watcher and report `not mounted`. Presence checks pick up arrivals (sampler at most ten seconds, watcher every second); identity changes release the old watcher before replacement. Open sampling descriptor identity is checked before statvfs. Covered scheduled and requested scan roots are refused before run_scan, following existing error/backoff handling; unrelated roots remain eligible. Firstboot is unhealthy for absent entries, but startup readiness is prompt.
+
+Open: clearing in-memory filesystem rate series/removing stale samples across appearance/disappearance/remount; current removable missing-mount reasons in `now.degraded`; daemon consumption of retained watcher mark identity and the residual check-to-mark race. Service persistence deduplication reset is not a rate-ring reset. The proposed future state behavior in W6-mount-presence is not claimed implemented.
+
+Invalid config.reload returns ok with `reloaded: false` and the error in warnings, keeping previous config/generation. Inventory/capacity/catalog/history/schedule preflight failures are contained the same way, without stopping scheduler. Reserve current configured roots transactionally within the 128-entry inventory, evict inactive manual history deterministically if needed, retire removed inactive roots and retain admitted/running roots until completion. Stale schedule generations cannot resurrect removed roots.
+
+One shared monotonic shutdown deadline governs recorder queue/acknowledgement waits and startup-error cleanup; poll cancellation/deadline at most every 50 ms while preserving eight-second per-operation limits. Before admission work is uncommitted; interruption after admission reports persistence uncertain. Retain/join worker handles even after reporting deadline expiry; the ten-second overall bound is unchanged and arbitrary blocked kernel/SQLite operations remain a limitation. Parse exactly the bounded no-follow captured bytes that are hashed. Startup, reload and --check-config validate core/bounds, scheduler schedules/windows and alert predicates before publication. Runtime intervals (throttle sample, sampler, LVM interval/timeout, procscan, metrics, alert renotify/for/resolve_for and every schedules) are at most 366 days inclusive; historical retention horizons are exempt. (13 R4-1/2/9/10/11.)
+
 - **Startup order:**
   1. Config.
   2. State dir (create, check permissions).
@@ -85,7 +97,7 @@ tidemarkd/src/
 - **Self-protection:** `state_dir` is always added to watch and procscan excludes and to scan excludes. The space guard emits the `state_space` alert.
 - **Reload (SIGHUP / `config.reload`):** re-read config and validate. Apply changes to schedules, alert rules, thresholds, exclude lists and metrics settings live. Changes to mounts or the watch set restart only the affected service. Invalid config keeps the old one and reports the issues.
 - **Shutdown:** stop the API, cancel the running scan (no partial snapshot kept), stop the watchers, flush the ts-writer, then exit within 10 s.
-- **First-boot report:** after startup, if `tidemarkd::firstboot::needs_report(state_dir, config_sha)` is true, the daemon builds `FirstbootInputs` once all components have reported (or after 2 minutes), then calls `build` + `write` (W4-B). Never more than once per staged config.
+- **First-boot report:** after startup, if `tidemarkd::firstboot::needs_report(state_dir, config_sha)` is true, the daemon builds `FirstbootInputs` once all components have reported (or after 2 minutes), then calls `build` + `write` (W4-B). Open limitation: on each start with changed configuration, the report is rewritten (13 R4-16); do not claim once-per-staged-config behavior.
 - **Strictly read-only** (ADR-008): the daemon has no code path that changes file metadata, mounts or LVM.
 
 ### CLI live commands (using W4-B's `client.rs`)
@@ -95,7 +107,7 @@ tidemarkd/src/
 - `hot`, `alerts`, `status`: tables. `status --show-config` labels the CLI’s effective config; there is no config.get API method. Alert history currently covers only this daemon run. `status` shows versions, uptime, each component's state and mode, last error per component, scan schedule and next run.
 - **Daemon branches:**
   - `lvm`, `writers`: try the daemon first, otherwise fall back to direct mode with a one-line notice.
-  - `scan`: if the daemon is up, `scan.start` + follow `scan.status` (and `--cancel` → `scan.cancel`); threads, extra excludes and keep-partial are refused while connected. Otherwise use W2-C’s direct mode.
+  - `scan`: if the daemon is up, `scan.start` + follow `scan.status` (and `--cancel` → `scan.cancel`); threads, extra excludes and keep-partial are refused while connected. Only absent/refused socket permits W2-C direct fallback. Follow only the started id; completed degraded/partial/unknown outcomes exit 3, and no automatic root-only cancellation of a replacement scan is allowed (13 R4-12).
   - `phantom`: same, but `--direct` forces direct mode.
 
 Contract details: daemon LVM omits segment type and other LVs; CLI trends remain store-derived. Procscan publishes writers_full/writer_evictions with no permission-error counts. Config parsing/hashing uses Config::from_toml_bytes on the actual loaded bytes. Rustix net/termios enable SO_PEERCRED and terminal width. See 13 R3-4/R3-5/R3-6/R3-14 and 12 for unresolved implementation risks.
@@ -115,6 +127,12 @@ Contract details: daemon LVM omits segment type and other LVs; CLI trends remain
 ---
 
 ## W6-B — Metrics exporter, dashboards, alert rules
+
+Independent global directory rankings retain at most the configured series cap per family and count omitted eligible rows exactly, with deterministic raw root/path ties, rather than refusing large inventories before selection. Startup and root/depth/capacity reload reconcile a read-only latest-complete snapshot cache. Crash-left owned single-link regular staging files are flocked, truncated and reused through a collector-directory handle; hostile or live staging files are refused. Nonrepresentable metrics interval reports component error until a new generation.
+
+HTTP removal is separately assigned ADR-020 work: do not adopt EDGE-metrics’ HTTP proposal here. Existing metrics.listen and alerts.webhook text is intentionally retained; see the PLAN-round4 handoff inventory.
+
+The existing HTTP deliverable paragraph is retained solely for the separately assigned ADR-020 removal; it is not a new endpoint decision here.
 
 **Read first:** `08-interfaces.md` §4, Prometheus text exposition format documentation.
 
@@ -152,6 +170,10 @@ Contract details: daemon LVM omits segment type and other LVs; CLI trends remain
 
 ## W6-C — Packaging, systemd, RPM, install tests
 
+The CLI manifest contains an empty `[package.metadata.generate-rpm]` table for external metadata. `cargo xtask rpm --native` builds on EL8; the changed-default test package requires `--native --version 0.1.1 --upgrade-fixture`. Native mode installs nothing, defaults offline and rejects foreign hosts/missing generator. `tools/check-rpm.sh` checks package identity, exact assets/modes/owners/config flags, scriptlets and extracted ELF binaries. `tools/el8-build-env.sh` prepares disposable EL8 build environments, pinning 8.8 repositories to the vault. GitHub Actions has a `ci` job and separate Rocky 8.8/8.10 `rpm` matrix, locked fetching, package/install verification, checksums and artifacts. ShellCheck runs on GitHub at default severity. Owner decision: push main to GitHub after each green local gate; this task does not push.
+
+Unit values have no trailing comments; the existing normative unit remains unchanged. Install neither starts nor enables. Upgrade/reinstall uses guarded `try-restart`: restart a running daemon and leave a stopped daemon stopped, preserving enablement. Erase stops/disables and retains state. The install gate requires effective memory limit 2147483648, notify/root, NoNewPrivileges and exact capability names, and rejects installed-unit parser warnings. Active upgrade must change a nonzero PID and regain API readiness; stopped reinstall stays inactive. Edited config survives, and the changed-default fixture must produce root:root 0600 `.rpmnew` with its marker. Enable and prove active/enabled before erase, then assert inactive/disabled and no wants entry even as a dangling symlink; retained `.rpmsave` matches edited bytes and mode 0600. Require SELinux Enforcing unless an explicit permissive override labels SELinux acceptance untested. Post-reboot verification requires an external writer’s hot directory on restored disposable XFS; any post-mount restart is explicit. (13 R4-4/5.)
+
 **Read first:** `08-interfaces.md` §5–6, `02-architecture.md` §7–8 and §10, ADR-013 in `12-decisions-and-risks.md`.
 
 ### Deliverables
@@ -159,7 +181,7 @@ Contract details: daemon LVM omits segment type and other LVs; CLI trends remain
 - `packaging/systemd/tidemarkd.service`: **exactly** `08` §6. Do not add mount-namespace options.
 - `packaging/tmpfiles.d/tidemark.conf`: `d /run/tidemark 0700 root root -`.
 - `packaging/config/tidemark.toml`: the `08` §3 example with explanatory comments. Webhook and HTTP metrics are disabled by default. Roots, sampler and watch mounts default to `/` and `/data` (matching the fleet layout); hosts without `/data` are caught by `deploy stage` pre-flight.
-- `xtask rpm [--container]`:
+- `xtask rpm [--container | --native]` (`--native --version 0.1.1 --upgrade-fixture` for the changed-default install fixture):
   - Build release binaries in a `rockylinux:8` container (podman, or docker if present). The toolchain is installed via rustup in the container image; cache it.
   - Then `cargo generate-rpm` with metadata in `packaging/rpm/rpm.toml`.
   - RPM layout:
@@ -172,7 +194,7 @@ Contract details: daemon LVM omits segment type and other LVs; CLI trends remain
   - Scriptlets:
     - **%post:** `systemd-tmpfiles --create /usr/lib/tmpfiles.d/tidemark.conf`, `systemctl daemon-reload`. **Do not enable or start** the service; `tidemark deploy stage` does that.
     - **%preun on erase:** stop and disable.
-    - **%postun:** `daemon-reload`.
+    - **%postun:** `daemon-reload`; on upgrade argument >=1, guarded `try-restart tidemarkd.service`, preserving stopped state and enablement.
 - `tests/install/`: a VM script run by `xtask vm-test --filter install`:
   1. Install the RPM.
   2. `tidemarkd --check-config`.

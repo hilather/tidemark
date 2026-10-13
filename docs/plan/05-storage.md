@@ -163,6 +163,8 @@ pub enum SortKey { Disk, Apparent, Reclaimable, Charged, Files, Inodes, Newest, 
 
 ## 4. Catalog
 
+`scans.file` stores raw bytes relative to the catalog state directory, retaining its SQL TEXT type. `record_start`, `record_finish` and `rebuild_from_files` remove dot components and strip the lexical state-directory prefix; outside paths, unanchored relative inputs and parent traversal are invalid. No symlink resolution occurs. `list`, `latest`, `nearest_before` and `get` join against the reader’s state directory. Existing legacy absolute files are returned unchanged; missing absolute files use the tail beginning at the last `snapshots` component if that file exists locally, otherwise remain unchanged. Rebuild repairs legacy rows to relative paths. `ScanEntry` and Catalog signatures are unchanged. (13 R4-3.)
+
 - **Source of truth:** the `scans` table in `timeseries.db` (§6).
 - **Rebuild:** when the database is missing or healthy, `tidemark snapshots rebuild-catalog` opens it normally and rebuilds from valid `snapshots/*/*.db` metadata.
 - **Open preflight:** Every open of an existing `timeseries.db`, including `Catalog::open` and `TimeSeries::open`, first reads its first 16 bytes without SQLite. If the file exists, is not empty, and does not start with `SQLite format 3\0`, return the corruption error without opening it with SQLite, preserving the DB/WAL/SHM bytes. Missing or empty files are created as today. Valid-header files open normally, with SQLite’s own WAL recovery. Reading Tidemark’s own state file is allowed; the metadata-only rule applies to scanned files.

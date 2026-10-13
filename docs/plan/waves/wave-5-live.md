@@ -97,7 +97,7 @@ Follow `13` R2-8: retry transient descriptor shortages, report failed workers, a
   - `watch_overflow_marks_lossy` (100k rapid close-writes → lossy minute flagged, thread survives).
   - `exclude_prefixes_respected`.
   - If FID modes are available: `fid_mode_create_delete_rename` (events with correct directory paths and names).
-- Load: 2,000 close-writes/s for 60 s; CPU of the watcher thread under 2% of one core (record the measurement).
+- Load: 2,000 close-writes/s for 60 s; CPU of the watcher thread under 10% of one core (13 R4-8: 5% per 1,000/s, replacing 2% at 2,000/s) (record the measurement).
 
 ### Acceptance
 
@@ -105,6 +105,8 @@ Follow `13` R2-8: retry transient descriptor shortages, report failed workers, a
 - [ ] No fd leaks: the fd count is stable over a 10-minute load test.
 
 ---
+
+CompletedMinute, drain_minutes and mount_identity are adopted by 13 R4-7 / LIVE-minutes; legacy drains share the persistence cursor. Exact daemon window consumption remains open.
 
 Watcher window and dirty-root contracts follow 07 §3.3 and 13 R3-1/R3-2: supported whole minutes only, unavailable lossy/truncated hot windows, and independent post-publication dirty takes. No permission-error count is reported in v1 (R3-5).
 

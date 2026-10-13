@@ -76,6 +76,12 @@ The CLI has no effective-uid check. A non-root user can run it against a config,
 
 ### 1.3 Exit codes
 
+Scan falls back directly only when socket is absent/refuses, with an absolute connection deadline rechecked under scan lock. Other connection failures exit 4 before direct state mutation. Follow only the started scan id and read its persisted outcome; degraded, partial or unknown outcome exits 3. Never follow a replacement scan or automatically cancel another id. Root-only scan.cancel remains an explicit root operation. Tables use positive stdout TTY width or 100 otherwise, shortening cells in the middle while preserving escaped tokens; prose wraps at whitespace. Human absolute times are UTC with Z; JSON integers remain integers. now displays provided rate_15m in hourly units and provided one-hour ttf_secs without recomputation.
+
+Open: `tidemark.lvm.v1` names both direct and reduced daemon shapes; scan.cancel cannot atomically condition on scan id under the frozen API. (13 R4-12.)
+
+`now.hot_dirs_5m` uses the ranked five-minute watcher list, not an exact completed window; top_unit and FILES follow 07 §3.3 (R4-6).
+
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
@@ -100,6 +106,8 @@ H = contains hard links shared with directories outside this one (see `tidemark 
 The `Δ24h` column appears when a snapshot about 24 h older exists.
 
 ## 2. Daemon API
+
+Invalid config.reload returns ok with `reloaded: false` and the error in warnings, keeping previous config/generation. Inventory/capacity/catalog/history/schedule preflight failures are contained the same way, without stopping scheduler. Reserve current configured roots transactionally within the 128-entry inventory, evict inactive manual history deterministically if needed, retire removed inactive roots and retain admitted/running roots until completion. Stale schedule generations cannot resurrect removed roots. (13 R4-10.)
 
 - **Transport:** Unix stream socket `/run/tidemark/api.sock`, mode `0600 root:root`.
 - **Framing:** newline-delimited JSON. One request per line, one response per line; the connection may carry several requests.
@@ -142,6 +150,10 @@ Scan params carry `"root":"<utf-8 path>"` or `"root_b64":"<base64>"` (padded sta
 Error codes: `bad_request`, `forbidden`, `not_found`, `unavailable`, `busy`, `internal`. Requests time out server-side after 10 s.
 
 ## 3. Configuration (`/etc/tidemark/tidemark.toml`)
+
+Daemon validation (13 R4-11): One shared monotonic shutdown deadline governs recorder queue/acknowledgement waits and startup-error cleanup; poll cancellation/deadline at most every 50 ms while preserving eight-second per-operation limits. Before admission work is uncommitted; interruption after admission reports persistence uncertain. Retain/join worker handles even after reporting deadline expiry; the ten-second overall bound is unchanged and arbitrary blocked kernel/SQLite operations remain a limitation. Parse exactly the bounded no-follow captured bytes that are hashed. Startup, reload and --check-config validate core/bounds, scheduler schedules/windows and alert predicates before publication. Runtime intervals (throttle sample, sampler, LVM interval/timeout, procscan, metrics, alert renotify/for/resolve_for and every schedules) are at most 366 days inclusive; historical retention horizons are exempt.
+
+Retained state storage is `/proc/self/fd/<n>/.`; tests bind storage as production does (R4-1).
 
 Durations use humantime (`30s`, `6h`); sizes use binary units (`1GiB`) or explicit SI suffixes, with checked u64 arithmetic and fractional-byte truncation. Unknown keys are rejected with a helpful error. `tidemark status` and `tidemarkd --check-config` validate the file.
 

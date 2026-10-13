@@ -104,6 +104,21 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 
 ## Risk register
 
+### First real runs: measured platform and resource facts (13 R4-8/15)
+
+First real runs on Rocky 8.8/8.10: bulkstat v5 works on both; statx supplies no mount id on either. fanotify fd mode works on both; filesystem marks work on 8.10, while 8.8 uses mount marks and cannot observe writes through another mount of that filesystem. On 8.10 the package installs/upgrades/erases and survives reboot under SELinux Enforcing without denials. Tidemark ships no SELinux policy and supports Enforcing, Permissive or Disabled; enforcing is a test posture, not a product prerequisite. Do not infer remaining VM/soak gates passed from these observations.
+
+Owner decision: fd-mode watcher budget is 5% of one core per 1,000 close-write events/s, or 50 microseconds/event, replacing 1%. EL8 kernels 4.18.0-477 and -553 offer no measured FID mode. Optimised 8.10 guest measured 45.6 microseconds/event at 2,000/s (9.1% of one core) with host under load. Owner will measure real servers; this is no universal performance guarantee. The 2,000/s scale test threshold is 10% of one core, replacing 2%. Idle CPU and write-throughput impact remain separate gates.
+
+### First real runs: open risks (13 R4-16)
+
+Open, not new accepted behavior: watcher-backed alert rules remain unevaluable until daemon publishes exact CompletedMinute windows (R4-7); W6-A2b alert reconfiguration continuity, component removal and cancellable process scan; mount rate-ring reset/current now.degraded (R4-9); one intermittent cancellation deadline miss on 8.8 in scan_lifecycle::interrupted_cancelled_and_failed_scans; firstboot report rewritten on every start with changed config; LVM schema/cancel-id gaps (R4-12).
+
+Review findings without landed fix notes: core S1 writer rollover failure/supervision, S2 stale collector alert availability, S3 procscan published-lock contention, S4 LVM retry units/backpressure, S5 wall-clock operational deadlines, S7 late sampler generation resurrection, S8 internal alert capacity; edge F02 incomplete-request API deadline, F03 abandoned handler cancellation, F04 mutable API parent path operations. B1/B2/S6/S9 have CORE-fix-1; F05–F08 EDGE-cli; F09–F12 EDGE-metrics plus CORE-fix-1 validation; F13 INSTALL-assert. F01 has an EDGE-metrics fix note but HTTP removal/ADR-020 is separately assigned and not resolved by this plan task. Landed notes establish implementation evidence, not independent verification; unrestricted socket tests and guest gates remain required.
+
+Mount-presence unresolved state publications and mark verification are detailed in R4-9; do not claim rate reset or now.degraded recovery.
+
+
 L = likelihood, I = impact (H/M/L).
 
 | ID | Risk | L | I | Mitigation | Where |
@@ -114,7 +129,7 @@ L = likelihood, I = impact (H/M/L).
 | R4 | Misleading numbers with hard links lead to wrong deletions | M | H | Normative spec; oracle, property and golden tests; reclaimable column; `H` markers; v5-only bulk metadata (32-bit nlink), never truncated v1 link counts | `03`, W2-A |
 | R5 | Watcher silently blind (namespace, bind mounts, overflow) | M | M | Namespace guard; install E2E test; probe warnings; lossy/overflow metrics and alert | W5-A, W6-C |
 | R6 | Memory blow-up on very large trees | M | M | Memory estimates; budget-driven mode choice; cgroup memory limit; scale tests; spill join if needed | `04` §7, W2, W7-B |
-| R7 | EL8 kernel behaviour differs from upstream (bulkstat units, v5, fanotify FID) | M | M | EL8 5.0.0 headers lack v5; module inspection found v5 handlers in 477.27.1.el8_8 and 553.172.1.el8_10, not runtime ioctl evidence. Hand-transcribed ABI pinned to gcc layouts (`04` §5.1); runtime probes and units tests on both VMs remain gates | W1-C, W5-A |
+| R7 | EL8 kernel behaviour differs from upstream (bulkstat units, v5, fanotify FID) | M | M | EL8 5.0.0 headers lack v5; module inspection found v5 handlers in 477.27.1.el8_8 and 553.172.1.el8_10, followed by successful v5 first-run runtime probes on both releases. No statx mount ID or FID mode measured; filesystem marks only on 8.10. Hand-transcribed ABI pinned to gcc layouts (`04` §5.1); units and scale tests remain gates | W1-C, W5-A |
 | R8 | Tidemark's own state fills the disk or adds random writes to RAID 5 | L | M | Space guard; retention; state dir on another device; excluded from scans and watch | `05` §8, W1-E |
 | R11 | *(removed: collector deferred, ADR-019)* | — | — | — | — |
 | R12 | Path names exposed through metrics or webhooks | M | M | Root-only file and API permissions (ADR-018); loopback-only HTTP; cardinality caps; document escaped webhook payload exposure; no separate v1 redaction (13 R2-10) | W6-B, W7-C |
@@ -136,11 +151,11 @@ These are open risks, not accepted implementation guarantees. Historical handoff
 |------|------------------------------------|-------------------|
 | N1 | Snapshot finish timestamp is after rows but before index build and sync because `SnapshotWriter::finish_with` takes `&SnapshotMeta`; needs a storage-owned finalization clock/metadata seam. | W23-fix-scan; store/scan owners |
 | R3-L1 | `deploy/files.rs` is compiled through `#[path]` from both daemon `lib.rs` and `firstboot.rs`; consolidate into one crate-visible module. | CI-fix-daemon-state, W6-A1; daemon/deploy owners |
-| R3-L2 | `tidemark_fs::lvm::collect` has no cancellation hook; shutdown can abandon an in-flight LVM worker after the join deadline. | W6-A1; FS/lifecycle owners |
+| R3-L2 | `tidemark_fs::lvm::collect` has no cancellation hook; an in-flight LVM worker can exceed the shared join deadline; CORE-fix-1 retains/joins handles rather than abandoning them. | W6-A1; FS/lifecycle owners |
 | R3-L3 | Store has no alert-history reader; `LiveStateView::alerts_history` covers only successfully persisted events in the current daemon run. | W6-A1/W6-A3; store/daemon owners |
 | R3-L4 | SQLite leaves are opened by pathname; retained directory descriptors and inspections do not guarantee leaf-level no-follow against same-uid substitution. | W6-A1; store owner |
-| R3-L5 | No privileged test has ever run in the supplied evidence. Compile-only and sandbox skips do not establish Rocky/XFS/fanotify/deploy acceptance. | All supplied test/implementation handoffs; W7 gate |
+| R3-L5 | First real guest runs establish R4-15 platform facts; remaining privileged gates are not established by compile-only or sandbox skips. | All supplied test/implementation handoffs; W7 gate |
 | R3-L6 | A counting gate detects removed charges for existing syscalls, but cannot detect a newly added uncharged syscall. | TEST-rules mutation evidence; W7-C review |
 | R3-L7 | Deployment scenarios use socket pairs rather than a real listener; production bind/connect/credential/service/reboot behavior needs VM execution. | TEST-e2e-deploy, W6-A3-fix; W6/W7 gates |
-| R3-L8 | Completed watcher rows lack empty-minute/boundary-loss facts; current services publish no WatchWindow measurements. Resolve producer/freshness seams before claiming exact watcher-rule evaluation. | W6-A2b; live/state owners |
-| R3-L9 | Series Flush unit acknowledgement cannot report a particular write error; pinned storage paths need durable logical catalog-path mapping. Follow-up proposals in W6-A2a remain unresolved. | W6-A2a; writer/store/scan owners |
+| R3-L8 | CompletedMinute now supplies empty-minute/boundary-loss facts (R4-7); daemon consumption still publishes no exact WatchWindow measurements. Resolve consumer/freshness seams before claiming watcher-rule evaluation. | W6-A2b; live/state owners |
+| R3-L9 | Series Flush unit acknowledgement cannot report a particular write error. R4-3 resolves catalog portability with relative bytes; the particular-write error seam remains open. | W6-A2a; writer/store/scan owners |
