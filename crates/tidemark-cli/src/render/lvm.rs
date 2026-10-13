@@ -123,11 +123,13 @@ pub(crate) fn write_width(
         .write_all(crate::render::table::wrap(&String::from_utf8(buffer)?, width).as_bytes())?;
     Ok(())
 }
-fn pct(v: Option<f64>) -> String {
-    v.map_or_else(|| "n/a".into(), |v| format!("{v:.2}%"))
+/// Shared direct/daemon percentage cell; a dash means no measurement.
+pub(super) fn pct(v: Option<f64>) -> String {
+    v.map_or_else(|| "-".into(), |v| format!("{v:.2}%"))
 }
-fn rate(v: Option<f64>) -> String {
-    v.map_or_else(|| "n/a".into(), |v| format!("{v:+.2}"))
+/// Shared signed percentage-point slope cell; the surrounding view supplies units.
+pub(super) fn rate(v: Option<f64>) -> String {
+    v.map_or_else(|| "-".into(), |v| format!("{v:+.2}"))
 }
 
 #[cfg(test)]

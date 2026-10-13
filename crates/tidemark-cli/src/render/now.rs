@@ -158,10 +158,10 @@ pub fn lvm_width(
             r.lv_size.to_string(),
             r.vg_free.to_string(),
             escape(r.thin_pool.as_deref().unwrap_or("?")),
-            format!("{:?}", r.data_pct),
-            format!("{:?}", r.meta_pct),
-            format!("{:?}", trend.and_then(|t| t.1)),
-            format!("{:?}", trend.and_then(|t| t.2)),
+            super::lvm::pct(r.data_pct),
+            super::lvm::pct(r.meta_pct),
+            super::lvm::rate(trend.and_then(|t| t.1)),
+            super::lvm::rate(trend.and_then(|t| t.2)),
         ]);
     }
     out.write_all(crate::render::table::aligned_wrapped(&table, width, &[0]).as_bytes())?;
@@ -242,12 +242,8 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
                     .map(|p| format!(
                         "  thin pool {} data {} meta {}",
                         escape(p),
-                        l.data_pct
-                            .map(|p| format!("{p:.1}%"))
-                            .unwrap_or_else(|| "unknown".into()),
-                        l.meta_pct
-                            .map(|p| format!("{p:.1}%"))
-                            .unwrap_or_else(|| "unknown".into())
+                        super::lvm::pct(l.data_pct),
+                        super::lvm::pct(l.meta_pct)
                     ))
                     .unwrap_or_default()
             ),

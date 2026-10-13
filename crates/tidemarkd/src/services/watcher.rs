@@ -36,6 +36,16 @@ fn options(config: &Config, path: &std::path::Path) -> Result<WatcherOptions, Da
     })
 }
 
+fn namespace_detail(result: &std::io::Result<bool>) -> String {
+    match result {
+        Ok(false) => {
+            "host mount namespace check failed: process is outside the host mount namespace".into()
+        }
+        Err(error) => format!("host mount namespace check failed: {error}"),
+        Ok(true) => "host mount namespace check passed".into(),
+    }
+}
+
 /// Start watchers only after the library's host namespace check succeeds.
 /// Restart only when watcher settings change, releasing state and service Arcs.
 /// Daemon use never enables the foreground event buffer or clears dirty roots.
@@ -124,7 +134,7 @@ pub fn start(
                             state.publish_component(crate::component(
                                 "watcher",
                                 "degraded",
-                                format!("namespace check: {namespace:?}"),
+                                namespace_detail(&namespace),
                             ))?;
                             crate::wait_service(
                                 &state,
@@ -145,7 +155,7 @@ pub fn start(
                             state.publish_component(crate::component(
                                 "watcher",
                                 "error",
-                                format!("host mount namespace check failed: {namespace:?}"),
+                                namespace_detail(&namespace),
                             ))?;
                         }
                         for path in &config.watch.mounts {
@@ -672,6 +682,27 @@ fn persistence_rows(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn namespace_failures_name_the_cause_without_debug_results() {
+        assert_eq!(
+            super::namespace_detail(&Ok(false)),
+            "host mount namespace check failed: process is outside the host mount namespace"
+        );
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let result = Err(std::io::Error::new(kind, "namespace metadata unavailable"));
+            assert_eq!(
+                super::namespace_detail(&result),
+                "host mount namespace check failed: namespace metadata unavailable"
+            );
+        }
+        assert_eq!(
+            super::namespace_detail(&Ok(true)),
+            "host mount namespace check passed"
+        );
+    }
     #[test]
     fn history_and_window_views_share_watcher_byte_admission_and_release() {
         let mut cfg = Config::default();

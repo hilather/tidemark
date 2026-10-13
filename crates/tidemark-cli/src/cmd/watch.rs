@@ -89,19 +89,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     .into_iter()
                     .filter(|row| row.scope == "dir")
                 {
-                    if context.json {
-                        crate::render::json("tidemark.watch.v1", &row, &mut output)?;
-                    } else {
-                        writeln!(
-                            output,
-                            "{}  {}  {}  ({} events{})",
-                            row.ts,
-                            signed_bytes(row.bytes_delta),
-                            tidemark_core::path::display_lossy_bytes(&row.key),
-                            row.events,
-                            if row.lossy { ", lossy" } else { "" }
-                        )?;
-                    }
+                    render_minute(&row, context.json, &mut output)?;
                 }
                 let stats = watcher.stats();
                 let lost = stats.dropped_events.saturating_sub(dropped[index]);
@@ -130,6 +118,26 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         watcher.stop();
     }
     result
+}
+fn render_minute(
+    row: &tidemark_core::live::HotMinute,
+    json: bool,
+    output: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    if json {
+        crate::render::json("tidemark.watch.v1", row, output)?;
+    } else {
+        writeln!(
+            output,
+            "{}  {}  {}  ({} events{})",
+            crate::render::size::timestamp(row.ts),
+            signed_bytes(row.bytes_delta),
+            tidemark_core::path::display_lossy_bytes(&row.key),
+            row.events,
+            if row.lossy { ", lossy" } else { "" }
+        )?;
+    }
+    Ok(())
 }
 fn exclusions(
     paths: &[std::path::PathBuf],
@@ -228,13 +236,7 @@ fn render_event(
     Ok(())
 }
 fn event_time(at: i64) -> String {
-    let seconds = at.rem_euclid(86_400);
-    format!(
-        "{:02}:{:02}:{:02}",
-        seconds / 3600,
-        seconds / 60 % 60,
-        seconds % 60
-    )
+    crate::render::size::timestamp(at)
 }
 fn signed_bytes(bytes: i64) -> String {
     format!(
@@ -245,6 +247,30 @@ fn signed_bytes(bytes: i64) -> String {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completed_minute_uses_utc_and_preserves_machine_seconds() {
+        let row = tidemark_core::live::HotMinute {
+            mount: "/data".into(),
+            scope: "dir".into(),
+            key: b"/data/x".to_vec(),
+            ts: 1_791_845_576,
+            events: 7,
+            files: 2,
+            bytes_delta: -1024,
+            lossy: true,
+        };
+        let mut out = Vec::new();
+        super::render_minute(&row, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            "2026-10-12 22:52:56Z  -1.00 KiB  /data/x  (7 events, lossy)\n"
+        );
+        let mut out = Vec::new();
+        super::render_minute(&row, true, &mut out).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(doc["data"], serde_json::to_value(&row).unwrap());
+    }
     #[test]
     fn limiter_and_complete_event_envelopes() {
         let mut limiter = super::RateLimit::default();
@@ -336,6 +362,6 @@ mod tests {
     fn signed_summary() {
         assert_eq!(super::signed_bytes(-1024), "-1.00 KiB");
         assert_eq!(super::signed_bytes(0), "+0 B");
-        assert_eq!(super::event_time(3661), "01:01:01");
+        assert_eq!(super::event_time(3661), "1970-01-01 01:01:01Z");
     }
 }
