@@ -373,6 +373,86 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
     #[test]
+    fn readable_storage_warns_once() {
+        const CHILD: &str = "TIDEMARK_READABLE_WARNING_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "state_dir::tests::readable_storage_warns_once",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Visitor(String);
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        _: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+                let mut visitor = Visitor(String::new());
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Capture(messages.clone()), || {
+            let temp = ::test_support::private_tempdir().unwrap();
+            let state = StateDir::open(temp.path(), false).unwrap();
+            let leaf = temp.path().join("readable.db");
+            ::test_support::private_write(&leaf, b"sentinel").unwrap();
+            std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o644)).unwrap();
+            state
+                .open_leaf(OsStr::new("readable.db"), false, false)
+                .unwrap();
+            state.check_leaf(OsStr::new("readable.db")).unwrap();
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            StateDir::open(temp.path(), false).unwrap();
+            let sub = state.subdir(OsStr::new("child"), true).unwrap();
+            std::fs::set_permissions(&sub.path, std::fs::Permissions::from_mode(0o750)).unwrap();
+            state.subdir(OsStr::new("child"), false).unwrap();
+            let captured = messages.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert!(captured[0].contains(&format!(
+                "state file readable by other users: {}",
+                leaf.display()
+            )));
+            assert_eq!(std::fs::read(&leaf).unwrap(), b"sentinel");
+            assert_eq!(
+                std::fs::metadata(&leaf).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        });
+    }
+
+    #[test]
     fn policy_table() {
         let base = PolicyInput {
             owner: 1000,

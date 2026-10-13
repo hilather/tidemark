@@ -68,7 +68,7 @@ fn main() -> Result<()> {
                     "warnings",
                 ],
             )?;
-            run(root, &["test", "--workspace"])?;
+            run(root, &["test", "--workspace", "--no-fail-fast"])?;
             run(
                 root,
                 &[
