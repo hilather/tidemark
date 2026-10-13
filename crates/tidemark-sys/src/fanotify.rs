@@ -175,6 +175,43 @@ pub enum RawEvent {
         name: Option<Vec<u8>>,
     },
 }
+/// Reusable, aligned storage for a kernel file handle (Linux maximum: 128 bytes).
+#[derive(Default)]
+pub struct EventHandle {
+    storage: [u64; 17],
+}
+impl EventHandle {
+    /// Obtain the event descriptor's handle and originating mount id without reading content.
+    pub fn identify(&mut self, fd: BorrowedFd<'_>) -> io::Result<u64> {
+        self.storage.fill(0);
+        let ptr = self.storage.as_mut_ptr().cast::<libc::file_handle>();
+        let mut mount_id = 0;
+        // SAFETY: storage is aligned and has room for the header and 128-byte tail;
+        // the empty C string and mount-id output remain valid throughout the call.
+        let result = unsafe {
+            (*ptr).handle_bytes = 128;
+            libc::name_to_handle_at(fd.as_raw_fd(), c"".as_ptr(), ptr, &mut mount_id, libc::AT_EMPTY_PATH)
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        u64::try_from(mount_id).map_err(io::Error::other)
+    }
+    /// Reopen the identified inode in the watched mount for metadata-only path resolution.
+    pub fn reopen(&self, mount: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+        let ptr = self.storage.as_ptr().cast::<libc::file_handle>();
+        // SAFETY: identify initialized the bounded aligned handle; no contents are read.
+        let mut fd = unsafe { libc::open_by_handle_at(mount.as_raw_fd(), ptr, libc::O_PATH | libc::O_CLOEXEC) };
+        if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+            // SAFETY: same valid handle, with nonblocking, no-follow, no-atime read-only flags.
+            fd = unsafe { libc::open_by_handle_at(mount.as_raw_fd(), ptr, libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOATIME | libc::O_CLOEXEC) };
+        }
+        if fd < 0 { return Err(io::Error::last_os_error()); }
+        // SAFETY: the successful syscall returned a new uniquely owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
 /// Resolve a bounded kernel handle with O_PATH, without opening file contents.
 pub fn open_by_handle(
     mount_fd: BorrowedFd<'_>,

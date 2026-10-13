@@ -135,7 +135,7 @@ fn resolve_with(
     let raw = RawPath::from_path(&path).map_err(io::Error::other)?;
     Ok((raw, stat, created))
 }
-fn descriptor_path(fd: BorrowedFd<'_>) -> io::Result<std::path::PathBuf> {
+pub(super) fn descriptor_path(fd: BorrowedFd<'_>) -> io::Result<std::path::PathBuf> {
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
     let mut buffer = [0u8; 32];
@@ -250,5 +250,33 @@ mod tests {
         assert_eq!(path.as_path(), dir.path());
         use std::os::unix::fs::MetadataExt;
         assert_eq!(st.st_ino, fd.metadata().unwrap().ino());
+    }
+}
+
+/// Select a host path only when its mount provenance is known. None means root fallback.
+pub(super) fn mapped_path<'a>(event_mount: Option<u64>, watched_mount: u64, original: &'a RawPath, reopened: Option<&'a RawPath>, mount: &RawPath) -> Option<&'a RawPath> {
+    let path = match event_mount {
+        Some(id) if id == watched_mount => Some(original),
+        Some(_) => reopened,
+        None => None,
+    }?;
+    (path.as_bytes() != b"/" && path.starts_with(mount)).then_some(path)
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    #[test]
+    fn provenance_and_bounds() {
+        let mount = RawPath::new(b"/data".to_vec()).unwrap();
+        let host = RawPath::new(b"/data/a (deleted)".to_vec()).unwrap();
+        let foreign = RawPath::new(b"/bind/a".to_vec()).unwrap();
+        let root = RawPath::new(b"/".to_vec()).unwrap();
+        assert_eq!(mapped_path(Some(1), 1, &host, None, &mount), Some(&host));
+        assert_eq!(mapped_path(Some(2), 1, &foreign, Some(&host), &mount), Some(&host));
+        for reopened in [None, Some(&foreign), Some(&root)] {
+            assert_eq!(mapped_path(Some(2), 1, &foreign, reopened, &mount), None);
+        }
+        assert_eq!(mapped_path(None, 1, &host, Some(&host), &mount), None);
     }
 }
