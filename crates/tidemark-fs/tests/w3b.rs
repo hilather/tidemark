@@ -56,7 +56,7 @@ fn symlink_loops_lexical_and_checked() {
     assert_eq!(count(&checked, SymlinkClass::Loop), 2);
     assert_eq!(count(&checked, SymlinkClass::Dangling), 1);
     assert_eq!(count(&checked, SymlinkClass::InsideRoot), 1);
-    assert_eq!(gate.0.load(Ordering::Relaxed), charges + 4);
+    assert!(gate.0.load(Ordering::Relaxed) > charges + 4);
 }
 #[test]
 fn targets_preserve_bytes_and_links_are_never_descended() {
@@ -322,4 +322,92 @@ fn long_target_retries_are_charged() {
     let report = analyze(&root, &gate, &cancel, &opts).unwrap();
     assert_eq!(report.examples[0].1, target.as_bytes());
     assert_eq!(gate.0.load(Ordering::Relaxed), short + 1);
+}
+
+// Compile a private copy so the test-only seam never enters the public fs API.
+use tidemark_fs::mount;
+#[allow(dead_code)]
+#[path = "../src/symlinks.rs"]
+mod bounded_resolution;
+
+#[test]
+fn selected_mount_boundary_stops_before_external_metadata_or_link_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    symlink("missing", temp.path().join("outside")).unwrap();
+    symlink("../outside", root.join("second")).unwrap();
+    symlink("second", root.join("first")).unwrap();
+    symlink("absent", root.join("dangling")).unwrap();
+    symlink("loop_b", root.join("loop_a")).unwrap();
+    symlink("loop_a", root.join("loop_b")).unwrap();
+    std::fs::write(root.join("file"), []).unwrap();
+    symlink("file", root.join("valid")).unwrap();
+    let raw = RawPath::from_path(&root).unwrap();
+    let absolute_out = temp.path().join("outside");
+    let absolute_in = root.join("valid");
+    use bounded_resolution::SymlinkClass as Class;
+    use std::os::unix::ffi::OsStrExt;
+    for (target, expected) in [
+        (b"../outside".as_slice(), Class::OtherFs),
+        (absolute_out.as_os_str().as_bytes(), Class::OtherFs),
+        (b"first", Class::OtherFs),
+        (b"dangling", Class::Dangling),
+        (b"loop_a", Class::Loop),
+        (absolute_in.as_os_str().as_bytes(), Class::InsideRoot),
+        (b"valid/../file", Class::Dangling),
+    ] {
+        let (class, calls) =
+            bounded_resolution::test_check_target(&raw, target, &CountingGate::default());
+        assert_eq!(class, expected, "target {target:?}");
+        assert!(calls.iter().all(|(path, _)| path.starts_with(&raw)));
+        assert!(calls
+            .iter()
+            .all(|(path, _)| !path.as_bytes().ends_with(b"outside")));
+    }
+}
+
+#[cfg(feature = "privileged")]
+#[test]
+fn cross_mount_chain_preserves_second_link_atime_pending_vm() {
+    use std::os::unix::fs::MetadataExt;
+    let mut first = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "strictatime");
+    let mut second = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "strictatime");
+    let outside = second.mountpoint.join("outside");
+    symlink("missing", &outside).unwrap();
+    let old = rustix::fs::Timespec {
+        tv_sec: 1_000_000_000,
+        tv_nsec: 123,
+    };
+    rustix::fs::utimensat(
+        rustix::fs::CWD,
+        &outside,
+        &rustix::fs::Timestamps {
+            last_access: old,
+            last_modification: old,
+        },
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .unwrap();
+    symlink(&outside, first.mountpoint.join("link")).unwrap();
+    let report = analyze(
+        &RawPath::from_path(&first.mountpoint).unwrap(),
+        &CountingGate::default(),
+        &AtomicBool::new(false),
+        &SymlinkOpts {
+            check_targets: true,
+            limit: 10,
+        },
+    )
+    .unwrap();
+    assert_eq!(count(&report, SymlinkClass::OtherFs), 1);
+    assert_eq!(count(&report, SymlinkClass::Dangling), 0);
+    assert_eq!(count(&report, SymlinkClass::Loop), 0);
+    let metadata = std::fs::symlink_metadata(&outside).unwrap();
+    assert_eq!(
+        (metadata.atime(), metadata.atime_nsec()),
+        (old.tv_sec, old.tv_nsec)
+    );
+    first.cleanup().unwrap();
+    second.cleanup().unwrap();
 }

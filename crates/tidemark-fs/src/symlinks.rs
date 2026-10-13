@@ -1,5 +1,5 @@
 //! Owned by: W3-B
-//! Gated metadata-only symlink analysis without symlink traversal.
+//! Gated metadata-only symlink analysis with mount-contained target resolution.
 
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir, StatxFlags, CWD};
 use std::{
@@ -18,7 +18,7 @@ const BYTE_CAP: usize = 64 * 1024 * 1024;
 const EXAMPLE_CAP: usize = 1_000_000;
 /// Symlink target checks and bounded example output.
 pub struct SymlinkOpts {
-    /// Follow only the target with stat to diagnose dangling links, loops and other devices.
+    /// Resolve targets component by component within the selected mount.
     pub check_targets: bool,
     /// Maximum number of examples; at most one million.
     pub limit: usize,
@@ -31,7 +31,7 @@ pub enum SymlinkClass {
     InsideRoot,
     /// Target is lexically outside the root.
     OutsideRoot,
-    /// Target stat reports another filesystem.
+    /// Target leaves the selected mount; its state beyond the boundary is not checked.
     OtherFs,
     /// Target does not exist.
     Dangling,
@@ -81,6 +81,33 @@ fn read_target(
         }
         buffer.resize((buffer.len() * 2).min(65_536), 0);
     }
+}
+// Pin the enumerated link before reading its text, so a concurrent replacement
+// cannot redirect readlink into an unvalidated mount.
+fn read_entry_target(
+    fd: &OwnedFd,
+    name: &[u8],
+    expected: &fs::Statx,
+    gate: &dyn Gate,
+    cancel: &AtomicBool,
+    buffer: &mut Vec<u8>,
+) -> io::Result<Vec<u8>> {
+    gate.acquire(1);
+    cancelled(cancel)?;
+    let pinned = fs::openat(
+        fd,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let current = sx(&pinned, gate, cancel)?;
+    if !same_fs(expected, &current)
+        || expected.stx_ino != current.stx_ino
+        || FileType::from_raw_mode(current.stx_mode.into()) != FileType::Symlink
+    {
+        return Err(io::Error::other("link changed during analysis"));
+    }
+    read_target(&pinned, b"", gate, cancel, buffer)
 }
 fn sx(fd: &OwnedFd, gate: &dyn Gate, cancel: &AtomicBool) -> io::Result<fs::Statx> {
     gate.acquire(1);
@@ -167,6 +194,197 @@ fn lexical(root: &RawPath, dir: &RawPath, target: &[u8]) -> io::Result<SymlinkCl
         SymlinkClass::OutsideRoot
     })
 }
+// Linux follows at most 40 symbolic links; pending text and directory handles are
+// independently bounded, including chains that repeatedly expand their targets.
+const CHAIN_CAP: usize = 40;
+const DEPTH_CAP: usize = 4096;
+const RESOLVE_BYTES: usize = 1024 * 1024;
+
+struct Resolver<'a> {
+    root: &'a RawPath,
+    mount: &'a RawPath,
+    mount_fd: &'a OwnedFd,
+    identity: &'a fs::Statx,
+    mounts: &'a [RawPath],
+    gate: &'a dyn Gate,
+    cancel: &'a AtomicBool,
+}
+impl Resolver<'_> {
+    fn check(
+        &self,
+        dir: &RawPath,
+        target: &[u8],
+        buffer: &mut Vec<u8>,
+    ) -> io::Result<SymlinkClass> {
+        let mut pending = if target.starts_with(b"/") {
+            match self.absolute(target) {
+                Some(p) => p,
+                None => return Ok(SymlinkClass::OtherFs),
+            }
+        } else {
+            let mut p = dir.as_bytes()[self.mount.as_bytes().len()..].to_vec();
+            p.push(b'/');
+            p.extend_from_slice(target);
+            p
+        };
+        let fd = open_one(self.mount_fd, b".", self.gate, self.cancel)?;
+        if !same_fs(self.identity, &sx(&fd, self.gate, self.cancel)?) {
+            return Ok(SymlinkClass::OtherFs);
+        }
+        let mut dirs = vec![(fd, self.mount.clone())];
+        let mut links = 0;
+        loop {
+            cancelled(self.cancel)?;
+            if pending.len() > RESOLVE_BYTES {
+                return Ok(SymlinkClass::Unreadable);
+            }
+            let split = pending
+                .iter()
+                .position(|b| *b == b'/')
+                .unwrap_or(pending.len());
+            let name = pending[..split].to_vec();
+            let rest = if split < pending.len() {
+                pending[split + 1..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let (parent, path) = &dirs[dirs.len() - 1];
+            if name.is_empty() || name == b"." {
+                if rest.is_empty() {
+                    return lexical(self.root, path, b".");
+                }
+                pending = rest;
+                continue;
+            }
+            if name == b".." {
+                if dirs.len() == 1 {
+                    if self.mount.as_bytes() != b"/" {
+                        return Ok(SymlinkClass::OtherFs);
+                    }
+                } else {
+                    dirs.pop();
+                }
+                pending = rest;
+                continue;
+            }
+            let next = path.join(&RawName::new(name.clone()).map_err(io::Error::other)?);
+            if self.mounts.binary_search(&next).is_ok() {
+                return Ok(SymlinkClass::OtherFs);
+            }
+            #[cfg(test)]
+            record_resolution(&next, "stat");
+            self.gate.acquire(1);
+            cancelled(self.cancel)?;
+            let stat = match fs::statx(
+                parent,
+                name.as_slice(),
+                AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
+                StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+            ) {
+                Ok(s) => s,
+                Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => {
+                    return Ok(SymlinkClass::Dangling)
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if !same_fs(self.identity, &stat) {
+                return Ok(SymlinkClass::OtherFs);
+            }
+            // Pin the entry without following it, then check again before reading
+            // text or opening a directory. A replacement can never induce following.
+            self.gate.acquire(1);
+            cancelled(self.cancel)?;
+            #[cfg(test)]
+            record_resolution(&next, "open");
+            let pinned = fs::openat(
+                parent,
+                name.as_slice(),
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            let pinned_stat = sx(&pinned, self.gate, self.cancel)?;
+            if !same_fs(self.identity, &pinned_stat) {
+                return Ok(SymlinkClass::OtherFs);
+            }
+            if stat.stx_ino != pinned_stat.stx_ino || stat.stx_mode != pinned_stat.stx_mode {
+                return Ok(SymlinkClass::Unreadable);
+            }
+            match FileType::from_raw_mode(pinned_stat.stx_mode.into()) {
+                FileType::Symlink => {
+                    links += 1;
+                    if links > CHAIN_CAP {
+                        return Ok(SymlinkClass::Loop);
+                    }
+                    #[cfg(test)]
+                    record_resolution(&next, "readlink");
+                    let text = read_target(&pinned, b"", self.gate, self.cancel, buffer)?;
+                    let mut replacement = if text.starts_with(b"/") {
+                        let Some(p) = self.absolute(&text) else {
+                            return Ok(SymlinkClass::OtherFs);
+                        };
+                        dirs.truncate(1);
+                        p
+                    } else {
+                        text
+                    };
+                    if split < pending.len() {
+                        replacement.push(b'/');
+                        replacement.extend_from_slice(&rest);
+                    }
+                    pending = replacement;
+                }
+                FileType::Directory => {
+                    if dirs.len() == DEPTH_CAP
+                        || dirs.iter().map(|(_, p)| p.as_bytes().len()).sum::<usize>()
+                            + next.as_bytes().len()
+                            > RESOLVE_BYTES
+                    {
+                        return Ok(SymlinkClass::Unreadable);
+                    }
+                    let fd = open_one(&pinned, b".", self.gate, self.cancel)?;
+                    if !same_fs(self.identity, &sx(&fd, self.gate, self.cancel)?) {
+                        return Ok(SymlinkClass::OtherFs);
+                    }
+                    dirs.push((fd, next));
+                    pending = rest;
+                }
+                _ if split < pending.len() => return Ok(SymlinkClass::Dangling),
+                _ => return lexical(self.root, &next, b"."),
+            }
+        }
+    }
+    // Do not normalize dot-dot before resolving preceding symlinks.
+    fn absolute(&self, mut text: &[u8]) -> Option<Vec<u8>> {
+        while text.starts_with(b"//") {
+            text = &text[1..];
+        }
+        let mount = self.mount.as_bytes();
+        if mount == b"/" {
+            return Some(text[1..].to_vec());
+        }
+        if text == mount {
+            return Some(Vec::new());
+        }
+        text.strip_prefix(mount)
+            .filter(|p| p.starts_with(b"/"))
+            .map(|p| p[1..].to_vec())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESOLUTION_CALLS: std::cell::RefCell<Option<Vec<(RawPath, &'static str)>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn record_resolution(path: &RawPath, operation: &'static str) {
+    RESOLUTION_CALLS.with(|calls| {
+        if let Some(calls) = calls.borrow_mut().as_mut() {
+            assert!(calls.len() < 10_000, "test instrumentation cap reached");
+            calls.push((path.clone(), operation));
+        }
+    });
+}
+
 /// Analyze a tree on one filesystem without descending through any symlink.
 ///
 /// Every open, getdents, stat and readlink is charged before execution. Directory
@@ -175,6 +393,9 @@ fn lexical(root: &RawPath, dir: &RawPath, target: &[u8]) -> io::Result<SymlinkCl
 /// and 64 MiB of paths, directory names
 /// at one million entries and 64 MiB, and examples at one million and 64 MiB.
 /// The reusable target buffer grows from 256 bytes to at most 64 KiB.
+/// Target checking follows at most 40 links, retains at most 4096 directory
+/// handles and 1 MiB of directory paths, and caps pending text at 1 MiB.
+/// Leaving the selected mount produces OtherFs (state beyond it not checked).
 /// Cancellation returns Interrupted rather than a deceptively complete report.
 pub fn analyze(
     root: &RawPath,
@@ -208,6 +429,22 @@ pub fn analyze_matching(
     gate.acquire(1);
     cancelled(cancel)?;
     let mounts = crate::mount::read_mountinfo()?;
+    let mount_root = crate::mount::mount_for_path(&mounts, root)
+        .ok_or_else(|| io::Error::other("selected mount not found"))?
+        .mount_point
+        .clone();
+    let mut target_mounts = crate::mount::submounts_under(&mounts, &mount_root);
+    target_mounts.sort_unstable();
+    let mount_fd = open_path(&mount_root, &mount_root, Some(&identity), gate, cancel)?;
+    let resolver = Resolver {
+        root,
+        mount: &mount_root,
+        mount_fd: &mount_fd,
+        identity: &identity,
+        mounts: &target_mounts,
+        gate,
+        cancel,
+    };
     let mut mounts = crate::mount::submounts_under(&mounts, root);
     mounts.sort_unstable();
     drop(fd);
@@ -277,47 +514,42 @@ pub fn analyze_matching(
                     }
                     children.push((path, stat.stx_ino));
                 }
-                FileType::Symlink => {
+                FileType::Symlink if same_fs(&identity, &stat) => {
                     report.total += 1;
-                    let (target, class) =
-                        match read_target(&fd, name.as_bytes(), gate, cancel, &mut target_buffer) {
-                            Ok(target) => {
-                                if target.starts_with(b"/") {
-                                    report.absolute += 1;
-                                } else {
-                                    report.relative += 1;
-                                }
-                                let mut class = lexical(root, &dir, &target)?;
-                                if opts.check_targets {
-                                    gate.acquire(1);
-                                    cancelled(cancel)?;
-                                    class = match fs::statat(
-                                        &fd,
-                                        target.as_slice(),
-                                        AtFlags::empty(),
-                                    ) {
-                                        Ok(st)
-                                            if st.st_dev
-                                                != libc::makedev(
-                                                    identity.stx_dev_major,
-                                                    identity.stx_dev_minor,
-                                                ) =>
-                                        {
-                                            SymlinkClass::OtherFs
-                                        }
-                                        Ok(_) => class,
-                                        Err(
-                                            rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR,
-                                        ) => SymlinkClass::Dangling,
-                                        Err(rustix::io::Errno::LOOP) => SymlinkClass::Loop,
-                                        Err(_) => SymlinkClass::Unreadable,
-                                    };
-                                }
-                                (target, class)
+                    let text = if opts.check_targets {
+                        read_entry_target(
+                            &fd,
+                            name.as_bytes(),
+                            &stat,
+                            gate,
+                            cancel,
+                            &mut target_buffer,
+                        )
+                    } else {
+                        read_target(&fd, name.as_bytes(), gate, cancel, &mut target_buffer)
+                    };
+                    let (target, class) = match text {
+                        Ok(target) => {
+                            if target.starts_with(b"/") {
+                                report.absolute += 1;
+                            } else {
+                                report.relative += 1;
                             }
-                            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(e),
-                            Err(_) => (Vec::new(), SymlinkClass::Unreadable),
-                        };
+                            let mut class = lexical(root, &dir, &target)?;
+                            if opts.check_targets {
+                                class = match resolver.check(&dir, &target, &mut target_buffer) {
+                                    Ok(class) => class,
+                                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                                        return Err(e)
+                                    }
+                                    Err(_) => SymlinkClass::Unreadable,
+                                };
+                            }
+                            (target, class)
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(e),
+                        Err(_) => (Vec::new(), SymlinkClass::Unreadable),
+                    };
                     for (c, count) in &mut report.by_class {
                         if *c == class {
                             *count += 1;
@@ -348,4 +580,32 @@ fn cancelled(cancel: &AtomicBool) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+// Integration tests compile this module privately to substitute a temporary
+// directory for a mount boundary without adding a production API or feature.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn test_check_target(
+    root: &RawPath,
+    target: &[u8],
+    gate: &dyn Gate,
+) -> (SymlinkClass, Vec<(RawPath, &'static str)>) {
+    let cancel = AtomicBool::new(false);
+    let fd = open_path(root, root, None, gate, &cancel).unwrap();
+    let identity = sx(&fd, gate, &cancel).unwrap();
+    RESOLUTION_CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
+    let class = Resolver {
+        root,
+        mount: root,
+        mount_fd: &fd,
+        identity: &identity,
+        mounts: &[],
+        gate,
+        cancel: &cancel,
+    }
+    .check(root, target, &mut vec![0; 256])
+    .unwrap();
+    let calls = RESOLUTION_CALLS.with(|calls| calls.borrow_mut().take().unwrap());
+    (class, calls)
 }

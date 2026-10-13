@@ -7,7 +7,7 @@ pub struct Args {
     /// Directory path to query (canonicalised before lookup).
     #[arg(value_name = "PATH")]
     pub path: Option<std::path::PathBuf>,
-    /// Stat targets to detect dangling, looping or other-filesystem links.
+    /// Check targets only inside the selected mount; other-filesystem links are not checked beyond its boundary.
     #[arg(long)]
     pub check_targets: bool,
     /// List only dangling symlinks.
