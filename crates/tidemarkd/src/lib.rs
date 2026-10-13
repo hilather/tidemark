@@ -1113,6 +1113,7 @@ fn validate_config(c: &tidemark_core::config::Config) -> Result<(), DaemonError>
                 .join("; "),
         ));
     }
+    validate_output_paths(c)?;
     state::validate_bounds(c)?;
     for (index, root) in c.roots.iter().enumerate() {
         scheduler::parse_schedule(&root.schedule)
@@ -1150,6 +1151,64 @@ fn validate_config(c: &tidemark_core::config::Config) -> Result<(), DaemonError>
     }
     tidemark_live::alerts::AlertEngine::new(&c.alerts.rule, c.alerts.renotify)
         .map_err(|e| DaemonError::Config(format!("alerts: {e}")))?;
+    Ok(())
+}
+fn validate_output_paths(c: &tidemark_core::config::Config) -> Result<(), DaemonError> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Component, Path, PathBuf};
+    fn suffix(path: &Path, suffix: &str) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        name.into()
+    }
+    fn normalize(path: &Path) -> PathBuf {
+        let mut result = PathBuf::new();
+        for part in path.components() {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    result.pop();
+                }
+                part => result.push(part.as_os_str()),
+            }
+        }
+        result
+    }
+    fn identity(path: &Path) -> Result<Option<(u64, u64, std::ffi::OsString)>, DaemonError> {
+        let Some(parent) = path.parent() else {
+            return Ok(None);
+        };
+        let Some(name) = path.file_name() else {
+            return Ok(None);
+        };
+        match std::fs::metadata(parent) {
+            Ok(md) => Ok(Some((md.dev(), md.ino(), name.to_os_string()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(DaemonError::Config(format!(
+                "output parent {}: {e}",
+                parent.display()
+            ))),
+        }
+    }
+    let textfile = &c.metrics.textfile;
+    if textfile.as_os_str().is_empty() {
+        return Ok(());
+    }
+    for api in [&c.general.socket, &suffix(&c.general.socket, ".lock")] {
+        for metrics in [textfile, &suffix(textfile, ".tmp")] {
+            let api_identity = identity(api)?;
+            let metrics_identity = identity(metrics)?;
+            if normalize(api) == normalize(metrics)
+                || api_identity.is_some() && api_identity == metrics_identity
+            {
+                return Err(DaemonError::Config(format!(
+                    "metrics.textfile collides with API output: {} and {}",
+                    metrics.display(),
+                    api.display()
+                )));
+            }
+        }
+    }
     Ok(())
 }
 fn validate_interval(field: &str, duration: std::time::Duration) -> Result<(), DaemonError> {

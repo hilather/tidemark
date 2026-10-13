@@ -625,6 +625,18 @@ pub fn write_textfile(path: &Path, text: &str) -> std::io::Result<()> {
     f.write_all(text.as_bytes())?;
     f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
     f.sync_all()?;
+    match rustix::fs::statat(&dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(destination)
+            if rustix::fs::FileType::from_raw_mode(destination.st_mode)
+                != rustix::fs::FileType::RegularFile =>
+        {
+            return Err(std::io::Error::other(
+                "metrics destination must be a regular file",
+            ));
+        }
+        Ok(_) | Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => return Err(error.into()),
+    }
     renameat(&dir, &tmp, &dir, name)?;
     Ok(())
 }
