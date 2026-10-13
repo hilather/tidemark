@@ -110,6 +110,7 @@ fn start_with(
             let mut identities = std::collections::BTreeMap::new();
             let mut next_sample = std::time::Instant::now();
             let mut previous_generation = None;
+            let mut measurement_errors = Vec::new();
             while !shutdown.load(Ordering::Acquire) {
                 let (config, generation) = state.config();
                 if previous_generation != Some(generation) {
@@ -123,6 +124,7 @@ fn start_with(
                 let mounts = match mount_source() {
                     Ok(mounts) => mounts,
                     Err(error) => {
+                        measurement_errors = vec![error.to_string()];
                         if matches!(&error, DaemonError::Io { source, .. } if crate::resource_pressure(source)) {
                             state.publish_component(crate::component("sampler", "degraded", error.to_string()))?;
                             crate::wait_service(&state, generation, &shutdown, config.sampler.interval.min(std::time::Duration::from_secs(10)));
@@ -168,6 +170,7 @@ fn start_with(
                     next_sample = std::time::Instant::now();
                 }
                 let due = std::time::Instant::now() >= next_sample;
+                if due { measurement_errors.clear(); }
                 // Include watch-only entries so the existing firstboot sampler
                 // health input cannot claim healthy while any entry is absent.
                 for path in config.sampler.mounts.iter().chain(&config.watch.mounts) {
@@ -216,7 +219,7 @@ fn start_with(
                         }
                         Err(e) => {
                             if matches!(&e, DaemonError::Io { source, .. } if crate::resource_pressure(source)) {
-                                errors.push(e.to_string());
+                                measurement_errors.push(e.to_string());
                                 continue;
                             }
                             state.publish(
@@ -227,7 +230,7 @@ fn start_with(
                                 },
                                 crate::component("sampler", "degraded", e.to_string()),
                             )?;
-                            errors.push(e.to_string());
+                            measurement_errors.push(e.to_string());
                         }
                     }
                 }
@@ -238,6 +241,7 @@ fn start_with(
                 {
                     errors.push("writer queue full or disconnected; persistence dropped".into());
                 }
+                errors.extend(measurement_errors.iter().cloned());
                 let health = if errors.is_empty() {
                     crate::component("sampler", "ok", "statvfs sampled")
                 } else {
@@ -264,6 +268,114 @@ fn start_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_measurement_survives_presence_poll_until_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mount");
+        std::os::unix::fs::symlink("/", &path).unwrap();
+        let mut cfg = Config::default();
+        cfg.sampler.mounts = vec![path];
+        cfg.watch.mounts.clear();
+        cfg.sampler.interval = std::time::Duration::from_secs(60);
+        let state = LiveState::new(&cfg, 100);
+        state
+            .publish(
+                Publication::Deployment {
+                    config_sha256: "a".repeat(64),
+                    started_at: 100,
+                },
+                crate::component("scheduler", "ok", "fixture"),
+            )
+            .unwrap();
+        for name in ["api", "tswriter"] {
+            state
+                .publish_component(crate::component(name, "ok", "fixture"))
+                .unwrap();
+        }
+        let report =
+            || crate::firstboot::build(&state.view_at(100).firstboot_inputs().unwrap(), 100);
+        let (tx, _rx) = crossbeam_channel::bounded(16);
+        let stop = Shutdown::default();
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let table = Arc::new(parking_lot::Mutex::new(
+            std::fs::read("/proc/self/mountinfo").unwrap(),
+        ));
+        let source = {
+            let passes = passes.clone();
+            let table = table.clone();
+            Arc::new(move || {
+                passes.fetch_add(1, Ordering::Release);
+                crate::mounts::parse(&table.lock())
+            })
+        };
+        let worker = start_with(
+            Arc::new(cfg.clone()),
+            state.clone(),
+            tx,
+            stop.clone(),
+            Arc::new(|| 100),
+            source,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let health = || {
+            state
+                .view_at(100)
+                .status(100)
+                .unwrap()
+                .components
+                .into_iter()
+                .find(|c| c.name == "sampler")
+        };
+        while !health().is_some_and(|c| c.state == "degraded") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "health={:?}",
+                health()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(state.view_at(100).fs_samples().is_none());
+        assert!(!report().healthy);
+        while passes.load(Ordering::Acquire) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "health={:?}",
+                health()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(health().unwrap().state, "degraded"); // firstboot's sampler input
+        assert!(!report().healthy);
+        assert!(state.view_at(100).fs_samples().is_none());
+        let raw = tidemark_core::path::RawPath::from_path(dir.path()).unwrap();
+        let parsed = crate::mounts::parse(&table.lock()).unwrap();
+        let actual = tidemark_fs::mount::mount_for_path(&parsed, &raw).unwrap();
+        *table.lock() = format!(
+            "{} 0 {}:{} / {} rw - xfs /dev/fixture rw\n",
+            actual.id,
+            actual.major,
+            actual.minor,
+            dir.path().display()
+        )
+        .into_bytes();
+        cfg.sampler.mounts = vec![dir.path().to_path_buf()];
+        state.replace_config(cfg).unwrap();
+        while !health().is_some_and(|c| c.state == "ok") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "health={:?}",
+                health()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(state.view_at(100).fs_samples().is_some());
+        assert!(report().healthy);
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap().unwrap();
+    }
+
     #[test]
     fn injected_mount_appears_then_disappears_without_sampling_parent() {
         use std::sync::atomic::AtomicI64;
