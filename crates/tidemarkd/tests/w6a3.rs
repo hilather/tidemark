@@ -500,3 +500,44 @@ fn full_backlog_probe_expires_and_concurrent_start_preserves_socket() {
     stop.store(true, Ordering::Release);
     handle.join().unwrap().unwrap();
 }
+
+#[test]
+fn api_and_metrics_share_a_private_directory() {
+    if !socket_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = socket_config(&dir);
+    c.metrics.textfile = dir.path().join("metrics.prom");
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = api::start_with_peer(
+        Arc::new(c.clone()),
+        context(&c),
+        stop.clone(),
+        Arc::new(|_| Ok((0, 1))),
+    )
+    .unwrap();
+    let lock = dir.path().join("api.sock.lock");
+    assert_eq!(
+        std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let result = tidemarkd::metrics::write_textfile(&c.metrics.textfile, "tidemark_up 1\n");
+    let mut stream = BufReader::new(UnixStream::connect(&c.general.socket).unwrap());
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write(&mut stream, &request("status", "{}"));
+    let response = read(&mut stream);
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap().unwrap();
+    result.unwrap();
+    assert!(response.ok);
+    assert_eq!(
+        std::fs::read_to_string(&c.metrics.textfile).unwrap(),
+        "tidemark_up 1\n"
+    );
+    assert!(!lock.exists());
+    assert!(!c.general.socket.exists());
+}

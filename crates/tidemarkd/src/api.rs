@@ -429,6 +429,9 @@ struct SocketPath {
     parent: std::os::fd::OwnedFd,
     name: std::ffi::OsString,
     identity: Option<(u64, u64)>,
+    lock: std::os::fd::OwnedFd,
+    lock_name: std::ffi::OsString,
+    lock_identity: (u64, u64),
 }
 impl SocketPath {
     fn open(path: &std::path::Path) -> std::io::Result<Self> {
@@ -491,12 +494,37 @@ impl SocketPath {
         if (stat.st_uid != 0 && stat.st_uid != uid) || stat.st_mode & 0o022 != 0 {
             return Err(std::io::Error::other("socket parent is not trusted"));
         }
-        // Serialize cooperating startup/stale removal in this API directory.
-        fs::flock(&fd, fs::FlockOperation::NonBlockingLockExclusive)?;
+        // Serialize only this socket, retaining the parent for identity checks.
+        let mut lock_name = name.to_owned();
+        lock_name.push(".lock");
+        let lock = fs::openat(
+            &fd,
+            &lock_name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )?;
+        let lock_stat = fs::fstat(&lock)?;
+        if fs::FileType::from_raw_mode(lock_stat.st_mode) != fs::FileType::RegularFile
+            || lock_stat.st_uid != uid
+            || lock_stat.st_nlink != 1
+        {
+            return Err(std::io::Error::other(
+                "API lock must be an owned regular single-link file",
+            ));
+        }
+        fs::flock(&lock, fs::FlockOperation::NonBlockingLockExclusive)?;
+        let named = fs::statat(&fd, &lock_name, fs::AtFlags::SYMLINK_NOFOLLOW)?;
+        if (named.st_dev, named.st_ino) != (lock_stat.st_dev, lock_stat.st_ino) {
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        fs::fchmod(&lock, Mode::from_raw_mode(0o600))?;
         Ok(Self {
             parent: fd,
             name: name.to_owned(),
             identity: None,
+            lock,
+            lock_name,
+            lock_identity: (lock_stat.st_dev, lock_stat.st_ino),
         })
     }
     fn address(&self) -> std::path::PathBuf {
@@ -607,9 +635,27 @@ impl SocketPath {
 }
 impl Drop for SocketPath {
     fn drop(&mut self) {
+        // Hold the lock through both identity-checked unlinks. A startup that
+        // opened this inode before cleanup must reject its now-unlinked handle.
+        let _keep_locked = &self.lock;
         if let Some(identity) = self.identity {
             if let Err(error) = self.unlink(identity) {
                 tracing::warn!(%error, "API socket cleanup failed");
+            }
+        }
+        if let Ok(stat) = rustix::fs::statat(
+            &self.parent,
+            &self.lock_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            if (stat.st_dev, stat.st_ino) == self.lock_identity {
+                if let Err(error) = rustix::fs::unlinkat(
+                    &self.parent,
+                    &self.lock_name,
+                    rustix::fs::AtFlags::empty(),
+                ) {
+                    tracing::warn!(%error, "API lock cleanup failed");
+                }
             }
         }
     }
@@ -911,6 +957,37 @@ mod tests {
         let stopping = Cancellation::new(stop.clone(), TIMEOUT);
         stop.store(true, Ordering::Release);
         assert!(stopping.begin_commit().is_err());
+    }
+    #[test]
+    fn socket_lock_excludes_same_socket_reuses_crash_file_and_preserves_replacement() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("api.sock");
+        let lock = dir.path().join("api.sock.lock");
+        std::fs::write(&lock, "crash leftover").unwrap();
+        let guard = SocketPath::open(&socket).unwrap();
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(SocketPath::open(&socket).is_err());
+        crate::metrics::write_textfile(&dir.path().join("metrics.prom"), "exported").unwrap();
+        let other = SocketPath::open(&dir.path().join("other.sock")).unwrap();
+        drop(other);
+        std::fs::rename(&lock, dir.path().join("old.lock")).unwrap();
+        std::fs::write(&lock, "replacement").unwrap();
+        drop(guard);
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), "replacement");
+        let guard = SocketPath::open(&socket).unwrap();
+        drop(guard);
+        assert!(!lock.exists());
+        symlink(dir.path().join("target"), &lock).unwrap();
+        assert!(SocketPath::open(&socket).is_err());
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::write(&lock, "linked").unwrap();
+        std::fs::hard_link(&lock, dir.path().join("alias")).unwrap();
+        assert!(SocketPath::open(&socket).is_err());
     }
     #[test]
     fn socket_parent_trust_and_no_follow_checks_without_listening() {
