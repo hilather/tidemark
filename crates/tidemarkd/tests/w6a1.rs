@@ -1619,3 +1619,55 @@ fn mount_presence_recovery_remount_and_rate_history() {
         .iter()
         .any(|d| d.starts_with("mount not present:")));
 }
+
+#[test]
+fn blocked_mount_transition_log_does_not_hold_state_lock() {
+    use std::io::Write;
+    #[derive(Clone)]
+    struct BlockedLog {
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    }
+    impl Write for BlockedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut config = Config::default();
+    config.sampler.mounts = vec!["/".into()];
+    config.watch.mounts.clear();
+    let state = LiveState::new(&config, 0);
+    let (entered, waiting) = crossbeam_channel::bounded(1);
+    let (release, released) = crossbeam_channel::bounded(1);
+    let sink = BlockedLog {
+        entered,
+        release: released,
+    };
+    let publisher_state = state.clone();
+    let publisher = std::thread::spawn(move || {
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            publisher_state.publish_mount_presence(0, &[]).unwrap()
+        });
+    });
+    waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (done, result) = crossbeam_channel::bounded(1);
+    let reader = std::thread::spawn(move || done.send(state.view_at(0).status(0)).unwrap());
+    let read = result.recv_timeout(Duration::from_millis(200));
+    release.send(()).unwrap();
+    publisher.join().unwrap();
+    reader.join().unwrap();
+    assert!(
+        read.is_ok(),
+        "state reader blocked on transition log writer"
+    );
+}

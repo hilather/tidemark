@@ -359,45 +359,64 @@ impl LiveState {
         generation: u64,
         mounts: &[tidemark_fs::mount::MountInfo],
     ) -> Result<(), crate::DaemonError> {
-        let mut d = self.0.write();
-        if generation != d.generation {
+        self.publish_mount_presence_with(
+            generation,
+            mounts,
+            crate::mounts::live_identity,
+            |changes| crate::mounts::log(changes, "presence"),
+        )
+    }
+    fn publish_mount_presence_with(
+        &self,
+        generation: u64,
+        mounts: &[tidemark_fs::mount::MountInfo],
+        resolve: impl Fn(
+            &[tidemark_fs::mount::MountInfo],
+            &std::path::Path,
+        ) -> Result<Option<crate::mounts::Identity>, crate::DaemonError>,
+        log: impl FnOnce(&[crate::mounts::Transition]),
+    ) -> Result<(), crate::DaemonError> {
+        let (config, captured_generation) = self.config();
+        if generation != captured_generation {
             return Ok(());
         }
-        let mut paths = d.config.sampler.mounts.clone();
-        paths.extend(d.config.watch.mounts.clone());
+        let mut paths = config.sampler.mounts.clone();
+        paths.extend(config.watch.mounts.clone());
         paths.sort();
         paths.dedup();
         let mut resolved = BTreeMap::new();
         for path in &paths {
-            resolved.insert(
-                path.to_string_lossy().into_owned(),
-                crate::mounts::live_identity(mounts, path)?,
-            );
+            resolved.insert(path.to_string_lossy().into_owned(), resolve(mounts, path)?);
         }
-        for (mount, current) in &resolved {
-            if d.presence.get(mount) != Some(current) {
-                let previous = d.presence.get(mount).copied().flatten();
-                if d.config
-                    .sampler
-                    .mounts
-                    .iter()
-                    .any(|p| p.to_string_lossy() == mount.as_str())
-                {
-                    interrupt_fs(&mut d, mount)?;
-                }
-                d.fs.remove(mount);
-                d.fs_available.remove(mount);
-                crate::mounts::log(
-                    &[crate::mounts::Transition {
+        let mut changes = Vec::new();
+        {
+            let mut d = self.0.write();
+            if generation != d.generation {
+                return Ok(());
+            }
+            for (mount, current) in &resolved {
+                if d.presence.get(mount) != Some(current) {
+                    let previous = d.presence.get(mount).copied().flatten();
+                    if config
+                        .sampler
+                        .mounts
+                        .iter()
+                        .any(|p| p.to_string_lossy() == mount.as_str())
+                    {
+                        interrupt_fs(&mut d, mount)?;
+                    }
+                    d.fs.remove(mount);
+                    d.fs_available.remove(mount);
+                    changes.push(crate::mounts::Transition {
                         path: mount.into(),
                         previous,
                         current: *current,
-                    }],
-                    "presence",
-                );
+                    });
+                }
             }
+            d.presence = resolved;
         }
-        d.presence = resolved;
+        log(&changes);
         Ok(())
     }
     /// Clear a mount's current samples on a presence/identity transition.
@@ -1332,4 +1351,61 @@ fn interrupt_fs(d: &mut Inner, mount: &str) -> Result<(), crate::DaemonError> {
     d.fs_failure_epoch = d.fs_failure_epoch.saturating_add(1);
     d.fs_failures.insert(mount.into(), d.fs_failure_epoch);
     Ok(())
+}
+
+#[cfg(test)]
+mod presence_lock_tests {
+    use super::*;
+    #[test]
+    fn blocked_resolution_and_logging_leave_readers_free_and_reject_stale_generation() {
+        for phase in [0, 1, 2] {
+            let mut config = Config::default();
+            config.sampler.mounts = vec!["/".into()];
+            config.watch.mounts.clear();
+            let state = LiveState::new(&config, 0);
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+            let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+            let worker_state = state.clone();
+            let worker = std::thread::spawn(move || {
+                worker_state
+                    .publish_mount_presence_with(
+                        0,
+                        &[],
+                        |_, _| {
+                            if phase != 1 {
+                                entered_tx.send(()).unwrap();
+                                release_rx.recv().unwrap();
+                            }
+                            Ok(Some(crate::mounts::Identity {
+                                id: 1,
+                                major: 8,
+                                minor: 0,
+                            }))
+                        },
+                        |_| {
+                            if phase == 1 {
+                                entered_tx.send(()).unwrap();
+                                release_rx.recv().unwrap();
+                            }
+                        },
+                    )
+                    .unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let (read_tx, read_rx) = crossbeam_channel::bounded(1);
+            let reader_state = state.clone();
+            let reader = std::thread::spawn(move || {
+                read_tx.send(reader_state.view_at(0).status(0)).unwrap();
+            });
+            let read = read_rx.recv_timeout(Duration::from_millis(200));
+            if phase == 2 {
+                state.replace_config(config).unwrap();
+            }
+            release_tx.send(()).unwrap();
+            worker.join().unwrap();
+            reader.join().unwrap();
+            assert!(read.is_ok(), "reader blocked during phase {phase}");
+            assert_eq!(state.0.read().presence.is_empty(), phase == 2);
+        }
+    }
 }
