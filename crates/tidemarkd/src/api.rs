@@ -17,8 +17,78 @@ use tidemark_core::api::*;
 const LIMIT: usize = 1024 * 1024;
 const CONNECTIONS: usize = 32;
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Cooperative request cancellation and absolute handler deadline.
+/// Cancellation cannot interrupt a kernel/SQLite call already in progress (R3-7).
+#[derive(Clone)]
+pub struct Cancellation {
+    phase: Arc<AtomicUsize>,
+    shutdown: crate::Shutdown,
+    deadline: Instant,
+}
+impl Cancellation {
+    /// Create an execution budget that also observes lifecycle shutdown.
+    pub fn new(shutdown: crate::Shutdown, timeout: Duration) -> Self {
+        Self {
+            phase: Arc::new(AtomicUsize::new(0)),
+            shutdown,
+            deadline: Instant::now() + timeout,
+        }
+    }
+    /// Reject uncommitted work when cancellation, shutdown or the deadline wins.
+    pub fn check(&self) -> Result<(), DaemonError> {
+        if self.phase.load(Ordering::Acquire) == 1
+            || self.shutdown.load(Ordering::Acquire)
+            || Instant::now() >= self.deadline
+        {
+            Err(DaemonError::Shutdown)
+        } else {
+            Ok(())
+        }
+    }
+    fn cancel(&self) {
+        let _ = self
+            .phase
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+    }
+    /// Claim the configuration commit boundary atomically against cancellation.
+    /// Once claimed, publication completes even if a transport timeout follows;
+    /// clients must treat a timeout during commit as an uncertain outcome.
+    pub fn begin_commit(&self) -> Result<(), DaemonError> {
+        self.check()?;
+        self.phase
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| DaemonError::Shutdown)
+    }
+}
+/// Internal reload execution contract. Production implementations observe the budget.
+pub trait ReloadCallback: Send + Sync {
+    /// Execute a reload with cooperative cancellation and an absolute deadline.
+    fn call(&self, cancellation: &Cancellation) -> Result<ConfigReloadResult, DaemonError>;
+}
+// Retain compatibility for existing injected zero-argument test callbacks.
+// Such callbacks are owned/joined but cannot promise cooperative cancellation.
+impl<F> ReloadCallback for F
+where
+    F: Fn() -> Result<ConfigReloadResult, DaemonError> + Send + Sync,
+{
+    fn call(&self, cancellation: &Cancellation) -> Result<ConfigReloadResult, DaemonError> {
+        cancellation.check()?;
+        self()
+    }
+}
 /// Validating lifecycle reload callback, retaining the old config on failure.
-pub type Reload = Arc<dyn Fn() -> Result<ConfigReloadResult, DaemonError> + Send + Sync>;
+pub type Reload = Arc<dyn ReloadCallback>;
+/// Adapt a callback that explicitly consumes the request execution budget.
+pub struct CooperativeReload<F>(pub F);
+impl<F> ReloadCallback for CooperativeReload<F>
+where
+    F: Fn(&Cancellation) -> Result<ConfigReloadResult, DaemonError> + Send + Sync,
+{
+    fn call(&self, cancellation: &Cancellation) -> Result<ConfigReloadResult, DaemonError> {
+        (self.0)(cancellation)
+    }
+}
 /// Shared handler dependencies; measurements remain in LiveState.
 pub struct Context {
     /// Measurement publication handle.
@@ -70,6 +140,21 @@ pub fn dispatch(
     context: &Context,
     now: i64,
 ) -> Result<Response, DaemonError> {
+    dispatch_controlled(
+        request,
+        peer_uid,
+        context,
+        now,
+        &Cancellation::new(Arc::new(std::sync::atomic::AtomicBool::new(false)), TIMEOUT),
+    )
+}
+fn dispatch_controlled(
+    request: &Request,
+    peer_uid: u32,
+    context: &Context,
+    now: i64,
+    cancellation: &Cancellation,
+) -> Result<Response, DaemonError> {
     if peer_uid != 0 {
         return Ok(error(
             &request.id,
@@ -85,6 +170,7 @@ pub fn dispatch(
         ));
     }
     let result = (|| {
+        cancellation.check()?;
         let view = context.state.view_at(now);
         match request.method.as_str() {
             "status" => {
@@ -108,7 +194,7 @@ pub fn dispatch(
             "scan.cancel" => value(context.scans.cancel(&params(request)?)?),
             "config.reload" => {
                 let _: ConfigReloadParams = params(request)?;
-                value((context.reload)()?)
+                value(context.reload.call(cancellation)?)
             }
             _ => Err(DaemonError::Invalid("unknown method".into())),
         }
@@ -128,6 +214,17 @@ struct Permit(Arc<AtomicUsize>);
 impl Drop for Permit {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+// A connection owns its handler even after a transport timeout. Joining here
+// also makes service shutdown wait for callbacks and retain the admission slot.
+// R3-7: neither a deadline nor shutdown can interrupt kernel I/O in progress.
+struct Handler(Option<std::thread::JoinHandle<()>>);
+impl Drop for Handler {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = handle.join();
+        }
     }
 }
 fn io(e: std::io::Error) -> DaemonError {
@@ -279,24 +376,35 @@ fn connection(
             let ctx = context.clone();
             let retained = permit.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
+            let cancellation = Cancellation::new(shutdown.clone(), timeout);
+            let budget = cancellation.clone();
             // A timed-out handler retains its admission permit until it exits,
             // bounding even callbacks that cannot be cancelled by their owner.
             let spawned = std::thread::Builder::new()
                 .name("api-handler".into())
                 .spawn(move || {
                     let _retained = retained;
-                    let _ = tx.send(dispatch(&request, uid, &ctx, crate::unix_now()));
+                    let _ = tx.send(dispatch_controlled(
+                        &request,
+                        uid,
+                        &ctx,
+                        crate::unix_now(),
+                        &budget,
+                    ));
                 });
-            if spawned.is_err() {
-                return;
-            }
-            let deadline = Instant::now() + timeout;
+            let _handler = match spawned {
+                Ok(handle) => Handler(Some(handle)),
+                Err(_) => return,
+            };
+            let deadline = cancellation.deadline;
             let mut timed_out = false;
             let response = loop {
                 if shutdown.load(Ordering::Acquire) {
+                    cancellation.cancel();
                     return;
                 }
                 if Instant::now() >= deadline {
+                    cancellation.cancel();
                     timed_out = true;
                     break error(&id, ApiErrorCode::Unavailable, "handler timed out");
                 }
@@ -383,13 +491,23 @@ pub fn start_with_peer_timeout(
     std::thread::Builder::new()
         .name("api".into())
         .spawn(move || {
-            let mut clients = Vec::new();
+            let mut clients: Vec<std::thread::JoinHandle<()>> = Vec::new();
+            let mut outcome = Ok(());
             while !shutdown.load(Ordering::Acquire) {
-                clients.retain(|h: &std::thread::JoinHandle<()>| !h.is_finished());
+                let mut index = 0;
+                while index < clients.len() {
+                    if clients[index].is_finished() {
+                        let _ = clients.swap_remove(index).join();
+                    } else {
+                        index += 1;
+                    }
+                }
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let accepted = Instant::now();
-                        if active.load(Ordering::Acquire) >= CONNECTIONS {
+                        if clients.len() >= CONNECTIONS
+                            || active.load(Ordering::Acquire) >= CONNECTIONS
+                        {
                             drop(stream);
                             continue;
                         }
@@ -413,17 +531,18 @@ pub fn start_with_peer_timeout(
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(e) => {
-                        let _ = std::fs::remove_file(&path);
-                        return Err(io(e));
+                        outcome = Err(io(e));
+                        shutdown.store(true, Ordering::Release);
+                        break;
                     }
                 }
             }
             drop(listener);
-            std::fs::remove_file(&path).map_err(io)?;
+            let cleanup = std::fs::remove_file(&path).map_err(io);
             for h in clients {
                 let _ = h.join();
             }
-            Ok(())
+            outcome.and(cleanup)
         })
         .map_err(io)
 }
@@ -539,6 +658,88 @@ mod tests {
         }
     }
     #[test]
+    fn peer_refusal_precedes_malformed_frame_and_credential_failure_closes() {
+        for peer in [
+            Arc::new(|_: &UnixStream| Ok((1000u32, 42))) as PeerCredentials,
+            Arc::new(|_: &UnixStream| Err(std::io::ErrorKind::PermissionDenied.into())),
+        ] {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            client.write_all(b"{malformed}\n").unwrap();
+            let context = Arc::new(Context {
+                state: crate::state::LiveState::new(&tidemark_core::config::Config::default(), 0),
+                scans: crate::scheduler::ScanControl::default(),
+                reload: Arc::new(|| unreachable!("unauthorized dispatch")),
+            });
+            let active = Arc::new(AtomicUsize::new(1));
+            connection(
+                server,
+                context,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Permit(active.clone()),
+                peer,
+                TIMEOUT,
+                Instant::now(),
+            );
+            let mut byte = [0];
+            match client.read(&mut byte) {
+                Ok(n) => assert_eq!(n, 0, "unauthorized peer received response bytes"),
+                Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset),
+            }
+            assert_eq!(active.load(Ordering::Acquire), 0);
+        }
+    }
+    #[test]
+    fn cooperative_reload_exits_on_deadline_and_shutdown() {
+        for stopping in [false, true] {
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+            let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = exited.clone();
+            let reload: Reload = Arc::new(CooperativeReload(move |budget: &Cancellation| {
+                entered_tx.send(()).unwrap();
+                while budget.check().is_ok() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                flag.store(true, Ordering::Release);
+                Err(DaemonError::Shutdown)
+            }));
+            let (mut stream, stop, handle) = pair(reload, Duration::from_millis(100));
+            stream
+                .get_mut()
+                .write_all(b"{\"v\":1,\"id\":\"x\",\"method\":\"config.reload\",\"params\":{}}\n")
+                .unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            if stopping {
+                stop.store(true, Ordering::Release);
+            } else {
+                assert_eq!(
+                    response(&mut stream).error.unwrap().code,
+                    ApiErrorCode::Unavailable
+                );
+            }
+            handle.join().unwrap();
+            assert!(exited.load(Ordering::Acquire));
+        }
+    }
+    #[test]
+    fn cancellation_and_commit_have_an_atomic_winner() {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = Cancellation::new(stop.clone(), TIMEOUT);
+        cancelled.cancel();
+        assert!(cancelled.begin_commit().is_err());
+        let committed = Cancellation::new(stop.clone(), TIMEOUT);
+        committed.begin_commit().unwrap();
+        committed.cancel();
+        assert_eq!(committed.phase.load(Ordering::Acquire), 2);
+        let expired = Cancellation::new(stop.clone(), Duration::ZERO);
+        assert!(expired.begin_commit().is_err());
+        let stopping = Cancellation::new(stop.clone(), TIMEOUT);
+        stop.store(true, Ordering::Release);
+        assert!(stopping.begin_commit().is_err());
+    }
+    #[test]
     fn pair_controllable_timeout_and_shutdown() {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let reload: Reload = Arc::new(move || {
@@ -557,7 +758,9 @@ mod tests {
             ApiErrorCode::Unavailable
         );
         stop.store(true, Ordering::Release);
-        h.join().unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!h.is_finished(), "server abandoned its blocked callback");
         tx.send(()).unwrap();
+        h.join().unwrap();
     }
 }
