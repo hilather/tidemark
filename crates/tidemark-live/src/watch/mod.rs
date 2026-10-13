@@ -1034,7 +1034,8 @@ impl Watcher {
         self.state.lock().rings.budget().used()
     }
     /// Explain caps and loss in the retained fifteen-minute history.
-    /// Reports at most eight causes, each with its latest affected UTC minute.
+    /// Reports at most eight ring causes with their latest affected UTC minute,
+    /// plus counts for the four most recent distinct handle-reopen errors.
     /// Truncation diagnostics do not change legacy lossy flags or alert availability.
     pub fn health_detail(&self) -> String {
         let state = self.state.lock();
