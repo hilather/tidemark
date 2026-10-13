@@ -29,6 +29,7 @@ if [[ $phase == verify ]]; then
         wait_for_status
     fi
     mkdir -p "$TIDEMARK_INSTALL_MOUNT/tidemark-install-reboot"
+    # shellcheck disable=SC2016 # $1 is expanded by the inner sh, using its directory argument.
     systemd-run --wait --unit=tidemark-install-reboot-writer /bin/sh -c 'dd if=/dev/zero of="$1/payload" bs=1M count=8 && sleep 5' sh "$TIDEMARK_INSTALL_MOUNT/tidemark-install-reboot"
     deadline=$((SECONDS + 60))
     until tidemark hot --window 5m | grep -F "$TIDEMARK_INSTALL_MOUNT/tidemark-install-reboot"; do

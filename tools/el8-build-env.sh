@@ -3,6 +3,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 # os-release is a trusted system file in this disposable guest.
+# shellcheck disable=SC1091 # Provided by the disposable EL8 guest, not the source tree.
 . /etc/os-release
 case "${ID:-}:${VERSION_ID:-}" in
     rocky:8|rocky:8.*|rhel:8|rhel:8.*|centos:8|centos:8.*|almalinux:8|almalinux:8.*|ol:8|ol:8.*) ;;
@@ -12,6 +13,7 @@ esac
 el=${1:-8.10}
 case "$el" in
     8.8)
+        # shellcheck disable=SC2016 # Match literal yum variables in repository URLs.
         sed -i -e 's|^mirrorlist=|#mirrorlist=|' \
             -e 's|^#baseurl=http://dl.rockylinux.org/\$contentdir/\$releasever/|baseurl=https://dl.rockylinux.org/vault/rocky/8.8/|' \
             /etc/yum.repos.d/*.repo
