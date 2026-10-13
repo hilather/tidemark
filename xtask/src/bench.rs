@@ -18,15 +18,25 @@ use std::{
 /// Validated benchmark options.
 #[derive(Debug)]
 pub struct Options {
+    /// Existing measured root.
     pub root: PathBuf,
+    /// Unique du/walk/bulk modes.
     pub modes: Vec<String>,
+    /// Unique warm/cold policies.
     pub caches: Vec<String>,
+    /// Result directory outside the root.
     pub out: PathBuf,
+    /// Scanner throttle preset.
     pub throttle: String,
+    /// Explicit host-wide cache-drop authorization.
     pub drop_caches: bool,
+    /// Override daemon/load cold guards.
     pub force: bool,
+    /// Run the separate watcher overhead experiment.
     pub watcher: bool,
+    /// Watcher workload duration in seconds.
     pub duration: u64,
+    /// Watcher workload logical operations per second.
     pub rate: u64,
 }
 /// Parse without running any command or touching host configuration.
@@ -100,7 +110,9 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
 /// Command as data, retaining raw OS paths and avoiding a shell.
 #[derive(Debug, Clone)]
 pub struct Invocation {
+    /// Executable path, without a shell.
     pub program: OsString,
+    /// Ordered raw OS arguments.
     pub args: Vec<OsString>,
 }
 impl Invocation {
@@ -585,19 +597,20 @@ pub fn run(workspace: &Path, args: impl Iterator<Item = OsString>) -> Result<()>
     let json_path = o.out.join(format!("{stem}.json"));
     fs::write(&json_path, serde_json::to_vec_pretty(&document)?)?;
     let mut md = File::create(o.out.join(format!("{stem}.md")))?;
-    writeln!(md,"# Benchmark {stem}\n\nRoot: `{}`; throttle `{}`. Raw evidence: [{}]({}); per-command output and block series: `{}`.\n\n| Cache | Mode | Wall s | User s | System s | Peak RSS KiB | Result |\n|---|---|---:|---:|---:|---:|---|",o.root.display(),o.throttle,json_path.display(),json_path.display(),run_dir.display())?;
+    writeln!(md,"# Benchmark {stem}\n\nRoot: `{}`; throttle `{}`. Raw evidence: [{}]({}); per-command output and block series: `{}`.\n\n| Cache | Mode | Wall s | User s | System s | Peak RSS KiB | Measurement source | Result |\n|---|---|---:|---:|---:|---:|---|---|",o.root.display(),o.throttle,json_path.display(),json_path.display(),run_dir.display())?;
     for row in &rows {
         if let Some(ms) = row["measurements"].as_array() {
             for m in ms {
                 writeln!(
                     md,
-                    "| {} | {} | {} | {} | {} | {} | `{}` |",
+                    "| {} | {} | {} | {} | {} | {} | {} | `{}` |",
                     row["cache"],
                     row["mode"],
                     m["wall_seconds"],
                     m["user_seconds"],
                     m["system_seconds"],
                     m["peak_rss_kib"],
+                    m["measurement_source"],
                     m["result"].to_string().replace('|', "\\|")
                 )?;
             }

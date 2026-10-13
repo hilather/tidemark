@@ -22,11 +22,17 @@ const MARKER: &str = ".tidemark-fixture";
 /// Generator options; inode count includes root, directories and control files.
 #[derive(Debug, Clone)]
 pub struct Options {
+    /// Existing empty or marked fixture directory.
     pub root: PathBuf,
+    /// Target unique-inode count including control files.
     pub inodes: u64,
+    /// Deterministic SplitMix64 seed.
     pub seed: u64,
+    /// Write large-file contents instead of creating holes.
     pub dense: bool,
+    /// Mutation logical operations per second; zero disables mutation.
     pub rate: u64,
+    /// Optional mutation duration in seconds.
     pub duration: Option<u64>,
 }
 /// Parse generator arguments without performing filesystem operations.
@@ -75,6 +81,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
 /// A no-follow directory capability, addressed through Linux procfs.
 pub struct Dir {
     file: File,
+    /// Validated absolute path for operator reporting.
     pub original: PathBuf,
 }
 impl Dir {
@@ -182,13 +189,21 @@ struct Marker {
 /// Unique-inode totals (hard-link aliases do not add bytes or inodes).
 #[derive(Default, Serialize, Deserialize, Debug)]
 pub struct Summary {
+    /// Directory inodes, including the root.
     pub directories: u64,
+    /// Unique regular data-file inodes.
     pub regular: u64,
+    /// Unique symlink inodes.
     pub symlinks: u64,
+    /// Marker and summary regular-file inodes.
     pub control_files: u64,
+    /// Unique inode apparent bytes including directories and controls.
     pub apparent_bytes: u64,
+    /// Unique inode allocated bytes including directories and controls.
     pub allocated_bytes: u64,
+    /// Data-file inodes with aliases.
     pub link_sets: u64,
+    /// Additional hard-link names.
     pub hard_link_entries: u64,
 }
 struct Random(u64);
