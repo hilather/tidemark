@@ -190,9 +190,9 @@ pub struct Watcher {
     state: Arc<Mutex<State>>,
     shutdown: Arc<OwnedFd>,
     stopping: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
     mount: RawPath,
-    mount_fd: Option<Arc<OwnedFd>>,
+    mount_fd: Mutex<Option<Arc<OwnedFd>>>,
 }
 // Acknowledgements are FIFO and scoped to the current loss. Eviction is conservative.
 const LOSS_ACK_CAP: usize = 1024;
@@ -294,10 +294,39 @@ impl Watcher {
                 rustix::event::EventfdFlags::NONBLOCK,
             )?),
             stopping: Arc::new(AtomicBool::new(false)),
-            thread: None,
+            thread: Mutex::new(None),
             mount,
-            mount_fd: None,
+            mount_fd: Mutex::new(None),
         })
+    }
+    /// Fanotify-free lifecycle seam: an eventfd stands in for the owned group.
+    /// Records worker stop and group close in order, using the production shutdown path.
+    #[doc(hidden)]
+    pub fn from_injected_events_with_shutdown_probe(
+        mount: RawPath,
+        descriptor: OwnedFd,
+        observer: impl Fn(&'static str) + Send + 'static,
+    ) -> io::Result<Self> {
+        let watcher = Self::from_injected_events(mount, [])?;
+        *watcher.mount_fd.lock() = Some(Arc::new(descriptor));
+        let shutdown = watcher.shutdown.clone();
+        let group = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)?;
+        *watcher.thread.lock() = Some(std::thread::spawn(move || {
+            let mut polls = [rustix::event::PollFd::new(
+                shutdown.as_ref(),
+                rustix::event::PollFlags::IN,
+            )];
+            loop {
+                match rustix::event::poll(&mut polls, None) {
+                    Err(rustix::io::Errno::INTR) => continue,
+                    _ => break,
+                }
+            }
+            observer("worker stopped");
+            drop(group);
+            observer("group closed");
+        }));
+        Ok(watcher)
     }
     /// Build attributed test events with an explicitly selected reporting mode.
     #[doc(hidden)]
@@ -530,9 +559,9 @@ impl Watcher {
             state,
             shutdown,
             stopping,
-            thread: Some(thread),
+            thread: Mutex::new(Some(thread)),
             mount,
-            mount_fd: Some(mount_fd),
+            mount_fd: Mutex::new(Some(mount_fd)),
         })
     }
     /// Return the reporting mode selected by successful marks.
@@ -590,7 +619,8 @@ impl Watcher {
     /// Injected-event watchers return [`io::ErrorKind::Unsupported`].
     pub fn mount_identity(&self) -> io::Result<(u64, u32, u32)> {
         use std::io::Read;
-        let fd = self.mount_fd.as_ref().ok_or_else(|| {
+        let mount_fd = self.mount_fd.lock();
+        let fd = mount_fd.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 "injected watcher has no mount descriptor",
@@ -716,15 +746,21 @@ impl Watcher {
         self.state.lock().unmapped_events
     }
     /// Wake the worker and join it, closing the group and all event descriptors.
-    pub fn stop(mut self) {
-        self.shutdown_worker();
+    pub fn stop(self) {
+        self.shutdown();
     }
-    fn shutdown_worker(&mut self) {
-        self.stopping.store(true, Ordering::Relaxed);
+    /// Stop and join the worker and release the fanotify group and mount descriptor.
+    /// Idempotent; old views keep measurements without keeping the transport alive.
+    pub fn shutdown(&self) {
+        // Keep this lock through join and descriptor release so every concurrent
+        // shutdown caller observes completed teardown before returning.
+        let mut thread = self.thread.lock();
+        self.stopping.store(true, Ordering::Release);
         let _ = rustix::io::write(self.shutdown.as_ref(), &1u64.to_ne_bytes());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(worker) = thread.take() {
+            let _ = worker.join();
         }
+        self.mount_fd.lock().take();
     }
 }
 fn mount_mark_path(fd: &impl AsRawFd) -> std::path::PathBuf {
@@ -1057,7 +1093,7 @@ pub enum WatchError {
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        self.shutdown_worker();
+        self.shutdown();
     }
 }
 fn dir_key(parent: &RawPath, mount: &RawPath, depth: usize) -> RawPath {
@@ -1392,8 +1428,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut watcher = Watcher::from_injected_events(raw("/fixture"), []).unwrap();
-        watcher.mount_fd = Some(fd.clone());
+        let watcher = Watcher::from_injected_events(raw("/fixture"), []).unwrap();
+        *watcher.mount_fd.lock() = Some(fd.clone());
         let identity = watcher.mount_identity().unwrap();
         let mounts = tidemark_fs::mount::read_mountinfo().unwrap();
         let raw_path = RawPath::from_path(&original).unwrap();
@@ -1467,9 +1503,9 @@ mod tests {
                 rustix::event::eventfd(0, rustix::event::EventfdFlags::NONBLOCK).unwrap(),
             ),
             stopping: Arc::new(AtomicBool::new(false)),
-            thread: None,
+            thread: Mutex::new(None),
             mount: raw("/data"),
-            mount_fd: None,
+            mount_fd: Mutex::new(None),
         }
     }
     fn raw(path: &str) -> RawPath {
@@ -1803,9 +1839,9 @@ mod tests {
             state: Arc::new(state),
             shutdown: Arc::new(shutdown),
             stopping: Arc::new(stopping),
-            thread: None,
+            thread: Mutex::new(None),
             mount: cfg.mount.clone(),
-            mount_fd: None,
+            mount_fd: Mutex::new(None),
         };
         assert_eq!(watcher.mode(), WatchMode::Failed);
         let drained = watcher.drain_events(3);

@@ -62,7 +62,8 @@ pub fn start(
                 while !shutdown.load(Ordering::Acquire) {
                     let (config, generation) = state.config();
                     if previous.as_ref() != Some(&config.watch) {
-                        for mount in watchers.keys() {
+                        for (mount, watcher) in &watchers {
+                            watcher.shutdown();
                             state.remove_watcher(mount);
                         }
                         if let Some(old) = &previous {
@@ -116,9 +117,7 @@ pub fn start(
                             let mount = RawPath::from_path(&change.path)
                                 .map_err(|e| DaemonError::Config(e.to_string()))?
                                 .display_lossy();
-                            state.remove_watcher(&mount);
-                            watchers.remove(&mount);
-                            minutes.remove(&mount);
+                            retire_watcher(&state, &mut watchers, &mut minutes, &mount);
                         }
                         let namespace = tidemark_live::watch::namespace_ok();
                         if matches!(&namespace, Err(error) if crate::resource_pressure(error)) {
@@ -136,7 +135,8 @@ pub fn start(
                             continue;
                         }
                         if !matches!(namespace, Ok(true)) {
-                            for mount in watchers.keys() {
+                            for (mount, watcher) in &watchers {
+                                watcher.shutdown();
                                 state.remove_watcher(mount);
                             }
                             watchers.clear();
@@ -235,8 +235,9 @@ pub fn start(
                 }
                 Ok(())
             })();
-            // Also release on publication failures: the last Arc drop joins the worker.
-            for mount in watchers.keys() {
+            // Also stop on publication failures, independently of retained reader views.
+            for (mount, watcher) in &watchers {
+                watcher.shutdown();
                 state.remove_watcher(mount);
             }
             watchers.clear();
@@ -452,6 +453,19 @@ fn requested_windows(config: &Config, mount: &str) -> BTreeSet<usize> {
         .collect()
 }
 
+fn retire_watcher(
+    state: &LiveState,
+    watchers: &mut BTreeMap<String, Arc<Watcher>>,
+    minutes: &mut BTreeMap<String, MinuteHistory>,
+    mount: &str,
+) {
+    if let Some(watcher) = watchers.remove(mount) {
+        watcher.shutdown();
+    }
+    state.remove_watcher(mount);
+    minutes.remove(mount);
+}
+
 fn read_mount_table(
     state: &LiveState,
     read: impl FnOnce() -> Result<Vec<tidemark_fs::mount::MountInfo>, DaemonError>,
@@ -463,7 +477,8 @@ fn read_mount_table(
         Err(error) => {
             if !matches!(&error, DaemonError::Io { source, .. } if crate::resource_pressure(source))
             {
-                for mount in watchers.keys() {
+                for (mount, watcher) in watchers.iter() {
+                    watcher.shutdown();
                     state.remove_watcher(mount);
                 }
                 watchers.clear();
@@ -509,6 +524,54 @@ fn persistence_rows(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_view_does_not_delay_retirement_before_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let descriptor = rustix::fs::open(
+            temp.path(),
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = order.clone();
+        let watcher = Arc::new(
+            Watcher::from_injected_events_with_shutdown_probe(
+                RawPath::new(b"/fixture".to_vec()).unwrap(),
+                descriptor,
+                move |step| recorded.lock().push(step),
+            )
+            .unwrap(),
+        );
+        let state = LiveState::new(&Config::default(), 0);
+        state
+            .publish(
+                Publication::Watcher(("/fixture".into(), watcher.clone())),
+                crate::component("watcher:/fixture", "ok", "fixture"),
+            )
+            .unwrap();
+        let old_view = state.view_at(0);
+        let mut watchers = BTreeMap::from([("/fixture".into(), watcher.clone())]);
+        let mut minutes = BTreeMap::from([("/fixture".into(), MinuteHistory::default())]);
+        retire_watcher(&state, &mut watchers, &mut minutes, "/fixture");
+        assert_eq!(
+            watcher.mount_identity().unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        // This seam occupies the same ordering position as Watcher::start in a pass.
+        order.lock().push("replacement starts");
+        let replacement =
+            Watcher::from_injected_events(RawPath::new(b"/fixture".to_vec()).unwrap(), []).unwrap();
+        assert_eq!(
+            *order.lock(),
+            vec!["worker stopped", "group closed", "replacement starts"]
+        );
+        assert!(watchers.is_empty() && minutes.is_empty());
+        watcher.shutdown();
+        assert_eq!(order.lock().len(), 3);
+        assert!(old_view.status(0).is_some());
+        drop(replacement);
+    }
     #[test]
     fn filesystem_mode_detail_is_healthy() {
         let watcher = super::Watcher::from_injected_events_in_mode(

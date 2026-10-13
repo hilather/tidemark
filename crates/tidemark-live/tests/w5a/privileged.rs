@@ -494,3 +494,21 @@ fn filesystem_mark_maps_namespace_bind_and_chroot() {
     watch.stop();
     fs.cleanup().unwrap();
 }
+
+#[test]
+fn shutdown_releases_mount_for_ordinary_unmount_while_old_reader_survives() {
+    let mut fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
+    let watched = Arc::new(watcher(options(&fs.mountpoint)));
+    // The live crate cannot depend on daemon views; this is the same retained Arc.
+    let old_view = watched.clone();
+    watched.shutdown();
+    watched.shutdown();
+    assert_eq!(
+        old_view.mount_identity().unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    // LoopXfs::cleanup executes ordinary `umount`, with no lazy or forced flags.
+    fs.cleanup().unwrap();
+    assert!(!old_view.stats().recovering);
+    assert!(old_view.hot(1, HotScope::Dir, 10).is_empty());
+}
