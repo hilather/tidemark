@@ -2,6 +2,8 @@
 //! Binary regressions for metadata-only reads and namespace mount boundaries.
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "support/config.rs"]
+mod config_support;
 use serde_json::Value;
 use std::{
     fs,
@@ -11,12 +13,10 @@ use std::{
 };
 
 fn command(temp: &Path) -> Command {
-    let config = temp.join("config.toml");
-    fs::write(
-        &config,
+    let config = config_support::direct_config(
+        temp,
         "[scan]\nthreads=1\n[throttle]\nmin_ops_per_sec=50000\nmax_ops_per_sec=50000\n",
-    )
-    .unwrap();
+    );
     fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
     let mut c = Command::new(env!("CARGO_BIN_EXE_tidemark"));
     c.arg("--config")

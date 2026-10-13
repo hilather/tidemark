@@ -1,5 +1,8 @@
 //! Owned by: TEST-e2e-scan
 //! Private state and unprivileged child commands, including on root test runners.
+#[path = "../support/config.rs"]
+mod config_support;
+pub(super) use config_support::direct_config;
 use serde_json::Value;
 use std::{
     ffi::OsStr,
@@ -23,12 +26,10 @@ impl Harness {
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let state = temp.path().join("state");
-        let config = temp.path().join("config.toml");
-        std::fs::write(
-            &config,
+        let config = direct_config(
+            temp.path(),
             "[scan]\nthreads=2\n[throttle]\nmin_ops_per_sec=50000\nmax_ops_per_sec=50000\n",
-        )
-        .unwrap();
+        );
         let binary = temp.path().join("tidemark");
         std::fs::copy(env!("CARGO_BIN_EXE_tidemark"), &binary).unwrap();
         let probe = temp.path().join("permission-probe");

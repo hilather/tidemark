@@ -55,7 +55,7 @@ fn story(root: &std::path::Path, state: &std::path::Path) {
     assert!(expected > 0);
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
         .arg("--config")
-        .arg(temp.path().join("missing.toml"))
+        .arg(super::config_support::direct_config(temp.path(), ""))
         .arg("--state-dir")
         .arg(&state)
         .arg("diff")
@@ -79,7 +79,7 @@ fn story(root: &std::path::Path, state: &std::path::Path) {
     );
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
         .arg("--config")
-        .arg(temp.path().join("missing.toml"))
+        .arg(super::config_support::direct_config(temp.path(), ""))
         .arg("--state-dir")
         .arg(&state)
         .arg("--json")
@@ -106,7 +106,7 @@ fn story(root: &std::path::Path, state: &std::path::Path) {
         .unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
         .arg("--config")
-        .arg(temp.path().join("missing.toml"))
+        .arg(super::config_support::direct_config(temp.path(), ""))
         .arg("--state-dir")
         .arg(&state)
         .arg("diff")

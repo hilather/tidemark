@@ -236,6 +236,18 @@ fn daemon_check_config_binary() {
         .split("```")
         .next()
         .unwrap();
+    let example = example
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("socket "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let example = example.replace(
+        "[general]",
+        &format!(
+            "[general]\nsocket = {:?}",
+            dir.path().join("absent-api.sock")
+        ),
+    );
     std::fs::write(&path, example).unwrap();
     assert_cmd::Command::new(&binary)
         .arg("--config")
@@ -243,7 +255,14 @@ fn daemon_check_config_binary() {
         .arg("--check-config")
         .assert()
         .success();
-    std::fs::write(&path, "[general]\nunknown_key = true\n").unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "[general]\nsocket = {:?}\nunknown_key = true\n",
+            dir.path().join("absent-api.sock")
+        ),
+    )
+    .unwrap();
     let output = assert_cmd::Command::new(&binary)
         .arg("--config")
         .arg(&path)

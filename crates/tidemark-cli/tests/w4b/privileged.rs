@@ -27,7 +27,8 @@ fn deploy_stage_preflight_blocks() {
     std::fs::write(
         &source,
         format!(
-            "[general]\nstate_dir = {:?}\n[[roots]]\npath = {:?}\n",
+            "[general]\nsocket = {:?}\nstate_dir = {:?}\n[[roots]]\npath = {:?}\n",
+            dir.path().join("absent-api.sock"),
             state,
             dir.path().join("absent-root")
         ),
@@ -62,7 +63,7 @@ fn deploy_unstage() {
     let state = dir.path().join("state");
     let source = dir.path().join("source.toml");
     let installed = dir.path().join("installed.toml");
-    std::fs::write(&source, format!("[general]\nstate_dir = {:?}\n[sampler]\nmounts = ['/']\n[watch]\nenabled = false\nmounts = ['/']\n[lvm]\nenabled = false\n[[roots]]\npath = '/'\n", state)).unwrap();
+    std::fs::write(&source, format!("[general]\nsocket = {:?}\nstate_dir = {:?}\n[sampler]\nmounts = ['/']\n[watch]\nenabled = false\nmounts = ['/']\n[lvm]\nenabled = false\n[[roots]]\npath = '/'\n", dir.path().join("absent-api.sock"), state)).unwrap();
     let env = RealEnv {
         installed_config: installed,
         now: 100,

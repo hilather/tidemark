@@ -51,7 +51,7 @@ fn since_age_notice_latest_complete_and_from_default_to() {
     let invoke = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
             .arg("--config")
-            .arg(temp.path().join("missing.toml"))
+            .arg(super::config_support::direct_config(temp.path(), ""))
             .arg("--state-dir")
             .arg(&state)
             .arg("--json")
@@ -123,7 +123,7 @@ fn explicit_partial_or_degraded_diff_warns_and_shows_both_inputs() {
             for json in [false, true] {
                 let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"));
                 cmd.arg("--config")
-                    .arg(temp.path().join("missing"))
+                    .arg(super::config_support::direct_config(temp.path(), ""))
                     .arg("--state-dir")
                     .arg(&state);
                 if json {

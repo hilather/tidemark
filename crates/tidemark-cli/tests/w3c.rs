@@ -1,6 +1,8 @@
 //! Owned by: W3-C
 //! Scanned fixture exports and command output protection.
 #![allow(clippy::unwrap_used)]
+#[path = "support/config.rs"]
+mod config_support;
 use std::sync::atomic::AtomicBool;
 use tidemark_core::{config::Config, path::RawPath};
 fn scan(
@@ -39,7 +41,7 @@ fn export_mode_overwrite_state_protection_and_wide_json() {
     let run = |args: &[&std::ffi::OsStr]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
             .arg("--config")
-            .arg(temp.path().join("missing"))
+            .arg(config_support::direct_config(temp.path(), ""))
             .arg("--state-dir")
             .arg(temp.path().join("state"))
             .args(args)
@@ -211,7 +213,7 @@ target = "regular"
     );
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
         .arg("--config")
-        .arg(temp.path().join("missing"))
+        .arg(config_support::direct_config(temp.path(), ""))
         .arg("--state-dir")
         .arg(temp.path().join("state"))
         .args(["export", "ncdu"])

@@ -5,7 +5,11 @@
 fn malformed_stage_config_prints_check_table_and_exits_five() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("invalid.toml");
-    std::fs::write(&source, "[general]\nunknown = true\n").unwrap();
+    let invalid = format!(
+        "[general]\nsocket = {:?}\nunknown = true\n",
+        dir.path().join("absent-api.sock")
+    );
+    std::fs::write(&source, &invalid).unwrap();
     let output = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("tidemark"))
         .arg("-c")
         .arg(dir.path().join("missing.toml"))
@@ -17,10 +21,7 @@ fn malformed_stage_config_prints_check_table_and_exits_five() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("FAIL"));
     assert!(text.contains("config"));
-    assert_eq!(
-        std::fs::read_to_string(&source).unwrap(),
-        "[general]\nunknown = true\n"
-    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), invalid);
 }
 #[test]
 fn json_preflight_failure_and_purge_confirmation_exit_five() {
@@ -61,7 +62,15 @@ fn missing_purge_marker_is_precondition_exit_five_without_service_calls() {
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     std::fs::write(state.join("keep"), b"untouched").unwrap();
-    std::fs::write(&config, format!("[general]\nstate_dir = {:?}\n", state)).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "[general]\nsocket = {:?}\nstate_dir = {:?}\n",
+            dir.path().join("absent-api.sock"),
+            state
+        ),
+    )
+    .unwrap();
     let output = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("tidemark"))
         .arg("-c")
         .arg(config)
@@ -79,7 +88,14 @@ fn valid_source_bypasses_invalid_installed_config_and_exits_five_for_unsafe_stat
     let installed = dir.path().join("installed.toml");
     let source = dir.path().join("source.toml");
     std::fs::write(&installed, "invalid TOML").unwrap();
-    std::fs::write(&source, "[general]\nstate_dir = '/'\n").unwrap();
+    std::fs::write(
+        &source,
+        format!(
+            "[general]\nsocket = {:?}\nstate_dir = '/'\n",
+            dir.path().join("absent-api.sock")
+        ),
+    )
+    .unwrap();
     let output = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("tidemark"))
         .arg("-c")
         .arg(&installed)
@@ -110,7 +126,15 @@ fn unsafe_directory_permissions_exit_five_before_service_access() {
             };
             std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(mode)).unwrap();
             let config = dir.path().join("config.toml");
-            std::fs::write(&config, format!("[general]\nstate_dir = {:?}\n", state)).unwrap();
+            std::fs::write(
+                &config,
+                format!(
+                    "[general]\nsocket = {:?}\nstate_dir = {:?}\n",
+                    dir.path().join("absent-api.sock"),
+                    state
+                ),
+            )
+            .unwrap();
             std::fs::write(state.join("deploy/staged.json"), b"original").unwrap();
             let outside = dir.path().join("outside");
             std::fs::write(&outside, b"outside").unwrap();

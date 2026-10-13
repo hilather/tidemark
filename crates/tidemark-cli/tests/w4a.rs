@@ -1,6 +1,8 @@
 //! Owned by: W4-A
 //! Process-isolated reporting-tool overrides and CLI n/a behavior.
 #![allow(clippy::unwrap_used)]
+#[path = "support/config.rs"]
+mod config_support;
 use std::os::unix::fs::PermissionsExt;
 fn script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
     let path = dir.join(name);
@@ -8,17 +10,19 @@ fn script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     path
 }
-fn command() -> std::process::Command {
+fn command(owner: &std::path::Path) -> std::process::Command {
     {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"));
-        cmd.args(["--config", "/missing/tidemark-w4a-config"]);
+        cmd.arg("--config")
+            .arg(config_support::direct_config(owner, ""));
         cmd
     }
 }
 #[test]
 fn missing_tools_render_na_text_and_json() {
     for json in [false, true] {
-        let mut cmd = command();
+        let command_owner = tempfile::tempdir().unwrap();
+        let mut cmd = command(command_owner.path());
         if json {
             cmd.arg("--json");
         }
@@ -54,7 +58,7 @@ fn fake_executables_are_collected_without_host_lvm() {
         "vgs",
         "printf '%s' '{\"report\":[{\"vg\":[]}]}'",
     );
-    let output = command()
+    let output = command(dir.path())
         .args(["--json", "lvm", "--mount"])
         .arg(dir.path())
         .env("TIDEMARK_LVS_BIN", lvs)
@@ -74,7 +78,7 @@ fn probe_tolerates_absent_or_failed_lvm() {
     let dir = tempfile::tempdir().unwrap();
     let failing = script(dir.path(), "fail", "exit 9");
     for path in [std::path::PathBuf::from("/missing/tidemark-lvs"), failing] {
-        let output = command()
+        let output = command(dir.path())
             .args(["--json", "probe", "--root"])
             .arg(dir.path())
             .env("TIDEMARK_LVS_BIN", path)
@@ -124,7 +128,7 @@ fn synthetic_report_maps_measured_fixture_device_in_cli_and_probe() {
             String::from_utf8_lossy(include_bytes!("../../test-support/fixtures/lvm/vgs.json"))
         ),
     );
-    let output = command()
+    let output = command(dir.path())
         .args(["--json", "lvm", "--mount"])
         .arg(dir.path())
         .env("TIDEMARK_LVS_BIN", &lvs)
@@ -139,7 +143,7 @@ fn synthetic_report_maps_measured_fixture_device_in_cli_and_probe() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["data"]["tracked"][0]["current"]["data_pct"], 25.5);
     assert_eq!(value["data"]["tracked"][0]["segtype"], "thin");
-    let output = command()
+    let output = command(dir.path())
         .args(["--json", "probe", "--root"])
         .arg(dir.path())
         .env("TIDEMARK_LVS_BIN", &lvs)
@@ -283,8 +287,7 @@ mod privileged {
         let selected = mount::mount_for_path(&mounts, &raw).unwrap();
         assert!(lvm::map_mounts(&report, std::slice::from_ref(selected)).is_empty());
         let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("config.toml");
-        std::fs::write(&config, "[lvm]\nenabled = true\n").unwrap();
+        let config = super::config_support::direct_config(dir.path(), "[lvm]\nenabled = true\n");
         for json in [false, true] {
             let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"));
             cmd.arg("--config").arg(&config);

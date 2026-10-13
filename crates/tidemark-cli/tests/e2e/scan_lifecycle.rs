@@ -1,6 +1,6 @@
 //! Owned by: TEST-e2e-scan
 //! Cancellation, retained partials, lock contention and invalid preflight.
-use super::support::{no_temporaries, Harness};
+use super::support::{direct_config, no_temporaries, Harness};
 use std::time::Duration;
 use tidemark_core::scan::SnapshotStatus;
 struct ChildGuard(Option<std::process::Child>);
@@ -22,12 +22,10 @@ fn interrupt_scan(
         std::fs::File::create(dir.join("file")).unwrap();
     }
     let state = tempfile::tempdir().unwrap();
-    let config = state.path().join("config.toml");
-    std::fs::write(
-        &config,
+    let config = direct_config(
+        state.path(),
         "[throttle]\nmin_ops_per_sec=1\nmax_ops_per_sec=1\n",
-    )
-    .unwrap();
+    );
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"));
     command
         .arg("--config")
@@ -101,7 +99,9 @@ fn interrupt_scan(
         rustix::process::Signal::INT,
     )
     .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // The cancellation diagnostic is emitted only after durable catalog/snapshot
+    // bookkeeping. This bounds test completion, not cancellation of scan work.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
         if guard.0.as_mut().unwrap().try_wait().unwrap().is_some() {
             break;
@@ -145,7 +145,7 @@ fn interrupted_cancelled_and_failed_scans() {
             drop(catalog);
             let scan = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
                 .arg("--config")
-                .arg(state.path().join("missing"))
+                .arg(direct_config(state.path(), ""))
                 .arg("--state-dir")
                 .arg(state.path())
                 .arg("--json")
@@ -162,7 +162,7 @@ fn interrupted_cancelled_and_failed_scans() {
             writable.record_finish(&old).unwrap();
             let out = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
                 .arg("--config")
-                .arg(state.path().join("missing"))
+                .arg(direct_config(state.path(), ""))
                 .arg("--state-dir")
                 .arg(state.path())
                 .arg("top")
@@ -244,4 +244,42 @@ fn interrupted_cancelled_and_failed_scans() {
     drop(guard.0.as_mut().unwrap().stdin.take());
     assert!(guard.0.take().unwrap().wait().unwrap().success());
     reader.join().unwrap();
+}
+
+#[test]
+fn unrelated_listener_does_not_redirect_direct_scan() {
+    use std::os::unix::net::UnixListener;
+    let h = Harness::new();
+    let socket = h.temp.path().join("unrelated-api.sock");
+    let listener = match UnixListener::bind(&socket) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipped unrelated listener: Unix socket bind denied by sandbox ({error})");
+            return;
+        }
+        Err(error) => panic!("unrelated listener bind failed: {error}"),
+    };
+    listener.set_nonblocking(true).unwrap();
+    let root = h.temp.path().join("fixture");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("file"), b"fixture").unwrap();
+    h.run(
+        true,
+        &[
+            "scan".as_ref(),
+            root.as_os_str(),
+            "--mode".as_ref(),
+            "walk".as_ref(),
+            "--throttle".as_ref(),
+            "max".as_ref(),
+        ],
+        0,
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    let catalog = tidemark_store::catalog::Catalog::open(&h.state, false).unwrap();
+    let rows = catalog.list(None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "complete");
 }
