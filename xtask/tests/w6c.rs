@@ -364,7 +364,11 @@ fn workflow_and_new_shell_syntax() {
     for required in [
         "el: [\"8.8\", \"8.10\"]",
         "tools/el8-build-env.sh ${{ matrix.el }}",
-        "cargo xtask rpm --native",
+        "cargo xtask rpm --native --require-clean",
+        "TIDEMARK_BUILD_DATE=$(git show -s --format=%cs HEAD)",
+        "tidemark --version | grep -F",
+        "tidemarkd --version | grep -F",
+        "TIDEMARK_BUILD_COMMIT=$commit",
         "tools/check-rpm.sh",
         "permissions:\n  contents: read",
         "fail-fast: false",
@@ -465,4 +469,69 @@ fn shellcheck_advisories_survive_passing_harness_and_warnings_fail() {
             assert!(String::from_utf8_lossy(&output.stdout).contains("WARNING_GATE"));
         }
     }
+}
+
+#[test]
+fn identity_environment_and_clean_flag() {
+    assert!(rpm::parse_args(["--require-clean".into()].into_iter()).is_err());
+    assert!(
+        rpm::parse_args(["--native".into(), "--require-clean".into()].into_iter())
+            .unwrap()
+            .require_clean
+    );
+    let commands = rpm::native_commands("0.1.0", false, false).unwrap();
+    assert_eq!(
+        commands[0].identity_env,
+        ["TIDEMARK_BUILD_COMMIT", "TIDEMARK_BUILD_DATE"]
+    );
+}
+
+#[test]
+fn container_receives_host_identity() {
+    let args = rpm::container_identity_args(
+        root(),
+        "0.1.0",
+        &[
+            ("TIDEMARK_BUILD_COMMIT", "012345abcdef"),
+            ("TIDEMARK_BUILD_DATE", "2026-10-13"),
+        ],
+    )
+    .unwrap();
+    assert!(args.contains(&"TIDEMARK_BUILD_COMMIT=012345abcdef".into()));
+    assert!(args.contains(&"TIDEMARK_BUILD_DATE=2026-10-13".into()));
+    assert_eq!(args.iter().filter(|arg| *arg == "--env").count(), 2);
+}
+
+#[test]
+fn require_clean_rejects_tracked_changes_before_building() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    git(&["init", "-q"]);
+    std::fs::write(dir.path().join("tracked"), "original").unwrap();
+    git(&["add", "tracked"]);
+    git(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@invalid",
+        "commit",
+        "-qm",
+        "fixture",
+    ]);
+    std::fs::write(dir.path().join("tracked"), "changed").unwrap();
+    let error = rpm::run(
+        dir.path(),
+        ["--native".into(), "--require-clean".into()].into_iter(),
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("rejects changes to tracked files"));
 }

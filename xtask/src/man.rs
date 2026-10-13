@@ -54,7 +54,7 @@ fn render(
     daemon: bool,
 ) -> Result<()> {
     let mut file = std::fs::File::create(out.join(format!("{name}.{section}")))?;
-    clap_mangen::Man::new(command)
+    clap_mangen::Man::new(command.long_version(None::<&str>))
         .title(name)
         .section(section)
         // roff does not quote empty arguments; retain the empty date position.

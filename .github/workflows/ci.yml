@@ -101,11 +101,19 @@ jobs:
             ~/.cargo/bin/cargo-generate-rpm
           key: rpm-el${{ matrix.el }}-generator-0.20.0-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - run: cargo fetch --locked
-      - run: cargo xtask rpm --native
+      - name: Set build identity from the checked-out commit
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          commit=$(printf '%s' '${{ github.sha }}' | cut -c1-12)
+          echo "TIDEMARK_BUILD_COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "TIDEMARK_BUILD_DATE=$(git show -s --format=%cs HEAD)" >> "$GITHUB_ENV"
+      - run: cargo xtask rpm --native --require-clean
       - run: tools/check-rpm.sh target/generate-rpm/tidemark-0.1.0-1.el8.x86_64.rpm
       - run: dnf install -y ./target/generate-rpm/tidemark-0.1.0-1.el8.x86_64.rpm
-      - run: tidemark --version
-      - run: tidemarkd --version
+      - name: Check installed build identity
+        run: |
+          tidemark --version | grep -F "commit: $TIDEMARK_BUILD_COMMIT ("
+          tidemarkd --version | grep -F "commit: $TIDEMARK_BUILD_COMMIT ("
       - run: rpm -V tidemark
       - run: sha256sum target/generate-rpm/tidemark-0.1.0-1.el8.x86_64.rpm > target/generate-rpm/tidemark-0.1.0-1.el8.x86_64.rpm.sha256
       - uses: actions/upload-artifact@v6

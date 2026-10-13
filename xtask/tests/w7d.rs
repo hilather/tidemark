@@ -31,6 +31,11 @@ fn deterministic_pages_cover_real_command_tree_and_sections() {
     man::generate(second.path()).unwrap();
     assert_eq!(files(first.path()), files(second.path()));
     for name in files(first.path()) {
+        let page = std::fs::read_to_string(first.path().join(name)).unwrap();
+        assert!(!page.contains("commit:"));
+        assert!(!page.contains("target:"));
+    }
+    for name in files(first.path()) {
         assert_eq!(
             std::fs::read(first.path().join(&name)).unwrap(),
             std::fs::read(second.path().join(&name)).unwrap()
@@ -116,4 +121,23 @@ fn rejects_invalid_generation_arguments() {
     ] {
         assert!(man::run(root(), args.into_iter().map(Into::into)).is_err());
     }
+}
+
+#[test]
+fn daemon_short_and_long_version_contract() {
+    let short = tidemarkd::Args::command()
+        .try_get_matches_from(["tidemarkd", "-V"])
+        .unwrap_err()
+        .to_string();
+    assert_eq!(short, "tidemarkd 0.1.0\n");
+    let long = tidemarkd::Args::command()
+        .try_get_matches_from(["tidemarkd", "--version"])
+        .unwrap_err()
+        .to_string();
+    let lines: Vec<_> = long.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0], short.trim());
+    assert!(lines[1].starts_with("commit: "));
+    assert!(lines[2].starts_with("target: "));
+    assert!(lines[2].contains(", profile "));
 }

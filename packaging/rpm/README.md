@@ -92,3 +92,24 @@ Download the RPM and `.sha256` from the workflow run's artifacts:
 release and layout are identical; the two artifacts differ only in the Rocky
 release they were built on (binary bytes and checksums may differ). Both use the
 same RPM filename, so keep the downloads in separate directories.
+
+## Build identity
+
+The package name and Version-Release remain unchanged. Use `tidemark --version`
+or `tidemarkd --version` after installation to see the commit, commit date,
+target triple and build profile. `-V` retains the single-line package version.
+The daemon also logs these facts when starting. Manuals omit the identity.
+
+`cargo xtask rpm` resolves identity on the host and passes
+`TIDEMARK_BUILD_COMMIT` and `TIDEMARK_BUILD_DATE` into native and container builds.
+Explicit environment values take precedence (CI uses the first 12 characters of
+`github.sha` and that commit's date). Without overrides, tracked changes add
+`-dirty` to the commit; missing Git information becomes `unknown`.
+`cargo xtask rpm --native --require-clean` rejects tracked changes before building;
+untracked files do not make the tree dirty. CI uses this guard and checks both
+installed binaries against its expected commit.
+
+RPM VCS metadata is unchanged: cargo-generate-rpm 0.20.0 was unavailable in the
+offline worker cache, so support for setting `vcs` at build time could not be
+confirmed. The coordinator should verify that capability before adding metadata;
+the executable identity is the available operator check.
