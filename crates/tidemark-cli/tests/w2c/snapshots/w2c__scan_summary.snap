@@ -2,7 +2,7 @@
 source: crates/tidemark-cli/tests/w2c/main.rs
 expression: "String::from_utf8(buf).unwrap()"
 ---
-Mode: Walk (test)
+Mode: walk (test)
 Duration: 2.00s
 Directories: 4  Files: 3
 Disk: 4.00 KiB  Reclaimable: 2.00 KiB

@@ -62,3 +62,8 @@ pub mod alerts;
 
 /// Live status output.
 pub mod status;
+
+/// Lower-case human label for an enumeration; machine serialization is untouched.
+pub fn enum_label(value: impl std::fmt::Debug) -> String {
+    format!("{value:?}").to_ascii_lowercase()
+}

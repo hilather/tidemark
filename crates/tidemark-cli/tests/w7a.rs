@@ -7,5 +7,5 @@ fn requires_terminal_with_usage_exit_code() {
     cmd.args(["--config", "/nonexistent/w7a-config", "tui"])
         .assert()
         .code(2)
-        .stderr("tui requires terminal input and output\n");
+        .stderr("tui: /data: tui requires terminal input and output\n");
 }

@@ -115,10 +115,10 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     table.push(vec![
                         e.scan_id,
                         e.root.display_lossy(),
-                        format!("{:?}", e.mode),
+                        crate::render::enum_label(e.mode),
                         format!(
                             "{}{}",
-                            e.status,
+                            e.status.to_ascii_lowercase(),
                             if e.degraded { " (degraded)" } else { "" }
                         ),
                         e.t_disk

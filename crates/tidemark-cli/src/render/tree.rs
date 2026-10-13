@@ -45,11 +45,11 @@ pub fn snapshot_header(
     let age = now.saturating_sub(meta.started_at).max(0) as u64;
     writeln!(
         out,
-        "Snapshot {} · {:?} · {}s ago · {:?}{}",
+        "Snapshot {} · {} · {}s ago · {}{}",
         meta.scan_id,
-        meta.mode,
+        super::enum_label(meta.mode),
         age,
-        meta.status,
+        super::enum_label(meta.status),
         if meta.degraded { " (degraded)" } else { "" }
     )?;
     Ok(())

@@ -1070,3 +1070,27 @@ fn catalog_mutations_preserve_existing_corrupt_state_on_uncertain_endpoint() {
         }
     }
 }
+
+#[test]
+fn live_human_state_and_scan_labels_are_lowercase() {
+    let mut report = example_now();
+    report.scans[0].last_complete.as_mut().unwrap().mode = "Walk".into();
+    let context = tidemark_cli::Context {
+        config: Default::default(),
+        config_path: "/fixture".into(),
+        json: false,
+        color: false,
+    };
+    let status = serde_json::from_value(serde_json::json!({"version":"fixture","uptime_s":1,"components":[{"name":"scan","state":"Complete","detail":"ready"}],"watch_modes":[["/data","Fid"]],"last_errors":[]})).unwrap();
+    for width in [80, 100] {
+        let text = tidemark_cli::render::now::render_text(&report, width);
+        assert!(text.contains("walk"), "{text}");
+        assert!(!text.contains("Walk"));
+        let mut out = Vec::new();
+        tidemark_cli::render::status::write_width(&status, &[], &context, false, width, &mut out)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("complete") && text.contains("fid"), "{text}");
+        assert!(!text.contains("Complete") && !text.contains("Fid"));
+    }
+}

@@ -24,18 +24,18 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
     .split(area);
     let meta = b.snapshot.meta();
     let header = format!(
-        "{} {:?} age {}s degraded={}\n{}",
+        "{} {} age {}s degraded={}\n{}",
         super::escape(meta.scan_id.to_string().as_bytes()),
-        meta.mode,
+        crate::render::enum_label(meta.mode),
         b.now.saturating_sub(meta.finished_at).max(0),
         meta.degraded,
         b.dir.path.display_lossy()
     );
     frame.render_widget(Paragraph::new(header).block(Block::bordered()), chunks[0]);
     let title = format!(
-        "{:?} | {:?} | filter {}",
-        b.state.pane,
-        b.state.sort,
+        "{} | {} | filter {}",
+        crate::render::enum_label(b.state.pane),
+        crate::render::enum_label(b.state.sort),
         super::escape(b.state.filter.as_bytes())
     );
     let items: Vec<ListItem<'_>> = match b.state.pane {

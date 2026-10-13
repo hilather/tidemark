@@ -624,3 +624,16 @@ fn missing_snapshot_file_names_the_file_and_operation() {
         "{text}"
     );
 }
+
+#[test]
+fn snapshot_header_uses_lowercase_enumerations() {
+    let mut out = Vec::new();
+    tidemark_cli::render::tree::snapshot_header(
+        &meta(RawPath::new(b"/fixture".to_vec()).unwrap(), 100),
+        110,
+        &mut out,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("· walk · 10s ago · complete"), "{text}");
+}

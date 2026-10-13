@@ -24,11 +24,11 @@ pub fn write(report: &Report, json: bool, output: &mut impl Write) -> anyhow::Re
             for dev in leaves {
                 writeln!(
                     output,
-                    "  ✓ device {} ({}:{}) {:?}; rotational={}, scheduler={}",
+                    "  ✓ device {} ({}:{}) {}; rotational={}, scheduler={}",
                     dev.name,
                     dev.major,
                     dev.minor,
-                    dev.kind,
+                    super::enum_label(&dev.kind),
                     dev.rotational
                         .map(|r| r.to_string())
                         .unwrap_or_else(|| "? (queue/rotational unavailable)".into()),
