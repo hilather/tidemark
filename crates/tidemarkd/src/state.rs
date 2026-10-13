@@ -877,9 +877,8 @@ impl LiveStateView {
                 .is_none_or(|f| f.warming && self.watch_window_at(mount, window).is_some())
     }
     pub(crate) fn rate_warming_up(&self, mount: &str, window: Duration) -> bool {
-        let elapsed = i128::from(self.now) - i128::from(self.data.started);
-        elapsed >= 0
-            && elapsed < i128::from(window.as_secs())
+        !window.is_zero()
+            && !self.rate_ready(mount)
             && self.fs_sample(mount).is_some()
             && self.fs_rate(mount, window).is_none()
     }
