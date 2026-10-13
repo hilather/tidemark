@@ -194,6 +194,9 @@ impl Drop for Rings {
 }
 
 fn ranked(map: &BTreeMap<Vec<u8>, HotEntry>, limit: usize) -> Vec<HotEntry> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let mut rows = Vec::new();
     if rows.try_reserve_exact(map.len()).is_err() {
         return Vec::new();
