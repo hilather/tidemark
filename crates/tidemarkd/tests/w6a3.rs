@@ -508,21 +508,42 @@ fn api_and_metrics_share_a_private_directory() {
     }
     let dir = tempfile::tempdir().unwrap();
     let mut c = socket_config(&dir);
+    c.general.state_dir = dir.path().join("state");
+    std::fs::create_dir(&c.general.state_dir).unwrap();
+    tidemark_store::catalog::Catalog::open(&c.general.state_dir, true).unwrap();
+    c.roots.clear();
     c.metrics.textfile = dir.path().join("metrics.prom");
+    c.metrics.interval = Duration::from_millis(50);
     let stop = Arc::new(AtomicBool::new(false));
+    let ctx = context(&c);
+    let state = ctx.state.clone();
     let handle = api::start_with_peer(
         Arc::new(c.clone()),
-        context(&c),
+        ctx,
         stop.clone(),
         Arc::new(|_| Ok((0, 1))),
     )
     .unwrap();
+    let exporter =
+        tidemarkd::metrics::start(Arc::new(c.clone()), state.clone(), stop.clone()).unwrap();
     let lock = dir.path().join("api.sock.lock");
     assert_eq!(
         std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    let result = tidemarkd::metrics::write_textfile(&c.metrics.textfile, "tidemark_up 1\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !state
+        .view()
+        .status(0)
+        .unwrap()
+        .components
+        .iter()
+        .any(|c| c.name == "metrics" && c.state == "ok")
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let exported = std::fs::read_to_string(&c.metrics.textfile);
     let mut stream = BufReader::new(UnixStream::connect(&c.general.socket).unwrap());
     stream
         .get_mut()
@@ -532,12 +553,14 @@ fn api_and_metrics_share_a_private_directory() {
     let response = read(&mut stream);
     stop.store(true, Ordering::Release);
     handle.join().unwrap().unwrap();
-    result.unwrap();
+    exporter.join().unwrap().unwrap();
     assert!(response.ok);
-    assert_eq!(
-        std::fs::read_to_string(&c.metrics.textfile).unwrap(),
-        "tidemark_up 1\n"
-    );
+    let status: StatusResult = serde_json::from_value(response.result.unwrap()).unwrap();
+    assert!(status
+        .components
+        .iter()
+        .any(|c| c.name == "metrics" && c.state == "ok"));
+    assert!(exported.unwrap().contains("tidemark_up 1"));
     assert!(!lock.exists());
     assert!(!c.general.socket.exists());
 }
