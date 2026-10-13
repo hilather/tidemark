@@ -1538,3 +1538,228 @@ fn metrics_ranked_query_counts_large_inventory_and_independent_families() {
     assert_eq!(used.len(), 1);
     assert_eq!(reclaimable.len(), 1);
 }
+
+#[test]
+fn w7a2_children_keysets_match_all_orders_and_filters() {
+    let temp = tempfile::tempdir().unwrap();
+    let metadata = meta();
+    let mut writer = SnapshotWriter::create(temp.path(), &metadata).unwrap();
+    let mut rows = vec![dir(0)];
+    for (i, name) in [
+        b"a".as_slice(),
+        b"a\x7f",
+        b"a\x80",
+        b"a\xff",
+        b"b",
+        b"bb",
+        b"z",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut r = dir(i as u32 + 1);
+        r.name = name.to_vec();
+        r.path = rows[0].path.join(&RawName::new(name.to_vec()).unwrap());
+        r.path_hash = r.path.hash64();
+        r.t_disk = (i % 3) as u64;
+        r.t_apparent = (i % 2) as u64;
+        r.t_reclaimable = (i % 4) as u64;
+        r.t_charged = (i % 2) as u64;
+        r.t_files = (i % 3) as u64;
+        r.t_inodes = (i % 2) as u64;
+        r.newest_mtime = i as i64 - 3;
+        rows.push(r);
+    }
+    writer.put_dirs(&rows).unwrap();
+    let snapshot = Snapshot::open(&writer.finish(&metadata).unwrap()).unwrap();
+    for sort in [
+        SortKey::Disk,
+        SortKey::Apparent,
+        SortKey::Reclaimable,
+        SortKey::Charged,
+        SortKey::Files,
+        SortKey::Inodes,
+        SortKey::Newest,
+        SortKey::Name,
+    ] {
+        for descending in [false, true] {
+            for filter in [b"".as_slice(), b"a", b"\xff", b"absent", b"bb"] {
+                let mut expected: Vec<_> = rows[1..]
+                    .iter()
+                    .filter(|r| {
+                        filter.is_empty() || r.name.windows(filter.len()).any(|w| w == filter)
+                    })
+                    .cloned()
+                    .collect();
+                let key = |r: &DirRow| match sort {
+                    SortKey::Disk => r.t_disk as i64,
+                    SortKey::Apparent => r.t_apparent as i64,
+                    SortKey::Reclaimable => r.t_reclaimable as i64,
+                    SortKey::Charged => r.t_charged as i64,
+                    SortKey::Files => r.t_files as i64,
+                    SortKey::Inodes => r.t_inodes as i64,
+                    SortKey::Newest => r.newest_mtime,
+                    SortKey::Name => 0,
+                };
+                expected.sort_by(|a, b| {
+                    let c = if sort == SortKey::Name {
+                        a.name.cmp(&b.name)
+                    } else {
+                        key(a).cmp(&key(b))
+                    };
+                    (if descending { c.reverse() } else { c }).then_with(|| a.name.cmp(&b.name))
+                });
+                assert_eq!(
+                    snapshot.children_count(0, filter).unwrap() as usize,
+                    expected.len()
+                );
+                for reverse in [false, true] {
+                    let ordered: Vec<_> = if reverse {
+                        expected.iter().rev().cloned().collect()
+                    } else {
+                        expected.clone()
+                    };
+                    let mut actual = Vec::new();
+                    for _ in 0..=rows.len() {
+                        let page = snapshot
+                            .children_page(0, sort, descending, actual.last(), reverse, 2, filter)
+                            .unwrap();
+                        if page.is_empty() {
+                            break;
+                        }
+                        actual.extend(page);
+                    }
+                    assert_eq!(actual, ordered);
+                    // Every possible exclusive cursor, including inside a tie group.
+                    for (i, cursor) in ordered.iter().enumerate() {
+                        assert_eq!(
+                            snapshot
+                                .children_page(
+                                    0,
+                                    sort,
+                                    descending,
+                                    Some(cursor),
+                                    reverse,
+                                    2,
+                                    filter
+                                )
+                                .unwrap(),
+                            ordered[i + 1..].iter().take(2).cloned().collect::<Vec<_>>()
+                        );
+                    }
+                }
+                if filter.is_empty() && (descending || sort == SortKey::Name) {
+                    let legacy = snapshot.children(0, sort, 100).unwrap();
+                    if sort != SortKey::Name || !descending {
+                        assert_eq!(expected, legacy);
+                    } else {
+                        assert_eq!(expected, legacy.into_iter().rev().collect::<Vec<_>>());
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(snapshot.children_count(999, b"").unwrap(), 0);
+    assert!(snapshot
+        .children_page(0, SortKey::Disk, true, None, false, 1_000_001, b"")
+        .is_err());
+    assert!(snapshot
+        .children_page(0, SortKey::Disk, true, None, false, 0, b"")
+        .unwrap()
+        .is_empty());
+    let mut invalid = rows[1].clone();
+    invalid.t_disk = u64::MAX;
+    assert!(snapshot
+        .children_page(0, SortKey::Disk, true, Some(&invalid), false, 1, b"")
+        .is_err());
+}
+
+#[test]
+fn w7a2_large_children_pages_have_no_duplicates_or_omissions() {
+    let (_temp, file) = write_fixture(2501);
+    let snapshot = Snapshot::open(&file).unwrap();
+    let mut actual = Vec::new();
+    for expected_len in [1000, 1000, 500, 0] {
+        let page = snapshot
+            .children_page(0, SortKey::Disk, true, actual.last(), false, 1000, b"")
+            .unwrap();
+        assert_eq!(page.len(), expected_len);
+        actual.extend(page);
+    }
+    assert_eq!(actual, snapshot.children(0, SortKey::Disk, 2500).unwrap());
+    assert_eq!(snapshot.children_count(0, b"").unwrap(), 2500);
+}
+
+#[test]
+fn w7a2_link_pages_preserve_null_duplicates_and_byte_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let metadata = meta();
+    let mut writer = SnapshotWriter::create(temp.path(), &metadata).unwrap();
+    writer.put_dirs(&[dir(0), dir(1)]).unwrap();
+    let mut instances = Vec::new();
+    for dir_id in [1, 0] {
+        for name in [
+            Some(b"a\xff".as_slice()),
+            None,
+            Some(b"a"),
+            None,
+            Some(b"a\x80"),
+            Some(b"a"),
+        ] {
+            instances.push(LinkInstanceRow {
+                ino: 100,
+                dir_id,
+                name: name.map(|n| RawName::new(n.to_vec()).unwrap()),
+            });
+        }
+    }
+    writer.put_link_instances(&instances).unwrap();
+    let snapshot = Snapshot::open(&writer.finish(&metadata).unwrap()).unwrap();
+    let mut forward = Vec::new();
+    for _ in 0..=instances.len() {
+        let page = snapshot
+            .link_instances_page(100, forward.last(), false, 1)
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        forward.extend(page);
+    }
+    assert_eq!(
+        forward.iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
+        snapshot.link_instances(100).unwrap()
+    );
+    assert_eq!(forward.len(), instances.len());
+    for reverse in [false, true] {
+        let mut ordered = forward.clone();
+        if reverse {
+            ordered.reverse();
+        }
+        assert_eq!(
+            snapshot.link_instances_page(100, None, reverse, 2).unwrap(),
+            ordered[..2]
+        );
+        for (i, cursor) in ordered.iter().enumerate() {
+            assert_eq!(
+                snapshot
+                    .link_instances_page(100, Some(cursor), reverse, 2)
+                    .unwrap(),
+                ordered[i + 1..].iter().take(2).cloned().collect::<Vec<_>>()
+            );
+        }
+    }
+    assert!(snapshot
+        .link_instances_page(999, None, false, 2)
+        .unwrap()
+        .is_empty());
+    assert!(snapshot
+        .link_instances_page(100, None, false, 0)
+        .unwrap()
+        .is_empty());
+    assert!(snapshot
+        .link_instances_page(100, None, false, 1_000_001)
+        .is_err());
+    assert!(snapshot
+        .link_instances_page(u64::MAX, None, false, 1)
+        .is_err());
+}
