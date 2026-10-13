@@ -1,13 +1,13 @@
 //! Owned by: W4-B
 //! Descriptor-relative state removal with configuration, marker and mount guards.
 
-use super::{DeployError, Marker, MARKER, MAX_RECORD_BYTES};
+use super::{DeployError, Marker, MARKER};
 use rustix::fs::{self, AtFlags, Dir, FileType, Mode, OFlags};
 use std::{
     ffi::CString,
     io::{self, Read},
     os::fd::{AsRawFd, OwnedFd},
-    path::{Component, Path},
+    path::Path,
 };
 
 // Limit simultaneous open directories; arbitrary width is streamed rather than collected.
@@ -25,48 +25,9 @@ fn directory_at(
     }
 }
 fn open_absolute(path: &Path) -> io::Result<OwnedFd> {
-    if !path.is_absolute() {
-        return Err(io::Error::other("purge path must be absolute"));
-    }
-    let mut fd = fs::open(
-        "/",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                fd = directory_at(&fd, name)?;
-            }
-            _ => {
-                return Err(io::Error::other(
-                    "purge path must have only normal components",
-                ))
-            }
-        }
-    }
-    Ok(fd)
+    tidemark_store::state_dir::trusted_directory(path)
 }
-fn read_at(fd: &OwnedFd, name: &str) -> io::Result<Vec<u8>> {
-    let file = fs::openat(
-        fd,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    )?;
-    if FileType::from_raw_mode(fs::fstat(&file)?.st_mode) != FileType::RegularFile {
-        return Err(io::Error::other("marker is not a regular file"));
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::from(file)
-        .take(MAX_RECORD_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(io::Error::other("marker exceeds 1 MiB"));
-    }
-    Ok(bytes)
-}
+
 fn mount_id(fd: &OwnedFd) -> io::Result<u64> {
     // fdinfo exposes mount ids on EL8, including same-device bind mounts (statx MNT_ID is newer).
     let mut text = String::new();
@@ -96,12 +57,16 @@ pub(super) fn purge_guard(state_dir: &Path) -> Result<GuardedRoot, DeployError> 
         open_absolute(parent_path).map_err(|error| DeployError::Guard(super::io_detail(&error)))?;
     let root = directory_at(&parent, &name)
         .map_err(|error| DeployError::Guard(super::io_detail(&error)))?;
-    let bytes = read_at(&root, MARKER).map_err(|error| {
-        DeployError::Guard(format!(
-            "missing or unsafe state marker: {}",
-            super::io_detail(&error)
-        ))
-    })?;
+    super::files::check_purge_root(&root, state_dir)?;
+    super::files::check_leaf_at(&root, std::ffi::OsStr::new(MARKER), &state_dir.join(MARKER))?;
+    let bytes =
+        super::files::read_state_at(&root, std::ffi::OsStr::new(MARKER), &state_dir.join(MARKER))
+            .map_err(|error| {
+            DeployError::Guard(format!(
+                "missing or unsafe state marker: {}",
+                super::io_detail(&error)
+            ))
+        })?;
     let marker: Marker = serde_json::from_slice(&bytes)
         .map_err(|error| DeployError::Guard(format!("invalid state marker: {error}")))?;
     if marker.format != "tidemark-state-v1" || marker.state_dir.as_path() != state_dir {
