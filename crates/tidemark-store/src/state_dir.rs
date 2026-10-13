@@ -153,6 +153,7 @@ impl StateDir {
             }
         }
         if found {
+            if base.as_os_str().as_bytes().starts_with(b"/proc/self/fd/") { base.push("."); }
             let mut dir = Self::open(&base, create)?;
             for name in relative {
                 dir = dir.subdir(name, create)?;
