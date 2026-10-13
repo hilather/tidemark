@@ -205,6 +205,7 @@ struct Shared {
     deadline: Arc<Mutex<Option<Instant>>>,
     commands: Sender<Command>,
     clock: crate::Clock,
+    monotonic: crate::Clock,
     // Same MAX_SUBJECTS cap as the scan-status inventory.
     failures: Arc<Mutex<std::collections::BTreeMap<RawPath, Retry>>>,
 }
@@ -771,7 +772,7 @@ fn launch(
                     let attempts = failures
                         .get(&req.root)
                         .map_or(1, |r| r.attempts.saturating_add(1));
-                    let due = retry_due((shared.clock)(), attempts);
+                    let due = retry_due((shared.monotonic)(), attempts);
                     if failures.len() == crate::state::MAX_SUBJECTS
                         && !failures.contains_key(&req.root)
                     {
@@ -794,7 +795,7 @@ fn launch(
                     // Preserve the existing 30-second scheduled deferral without
                     // counting Busy/cancellation as a failure or claiming recovery.
                     let mut failures = shared.failures.lock();
-                    let due = (shared.clock)().saturating_add(30);
+                    let due = (shared.monotonic)().saturating_add(30);
                     if failures.len() == crate::state::MAX_SUBJECTS
                         && !failures.contains_key(&req.root)
                     {
@@ -814,7 +815,7 @@ fn launch(
                     if let Some(mut status) = shared.state.view().scans().and_then(|v| {
                         v.into_iter().find(|s| s.root == root_label(&req.root))
                     }) {
-                        status.next_due = Some(due);
+                        status.next_due = Some((shared.clock)().saturating_add(due.saturating_sub((shared.monotonic)())));
                         shared.state.publish(Publication::Scan(status), health.clone())?;
                     }
                 }
@@ -845,7 +846,19 @@ fn launch(
         })
 }
 
+#[cfg(test)]
 fn report_firstboot(state: &LiveState, now: i64) -> Result<bool, DaemonError> {
+    let elapsed = state
+        .view()
+        .firstboot_inputs()
+        .map_or(0, |i| now.saturating_sub(i.daemon_started_at));
+    report_firstboot_elapsed(state, now, elapsed)
+}
+fn report_firstboot_elapsed(
+    state: &LiveState,
+    now: i64,
+    elapsed: i64,
+) -> Result<bool, DaemonError> {
     let Some(inputs) = state.view().firstboot_inputs() else {
         return Ok(false);
     };
@@ -876,7 +889,7 @@ fn report_firstboot(state: &LiveState, now: i64) -> Result<bool, DaemonError> {
         ]
         .iter()
         .all(|name| inputs.components.iter().any(|c| c.name == *name));
-    if !ready && now.saturating_sub(inputs.daemon_started_at) < 120 {
+    if !ready && elapsed < 120 {
         return Ok(false);
     }
     let report = crate::firstboot::build(&inputs, now);
@@ -898,7 +911,7 @@ pub fn start(
 ) -> Result<(ScanControl, crate::ServiceHandle), DaemonError> {
     start_with_clock(config, state, writer, shutdown, Arc::new(crate::unix_now))
 }
-/// Start scan scheduling with an injected Unix-seconds clock for retry and due times.
+/// Inject wall time for calendar schedules; operational intervals use real elapsed time.
 /// Scan metadata timestamps remain owned by the orchestrator.
 pub fn start_with_clock(
     config: Arc<Config>,
@@ -907,12 +920,31 @@ pub fn start_with_clock(
     shutdown: Shutdown,
     clock: crate::Clock,
 ) -> Result<(ScanControl, crate::ServiceHandle), DaemonError> {
+    start_with_clocks(
+        config,
+        state,
+        writer,
+        shutdown,
+        clock,
+        crate::monotonic_clock(),
+    )
+}
+/// Start with independent wall and elapsed-seconds clocks.
+pub fn start_with_clocks(
+    config: Arc<Config>,
+    state: LiveState,
+    writer: tswriter::Sender,
+    shutdown: Shutdown,
+    clock: crate::Clock,
+    monotonic: crate::Clock,
+) -> Result<(ScanControl, crate::ServiceHandle), DaemonError> {
     start_inner(
         config,
         state,
         writer,
         shutdown,
         clock,
+        monotonic,
         Arc::new(Mutex::new(None)),
     )
 }
@@ -929,6 +961,7 @@ pub(crate) fn start_with_deadline(
         writer,
         shutdown,
         Arc::new(crate::unix_now),
+        crate::monotonic_clock(),
         deadline,
     )
 }
@@ -938,6 +971,7 @@ fn start_inner(
     writer: tswriter::Sender,
     shutdown: Shutdown,
     clock: crate::Clock,
+    monotonic: crate::Clock,
     deadline: Arc<Mutex<Option<Instant>>>,
 ) -> Result<(ScanControl, crate::ServiceHandle), DaemonError> {
     crate::state::validate_bounds(&config)?;
@@ -953,6 +987,7 @@ fn start_inner(
         deadline,
         commands: tx,
         clock,
+        monotonic,
         failures: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
     });
     let control = ScanControl {
@@ -1077,6 +1112,8 @@ fn scheduler(
     let mut report_at = i64::MIN;
     let mut schedule_at = i64::MIN;
     let mut generation = u64::MAX;
+    let started = (shared.monotonic)();
+    let mut cadence = std::collections::BTreeMap::new();
     shared
         .state
         .publish_component(component("scheduler", "ok", "scheduler started"))?;
@@ -1091,9 +1128,10 @@ fn scheduler(
             }
         }
         let now = (shared.clock)();
-        if !reported && now >= report_at {
-            report_at = now.saturating_add(1);
-            match report_firstboot(&shared.state, now) {
+        let elapsed = (shared.monotonic)();
+        if !reported && elapsed >= report_at {
+            report_at = elapsed.saturating_add(1);
+            match report_firstboot_elapsed(&shared.state, now, elapsed.saturating_sub(started)) {
                 Ok(done) => {
                     reported = done
                         || shared.state.view().firstboot_inputs().is_some_and(|i| {
@@ -1134,15 +1172,16 @@ fn scheduler(
             continue;
         }
         let (config, current_generation) = shared.state.config();
-        if now < schedule_at && generation == current_generation {
+        if elapsed < schedule_at && generation == current_generation {
             continue;
         }
-        schedule_at = now.saturating_add(1);
+        schedule_at = elapsed.saturating_add(1);
         if generation != current_generation {
+            cadence.clear();
             // Reload resets delays and attempts, but cannot claim a failed root recovered.
             shared.failures.lock().values_mut().for_each(|r| {
                 r.attempts = 0;
-                r.due = now;
+                r.due = elapsed;
             });
         }
         generation = current_generation;
@@ -1161,7 +1200,7 @@ fn scheduler(
             let last = catalog
                 .latest(&raw)
                 .map_err(|e| DaemonError::Store(e.to_string()))?;
-            let due = next_run(
+            let mut due = next_run(
                 &parse_schedule(&root.schedule)?,
                 root.window
                     .as_deref()
@@ -1171,12 +1210,37 @@ fn scheduler(
                 last.as_ref().and_then(|e| e.finished_at),
                 now,
             )?;
+            let mut operational_due = None;
+            if let Schedule::Every(interval) = parse_schedule(&root.schedule)? {
+                let last_finished = last.as_ref().and_then(|e| e.finished_at);
+                let initial_due = next_run(&Schedule::Every(interval), None, last_finished, now)?;
+                let entry = cadence.entry(raw.clone()).or_insert_with(|| {
+                    (
+                        last_finished,
+                        elapsed
+                            .saturating_add(initial_due.unwrap_or(now).saturating_sub(now).max(0)),
+                    )
+                });
+                if entry.0 != last_finished {
+                    *entry = (last_finished, elapsed.saturating_add(interval));
+                }
+                operational_due = Some(entry.1);
+                // Calendar windows still use wall time; elapsed cadence supplies readiness.
+                due = next_run(
+                    &Schedule::Every(interval),
+                    root.window
+                        .as_deref()
+                        .map(parse_window)
+                        .transpose()?
+                        .as_ref(),
+                    None,
+                    now.saturating_add(entry.1.saturating_sub(elapsed).max(0)),
+                )?;
+            }
             let next_due = due.map(|scheduled| {
-                shared
-                    .failures
-                    .lock()
-                    .get(&raw)
-                    .map_or(scheduled, |r| r.due)
+                shared.failures.lock().get(&raw).map_or(scheduled, |r| {
+                    now.saturating_add(r.due.saturating_sub(elapsed).max(0))
+                })
             });
             if let Err(error) = shared.state.publish_scheduled(
                 ScanStatus {
@@ -1195,11 +1259,12 @@ fn scheduler(
                 continue;
             }
             if due.is_some_and(|d| d <= now)
+                && operational_due.is_none_or(|d| d <= elapsed)
                 && shared
                     .failures
                     .lock()
                     .get(&raw)
-                    .is_none_or(|r| r.due <= now)
+                    .is_none_or(|r| r.due <= elapsed)
             {
                 let mut active = shared.active.lock();
                 if active.is_some() {
@@ -1524,8 +1589,10 @@ mod tests {
                 component("startup", "ok", "test"),
             )
             .unwrap();
+        assert!(!report_firstboot_elapsed(&state, 7200, 119).unwrap());
+        assert!(!report_firstboot_elapsed(&state, 0, 119).unwrap());
         assert!(!report_firstboot(&state, 129).unwrap());
-        assert!(report_firstboot(&state, 130).unwrap());
+        assert!(report_firstboot_elapsed(&state, 0, 120).unwrap());
         let path = storage.path().join("deploy/firstboot.json");
         let bytes = std::fs::read(&path).unwrap();
         assert!(!report_firstboot(&state, 140).unwrap());
