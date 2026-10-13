@@ -161,7 +161,7 @@ fn mutation_is_confined() {
 }
 #[test]
 fn tiny_bench_matches_du() {
-    let t = TempDir::new().unwrap();
+    let t = test_support::private_tempdir().unwrap();
     let root = t.path().join("fixture");
     let out = t.path().join("results");
     fs::create_dir(&root).unwrap();
@@ -273,7 +273,7 @@ fn staging_cold_and_watcher() {
         eprintln!("pending VM: set TIDEMARK_W7B_STAGING_VM=1 on a disposable staging VM only");
         return;
     }
-    let t = TempDir::new().unwrap();
+    let t = test_support::private_tempdir().unwrap();
     let root = t.path().join("fixture");
     fs::create_dir(&root).unwrap();
     assert!(generate(&root, 500, &[]).status.success());
