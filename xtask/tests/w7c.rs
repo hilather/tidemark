@@ -100,3 +100,65 @@ fn fault_scripts_are_guarded_and_valid_shell() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// Deliberately conservative: reject forbidden command words even in quoted
+// subprocess argv, absolute paths, and inline shell/Python snippets. This is a
+// source guard, not shell evaluation or dynamic command/data-flow analysis.
+fn forbidden_guest_tool(source: &str) -> Option<&str> {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .flat_map(|line| line.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-'))
+        .find(|word| matches!(*word, "rg" | "jq" | "fd" | "bc"))
+}
+
+#[test]
+fn fault_scripts_use_available_guest_tools() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut pending = vec![root.join("tests/fault")];
+    let mut checked = 0;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|ext| ext == "sh" || ext == "bash" || ext == "py")
+            {
+                let source = std::fs::read_to_string(&path).unwrap();
+                assert_eq!(
+                    forbidden_guest_tool(&source),
+                    None,
+                    "unsupported guest tool in {}",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked >= 9, "must check entrypoints and shared helpers");
+    let common = std::fs::read_to_string(root.join("tests/fault/common.bash")).unwrap();
+    assert!(common.find("command -v mkfs.xfs").unwrap() < common.find("work=$(mktemp").unwrap());
+    assert!(common.contains("install xfsprogs in the disposable guest"));
+}
+
+#[test]
+fn guest_tool_guard_covers_shell_and_python_commands() {
+    for tool in ["rg", "jq", "fd", "bc"] {
+        for source in [
+            format!("{tool} -q pattern file"),
+            format!("if /usr/bin/{tool} file; then :; fi"),
+            format!("subprocess.run(['{tool}', 'file'])"),
+            format!("os.system(\"{tool} file\")"),
+            format!("run_helper 20 {tool} file"),
+        ] {
+            assert_eq!(forbidden_guest_tool(&source), Some(tool), "{source}");
+        }
+    }
+    assert_eq!(
+        forbidden_guest_tool("# rg is unavailable\ngrep -Fq NoSpace file\nchild_fd = 1"),
+        None
+    );
+}

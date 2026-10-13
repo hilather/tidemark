@@ -1,6 +1,12 @@
 # Owned by: W7-C2-fault. Shared disposable-guest harness (not a runner entrypoint).
 # shellcheck shell=bash
 setup() {
+    # xfsprogs is additional to the minimal guest tools; fail before resources.
+    command -v mkfs.xfs >/dev/null 2>&1 || {
+        echo 'FAIL: requires mkfs.xfs (install xfsprogs in the disposable guest)' >&2
+        echo "RESULT $(basename "$0"): FAIL"
+        exit 1
+    }
     umask 077
     script=$(basename "$0")
     repo=$(pwd)
