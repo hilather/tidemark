@@ -112,7 +112,7 @@ pub(super) fn resolve_event_with_fallback(
     path_fd: BorrowedFd<'_>,
     fallback: Option<&RawPath>,
 ) -> io::Result<(RawPath, EventStat, i64)> {
-    resolve_with_fallback(path_fd, fallback, || {
+    resolve_with_fallback(fd, path_fd, fallback, || {
         rustix::fs::statx(
             fd,
             "",
@@ -127,10 +127,11 @@ fn resolve_with(
     fd: BorrowedFd<'_>,
     stat: impl FnOnce() -> io::Result<rustix::fs::Statx>,
 ) -> io::Result<(RawPath, EventStat, i64)> {
-    resolve_with_fallback(fd, None, stat)
+    resolve_with_fallback(fd, fd, None, stat)
 }
 fn resolve_with_fallback(
     fd: BorrowedFd<'_>,
+    path_fd: BorrowedFd<'_>,
     fallback: Option<&RawPath>,
     stat: impl FnOnce() -> io::Result<rustix::fs::Statx>,
 ) -> io::Result<(RawPath, EventStat, i64)> {
@@ -143,7 +144,7 @@ fn resolve_with_fallback(
             (stat, stat.st_ctime)
         }
     };
-    let raw = match descriptor_path(fd)
+    let raw = match descriptor_path(path_fd)
         .and_then(|path| RawPath::from_path(&path).map_err(io::Error::other))
     {
         Ok(path) => path,
