@@ -196,11 +196,14 @@ pub struct Watcher {
 }
 // Acknowledgements are FIFO and scoped to the current loss. Eviction is conservative.
 const LOSS_ACK_CAP: usize = 1024;
+const DIRTY_CAP: usize = 200_000;
 struct State {
     rings: rings::Rings,
     dirty: BTreeSet<RawPath>,
+    dirty_bytes: usize,
     loss_pending: bool,
     loss_taken: VecDeque<RawPath>,
+    loss_taken_bytes: usize,
     last_at: Option<i64>,
     events: u64,
     overflows: u64,
@@ -213,9 +216,32 @@ struct State {
 }
 impl State {
     fn mark_loss(&mut self) {
+        self.rings.budget().release(self.dirty_bytes);
+        self.dirty_bytes = 0;
         self.dirty.clear();
         self.loss_pending = true;
+        self.rings.budget().release(self.loss_taken_bytes);
+        self.loss_taken_bytes = 0;
         self.loss_taken.clear();
+    }
+    fn dirty_parent(&mut self, parent: &RawPath, at: i64) {
+        if self.dirty.contains(parent) {
+            return;
+        }
+        let bytes = parent.as_bytes().len();
+        let full = self.dirty.len() >= DIRTY_CAP;
+        if full {
+            self.rings.overflow(at);
+            return;
+        }
+        if !self.rings.budget().reserve(bytes) {
+            self.mark_loss();
+            self.rings.dirty_loss(at, true);
+            return;
+        }
+        // RawPath::clone clones the normalized Vec into an exact-length allocation.
+        self.dirty.insert(parent.clone());
+        self.dirty_bytes += bytes;
     }
     fn observe_time(&mut self, at: i64) {
         if self.last_at.is_some_and(|last| at < last) {
@@ -242,6 +268,7 @@ impl Watcher {
         events: impl IntoIterator<Item = (i64, [Vec<u8>; 3], i64, Option<String>, (u64, u64))>,
     ) -> io::Result<Self> {
         let mut rings = rings::Rings::new();
+        rings.configure(budget::Budget::new(), mount.as_bytes());
         let mut events = events.into_iter().peekable();
         rings.advance(events.peek().map_or_else(now, |event| event.0));
         for (at, keys, delta, unit, identity) in events {
@@ -252,8 +279,10 @@ impl Watcher {
             state: Arc::new(Mutex::new(State {
                 rings,
                 dirty: BTreeSet::new(),
+                dirty_bytes: 0,
                 loss_pending: false,
                 loss_taken: VecDeque::new(),
+                loss_taken_bytes: 0,
                 last_at: None,
                 events: 0,
                 overflows: 0,
@@ -356,8 +385,10 @@ impl Watcher {
         let state = Arc::new(Mutex::new(State {
             rings: rings::Rings::new(),
             dirty: BTreeSet::new(),
+            dirty_bytes: 0,
             loss_pending: false,
             loss_taken: VecDeque::new(),
+            loss_taken_bytes: 0,
             last_at: None,
             events: 0,
             overflows: 0,
@@ -368,6 +399,10 @@ impl Watcher {
             dropped_events: 0,
             unmapped_events: 0,
         }));
+        state
+            .lock()
+            .rings
+            .configure(budget::Budget::new(), cfg.mount.as_bytes());
         state.lock().rings.advance(now());
         let filesystem_mount = if mode == WatchMode::FdFilesystem {
             Some(descriptor_mount_id(mount_fd.as_fd())?)
@@ -409,6 +444,9 @@ impl Watcher {
                     paths: fidmode::PathSizes::new(cfg.lru_entries),
                     handles: fidmode::HandlePaths::new(100_000),
                 };
+                let budget = worker_state.lock().rings.budget().clone();
+                processor.paths.set_budget(budget.clone());
+                processor.handles.set_budget(budget);
                 loop {
                     if worker_stopping.load(Ordering::Relaxed) {
                         break;
@@ -537,7 +575,7 @@ impl Watcher {
     /// Recovery, overflow, rollback and cut lists make hot data unavailable (lossy).
     /// Persistence rows share a cursor with [`Self::drain_completed_minutes`]; a row
     /// is handed out once through whichever method drains its minute first. The
-    /// minute facts and directory rows remain available after the legacy row drain.
+    /// minute facts remain available after the legacy row drain; its key maps are released.
     pub fn drain_minutes(&self, top_k: usize) -> Vec<CompletedMinute> {
         self.drain_minutes_at(now(), top_k)
     }
@@ -609,25 +647,41 @@ impl Watcher {
             && !state.loss_taken.contains(under);
         if lost {
             if state.loss_taken.len() == LOSS_ACK_CAP {
-                state.loss_taken.pop_front();
+                if let Some(old) = state.loss_taken.pop_front() {
+                    let bytes = old.as_bytes().len();
+                    state.loss_taken_bytes -= bytes;
+                    state.rings.budget().release(bytes);
+                }
             }
-            state.loss_taken.push_back(under.clone());
+            let bytes = under.as_bytes().len();
+            if state.rings.budget().reserve(bytes) {
+                if state.loss_taken.try_reserve(1).is_ok() {
+                    state.loss_taken.push_back(under.clone());
+                    state.loss_taken_bytes += bytes;
+                } else {
+                    state.rings.budget().release(bytes);
+                }
+            }
         }
         let mut paths: Vec<_> = state
             .dirty
-            .iter()
-            .filter(|p| p.starts_with(under))
-            .cloned()
+            .extract_if(.., |p| p.starts_with(under))
             .collect();
-        for path in &paths {
-            state.dirty.remove(path);
-        }
+        let removed: usize = paths.iter().map(|p| p.as_bytes().len()).sum();
+        // Tests may seed dirty directly without the admission helper.
+        let removed = removed.min(state.dirty_bytes);
+        state.dirty_bytes -= removed;
+        state.rings.budget().release(removed);
         if ancestor || lost {
             paths.push(under.clone());
             paths.sort();
             paths.dedup();
         }
         paths
+    }
+    /// Retained path/key capacities currently admitted against the 64 MiB ceiling.
+    pub fn retained_key_bytes(&self) -> usize {
+        self.state.lock().rings.budget().used()
     }
     /// Explain caps and loss in the retained fifteen-minute history.
     /// Reports at most eight causes, each with its latest affected UTC minute.
@@ -979,14 +1033,11 @@ impl Processor<'_> {
             who.unit,
             identity,
         );
-        if state.dirty.len() < 200_000 {
-            state.dirty.insert(parent);
-        } else {
-            state.rings.overflow(at);
-        }
+        state.dirty_parent(&parent, at);
     }
 }
 
+mod budget;
 mod fdmode;
 mod fidmode;
 mod rings;
@@ -1045,6 +1096,41 @@ impl std::fmt::Display for WatchMode {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn dirty_byte_admission_collapses_to_root_and_recovers() {
+        let watcher = Watcher::from_injected_events(raw("/data"), []).unwrap();
+        watcher
+            .state
+            .lock()
+            .rings
+            .configure(budget::Budget::with_limit(240), b"/data");
+        let parent = raw(&format!("/data/{}", "x".repeat(220)));
+        {
+            let mut state = watcher.state.lock();
+            state.dirty_parent(&parent, 0);
+            state.dirty_parent(&parent, 0); // existing parent requires no reservation
+            assert_eq!(state.dirty.len(), 1);
+            state.dirty_parent(&raw("/data/other-long-parent"), 60);
+            assert!(state.dirty.is_empty());
+            assert_eq!(state.dirty_bytes, 0);
+            assert!(state
+                .rings
+                .detail(60)
+                .contains("dirty set over its memory budget"));
+        }
+        assert_eq!(
+            watcher.take_dirty(&raw("/data/new-subtree")),
+            vec![raw("/data/new-subtree")]
+        );
+        watcher
+            .state
+            .lock()
+            .dirty_parent(&raw("/data/recovered"), 120);
+        assert_eq!(
+            watcher.take_dirty(&raw("/data/recovered")),
+            vec![raw("/data/recovered")]
+        );
+    }
     #[test]
     fn unmapped_event_keeps_totals_and_root_directory() {
         let temp = tempfile::tempdir().unwrap();
@@ -1201,8 +1287,12 @@ mod tests {
             let minutes = watcher.drain_minutes_at(180, 1000);
             assert_eq!(minutes.len(), 2);
             assert_eq!(minutes[0].started_at, 60);
-            assert_eq!(minutes[0].dirs[0].bytes_delta, 2);
-            assert_eq!(minutes[0].dirs[0].top_unit.as_deref(), Some("u"));
+            if legacy_first {
+                assert!(minutes[0].dirs.is_empty());
+            } else {
+                assert_eq!(minutes[0].dirs[0].bytes_delta, 2);
+                assert_eq!(minutes[0].dirs[0].top_unit.as_deref(), Some("u"));
+            }
             assert_eq!(minutes[0].persisted.len(), if legacy_first { 0 } else { 3 });
             assert!(minutes[1].dirs.is_empty() && minutes[1].persisted.is_empty());
             assert!(!minutes[1].lossy);
@@ -1314,8 +1404,10 @@ mod tests {
         Mutex::new(State {
             rings: rings::Rings::new(),
             dirty: BTreeSet::new(),
+            dirty_bytes: 0,
             loss_pending: false,
             loss_taken: VecDeque::new(),
+            loss_taken_bytes: 0,
             last_at: None,
             events: 0,
             overflows: 0,

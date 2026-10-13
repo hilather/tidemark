@@ -1,6 +1,9 @@
 //! Owned by: W5-A
 //! Bounded minute aggregation with deterministic top-key retention.
-use super::{CompletedMinute, HotScope};
+use super::{
+    budget::{copy, Budget, Reservation},
+    CompletedMinute, HotScope,
+};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use tidemark_core::live::{HotEntry, HotMinute};
 const CURRENT_CAP: usize = 20_000;
@@ -41,6 +44,11 @@ impl UnitCounts {
     }
 }
 struct Bucket {
+    budget: Budget,
+    charged: usize,
+    key_budget: bool,
+    dirty_full: bool,
+    dirty_budget: bool,
     minute: i64,
     maps: [BTreeMap<Vec<u8>, HotEntry>; 3],
     units: [BTreeMap<Vec<u8>, UnitCounts>; 3],
@@ -58,7 +66,67 @@ struct Bucket {
     overflow_end: u64,
     seen: HashSet<(usize, Vec<u8>, (u64, u64))>,
 }
+impl Bucket {
+    fn release(&mut self, bytes: usize) {
+        self.charged -= bytes;
+        self.budget.release(bytes);
+    }
+    fn compact(&mut self, index: usize, limit: usize) {
+        // Rank references, then move retained rows: no duplicate pathname payload.
+        let mut rows: Vec<_> = self.maps[index].iter().collect();
+        rows.sort_by(|(_, a), (_, b)| b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key)));
+        let keep: HashSet<_> = rows
+            .into_iter()
+            .take(limit)
+            .map(|(k, _)| k.as_slice())
+            .collect();
+        let removed: usize = self.maps[index]
+            .iter()
+            .filter(|(k, _)| !keep.contains(k.as_slice()))
+            .map(|(k, r)| {
+                k.capacity() + r.key.capacity() + r.top_unit.as_ref().map_or(0, String::capacity)
+            })
+            .sum();
+        let keep: HashSet<_> = keep.into_iter().map(|k| k as *const [u8]).collect();
+        self.maps[index].retain(|k, _| keep.contains(&(k.as_slice() as *const [u8])));
+        let mut removed = removed;
+        self.units[index].retain(|k, v| {
+            let retain = self.maps[index].contains_key(k);
+            if !retain {
+                removed += k.capacity() + v.0.keys().map(String::capacity).sum::<usize>();
+            }
+            retain
+        });
+        self.release(removed);
+    }
+    fn clear_rows(&mut self) {
+        let bytes: usize = self
+            .maps
+            .iter()
+            .flat_map(|m| m.iter())
+            .map(|(k, r)| {
+                k.capacity() + r.key.capacity() + r.top_unit.as_ref().map_or(0, String::capacity)
+            })
+            .sum::<usize>()
+            + self
+                .units
+                .iter()
+                .flat_map(|m| m.iter())
+                .map(|(k, v)| k.capacity() + v.0.keys().map(String::capacity).sum::<usize>())
+                .sum::<usize>();
+        self.maps = std::array::from_fn(|_| BTreeMap::new());
+        self.units = std::array::from_fn(|_| BTreeMap::new());
+        self.release(bytes);
+    }
+}
+impl Drop for Bucket {
+    fn drop(&mut self) {
+        self.budget.release(self.charged);
+    }
+}
 pub(super) struct Rings {
+    budget: Budget,
+    root: Vec<u8>,
     buckets: VecDeque<Bucket>,
     pub dropped: u64,
     overflow_total: u64,
@@ -67,14 +135,28 @@ pub(super) struct Rings {
     last_emitted_end: Option<u64>,
     rows_drained_until: Option<i64>,
 }
-fn ranked(map: &BTreeMap<Vec<u8>, HotEntry>) -> Vec<HotEntry> {
-    let mut rows: Vec<_> = map.values().cloned().collect();
+fn ranked(map: &BTreeMap<Vec<u8>, HotEntry>, limit: usize) -> Vec<HotEntry> {
+    let mut rows: Vec<_> = map.values().collect();
     rows.sort_by(|a, b| b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key)));
-    rows
+    rows.into_iter()
+        .take(limit)
+        .filter_map(|r| {
+            Some(HotEntry {
+                key: copy(&r.key)?,
+                events: r.events,
+                files: r.files,
+                bytes_delta: r.bytes_delta,
+                top_unit: r.top_unit.clone(),
+                lossy: r.lossy,
+            })
+        })
+        .collect()
 }
 impl Rings {
     pub fn new() -> Self {
         Self {
+            budget: Budget::new(),
+            root: b"/".to_vec(),
             buckets: VecDeque::new(),
             dropped: 0,
             overflow_total: 0,
@@ -82,6 +164,21 @@ impl Rings {
             rollback_until: None,
             last_emitted_end: None,
             rows_drained_until: None,
+        }
+    }
+    pub fn budget(&self) -> &Budget {
+        &self.budget
+    }
+    pub fn configure(&mut self, budget: Budget, root: &[u8]) {
+        self.budget = budget;
+        self.root = root.to_vec();
+    }
+    pub fn dirty_loss(&mut self, now: i64, memory: bool) {
+        self.advance(now);
+        if let Some(b) = self.buckets.back_mut() {
+            b.lossy = true;
+            b.dirty_budget |= memory;
+            b.dirty_full |= !memory;
         }
     }
     pub fn advance(&mut self, now: i64) {
@@ -98,23 +195,19 @@ impl Rings {
             return;
         }
         if let Some(last) = self.buckets.back_mut() {
+            let seen_bytes: usize = last.seen.iter().map(|(_, k, _)| k.capacity()).sum();
+            last.release(seen_bytes);
             last.seen.clear();
             last.seen.shrink_to_fit();
             last.overflow_end = self.overflow_total;
-            for (map, units) in last.maps.iter_mut().zip(&mut last.units) {
-                let rows = ranked(map);
-                if rows.len() > COMPLETED_CAP {
+            for index in 0..3 {
+                if last.maps[index].len() > COMPLETED_CAP {
                     last.lossy = true;
                     last.truncated = true;
                     last.completed_capped = true;
-                    self.dropped += (rows.len() - COMPLETED_CAP) as u64;
+                    self.dropped += (last.maps[index].len() - COMPLETED_CAP) as u64;
+                    last.compact(index, COMPLETED_CAP);
                 }
-                *map = rows
-                    .into_iter()
-                    .take(COMPLETED_CAP)
-                    .map(|r| (r.key.clone(), r))
-                    .collect();
-                units.retain(|key, _| map.contains_key(key));
             }
         }
         let next = self.buckets.back().map(|b| b.minute.saturating_add(60));
@@ -128,6 +221,11 @@ impl Rings {
                 break;
             }
             self.buckets.push_back(Bucket {
+                budget: self.budget.clone(),
+                charged: 0,
+                key_budget: false,
+                dirty_full: false,
+                dirty_budget: false,
                 minute: at,
                 maps: std::array::from_fn(|_| BTreeMap::new()),
                 units: std::array::from_fn(|_| BTreeMap::new()),
@@ -195,59 +293,124 @@ impl Rings {
         let Some(bucket) = self.buckets.back_mut() else {
             return;
         };
-        for (index, (map, key)) in bucket.maps.iter_mut().zip(keys).enumerate() {
-            let unique = if bucket.seen.len() < 200_000 {
-                bucket.seen.insert((index, key.clone(), identity))
-            } else {
-                bucket.lossy = true;
-                bucket.truncated = true;
-                bucket.distinct_capped = true;
-                false
-            };
-            if !map.contains_key(&key) && map.len() >= CURRENT_CAP {
-                let rows = ranked(map);
-                self.dropped += (rows.len() / 2) as u64;
-                *map = rows
-                    .into_iter()
-                    .take(CURRENT_CAP / 2)
-                    .map(|r| (r.key.clone(), r))
-                    .collect();
-                bucket.units[index].retain(|key, _| map.contains_key(key));
+        for (index, key) in keys.into_iter().enumerate() {
+            if !bucket.maps[index].contains_key(&key) && bucket.maps[index].len() >= CURRENT_CAP {
+                self.dropped += (bucket.maps[index].len() / 2) as u64;
+                bucket.compact(index, CURRENT_CAP / 2);
                 bucket.lossy = true;
                 bucket.truncated = true;
                 bucket.current_capped = true;
             }
-            let row = if map.contains_key(&key) {
-                map.get_mut(&key)
+            let new_row = !bucket.maps[index].contains_key(&key);
+            let new_unit = unit.is_some() && !bucket.units[index].contains_key(&key);
+            let seen_scratch = Reservation::new(&bucket.budget, key.len());
+            let seen_key = seen_scratch
+                .as_ref()
+                .and_then(|_| copy(&key))
+                .map(|k| (index, k, identity));
+            let new_seen = seen_key.as_ref().is_some_and(|k| !bucket.seen.contains(k))
+                && bucket.seen.len() < 200_000;
+            let copies = 2 * usize::from(new_row) + usize::from(new_unit) + usize::from(new_seen);
+            let unit_reserve = unit.as_ref().map_or(0, |u| u.len() * 2);
+            let needed = key
+                .len()
+                .saturating_mul(copies)
+                .saturating_add(unit_reserve);
+            let admitted = bucket.budget.reserve(needed);
+            let key = if admitted {
+                bucket.charged += needed;
+                key
             } else {
-                Some(map.entry(key.clone()).or_insert(HotEntry {
-                    key,
-                    events: 0,
-                    files: 0,
-                    bytes_delta: 0,
-                    top_unit: None,
-                    lossy: false,
-                }))
-            };
-            let Some(row) = row else {
-                continue;
-            };
-            if let Some(unit) = unit.as_deref() {
-                if !bucket.units[index].contains_key(&row.key) {
-                    bucket.units[index].insert(row.key.clone(), UnitCounts::default());
-                }
-                let Some(counts) = bucket.units[index].get_mut(&row.key) else {
+                bucket.lossy = true;
+                bucket.truncated = true;
+                bucket.key_budget = true;
+                // Directory scope already counts this event exactly. Dropping
+                // optional unit/command attribution must not count it twice there.
+                if index != 0 {
                     continue;
-                };
-                counts.add(unit, delta.unsigned_abs());
-                let top = counts.top();
-                if row.top_unit.as_ref() != top {
-                    row.top_unit = top.cloned();
+                }
+                self.root.clone()
+            };
+            let mut actual = 0;
+            let unique = if admitted && new_seen {
+                if let Some(k) = copy(&key) {
+                    actual += k.capacity();
+                    bucket.seen.insert((index, k, identity))
+                } else {
+                    false
+                }
+            } else {
+                if admitted && bucket.seen.len() >= 200_000 {
+                    bucket.lossy = true;
+                    bucket.truncated = true;
+                    bucket.distinct_capped = true;
+                }
+                false
+            };
+            if !bucket.maps[index].contains_key(&key) {
+                let pair = copy(&key).zip(copy(&key));
+                if let Some((map_key, row_key)) = pair {
+                    let bytes = map_key.capacity() + row_key.capacity();
+                    if !admitted && !bucket.budget.reserve_root(bytes) {
+                        continue;
+                    }
+                    if !admitted {
+                        bucket.charged += bytes;
+                    } else {
+                        actual += bytes;
+                    }
+                    bucket.maps[index].insert(
+                        map_key,
+                        HotEntry {
+                            key: row_key,
+                            events: 0,
+                            files: 0,
+                            bytes_delta: 0,
+                            top_unit: None,
+                            lossy: false,
+                        },
+                    );
                 }
             }
-            row.events = row.events.saturating_add(1);
-            row.files = row.files.saturating_add(u64::from(unique));
-            row.bytes_delta = row.bytes_delta.saturating_add(delta);
+            if admitted {
+                if let Some(unit) = unit.as_deref() {
+                    if !bucket.units[index].contains_key(&key) {
+                        if let Some(k) = copy(&key) {
+                            actual += k.capacity();
+                            bucket.units[index].insert(k, UnitCounts::default());
+                        }
+                    }
+                    if let Some(counts) = bucket.units[index].get_mut(&key) {
+                        let before: usize = counts.0.keys().map(String::capacity).sum();
+                        counts.add(unit, delta.unsigned_abs());
+                        let after: usize = counts.0.keys().map(String::capacity).sum();
+                        actual += after.saturating_sub(before);
+                        if before > after {
+                            bucket.charged -= before - after;
+                            bucket.budget.release(before - after);
+                        }
+                    }
+                }
+                if let Some(row) = bucket.maps[index].get_mut(&key) {
+                    let previous = row.top_unit.as_ref().map_or(0, String::capacity);
+                    row.top_unit = bucket.units[index]
+                        .get(&key)
+                        .and_then(UnitCounts::top)
+                        .cloned();
+                    let next = row.top_unit.as_ref().map_or(0, String::capacity);
+                    actual += next.saturating_sub(previous);
+                    if previous > next {
+                        bucket.charged -= previous - next;
+                        bucket.budget.release(previous - next);
+                    }
+                }
+                bucket.release(needed.saturating_sub(actual));
+            }
+            if let Some(row) = bucket.maps[index].get_mut(&key) {
+                row.events = row.events.saturating_add(1);
+                row.files = row.files.saturating_add(u64::from(unique));
+                row.bytes_delta = row.bytes_delta.saturating_add(delta);
+            }
         }
     }
     pub fn hot(&self, now: i64, window: u32, scope: HotScope, limit: usize) -> Vec<HotEntry> {
@@ -257,6 +420,56 @@ impl Rings {
             HotScope::Comm => 2,
         };
         let cutoff = now.div_euclid(60) * 60 - i64::from(window.clamp(1, 60) - 1) * 60;
+        let selected = || {
+            self.buckets
+                .iter()
+                .filter(|b| b.minute >= cutoff && b.minute <= now.div_euclid(60) * 60)
+        };
+        let scratch = selected()
+            .map(|b| {
+                b.maps[index]
+                    .values()
+                    .map(|r| {
+                        4 * r.key.capacity() + 2 * r.top_unit.as_ref().map_or(0, String::capacity)
+                    })
+                    .sum::<usize>()
+                    + b.units[index]
+                        .iter()
+                        .map(|(k, v)| {
+                            k.capacity() + v.0.keys().map(String::capacity).sum::<usize>()
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+        let Some(_scratch) = Reservation::new(&self.budget, scratch) else {
+            if limit == 0 {
+                return Vec::new();
+            }
+            let Some(_root) = Reservation::new(&self.budget, self.root.len()) else {
+                return Vec::new();
+            };
+            let Some(key) = copy(&self.root) else {
+                return Vec::new();
+            };
+            let mut row = HotEntry {
+                key,
+                events: 0,
+                files: 0,
+                bytes_delta: 0,
+                top_unit: None,
+                lossy: true,
+            };
+            for r in selected().flat_map(|b| b.maps[index].values()) {
+                row.events = row.events.saturating_add(r.events);
+                row.files = row.files.saturating_add(r.files);
+                row.bytes_delta = row.bytes_delta.saturating_add(r.bytes_delta);
+            }
+            return if row.events == 0 {
+                Vec::new()
+            } else {
+                vec![row]
+            };
+        };
         let mut sum: BTreeMap<Vec<u8>, HotEntry> = BTreeMap::new();
         let mut units: BTreeMap<Vec<u8>, BTreeMap<String, u64>> = BTreeMap::new();
         let lossy = self
@@ -295,13 +508,13 @@ impl Rings {
                 row.top_unit = UnitCounts(counts).top().cloned();
             }
         }
-        ranked(&sum).into_iter().take(limit).collect()
+        ranked(&sum, limit)
     }
     pub fn detail(&self, now: i64) -> String {
         let cutoff = now.div_euclid(60) * 60 - 14 * 60;
         // One latest occurrence per cause bounds status text independently of
         // the number of affected minutes and configured watchers.
-        let mut reported = [false; 8];
+        let mut reported = [false; 11];
         let mut reasons = Vec::with_capacity(reported.len());
         for b in self
             .buckets
@@ -310,6 +523,12 @@ impl Rings {
             .filter(|b| b.minute >= cutoff && b.minute <= now)
         {
             let causes = [
+                (b.key_budget, "truncated: key bytes over the memory budget"),
+                (b.dirty_full, "lost events: dirty set full"),
+                (
+                    b.dirty_budget,
+                    "lost events: dirty set over its memory budget",
+                ),
                 (b.distinct_capped, "truncated: distinct-file cap reached"),
                 (b.current_capped, "truncated: current-key cap reached"),
                 (b.completed_capped, "truncated: completed-key cap reached"),
@@ -339,9 +558,9 @@ impl Rings {
                     b.minute.div_euclid(60).rem_euclid(60),
                     b.minute
                 );
-                let qualifier = if index == 0 && !b.transport_loss {
+                let qualifier = if index == 3 && !b.transport_loss {
                     " (events complete, per-file counts capped)"
-                } else if index == 0 {
+                } else if index == 3 {
                     " (per-file counts capped)"
                 } else {
                     ""
@@ -361,16 +580,58 @@ impl Rings {
             })
             .count() as u32
     }
+    fn output_bytes(b: &Bucket, limit: usize, mount: &str, dirs: bool) -> usize {
+        let mut bytes = 0;
+        for (index, map) in b.maps.iter().enumerate() {
+            let mut rows: Vec<_> = map.values().collect();
+            rows.sort_by(|a, b| b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key)));
+            for row in rows.into_iter().take(limit) {
+                if !b.drained {
+                    bytes += row.key.len()
+                        + row.top_unit.as_ref().map_or(0, String::len)
+                        + mount.len()
+                        + [3, 4, 4][index];
+                }
+                if dirs && index == 0 {
+                    bytes += row.key.len() + row.top_unit.as_ref().map_or(0, String::len);
+                }
+            }
+        }
+        bytes
+    }
+    fn output_reservation(
+        b: &mut Bucket,
+        top_k: usize,
+        mount: &str,
+        dirs: bool,
+    ) -> (usize, Option<Reservation>) {
+        let mut limit = top_k.min(COMPLETED_CAP);
+        loop {
+            if let Some(lease) =
+                Reservation::new(&b.budget, Self::output_bytes(b, limit, mount, dirs))
+            {
+                return (limit, Some(lease));
+            }
+            b.drain_truncated = true;
+            b.key_budget = true;
+            b.truncated = true;
+            b.lossy = true;
+            if limit == 0 {
+                return (0, None);
+            }
+            limit /= 2;
+        }
+    }
     fn persisted(b: &mut Bucket, mount: &str, top_k: usize) -> Vec<HotMinute> {
         if b.drained {
             return Vec::new();
         }
         b.drained = true;
         let limit = top_k.min(COMPLETED_CAP);
-        b.drain_truncated = b.maps.iter().any(|map| map.len() > limit);
+        b.drain_truncated |= b.maps.iter().any(|map| map.len() > limit);
         let mut result = Vec::new();
         for (scope, map) in ["dir", "unit", "comm"].into_iter().zip(&b.maps) {
-            result.extend(ranked(map).into_iter().take(limit).map(|r| HotMinute {
+            result.extend(ranked(map, limit).into_iter().map(|r| HotMinute {
                 mount: mount.into(),
                 scope: scope.into(),
                 key: r.key,
@@ -386,9 +647,13 @@ impl Rings {
     pub fn drain(&mut self, now: i64, mount: &str, top_k: usize) -> Vec<HotMinute> {
         self.advance(now);
         let mut result = Vec::new();
+        let mut reservations = Vec::new();
         for b in &mut self.buckets {
             if b.minute < now.div_euclid(60) * 60 {
-                result.extend(Self::persisted(b, mount, top_k));
+                let (limit, lease) = Self::output_reservation(b, top_k, mount, false);
+                reservations.push(lease);
+                result.extend(Self::persisted(b, mount, limit));
+                b.clear_rows();
                 self.rows_drained_until = self.rows_drained_until.max(Some(b.minute));
             }
         }
@@ -397,6 +662,7 @@ impl Rings {
     pub fn drain_minutes(&mut self, now: i64, mount: &str, top_k: usize) -> Vec<CompletedMinute> {
         self.advance(now);
         let mut result = Vec::new();
+        let mut reservations = Vec::new();
         let Some(mut next) = self.next_minute else {
             return result;
         };
@@ -404,14 +670,15 @@ impl Rings {
             if b.minute < next || b.minute >= now.div_euclid(60) * 60 {
                 continue;
             }
-            let persisted = Self::persisted(b, mount, top_k);
+            let (limit, lease) = Self::output_reservation(b, top_k, mount, true);
+            reservations.push(lease);
+            let persisted = Self::persisted(b, mount, limit);
             self.rows_drained_until = self.rows_drained_until.max(Some(b.minute));
             let truncated =
                 b.truncated || b.drain_truncated || b.maps[0].len() > top_k.min(COMPLETED_CAP);
             let lossy = b.lossy || truncated || b.minute != next;
-            let dirs = ranked(&b.maps[0])
+            let dirs = ranked(&b.maps[0], limit)
                 .into_iter()
-                .take(top_k.min(COMPLETED_CAP))
                 .map(|mut row| {
                     row.lossy = lossy;
                     row
@@ -430,6 +697,7 @@ impl Rings {
                 dirs,
                 persisted,
             });
+            b.clear_rows();
             self.last_emitted_end = Some(b.overflow_end);
             next = b.minute.saturating_add(60);
         }
@@ -448,6 +716,66 @@ mod tests {
             b"unit".to_vec(),
             b"comm".to_vec(),
         ]
+    }
+    fn payload(r: &Rings) -> usize {
+        r.buckets
+            .iter()
+            .map(|b| {
+                b.maps
+                    .iter()
+                    .flat_map(|m| m.iter())
+                    .map(|(k, v)| {
+                        k.capacity()
+                            + v.key.capacity()
+                            + v.top_unit.as_ref().map_or(0, String::capacity)
+                    })
+                    .sum::<usize>()
+                    + b.units
+                        .iter()
+                        .flat_map(|m| m.iter())
+                        .map(|(k, v)| {
+                            k.capacity() + v.0.keys().map(String::capacity).sum::<usize>()
+                        })
+                        .sum::<usize>()
+                    + b.seen.iter().map(|(_, k, _)| k.capacity()).sum::<usize>()
+            })
+            .sum()
+    }
+    #[test]
+    fn byte_budget_falls_back_to_root_and_releases_completed_maps() {
+        let mut r = Rings::new();
+        let budget = Budget::with_limit(4096);
+        r.configure(budget.clone(), b"/mount");
+        for minute in 0..70 {
+            for n in 0..8 {
+                let mut key = vec![b'x'; 1500];
+                key[0] = b'/';
+                key[1] = b'a' + n;
+                r.add(
+                    minute * 60,
+                    [key, b"unit".to_vec(), b"comm".to_vec()],
+                    7,
+                    Some("writer".into()),
+                    (1, n as u64),
+                );
+            }
+            let rows = r.hot(minute * 60, 1, HotScope::Dir, 20);
+            assert_eq!(rows.iter().map(|r| r.events).sum::<u64>(), 8);
+            assert_eq!(rows.iter().map(|r| r.bytes_delta).sum::<i64>(), 56);
+            assert!(rows.iter().any(|r| r.key == b"/mount"));
+            assert!(r
+                .detail(minute * 60)
+                .contains("key bytes over the memory budget"));
+            assert_eq!(budget.used(), payload(&r)); // exact, zero tolerance
+            assert!(budget.used() <= 4096);
+            r.drain_minutes((minute + 1) * 60, "/mount", 1000);
+            assert!(r
+                .buckets
+                .iter()
+                .filter(|b| b.drained)
+                .all(|b| b.maps.iter().all(BTreeMap::is_empty)));
+            assert_eq!(budget.used(), payload(&r));
+        }
     }
     #[test]
     fn diagnostics_distinguish_caps_from_each_transport_loss() {
@@ -558,7 +886,7 @@ mod tests {
             }
             let minutes = r.drain_minutes(120, "/", 1);
             assert_eq!(minutes.len(), 1);
-            assert_eq!(minutes[0].dirs.len(), 1);
+            assert_eq!(minutes[0].dirs.len(), usize::from(!legacy_first));
             assert_eq!(minutes[0].persisted.len(), if legacy_first { 0 } else { 3 });
             assert!(r.drain(120, "/", 1).is_empty());
             assert!(r.drain_minutes(120, "/", 1).is_empty());

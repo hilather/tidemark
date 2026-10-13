@@ -1,5 +1,6 @@
 //! Owned by: W5-A
 //! Resolve kernel file handles without reading file data or following names.
+use super::budget::Budget;
 use std::{
     io,
     os::fd::{AsFd, BorrowedFd},
@@ -65,6 +66,8 @@ pub(super) struct PathSizes {
     order: std::collections::VecDeque<(RawPath, u64)>,
     sequence: u64,
     cap: usize,
+    budget: Budget,
+    charged: usize,
 }
 impl PathSizes {
     pub fn new(cap: usize) -> Self {
@@ -73,9 +76,16 @@ impl PathSizes {
             order: Default::default(),
             sequence: 0,
             cap,
+            budget: Budget::new(),
+            charged: 0,
         }
     }
+    pub fn set_budget(&mut self, budget: Budget) {
+        self.budget = budget;
+    }
     pub fn clear(&mut self) {
+        self.budget.release(self.charged);
+        self.charged = 0;
         self.entries.clear();
         self.order.clear();
     }
@@ -83,23 +93,50 @@ impl PathSizes {
         if self.cap == 0 {
             return;
         }
+        let old = self.entries.contains_key(path);
+        let bytes = path.as_bytes().len() * (1 + usize::from(!old));
+        if !self.budget.reserve(bytes) {
+            return;
+        }
+        if self.entries.try_reserve(1).is_err() || self.order.try_reserve(1).is_err() {
+            self.budget.release(bytes);
+            return;
+        }
+        self.charged += bytes;
         self.sequence = self.sequence.wrapping_add(1);
         self.entries.insert(path.clone(), (id, disk, self.sequence));
         self.order.push_back((path.clone(), self.sequence));
         if self.order.len() > self.cap.saturating_mul(2) {
-            self.order
-                .retain(|(p, s)| self.entries.get(p).is_some_and(|v| v.2 == *s));
+            let mut released = 0;
+            self.order.retain(|(p, s)| {
+                let keep = self.entries.get(p).is_some_and(|v| v.2 == *s);
+                if !keep {
+                    released += p.as_bytes().len();
+                }
+                keep
+            });
+            self.charged -= released;
+            self.budget.release(released);
         }
         while self.entries.len() > self.cap {
             if let Some((p, s)) = self.order.pop_front() {
+                let mut released = p.as_bytes().len();
                 if self.entries.get(&p).is_some_and(|v| v.2 == s) {
                     self.entries.remove(&p);
+                    released += p.as_bytes().len();
                 }
+                self.charged -= released;
+                self.budget.release(released);
             }
         }
     }
     pub fn remove(&mut self, path: &RawPath) -> Option<((u64, u64), i64)> {
-        self.entries.remove(path).map(|(id, disk, _)| (id, disk))
+        self.entries.remove(path).map(|(id, disk, _)| {
+            let bytes = path.as_bytes().len();
+            self.charged -= bytes;
+            self.budget.release(bytes);
+            (id, disk)
+        })
     }
 }
 
@@ -109,6 +146,8 @@ pub(super) struct HandlePaths {
     order: std::collections::VecDeque<((i32, Vec<u8>), u64)>,
     sequence: u64,
     cap: usize,
+    budget: Budget,
+    charged: usize,
 }
 impl HandlePaths {
     pub fn new(cap: usize) -> Self {
@@ -117,9 +156,16 @@ impl HandlePaths {
             order: Default::default(),
             sequence: 0,
             cap,
+            budget: Budget::new(),
+            charged: 0,
         }
     }
+    pub fn set_budget(&mut self, budget: Budget) {
+        self.budget = budget;
+    }
     pub fn clear(&mut self) {
+        self.budget.release(self.charged);
+        self.charged = 0;
         self.entries.clear();
         self.order.clear();
     }
@@ -132,26 +178,109 @@ impl HandlePaths {
         if self.cap == 0 {
             return;
         }
+        let Some(handle) = super::budget::copy(&key.1) else {
+            return;
+        };
+        let key = (key.0, handle);
+        // Refresh existing handles without adding duplicate path allocations.
+        let old_bytes = self
+            .entries
+            .get(&key)
+            .map_or(0, |(p, _)| p.as_bytes().len() + key.1.len());
+        let bytes = key.1.len() * 2 + path.as_bytes().len();
+        if !self.budget.reserve(bytes) {
+            return;
+        }
+        if self.entries.try_reserve(1).is_err() || self.order.try_reserve(1).is_err() {
+            self.budget.release(bytes);
+            return;
+        }
+        self.charged += bytes;
         self.sequence = self.sequence.wrapping_add(1);
-        self.entries.insert(key.clone(), (path, self.sequence));
+        self.entries
+            .insert(key.clone(), (path.clone(), self.sequence));
+        self.charged -= old_bytes;
+        self.budget.release(old_bytes);
         self.order.push_back((key, self.sequence));
         if self.order.len() > self.cap.saturating_mul(2) {
-            self.order
-                .retain(|(k, s)| self.entries.get(k).is_some_and(|v| v.1 == *s));
+            let mut released = 0;
+            self.order.retain(|(k, s)| {
+                let keep = self.entries.get(k).is_some_and(|v| v.1 == *s);
+                if !keep {
+                    released += k.1.capacity();
+                }
+                keep
+            });
+            self.charged -= released;
+            self.budget.release(released);
         }
         while self.entries.len() > self.cap {
             if let Some((k, s)) = self.order.pop_front() {
+                let mut released = k.1.capacity();
                 if self.entries.get(&k).is_some_and(|v| v.1 == s) {
-                    self.entries.remove(&k);
+                    if let Some((p, _)) = self.entries.remove(&k) {
+                        released += k.1.len() + p.as_bytes().len();
+                    }
                 }
+                self.charged -= released;
+                self.budget.release(released);
             }
         }
+    }
+}
+impl Drop for PathSizes {
+    fn drop(&mut self) {
+        self.budget.release(self.charged);
+    }
+}
+impl Drop for HandlePaths {
+    fn drop(&mut self) {
+        self.budget.release(self.charged);
     }
 }
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_cache_budget_tracks_repeated_entries_eviction_and_clear() {
+        let budget = Budget::with_limit(2048);
+        let mut paths = PathSizes::new(10);
+        let mut handles = HandlePaths::new(10);
+        paths.set_budget(budget.clone());
+        handles.set_budget(budget.clone());
+        for n in 0..100 {
+            let path = RawPath::new(format!("/{}-{n}", "x".repeat(100)).into_bytes()).unwrap();
+            paths.remember(&path, (1, n), 7);
+            handles.put((1, vec![n as u8; 100]), path.clone());
+            let path_bytes = paths
+                .entries
+                .keys()
+                .map(|p| p.as_bytes().len())
+                .sum::<usize>()
+                + paths
+                    .order
+                    .iter()
+                    .map(|(p, _)| p.as_bytes().len())
+                    .sum::<usize>();
+            let handle_bytes = handles
+                .entries
+                .iter()
+                .map(|(k, (p, _))| k.1.capacity() + p.as_bytes().len())
+                .sum::<usize>()
+                + handles
+                    .order
+                    .iter()
+                    .map(|(k, _)| k.1.capacity())
+                    .sum::<usize>();
+            assert_eq!(budget.used(), path_bytes + handle_bytes);
+            assert!(budget.used() <= 2048);
+            paths.remove(&path);
+        }
+        paths.clear();
+        handles.clear();
+        assert_eq!(budget.used(), 0);
+    }
     #[test]
     fn handle_path_lru_and_invalidation() {
         let path = RawPath::new(b"/dir".to_vec()).unwrap();
