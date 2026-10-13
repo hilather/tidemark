@@ -515,7 +515,9 @@ pub fn run_controlled(
                 }
                 std::thread::park_timeout(Duration::from_millis(50));
             }
-            shutdown_deadline = Some(Instant::now() + Duration::from_secs(9));
+            let deadline = Instant::now() + Duration::from_secs(9);
+            shutdown_deadline = Some(deadline);
+            scans.begin_shutdown(deadline);
             // API observes shutdown first; cancellation precedes producer joins and writer drain.
             for scan in state
                 .view()
@@ -595,17 +597,24 @@ fn join_until(
     handle: ServiceHandle,
     deadline: std::time::Instant,
 ) -> Result<(), DaemonError> {
+    let mut expired = false;
     while !handle.is_finished() {
         if std::time::Instant::now() >= deadline {
-            return Err(DaemonError::Internal(format!(
-                "{name} did not stop before shutdown deadline"
-            )));
+            expired = true;
+            break;
         }
         std::thread::park_timeout(std::time::Duration::from_millis(10));
     }
-    handle
+    // Never detach a producer: resources and the writer remain alive until it exits.
+    let result = handle
         .join()
-        .map_err(|_| DaemonError::Internal(format!("{name} thread panicked")))?
+        .map_err(|_| DaemonError::Internal(format!("{name} thread panicked")))?;
+    if expired {
+        return Err(DaemonError::Internal(format!(
+            "{name} did not stop before shutdown deadline"
+        )));
+    }
+    result
 }
 fn corrupt(e: &tidemark_store::StoreError) -> bool {
     // Match the exposed SQLite error code without adding a direct rusqlite dependency.
@@ -662,6 +671,7 @@ pub fn reload_callback(path: std::path::PathBuf, state: state::LiveState) -> api
             validate_config(&config)?;
             validate_state_paths(&config)?;
             protect_config(&mut config)?;
+            scheduler::preflight_reload(&state, &config)?;
             state.replace_config(config)?;
             let started = state
                 .view()

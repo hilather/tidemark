@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tidemark_core::{
     api::{ScanCancelParams, ScanCancelResult, ScanStartParams, ScanStartResult, ScanStatusParams},
@@ -202,6 +202,7 @@ struct Shared {
     state: LiveState,
     shutdown: Shutdown,
     active: Mutex<Option<Active>>,
+    deadline: Arc<Mutex<Option<Instant>>>,
     commands: Sender<Command>,
     clock: crate::Clock,
     // Same MAX_SUBJECTS cap as the scan-status inventory.
@@ -246,6 +247,15 @@ pub struct ScanControl {
     shared: Option<Arc<Shared>>,
 }
 impl ScanControl {
+    pub(crate) fn begin_shutdown(&self, deadline: Instant) {
+        if let Some(shared) = &self.shared {
+            *shared.deadline.lock() = Some(deadline);
+            if let Some(active) = shared.active.lock().as_ref() {
+                active.cancel.store(true, Ordering::Release);
+            }
+        }
+    }
+
     /// Start one root, acknowledging only after the writer persists
     /// scan_started. Host lock conflicts return `DaemonError::Scan("Busy")`.
     pub fn start(&self, params: &ScanStartParams) -> Result<ScanStartResult, DaemonError> {
@@ -345,6 +355,9 @@ impl ScanControl {
 }
 
 struct Recorder {
+    cancel: Shutdown,
+    shutdown: Shutdown,
+    deadline: Arc<Mutex<Option<Instant>>>,
     state: LiveState,
     writer: tswriter::Sender,
     config: Arc<Config>,
@@ -364,13 +377,54 @@ impl Recorder {
         } else {
             Message::ScanStarted(copy_entry(entry), tx)
         };
-        self.writer
-            .send_timeout(message, ACK_TIMEOUT)
-            .map_err(scan_error)?;
-        rx.recv_timeout(ACK_TIMEOUT)
-            .map_err(scan_error)?
-            .map_err(scan_error)
+        self.send(message)?;
+        self.ack(&rx)?.map_err(scan_error)
     }
+    fn stopped(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+            || self.shutdown.load(Ordering::Acquire)
+            || self.deadline.lock().is_some_and(|d| Instant::now() >= d)
+    }
+    fn send(&self, mut message: Message) -> Result<(), ScanError> {
+        let end = Instant::now() + ACK_TIMEOUT;
+        loop {
+            if self.stopped() {
+                return Err(ScanError::Cancelled);
+            }
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(scan_error("writer queue timed out; message not committed"));
+            }
+            match self.writer.send_timeout(message, remaining.min(POLL)) {
+                Ok(()) => return Ok(()),
+                Err(crossbeam_channel::SendTimeoutError::Timeout(m)) => message = m,
+                Err(e) => return Err(scan_error(e)),
+            }
+        }
+    }
+    fn ack<T>(&self, rx: &Receiver<T>) -> Result<T, ScanError> {
+        let end = Instant::now() + ACK_TIMEOUT;
+        loop {
+            // Once enqueued, interruption cannot prove the writer did not commit.
+            if self.stopped() {
+                return Err(scan_error(
+                    "persistence uncertain: acknowledgement interrupted",
+                ));
+            }
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(scan_error(
+                    "persistence uncertain: acknowledgement timed out",
+                ));
+            }
+            match rx.recv_timeout(remaining.min(POLL)) {
+                Ok(value) => return Ok(value),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(e) => return Err(scan_error(e)),
+            }
+        }
+    }
+
     fn status(&self, entry: &ScanEntry, running: bool) -> Result<(), ScanError> {
         let root = root_label(&entry.root);
         let previous = self.previous.lock();
@@ -583,18 +637,16 @@ impl ScanRecorder for Recorder {
         if rows.len() > 20_000 {
             return Err(scan_error("directory series exceeds 20,000 rows"));
         }
-        self.writer
-            .send_timeout(
-                Message::DirSeries((root.clone(), scan_id.into(), ts, rows.to_vec())),
-                ACK_TIMEOUT,
-            )
-            .map_err(scan_error)?;
+        self.send(Message::DirSeries((
+            root.clone(),
+            scan_id.into(),
+            ts,
+            rows.to_vec(),
+        )))?;
         // Barrier preserves series-before-retention ordering on the one writer.
         let (tx, rx) = bounded(1);
-        self.writer
-            .send_timeout(Message::Flush(tx), ACK_TIMEOUT)
-            .map_err(scan_error)?;
-        rx.recv_timeout(ACK_TIMEOUT).map_err(scan_error)?;
+        self.send(Message::Flush(tx))?;
+        self.ack(&rx)?;
         Ok(())
     }
 }
@@ -651,6 +703,9 @@ fn launch(
                 annotations: vec![],
             };
             let recorder = Recorder {
+                cancel: command.cancel.clone(),
+                shutdown: shared.shutdown.clone(),
+                deadline: shared.deadline.clone(),
                 state: shared.state.clone(),
                 writer,
                 config: config.clone(),
@@ -836,6 +891,7 @@ pub fn start_with_clock(
         state,
         shutdown,
         active: Mutex::new(None),
+        deadline: Arc::new(Mutex::new(None)),
         commands: tx,
         clock,
         failures: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
@@ -856,7 +912,7 @@ pub fn start_with_clock(
 // optional services. Populate every root before that first readiness check,
 // even when the first due scan will occupy the host slot for a long time.
 fn initialize_schedules(state: &LiveState, now: i64) -> Result<(), DaemonError> {
-    let (config, _) = state.config();
+    let (config, generation) = state.config();
     let catalog = Catalog::open(&state.storage_path(), false)
         .map_err(|e| DaemonError::Store(e.to_string()))?;
     for root in &config.roots {
@@ -875,14 +931,37 @@ fn initialize_schedules(state: &LiveState, now: i64) -> Result<(), DaemonError> 
             last.as_ref().and_then(|e| e.finished_at),
             now,
         )?;
-        state.publish(
-            Publication::Scan(ScanStatus {
+        state.publish_scheduled(
+            ScanStatus {
                 root: root_label(&raw),
                 running: None,
                 last_complete: last.as_ref().map(last_scan),
                 next_due,
-            }),
+            },
+            generation,
             component("scheduler", "ok", "initial schedules published"),
+        )?;
+    }
+    Ok(())
+}
+pub(crate) fn preflight_reload(state: &LiveState, config: &Config) -> Result<(), DaemonError> {
+    let catalog = Catalog::open(&state.storage_path(), false)
+        .map_err(|e| DaemonError::Store(e.to_string()))?;
+    for root in &config.roots {
+        let raw =
+            RawPath::from_path(&root.path).map_err(|e| DaemonError::Invalid(e.to_string()))?;
+        let last = catalog
+            .latest(&raw)
+            .map_err(|e| DaemonError::Store(e.to_string()))?;
+        next_run(
+            &parse_schedule(&root.schedule)?,
+            root.window
+                .as_deref()
+                .map(parse_window)
+                .transpose()?
+                .as_ref(),
+            last.as_ref().and_then(|e| e.finished_at),
+            crate::unix_now(),
         )?;
     }
     Ok(())
@@ -1014,15 +1093,22 @@ fn scheduler(
                     .get(&raw)
                     .map_or(scheduled, |r| r.due)
             });
-            shared.state.publish(
-                Publication::Scan(ScanStatus {
+            if let Err(error) = shared.state.publish_scheduled(
+                ScanStatus {
                     root: root_label(&raw),
                     running: None,
                     last_complete: last.as_ref().map(last_scan),
                     next_due,
-                }),
+                },
+                current_generation,
                 scheduler_health(&shared.failures, "waiting for scheduled scan"),
-            )?;
+            ) {
+                shared
+                    .state
+                    .publish_component(component("config", "error", error.to_string()))?;
+                tracing::error!(%error, "scan inventory publication rejected; scheduler continuing");
+                continue;
+            }
             if due.is_some_and(|d| d <= now)
                 && shared
                     .failures
@@ -1112,6 +1198,9 @@ mod tests {
         previous: Option<ScanEntry>,
     ) -> Recorder {
         Recorder {
+            cancel: Shutdown::default(),
+            shutdown: Shutdown::default(),
+            deadline: Arc::new(Mutex::new(None)),
             config: cfg,
             state,
             writer,
@@ -1179,6 +1268,83 @@ mod tests {
             .to_string()
             .contains("injected persistence failure"));
         worker.join().unwrap();
+    }
+    #[test]
+    fn recorder_interrupts_stalled_queue_and_uncertain_ack() {
+        for enqueued in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let cfg = Arc::new(config(root.path(), storage.path()));
+            let state = LiveState::new(&cfg, 0);
+            let (writer, rx) = bounded(1);
+            let rec = recorder(cfg, state, writer.clone(), None);
+            let cancel = rec.cancel.clone();
+            if !enqueued {
+                let (tx, _) = bounded(1);
+                writer.send(Message::Flush(tx)).unwrap();
+            }
+            let entry = ScanEntry {
+                scan_id: "stalled".into(),
+                root: RawPath::from_path(root.path()).unwrap(),
+                mode: tidemark_core::scan::ScanMode::Walk,
+                started_at: 0,
+                finished_at: None,
+                status: "running".into(),
+                degraded: false,
+                file: None,
+                t_disk: None,
+                t_inodes: None,
+                t_dirs: None,
+                errors: None,
+                duration_ms: None,
+            };
+            let (done, result) = bounded(1);
+            let worker = std::thread::spawn(move || done.send(rec.persist(&entry, false)).unwrap());
+            // Keep acknowledgement sender alive, so disconnect cannot mask cancellation.
+            let held = if enqueued {
+                Some(rx.recv_timeout(Duration::from_secs(1)).unwrap())
+            } else {
+                None
+            };
+            cancel.store(true, Ordering::Release);
+            let error = result
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap()
+                .unwrap_err();
+            if enqueued {
+                assert!(
+                    error.to_string().contains("persistence uncertain"),
+                    "{error}"
+                );
+            } else {
+                assert!(matches!(error, ScanError::Cancelled));
+                assert!(matches!(rx.try_recv().unwrap(), Message::Flush(_)));
+                assert!(rx.try_recv().is_err());
+            }
+            worker.join().unwrap();
+            drop(held);
+        }
+    }
+    #[test]
+    fn recorder_shared_deadline_interrupts_series_queue_and_barrier_ack() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(config(root.path(), storage.path()));
+        let state = LiveState::new(&cfg, 0);
+        let (writer, rx) = bounded(1);
+        let rec = recorder(cfg, state, writer, None);
+        *rec.deadline.lock() = Some(Instant::now());
+        let (tx, ack) = bounded(1);
+        assert!(matches!(
+            rec.send(Message::Flush(tx)),
+            Err(ScanError::Cancelled)
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(rec
+            .ack(&ack)
+            .unwrap_err()
+            .to_string()
+            .contains("persistence uncertain"));
     }
     #[test]
     fn firstboot_waits_for_components_or_deadline_and_writes_once() {

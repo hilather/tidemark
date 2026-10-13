@@ -755,3 +755,33 @@ fn bound_storage_snapshot_readable_in_separate_process_without_sockets() {
         assert_eq!(json["schema"], "tidemark.snapshots.v1");
     }
 }
+
+#[test]
+fn exact_capacity_root_replacement_and_cumulative_churn_keep_scheduler_alive() {
+    let h = Harness::new("off", "max");
+    h.idle();
+    let mut cfg = h.cfg.clone();
+    cfg.roots = (0..128)
+        .map(|n| {
+            let mut root = h.cfg.roots[0].clone();
+            root.path = h.cfg.roots[0].path.join(format!("root-{n}"));
+            root
+        })
+        .collect();
+    h.state.replace_config(cfg).unwrap();
+    wait(|| h.state.view().scans().unwrap().len() == 128);
+    for n in 0..140 {
+        let mut cfg = h.cfg.clone();
+        cfg.roots[0].path = h.cfg.roots[0].path.join(format!("replacement-{n}"));
+        let label = cfg.roots[0].path.to_string_lossy().into_owned();
+        h.state.replace_config(cfg).unwrap();
+        wait(|| {
+            let scans = h.state.view().scans().unwrap();
+            scans.len() == 1 && scans[0].root == label
+        });
+        assert!(!h.stop.load(Ordering::Acquire));
+    }
+    // Allow a real scheduler boundary after the last replacement.
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!h.stop.load(Ordering::Acquire));
+}
