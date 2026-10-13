@@ -124,3 +124,10 @@ path = "fuzz_targets/mount_id.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "api_frame"
+path = "fuzz_targets/api_frame.rs"
+test = false
+doc = false
+bench = false
