@@ -386,7 +386,8 @@ mod tests {
                 .is_some()
         });
         stop.store(true, Ordering::Release);
-        commands.send(true).unwrap();
+        // The service may already have dropped its receiver after observing shutdown.
+        let _ = commands.send(true);
         worker.join().unwrap().unwrap();
     }
 

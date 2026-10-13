@@ -289,7 +289,9 @@ fn alert_source_unavailable_empty_and_measured() {
 #[test]
 fn scanner_measured_empty() {
     use tidemark_live::procscan::{ProcScanner, ProcScannerOptions};
-    let s = LiveState::default();
+    let mut config = Config::default();
+    config.procscan.enabled = true;
+    let s = LiveState::new(&config, 0);
     let mut scanner = ProcScanner::new(
         ProcScannerOptions {
             mounts: vec![(RawPath::new(b"/fixture".to_vec()).unwrap(), u64::MAX)],
@@ -304,11 +306,15 @@ fn scanner_measured_empty() {
     scanner.scan_once(1).unwrap();
     publish(
         &s,
-        Publication::Procscan(Arc::new(scanner.report().unwrap())),
+        Publication::ProcscanCompleted {
+            generation: 0,
+            report: Arc::new(scanner.report().unwrap()),
+            completed_at: 1,
+        },
     );
-    assert_eq!(s.view().phantom_bytes("/fixture"), Some(0));
+    assert_eq!(s.view_at(1).phantom_bytes("/fixture"), Some(0));
     assert_eq!(
-        s.view().writers(&WritersParams {
+        s.view_at(1).writers(&WritersParams {
             mount: None,
             window: Duration::from_secs(1)
         }),
@@ -794,20 +800,26 @@ fn phantom_measurement_uses_allocated_byte_oracle() {
         )),
     );
     scanner.scan_once(1).unwrap();
-    let state = LiveState::default();
+    let mut config = Config::default();
+    config.procscan.enabled = true;
+    let state = LiveState::new(&config, 0);
     publish(
         &state,
-        Publication::Procscan(Arc::new(scanner.report().unwrap())),
+        Publication::ProcscanCompleted {
+            generation: 0,
+            report: Arc::new(scanner.report().unwrap()),
+            completed_at: 1,
+        },
     );
     assert!(
         state
-            .view()
+            .view_at(1)
             .phantom_bytes(mount.as_path().to_str().unwrap())
             .unwrap()
             >= allocated
     );
     assert!(state
-        .view()
+        .view_at(1)
         .phantom(&PhantomParams { mount: None })
         .unwrap()
         .iter()
@@ -1430,9 +1442,10 @@ fn internal_alert_has_reserved_publication_slot() {
 }
 
 #[test]
-fn process_publication_is_independent_of_collector_and_clears_on_invalidation() {
+fn process_publication_is_independent_of_collector_and_retains_failed_history() {
     use tidemark_live::procscan::{ProcScanner, ProcScannerOptions};
     let mut config = Config::default();
+    config.procscan.enabled = true;
     config.watch.mounts = vec!["/fixture".into()];
     let state = LiveState::new(&config, 0);
     let mut scanner = ProcScanner::new(
@@ -1448,7 +1461,15 @@ fn process_publication_is_independent_of_collector_and_clears_on_invalidation() 
     );
     scanner.scan_once(1).unwrap();
     let report = Arc::new(scanner.report().unwrap());
-    publish(&state, Publication::Procscan(report.clone()));
+    publish(
+        &state,
+        Publication::ProcscanCompleted {
+            generation: 0,
+            report: report.clone(),
+            completed_at: 1,
+        },
+    );
+    assert_eq!(state.view_at(1).phantom_bytes("/fixture"), Some(0));
     let scanner = Arc::new(parking_lot::Mutex::new(scanner));
     let guard = scanner.lock();
     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1491,7 +1512,7 @@ fn process_publication_is_independent_of_collector_and_clears_on_invalidation() 
             window: Duration::from_secs(300)
         })
         .is_some());
-    assert!(state.view_at(2).phantom_bytes("/fixture").is_none());
+    assert!(state.view_at(1).phantom_bytes("/fixture").is_none());
     publish(&state, Publication::Procscan(report.clone()));
     config.procscan.open_writers = !config.procscan.open_writers;
     state.replace_config(config.clone()).unwrap();

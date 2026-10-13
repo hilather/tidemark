@@ -282,7 +282,8 @@ mod tests {
             .iter()
             .any(|d| d.reason.contains("phantom measurement unavailable")));
         stop.store(true, Ordering::Release);
-        commands.send(true).unwrap();
+        // The service may already have dropped its receiver after observing shutdown.
+        let _ = commands.send(true);
         worker.join().unwrap().unwrap();
     }
 }
