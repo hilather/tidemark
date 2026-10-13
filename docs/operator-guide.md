@@ -2,7 +2,7 @@
 
 The packaged service permits only Unix sockets (`RestrictAddressFamilies=AF_UNIX`).
 
-For administrators on Rocky Linux 8 with access through `sudo`. Examples use `/data`; substitute your actual mount and subtree names. Tidemark reads metadata, keeps snapshots, and observes growth. It does not delete data or resize storage. Scans skip symlinks and all nested mounts, including same-device bind mounts. They leave access times alone. The optional `symlinks --check-targets` reads link targets and can update symbolic-link access times under some mount options.
+For administrators on Rocky Linux 8 with access through `sudo`. Examples use `/data`; substitute your actual mount and subtree names. Tidemark reads metadata, keeps snapshots, and observes growth. It does not delete data or resize storage. Scans skip symlinks and all nested mounts, including same-device bind mounts. Scans request O_NOATIME on directories (EPERM fallback is a limit). `tidemark symlinks`, even without --check-targets, reads link text and may update that link’s access time under the mount’s atime policy. See the [security model](security.md).
 
 ## Install and inspect the host
 
@@ -61,7 +61,9 @@ dir_metrics_depth = 2
 max_series_per_metric = 500
 ```
 
-Keep `general.state_dir` on local storage, normally `/var/lib/tidemark` on the root filesystem, away from the busy data array where possible. Tidemark excludes its own state automatically. Stage requires an allowlisted local state filesystem (or the longest existing ancestor if the directory is missing); network or unsupported storage is refused. The stage allowlist is xfs, ext2, ext3, ext4, btrfs, tmpfs, zfs, f2fs, jfs and reiserfs; unknown types block. Use persistent storage for retained production history. Validate the full candidate:
+Keep `general.state_dir` on local storage, normally `/var/lib/tidemark` on the root filesystem, away from the busy data array where possible. Tidemark excludes its own state automatically. Stage requires an allowlisted local state filesystem (or the longest existing ancestor if the directory is missing); network or unsupported storage is refused. The stage allowlist is xfs, ext2, ext3, ext4, btrfs, tmpfs, zfs, f2fs, jfs and reiserfs; unknown types block. Use persistent storage for retained production history. For a custom `--state-dir`, every ancestor must be a real directory reached without symbolic links, owned by root/effective user (or a trusted read-only ancestor), with no group/world writes unless sticky. Sticky children must remain trusted; writable sticky chains propagate that rule. Storage state/used subdirectories and regular single-link leaves must be owned by the effective user and not group/world writable. Storage accepts readability with a warning, but production state should stay root-owned 0700 with 0600 leaves. Daemon/deploy admission requires private state; a checked deployment marker can authorize normalizing read/execute bits, never foreign ownership or write bits. Preexisting unsafe paths are refused; Tidemark does not repair ownership. In user namespaces only ancestor/sticky-child overflow ownership receives the documented exception; state and leaves never do. Metrics collector ancestry must also be trusted. See [security](security.md#state-directory-and-leaf-trust) before choosing custom paths.
+
+Validate the full candidate:
 
 ```sh
 sudo tidemarkd --check-config --config ./tidemark.toml
@@ -281,8 +283,7 @@ resolve_for = "10m"
 ```
 
 Watcher rules `hot_dir_growth` and `watch_lossy` require whole-minute windows from 1 to 60 minutes. Exact hot-growth evaluation requires consecutive completed, healthy minutes without loss or truncation; overflow evaluation needs consistent boundary counts. `now`'s ranked five-minute list is not proof of an exact alert window. For hot growth, numeric `above` means bytes/second, or use a rate such as `"50GiB/h"`.
-<!-- verify after W6-watch-windows -->
-<!-- gap: daemon exact watcher-window publication is pending; these rules currently remain not evaluable. -->
+Exact watcher-window publication is implemented. The newest completed boundary must be no more than 90 seconds old; startup’s partial minute is excluded, so warmup needs the next boundary plus the full configured minutes. Missing/lossy/truncated hot history is unavailable, while overflow uses consistent exact boundary totals. Files are summed per-minute counts, not distinct files across the whole window.
 
 ## Tune scans against workload impact
 
@@ -373,3 +374,13 @@ sudo dnf remove tidemark
 ```
 
 Unstage stops and disables the service, keeping state. RPM erase also stops/disables and keeps `/var/lib/tidemark`; edited config may remain as `.rpmsave`. For deliberately approved deletion of Tidemark's own retained state, `sudo tidemark deploy unstage --purge-state --yes` is available. Unstage/purge remain available when storage would be ineligible for stage. No monitored application data is removed. Keep incident evidence before purging.
+
+## Watcher visibility and symbolic-link limits
+
+Run `sudo tidemark status` and inspect the mode and watcher component detail. `fd_filesystem` in status (`fd/filesystem` in foreground/detail) uses a filesystem mark where supported, measured on Rocky 8.10, and sees writes through bind mounts and private mount namespaces. Foreign-mount events are mapped by file handle to the watched mount. Unmappable paths keep total/unit/command counts and use the watched root for directory activity; `unmapped_events` reports this fallback. Hard-link names and directory attribution remain best effort. A watched subdirectory bind can receive outside activity attributed at its root.
+
+`fd/mount` is the fallback on Rocky 8.8 or a failed filesystem mark. It sees only writes through the selected mount and explicitly warns that other mount namespaces and bind mounts are not seen. Database services using `PrivateTmp=` or `ProtectSystem=` may be invisible on 8.8. Both fd modes observe close-write, not FID create/delete/rename; capability probing and status are the way to tell. Do not add namespace settings to the Tidemark unit: host-namespace checks still protect scans, sampling and path interpretation.
+
+`sudo tidemark symlinks /data --check-targets` resolves components only within the selected mount, including same-device bind boundaries. `other_fs` means the external target was not checked: it does not tell you whether it exists, dangles or loops. Reading link text may update that link’s atime under mount policy. No scan and no other command reads the text of symbolic links it finds; resolving an administrator-supplied path on the command line follows links in that path as ordinary tools do. The 40-expansion bound also treats overlong chains as loops. Tidemark never restores timestamps or changes mount options to hide this limit.
+
+`man tidemark` and `man tidemarkd` provide the packaged command references. Final guest acceptance for real second-user trust, filesystem marks under packaged restrictions and cross-mount link atime remains pending; implemented checks and earlier capability measurements do not replace those gates.

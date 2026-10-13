@@ -40,7 +40,7 @@
    - `ci`: runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo deny check` (if installed; warn otherwise), the owner-tag check and the forbidden-symbol scan.
    - **Features:** every member crate declares `privileged = []` (it may be empty), so `--workspace --features privileged` works.
    - `vm-test`: stub here, implemented in W0-C. `gen-fixture`, `bench`: stubs owned by W7-B. `rpm`: stub owned by W6-C.
-6. **`deny.toml`**: license allow-list and advisories on; deny `openssl-sys`, since nothing should need it (keep the binary free of system TLS dependencies; `ureq` uses rustls).
+6. **`deny.toml`**: license allow-list and advisories on; deny `openssl-sys`, since nothing should need it (keep the binary free of system TLS dependencies; no HTTP/TLS stack remains in v1 (ADR-020)).
 7. A `.gitignore` covering `target/` and `*.db.tmp`.
 
 ### Stub map (file → owning task)
