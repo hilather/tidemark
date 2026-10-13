@@ -31,6 +31,9 @@ fn sum(v: &Value, key: &str) -> u64 {
 }
 #[test]
 fn scan_to_every_report() {
+    if super::identity::delegate("scan_reports::scan_to_every_report") {
+        return;
+    }
     assert!(test_support::oracle::gnu_available("du"));
     assert!(test_support::oracle::gnu_available("find"));
     let f = test_support::materialize(include_str!("../../../test-support/fixtures/e2e_scan.toml"));

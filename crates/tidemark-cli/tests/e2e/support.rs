@@ -30,7 +30,9 @@ impl Harness {
             "[scan]\nthreads=2\n[throttle]\nmin_ops_per_sec=50000\nmax_ops_per_sec=50000\n",
         );
         let binary = temp.path().join("tidemark");
-        std::fs::copy(env!("CARGO_BIN_EXE_tidemark"), &binary).unwrap();
+        let source = std::env::var_os("TIDEMARK_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_tidemark").into());
+        std::fs::copy(source, &binary).unwrap();
         let probe = temp.path().join("permission-probe");
         std::fs::create_dir(&probe).unwrap();
         std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o0)).unwrap();

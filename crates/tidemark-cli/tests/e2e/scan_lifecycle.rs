@@ -238,6 +238,10 @@ fn interrupted_cancelled_and_failed_scans() {
 
 #[test]
 fn unrelated_listener_does_not_redirect_direct_scan() {
+    if super::identity::delegate("scan_lifecycle::unrelated_listener_does_not_redirect_direct_scan")
+    {
+        return;
+    }
     use std::os::unix::net::UnixListener;
     let h = Harness::new();
     let socket = h.temp.path().join("unrelated-api.sock");

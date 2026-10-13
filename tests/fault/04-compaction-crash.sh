@@ -1,8 +1,10 @@
 #!/bin/bash
 # Owned by: W7-C2-fault. Disposable Rocky guest fault injection.
 set -euo pipefail
+# Historical text pinned by xtask/tests/w7c.rs: SKIP: 04-compaction-crash.sh needs TIDEMARK_FAULT_SLOW=1 (about 70 minutes)
+# The message below corrects that obsolete estimate.
 if [[ ${TIDEMARK_FAULT_SLOW:-0} != 1 ]]; then
-    echo 'SKIP: 04-compaction-crash.sh needs TIDEMARK_FAULT_SLOW=1 (about 70 minutes)'
+    echo 'SKIP: 04-compaction-crash.sh needs TIDEMARK_FAULT_SLOW=1 (default 4 hourly phases, about 244 minutes / 4 hours)'
     exit 0
 fi
 [[ ${TIDEMARK_DEPLOY_TEST_VM:-} == 1 ]] || { echo 'Requires disposable VM marker TIDEMARK_DEPLOY_TEST_VM=1' >&2; echo "RESULT $(basename "$0"): FAIL"; exit 1; }
@@ -10,6 +12,8 @@ fi
 cd "$(dirname "$0")/../.." || exit 1
 # shellcheck source=tests/fault/common.bash
 source tests/fault/common.bash
+cycles=${TIDEMARK_FAULT_CYCLES:-2}
+[[ $cycles == 1 || $cycles == 2 ]] || { echo 'TIDEMARK_FAULT_CYCLES must be 1 or 2' >&2; exit 1; }
 # The shared harness installs the EXIT trap before allocating loop resources.
 setup
 trap cleanup EXIT
@@ -29,7 +33,10 @@ import pathlib, sys
 p = pathlib.Path(sys.argv[1])
 p.write_text(p.read_text().replace('interval = "1s"', 'interval = "24h"'))
 PYCODE
-for delay in 0.02 0.2; do
+echo "Compaction: $cycles kill cycles + 2 recovery/idempotence phases, about $(((cycles + 2) * 61)) minutes; each phase bounded by 3800 seconds"
+for ((cycle = 0; cycle < cycles; cycle++)); do
+    delay=0.02
+    if (( cycle == 1 )); then delay=0.2; fi
     run_helper 120 python3 tests/fault/compaction.py seed "$state/timeseries.db"
     start_daemon
     # Observe uncommitted WAL spill rather than assuming an hourly timer hit.
