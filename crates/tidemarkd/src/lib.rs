@@ -141,6 +141,21 @@ pub fn main_entry() -> std::process::ExitCode {
 mod tests {
     use super::*;
     #[test]
+    fn resource_exit_does_not_fail_lifecycle_join() {
+        let handle = std::thread::spawn(|| {
+            Err(DaemonError::Io {
+                context: "final pass".into(),
+                source: std::io::Error::from_raw_os_error(24),
+            })
+        });
+        assert!(join_until(
+            "sampler",
+            handle,
+            std::time::Instant::now() + std::time::Duration::from_secs(5)
+        )
+        .is_ok());
+    }
+    #[test]
     fn sqlite_extended_pressure_codes_exclude_corruption() {
         for code in [7, 10, 14, 10 | (3 << 8), 14 | (2 << 8)] {
             assert!(sqlite_pressure_code(code));
@@ -986,6 +1001,12 @@ fn join_until(
         return Err(DaemonError::Internal(format!(
             "{name} did not stop before shutdown deadline"
         )));
+    }
+    if let Err(error) = &result {
+        if daemon_pressure(error) {
+            tracing::warn!(component=name, %error, "service degraded at shutdown");
+            return Ok(());
+        }
     }
     result
 }

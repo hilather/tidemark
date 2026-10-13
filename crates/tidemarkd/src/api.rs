@@ -723,6 +723,7 @@ pub fn start_with_peer_timeout(
                         index += 1;
                     }
                 }
+                let was_degraded = pressure.failures > 0;
                 let accepted = accept_once(
                     &mut pressure,
                     || listener.accept(),
@@ -772,7 +773,15 @@ pub fn start_with_peer_timeout(
                             clients.push(h);
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if was_degraded && pressure.failures == 0 {
+                            let _ = context.state.publish_component(crate::component(
+                                "api",
+                                "ok",
+                                "Unix socket listening",
+                            ));
+                        }
+                    }
                     Err(e) => {
                         outcome = Err(io(e));
                         shutdown.store(true, Ordering::Release);

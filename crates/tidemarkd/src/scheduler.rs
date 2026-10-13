@@ -1418,6 +1418,13 @@ fn scheduler(
         );
         match job.join()? {
             Ok(()) | Err(DaemonError::Scan(_)) => {}
+            Err(DaemonError::Io { source, .. }) if crate::resource_pressure(&source) => {
+                shared.state.publish_component(component(
+                    "scheduler",
+                    "degraded",
+                    source.to_string(),
+                ))?;
+            }
             Err(e) => return Err(e),
         }
     }

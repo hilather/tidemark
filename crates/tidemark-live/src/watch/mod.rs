@@ -44,20 +44,32 @@ fn read_batch<T>(
 }
 
 fn descriptor_limit_reached() -> bool {
-    let Some(limit) = rustix::process::getrlimit(rustix::process::Resource::Nofile).current else {
-        return false;
-    };
-    // Opening fdinfo also fails at the limit; do not silently treat that as healthy.
-    match std::fs::read_dir("/proc/self/fd") {
-        Ok(entries) => {
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+    descriptor_limit_with(limit, |limit| {
+        std::fs::read_dir("/proc/self/fd").map(|entries| {
             entries
                 .take(usize::try_from(limit).unwrap_or(usize::MAX))
                 .count() as u64
-                >= limit
-        }
+        })
+    })
+}
+fn descriptor_limit_with(limit: Option<u64>, count: impl FnOnce(u64) -> io::Result<u64>) -> bool {
+    let Some(limit) = limit else {
+        return false;
+    };
+    // The procfs directory descriptor is included, conservatively detecting
+    // the last remaining slot. Its open fails if no slot remains at all.
+    match count(limit) {
+        Ok(count) => count >= limit,
         Err(error) => error.raw_os_error().is_some_and(|code| {
-            code == rustix::io::Errno::MFILE.raw_os_error()
-                || code == rustix::io::Errno::NFILE.raw_os_error()
+            [
+                rustix::io::Errno::MFILE,
+                rustix::io::Errno::NFILE,
+                rustix::io::Errno::NOMEM,
+                rustix::io::Errno::NOBUFS,
+            ]
+            .iter()
+            .any(|errno| code == errno.raw_os_error())
         }),
     }
 }
@@ -906,6 +918,20 @@ impl std::fmt::Display for WatchMode {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn descriptor_limit_counts_and_unreadable_pressure_are_lossy() {
+        assert!(descriptor_limit_with(Some(64), |_| Ok(64)));
+        assert!(!descriptor_limit_with(Some(64), |_| Ok(63)));
+        assert!(!descriptor_limit_with(None, |_| panic!("unlimited")));
+        for errno in [24, 23, 12, 105] {
+            assert!(descriptor_limit_with(Some(64), |_| Err(
+                io::Error::from_raw_os_error(errno)
+            )));
+        }
+        assert!(!descriptor_limit_with(Some(64), |_| Err(
+            io::Error::from_raw_os_error(2)
+        )));
+    }
     #[test]
     fn fd_reader_drains_five_thousand_in_bounded_batches() {
         for batch in [256, 32, 16] {
