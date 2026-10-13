@@ -28,6 +28,7 @@ fn browser(count: u32) -> (tempfile::TempDir, Browser) {
     let dir = snapshot.root().unwrap();
     let mut b = Browser {
         snapshot,
+        snapshot_file: file.clone(),
         old: None,
         dir,
         state: State::new(1),
@@ -156,6 +157,7 @@ fn hostile_names_in_data_panes() {
     let mut b = Browser {
         dir: snapshot.root().unwrap(),
         snapshot,
+        snapshot_file: file.clone(),
         old: None,
         state: State::new(1),
         rows: vec![],
@@ -217,6 +219,7 @@ fn million_directory_navigation() {
     let mut b = Browser {
         dir: snapshot.root().unwrap(),
         snapshot,
+        snapshot_file: file.clone(),
         old: None,
         state: State::new(1),
         rows: vec![],
@@ -261,6 +264,7 @@ fn query_pages_skip_nested_subtrees_and_support_back() {
     let mut b = Browser {
         dir: snapshot.root().unwrap(),
         snapshot,
+        snapshot_file: file.clone(),
         old: None,
         state: State::new(1),
         rows: vec![],
@@ -434,6 +438,7 @@ size = 8192
     let file = fixture::snapshot(store.path(), &rows, 1_000_000);
     let (_temp, mut b) = browser(0);
     b.snapshot = Snapshot::open(&file).unwrap();
+    b.snapshot_file = file.clone();
     b.navigate(b.snapshot.root().unwrap()).unwrap();
     let baseline = b.rows[0].0.t_disk;
     std::fs::write(fixture.root.join("a/new"), vec![0; 1024 * 1024]).unwrap();
@@ -457,6 +462,8 @@ size = 8192
     config.throttle.min_ops_per_sec = 1;
     config.throttle.max_ops_per_sec = 1;
     b.start_refresh(&config);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    b.state.move_by(1, b.count());
     b.refresh
         .as_ref()
         .unwrap()

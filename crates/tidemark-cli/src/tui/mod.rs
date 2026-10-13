@@ -23,9 +23,14 @@ struct Pages {
     live: Option<Vec<(DirRow, Option<i128>)>>,
     live_order: Option<state::Sort>,
 }
+struct LiveResult {
+    root: DirRow,
+    children: Vec<(DirRow, Option<i128>)>,
+    sort: state::Sort,
+}
 struct Refresh {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    rx: crossbeam_channel::Receiver<anyhow::Result<Vec<DirRow>>>,
+    rx: crossbeam_channel::Receiver<anyhow::Result<LiveResult>>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 impl Drop for Refresh {
@@ -39,6 +44,7 @@ impl Drop for Refresh {
 }
 struct Browser {
     snapshot: Snapshot,
+    snapshot_file: std::path::PathBuf,
     old: Option<Snapshot>,
     dir: DirRow,
     state: State,
@@ -250,9 +256,44 @@ impl Browser {
         let worker_cancel = cancel.clone();
         let path = self.dir.path.clone();
         let config = config.clone();
+        let snapshot_file = self.snapshot_file.clone();
+        let sort = self.state.sort;
         let (tx, rx) = crossbeam_channel::bounded(1);
         let worker = std::thread::spawn(move || {
-            let result = crate::live_rows::live_rows(&path, &config, &worker_cancel);
+            let result = (|| -> anyhow::Result<LiveResult> {
+                let rows = crate::live_rows::live_rows(&path, &config, &worker_cancel)?;
+                let root = rows
+                    .iter()
+                    .find(|r| r.path == path)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("live root missing"))?;
+                let snapshot = Snapshot::open(&snapshot_file)?;
+                let mut children = Vec::new();
+                for row in rows.into_iter().filter(|r| r.parent_id == Some(root.id)) {
+                    if worker_cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(tidemark_fs::walk::WalkError::Cancelled.into());
+                    }
+                    if children.len() == MAX_LIVE_CHILDREN {
+                        return Err(anyhow::anyhow!(
+                            "Live refresh exceeds the 1,000,000-child display cap"
+                        ));
+                    }
+                    let baseline = snapshot
+                        .dir_by_path(&row.path)?
+                        .map(|r| r.t_disk)
+                        .unwrap_or(0);
+                    let delta = i128::from(row.t_disk) - i128::from(baseline);
+                    children.push((row, Some(delta)));
+                }
+                let mut ordering = State::new(0);
+                ordering.sort = sort;
+                ordering.order(&mut children);
+                Ok(LiveResult {
+                    root,
+                    children,
+                    sort,
+                })
+            })();
             let _ = tx.send(result);
         });
         self.refresh = Some(Refresh {
@@ -288,33 +329,13 @@ impl Browser {
                 return Ok(());
             }
         };
-        let root = rows.iter().find(|r| r.path == self.dir.path).map(|r| r.id);
-        if rows.iter().filter(|r| r.parent_id == root).count() > MAX_LIVE_CHILDREN {
-            self.message = "Live refresh exceeds the 1,000,000-child display cap".into();
-            return Ok(());
-        }
-        let mut children = Vec::new();
-        for row in rows {
-            if Some(row.id) == root {
-                self.dir = DirRow {
-                    id: self.dir.id,
-                    parent_id: self.dir.parent_id,
-                    ..row
-                };
-            } else if row.parent_id == root {
-                let baseline = self
-                    .snapshot
-                    .dir_by_path(&row.path)?
-                    .map(|r| r.t_disk)
-                    .unwrap_or(0);
-                children.push((row, Some(i128::from(baseline))));
-            }
-        }
-        for (row, delta) in &mut children {
-            *delta = delta.map(|baseline| i128::from(row.t_disk) - baseline);
-        }
-        self.pages.live = Some(children);
-        self.pages.live_order = None;
+        self.dir = DirRow {
+            id: self.dir.id,
+            parent_id: self.dir.parent_id,
+            ..rows.root
+        };
+        self.pages.live = Some(rows.children);
+        self.pages.live_order = Some(rows.sort);
         self.pages.offset = 0;
         self.load()?;
         self.message = "live values; delta against snapshot".into();
@@ -445,6 +466,7 @@ impl Browser {
                             .max_by_key(|(_, _, started)| *started)
                             .map(|(_, file, _)| Snapshot::open(file))
                             .transpose()?;
+                        self.snapshot_file = file.clone();
                         self.snapshot = snapshot;
                         self.old = old;
                         self.navigate(dir)?;
@@ -494,6 +516,11 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         .and_then(|e| e.file.as_ref())
         .map(|file| Snapshot::open(file))
         .transpose()?;
+    let snapshot_file = entries
+        .iter()
+        .find(|e| e.scan_id == snapshot.meta().scan_id.to_string())
+        .and_then(|e| e.file.clone())
+        .ok_or_else(|| anyhow::anyhow!("snapshot missing from catalog"))?;
     let snapshots = entries
         .into_iter()
         .filter_map(|e| e.file.map(|file| (e.scan_id, file, e.started_at)))
@@ -501,6 +528,7 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
     let start = dir.id.saturating_add(1);
     let mut browser = Browser {
         snapshot,
+        snapshot_file,
         old,
         dir,
         state: State::new(start),
