@@ -3,12 +3,37 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "23 6 * * 1"
 permissions:
   contents: read
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  deny:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    # Becomes required once the first findings are resolved.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup toolchain install "$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" --profile minimal --component rustfmt --component clippy
+      - uses: actions/cache@v5
+        id: deny-cache
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-0.18.4
+      - name: Install pinned cargo-deny
+        if: steps.deny-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-deny --locked --version 0.18.4
+      - run: cargo fetch --locked
+      - run: cargo deny --version
+      - run: cargo deny check
   ci:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
