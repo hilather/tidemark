@@ -13,20 +13,40 @@ const FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 pub(crate) fn directory(path: &Path, create: bool) -> io::Result<OwnedFd> {
-    if !path.is_absolute() {
-        return Err(io::Error::other("deployment path must be absolute"));
+    if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(io::Error::other(format!(
+            "unsafe deployment directory {}",
+            display(path)
+        )));
     }
-    let mut fd = fs::open("/", FLAGS, Mode::empty())?;
-    for part in path.components() {
-        let name = match part {
-            Component::RootDir => continue,
-            Component::Normal(n) => n,
-            _ => return Err(io::Error::other("unsafe deployment path component")),
-        };
-        fd = directory_at(&fd, name, create)?;
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    let mut fd = loop {
+        match tidemark_store::state_dir::trusted_directory(ancestor) {
+            Ok(fd) => break fd,
+            Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
+                if missing.len() >= 4096 {
+                    return Err(io::Error::other("deployment directory depth exceeds 4096"));
+                }
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| io::Error::other("missing name"))?,
+                );
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| io::Error::other("missing parent"))?;
+            }
+            Err(e) => return Err(directory_error(path, e)),
+        }
+    };
+    for name in missing.into_iter().rev() {
+        fd = directory_at(&fd, name, true)?;
+        eligible(&fd, Path::new(name), false)?;
     }
     Ok(fd)
 }
+
 pub(crate) fn directory_at(
     parent: &OwnedFd,
     name: &std::ffi::OsStr,
@@ -125,7 +145,7 @@ pub(crate) fn validate_state(
 pub(crate) fn validate_marker_roots_at(path: &Path, state: Option<&OwnedFd>) -> io::Result<()> {
     let bytes = match state.map_or_else(
         || Err(io::ErrorKind::NotFound.into()),
-        |fd| read_at(fd, std::ffi::OsStr::new(MARKER)),
+        |fd| read_state_at(fd, std::ffi::OsStr::new(MARKER), &path.join(MARKER)),
     ) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -219,60 +239,12 @@ pub(crate) fn inspect(path: &Path) -> io::Result<()> {
         Err(e) => Err(e),
     }
 }
-pub(crate) fn private_dir(path: &Path, root: bool) -> io::Result<()> {
-    let fd = match directory(path, false) {
-        Ok(fd) => {
-            let marker = fs::openat(
-                &fd,
-                MARKER,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            );
-            let marked = marker
-                .ok()
-                .and_then(|m| {
-                    if FileType::from_raw_mode(fs::fstat(&m).ok()?.st_mode) != FileType::RegularFile
-                    {
-                        return None;
-                    }
-                    let mut bytes = Vec::new();
-                    std::fs::File::from(m)
-                        .take(1024 * 1024 + 1)
-                        .read_to_end(&mut bytes)
-                        .ok()?;
-                    if bytes.len() > 1024 * 1024 {
-                        return None;
-                    }
-                    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-                })
-                .is_some_and(|v| {
-                    v.get("format").and_then(|v| v.as_str()) == Some("tidemark-state-v1")
-                        && v.get("state_dir")
-                            .and_then(|v| {
-                                serde_json::from_value::<tidemark_core::path::RawPath>(v.clone())
-                                    .ok()
-                            })
-                            .is_some_and(|p| p.as_path() == path)
-                });
-            if !marked {
-                eligible(&fd, path, false)?;
-                return Ok(());
-            }
-            fd
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => directory(path, true)?,
-        Err(e) => return Err(e),
-    };
-    fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
-    if root {
-        fs::fchown(
-            &fd,
-            Some(rustix::process::Uid::ROOT),
-            Some(rustix::process::Gid::ROOT),
-        )?;
-    }
-    Ok(())
+pub(crate) fn private_dir(path: &Path, _root: bool) -> io::Result<()> {
+    let (state, deploy) = state_handles(path, true)?;
+    let (fd, _) = complete_handles(path, state, deploy)?;
+    eligible(&fd, path, false)
 }
+
 pub(crate) fn remove(path: &Path) -> io::Result<()> {
     let parent = match directory(
         path.parent()
@@ -357,20 +329,33 @@ pub(crate) fn state_handles(
         Err(e) if e.kind() == io::ErrorKind::NotFound => directory(path, true)?,
         Err(e) => return Err(e),
     };
+    eligible(&state, path, true)?;
     let marked = marker_authorizes(&state, path)?;
     eligible(&state, path, marked)?;
-    let deploy = match directory_at(&state, std::ffi::OsStr::new("deploy"), create) {
+    let mut deploy = match directory_at(&state, std::ffi::OsStr::new("deploy"), false) {
         Ok(fd) => {
             eligible(&fd, &path.join("deploy"), false)?;
             Some(fd)
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound && !create => None,
-        Err(e) => return Err(e),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(leaf_error(
+                &state,
+                std::ffi::OsStr::new("deploy"),
+                &path.join("deploy"),
+                e,
+            ))
+        }
     };
+    check_content(&state, deploy.as_ref(), path)?;
+    if create && deploy.is_none() {
+        deploy = Some(directory_at(&state, std::ffi::OsStr::new("deploy"), true)?);
+    }
     Ok((Some(state), deploy))
 }
 fn marker_authorizes(state: &OwnedFd, path: &Path) -> io::Result<bool> {
-    match read_at(state, std::ffi::OsStr::new(MARKER)) {
+    check_leaf_at(state, std::ffi::OsStr::new(MARKER), &path.join(MARKER))?;
+    match read_state_at(state, std::ffi::OsStr::new(MARKER), &path.join(MARKER)) {
         Ok(bytes) => {
             let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
             Ok(
@@ -396,9 +381,11 @@ fn eligible(fd: &OwnedFd, path: &Path, marked: bool) -> io::Result<()> {
         }
         stat
     });
-    if !marked && (stat.st_uid != rustix::process::geteuid().as_raw() || stat.st_mode & 0o077 != 0)
+    if stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o022 != 0
+        || (!marked && stat.st_mode & 0o077 != 0)
     {
-        return Err(io::Error::other(format!("unsafe directory {}: owner {}, mode {:04o}; requires effective-uid ownership and no group/world permissions", path.display(), stat.st_uid, stat.st_mode & 0o7777)));
+        return Err(io::Error::other(format!("unsafe directory {}: owner {}, mode {:04o}, links {}; requires effective-uid ownership and no group/world permissions", display(path), stat.st_uid, stat.st_mode & 0o7777, stat.st_nlink)));
     }
     Ok(())
 }
@@ -416,18 +403,16 @@ pub(crate) fn complete_handles(
             fd
         }
     };
+    let marked = marker_authorizes(&state, path)?;
+    eligible(&state, path, marked)?;
+    check_content(&state, deploy.as_ref(), path)?;
     let deploy = match deploy {
         Some(fd) => fd,
         None => directory_at(&state, std::ffi::OsStr::new("deploy"), true)?,
     };
     eligible(&deploy, &path.join("deploy"), false)?;
     // Existing directories are normalized only when their marker authorizes it.
-    if marker_authorizes(&state, path)? {
-        fs::fchown(
-            &state,
-            Some(rustix::process::geteuid()),
-            Some(rustix::process::getegid()),
-        )?;
+    if marked {
         fs::fchmod(&state, Mode::from_raw_mode(0o700))?;
     }
     Ok((state, deploy))
@@ -436,7 +421,7 @@ pub(crate) fn optional_at(parent: Option<&OwnedFd>, name: &str) -> io::Result<Op
     let Some(parent) = parent else {
         return Ok(None);
     };
-    match read_at(parent, std::ffi::OsStr::new(name)) {
+    match read_state_at(parent, std::ffi::OsStr::new(name), Path::new(name)) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
@@ -447,4 +432,177 @@ pub(crate) fn optional_at(parent: Option<&OwnedFd>, name: &str) -> io::Result<Op
 #[cfg(test)]
 thread_local! {
     pub(crate) static FOREIGN_OWNER: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn display(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    tidemark_core::path::display_lossy_bytes(path.as_os_str().as_bytes())
+}
+
+pub(crate) fn check_leaf_at(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let dir = tidemark_store::state_dir::StateDir::open(
+        Path::new(&format!("/proc/self/fd/{}/.", parent.as_raw_fd())),
+        false,
+    )?;
+    let result = dir.check_leaf(name);
+    #[cfg(test)]
+    let result = FOREIGN_OWNER.with(|owner| {
+        if owner.borrow().as_deref() == Some(path) {
+            Err(io::Error::other("untrusted owner (test injection)"))
+        } else {
+            result
+        }
+    });
+    result.map_err(|e| leaf_error(parent, name, path, e))?;
+    Ok(())
+}
+
+fn check_content(state: &OwnedFd, deploy: Option<&OwnedFd>, path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let dir = tidemark_store::state_dir::StateDir::open(
+        Path::new(&format!("/proc/self/fd/{}/.", state.as_raw_fd())),
+        false,
+    )?;
+    for name in [
+        "timeseries.db",
+        "timeseries.db-wal",
+        "timeseries.db-shm",
+        "timeseries.db-journal",
+        "timeseries.db.bak-v0",
+        "timeseries.db.bak-v0-wal",
+        "timeseries.db.bak-v0-shm",
+        "timeseries.db.bak-v0-journal",
+        "scan.lock",
+        MARKER,
+    ] {
+        check_leaf_at(state, std::ffi::OsStr::new(name), &path.join(name))?;
+    }
+    for name in ["snapshots", "tmp", "deploy"] {
+        match dir.subdir(std::ffi::OsStr::new(name), false) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(leaf_error(
+                    state,
+                    std::ffi::OsStr::new(name),
+                    &path.join(name),
+                    e,
+                ))
+            }
+        }
+    }
+    if let Some(deploy) = deploy {
+        for name in ["staged.json", "firstboot.json"] {
+            check_leaf_at(
+                deploy,
+                std::ffi::OsStr::new(name),
+                &path.join("deploy").join(name),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_purge_root(fd: &OwnedFd, path: &Path) -> io::Result<()> {
+    eligible(fd, path, true)
+}
+
+pub(crate) fn optional_name_at(
+    parent: Option<&OwnedFd>,
+    name: &std::ffi::OsStr,
+) -> io::Result<Option<Vec<u8>>> {
+    let Some(parent) = parent else {
+        return Ok(None);
+    };
+    match read_at(parent, name) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+pub(crate) fn remove_at(parent: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
+    match fs::unlinkat(parent, name, AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn leaf_error(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+    path: &Path,
+    error: io::Error,
+) -> io::Error {
+    let metadata = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map(|s| {
+            format!(
+                "owner {}, mode {:04o}, links {}",
+                s.st_uid,
+                s.st_mode & 0o7777,
+                s.st_nlink
+            )
+        })
+        .unwrap_or_else(|e| format!("metadata unavailable: {e}"));
+    io::Error::new(
+        error.kind(),
+        format!("{}: {error}; {metadata}", display(path)),
+    )
+}
+pub(crate) fn read_state_at(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> io::Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    check_leaf_at(parent, name, path)?;
+    let dir = tidemark_store::state_dir::StateDir::open(
+        Path::new(&format!("/proc/self/fd/{}/.", parent.as_raw_fd())),
+        false,
+    )?;
+    let mut bytes = Vec::new();
+    dir.open_leaf(name, false, false)
+        .map_err(|e| leaf_error(parent, name, path, e))?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(io::Error::other("deployment file exceeds 1 MiB"));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn read_state(path: &Path) -> io::Result<Vec<u8>> {
+    let parent = tidemark_store::state_dir::StateDir::open(
+        &tidemark_store::state_dir::file_parent(path)?,
+        false,
+    )?;
+    let fd = rustix::io::dup(parent.fd())?;
+    read_state_at(
+        &fd,
+        path.file_name()
+            .ok_or_else(|| io::Error::other("missing state name"))?,
+        path,
+    )
+}
+
+fn directory_error(path: &Path, error: io::Error) -> io::Error {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)
+        .map(|s| {
+            format!(
+                "owner {}, mode {:04o}, links {}",
+                s.uid(),
+                s.mode() & 0o7777,
+                s.nlink()
+            )
+        })
+        .unwrap_or_else(|e| format!("metadata unavailable: {e}"));
+    io::Error::new(
+        error.kind(),
+        format!("{}: {error}; {metadata}", display(path)),
+    )
 }
