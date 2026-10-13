@@ -133,6 +133,11 @@ fn start_with(
                                 crate::component("sampler", "degraded", error.to_string()),
                             )?;
                         }
+                        state.publish_component(crate::component(
+                            "sampler",
+                            "degraded",
+                            error.to_string(),
+                        ))?;
                         crate::wait_service(
                             &state,
                             generation,
