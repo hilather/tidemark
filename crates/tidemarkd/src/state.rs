@@ -1170,6 +1170,27 @@ impl LiveStateView {
             .transpose_option()?;
         Some(self.data.procscan.as_ref()?.phantom(raw.as_ref()))
     }
+    pub(crate) fn process_unavailable_detail(&self) -> String {
+        if !self.data.config.procscan.enabled {
+            return "process scan not configured: disabled by config".into();
+        }
+        if let Some(component) = self.data.components.get("procscan") {
+            if matches!(component.state.as_str(), "error" | "degraded")
+                && !component.detail.contains("awaiting completed scan")
+            {
+                return if component.detail.starts_with("process scan failed:")
+                    || component
+                        .detail
+                        .starts_with("process inventory over its memory budget")
+                {
+                    component.detail.clone()
+                } else {
+                    format!("process scan failed: {}", component.detail)
+                };
+            }
+        }
+        "process scan has not completed yet".into()
+    }
     /// Scanner growth using the caller's exact positive duration.
     pub fn writers(&self, p: &WritersParams) -> Option<Vec<OpenWriter>> {
         let raw = p

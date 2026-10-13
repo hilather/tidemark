@@ -267,7 +267,10 @@ pub(crate) fn dispatch_controlled(
             "hot" => value(available(view.hot(&params(request)?))?),
             "lvm" => value(available(view.lvm_report(&params(request)?))?),
             "phantom" => value(available(view.phantom(&params(request)?))?),
-            "writers" => value(available(view.writers(&params(request)?))?),
+            "writers" => value(
+                view.writers(&params(request)?)
+                    .ok_or_else(|| DaemonError::Unavailable(view.process_unavailable_detail()))?,
+            ),
             "alerts.active" => {
                 let p: AlertsActiveParams = params(request)?;
                 let mut rows = available(view.active_alerts())?;
@@ -954,6 +957,46 @@ mod fuzz_seams;
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn writers_unavailable_names_the_process_scan_and_failure() {
+        let mut config = tidemark_core::config::Config::default();
+        config.procscan.enabled = true;
+        let state = crate::state::LiveState::new(&config, 0);
+        let context = Context {
+            state: state.clone(),
+            scans: crate::scheduler::ScanControl::default(),
+            reload: Arc::new(|| unreachable!("writers does not reload")),
+        };
+        let request = Request {
+            v: 1,
+            id: "writers-test".into(),
+            method: "writers".into(),
+            params: serde_json::json!({"window": "5m"}),
+        };
+        let response = dispatch(&request, 0, &context, 0).unwrap();
+        assert_eq!(
+            response.error.unwrap().message,
+            "unavailable: process scan has not completed yet"
+        );
+        state.publish(crate::state::Publication::ProcscanAttempt { generation: 0, report: None }, crate::component("procscan", "degraded", "process inventory over its memory budget: 34000 descriptors, 134217000 bytes retained")).unwrap();
+        let response = dispatch(&request, 0, &context, 1).unwrap();
+        assert_eq!(response.error.unwrap().message, "unavailable: process inventory over its memory budget: 34000 descriptors, 134217000 bytes retained");
+        state
+            .publish_component(crate::component("procscan", "error", "permission denied"))
+            .unwrap();
+        let response = dispatch(&request, 0, &context, 1).unwrap();
+        assert_eq!(
+            response.error.unwrap().message,
+            "unavailable: process scan failed: permission denied"
+        );
+        config.procscan.enabled = false;
+        state.replace_config(config).unwrap();
+        let response = dispatch(&request, 0, &context, 1).unwrap();
+        assert_eq!(
+            response.error.unwrap().message,
+            "unavailable: process scan not configured: disabled by config"
+        );
+    }
     const FRAME_SEED: &[u8] = include_bytes!("../../../fuzz/corpus/api_frame/sample");
     fn exercise_frame(bytes: &[u8]) {
         let mut input = bytes;
