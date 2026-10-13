@@ -1,5 +1,5 @@
 //! Owned by: W7-A
-//! Pure browser navigation and page-local ordering.
+//! Pure browser navigation and bounded ordering.
 
 use tidemark_core::snapshot::DirRow;
 
@@ -42,8 +42,6 @@ pub(crate) struct State {
     pub(crate) filter: String,
     pub(crate) editing: bool,
     pub(crate) page_start: u32,
-    pub(crate) next: Option<u32>,
-    history: std::collections::VecDeque<u32>,
 }
 impl State {
     pub(crate) fn new(start: u32) -> Self {
@@ -54,8 +52,6 @@ impl State {
             filter: String::new(),
             editing: false,
             page_start: start,
-            next: None,
-            history: std::collections::VecDeque::new(),
         }
     }
     pub(crate) fn move_by(&mut self, amount: isize, count: usize) {
@@ -67,31 +63,7 @@ impl State {
     pub(crate) fn reset(&mut self, start: u32) {
         self.selected = 0;
         self.page_start = start;
-        self.next = None;
-        self.history.clear();
         self.pane = Pane::Main;
-    }
-    pub(crate) fn next_page(&mut self) -> bool {
-        let Some(next) = self.next else {
-            return false;
-        };
-        // Four KiB cursor history covers a million-child directory. Beyond
-        // 1,024 pages discard the oldest cursor rather than growing memory.
-        if self.history.len() == 1_024 {
-            self.history.pop_front();
-        }
-        self.history.push_back(self.page_start);
-        self.page_start = next;
-        self.selected = 0;
-        true
-    }
-    pub(crate) fn previous_page(&mut self) -> bool {
-        let Some(previous) = self.history.pop_back() else {
-            return false;
-        };
-        self.page_start = previous;
-        self.selected = 0;
-        true
     }
     pub(crate) fn order(&self, rows: &mut [(DirRow, Option<i128>)]) {
         rows.sort_by(|a, b| {

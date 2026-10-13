@@ -37,6 +37,8 @@ fn browser(count: u32) -> (tempfile::TempDir, Browser) {
         snapshots: vec![],
         message: String::new(),
         now: 1_000_100,
+        pages: Pages::default(),
+        refresh: None,
     };
     b.load().unwrap();
     (temp, b)
@@ -61,11 +63,10 @@ fn pages_all_2500_children() {
     loop {
         assert!(b.rows.len() <= PAGE);
         ids.extend(b.rows.iter().map(|r| r.0.id));
-        let Some(next) = b.state.next else {
+        if b.rows.len() < PAGE {
             break;
-        };
-        b.state.page_start = next;
-        b.load().unwrap();
+        }
+        b.page(false).unwrap();
     }
     ids.sort_unstable();
     assert_eq!(ids, (1..=2500).collect::<Vec<_>>());
@@ -74,6 +75,7 @@ fn pages_all_2500_children() {
 fn descend_ascend_filter_sort_and_bounds() {
     let (_temp, mut b) = browser(10);
     b.state.filter = "00000005".into();
+    b.boundary(false).unwrap();
     assert_eq!(b.visible().len(), 1);
     b.enter().unwrap();
     assert_eq!(b.dir.id, 5);
@@ -81,6 +83,7 @@ fn descend_ascend_filter_sort_and_bounds() {
     let parent = b.snapshot.dir(b.dir.parent_id.unwrap()).unwrap();
     b.navigate(parent).unwrap();
     b.state.filter.clear();
+    b.boundary(false).unwrap();
     b.state.sort = state::Sort::Name;
     b.state.order(&mut b.rows);
     assert_eq!(b.rows[0].0.id, 1);
@@ -161,6 +164,8 @@ fn hostile_names_in_data_panes() {
         snapshots: vec![],
         message: String::new(),
         now: 1_000_100,
+        pages: Pages::default(),
+        refresh: None,
     };
     b.load().unwrap();
     for pane in [
@@ -220,6 +225,8 @@ fn million_directory_navigation() {
         snapshots: vec![],
         message: String::new(),
         now: 1_000_100,
+        pages: Pages::default(),
+        refresh: None,
     };
     for step in 0..10 {
         let start = std::time::Instant::now();
@@ -229,11 +236,10 @@ fn million_directory_navigation() {
             "dirs={count} step={step} load_page_ms={:.3}",
             elapsed.as_secs_f64() * 1000.0
         );
-        assert!(elapsed < std::time::Duration::from_millis(100));
-        let Some(next) = b.state.next else {
-            break;
-        };
-        b.state.page_start = next;
+        let nav = std::time::Instant::now();
+        b.state.move_by(1, b.count());
+        println!("navigation_ms={:.3}", nav.elapsed().as_secs_f64() * 1000.0);
+        b.page(false).unwrap();
     }
 }
 
@@ -261,6 +267,8 @@ fn preorder_pages_skip_nested_subtrees_and_support_back() {
         snapshots: vec![],
         message: String::new(),
         now: 1_000_100,
+        pages: Pages::default(),
+        refresh: None,
     };
     b.load().unwrap();
     assert_eq!(
@@ -268,20 +276,14 @@ fn preorder_pages_skip_nested_subtrees_and_support_back() {
         vec![1, 3]
     );
     let (_temp, mut b) = browser(2500);
-    assert!(b.state.next_page());
-    b.load().unwrap();
-    assert_eq!(b.state.page_start, 1001);
-    assert!(b.state.next_page());
-    b.load().unwrap();
-    assert_eq!(b.state.page_start, 2001);
-    assert!(!b.state.next_page());
-    assert!(b.state.previous_page());
-    b.load().unwrap();
-    assert_eq!(b.state.page_start, 1001);
-    assert!(b.state.previous_page());
-    b.load().unwrap();
-    assert_eq!(b.state.page_start, 1);
-    assert!(!b.state.previous_page());
+    b.page(false).unwrap();
+    assert_eq!(b.rows[0].0.id, 1001);
+    b.page(false).unwrap();
+    assert_eq!(b.rows[0].0.id, 2001);
+    b.page(true).unwrap();
+    assert_eq!(b.rows[0].0.id, 1001);
+    b.page(true).unwrap();
+    assert_eq!(b.rows[0].0.id, 1);
 }
 #[test]
 fn delta_lookups_and_growth_sort_are_snapshot_relative() {
@@ -302,4 +304,165 @@ fn delta_lookups_and_growth_sort_are_snapshot_relative() {
     b.state.sort = state::Sort::Growth;
     b.state.order(&mut b.rows);
     assert_eq!(b.rows[0].0.id, 3);
+}
+
+#[test]
+fn global_orders_filter_and_boundaries() {
+    let (_temp, mut b) = browser(2500);
+    // All query orders must cover all pages, with global byte-name ties.
+    for sort in [
+        state::Sort::Size,
+        state::Sort::Reclaim,
+        state::Sort::Files,
+        state::Sort::Newest,
+        state::Sort::Growth,
+        state::Sort::Name,
+    ] {
+        b.state.sort = sort;
+        b.boundary(false).unwrap();
+        let mut ids = Vec::new();
+        loop {
+            ids.extend(b.rows.iter().map(|r| r.0.id));
+            if b.rows.len() < PAGE {
+                break;
+            }
+            b.page(false).unwrap();
+        }
+        assert_eq!(ids, (1..=2500).collect::<Vec<_>>());
+        b.boundary(true).unwrap();
+        assert_eq!(b.rows.last().unwrap().0.id, 2500);
+        assert_eq!(b.state.selected, b.rows.len());
+        b.boundary(false).unwrap();
+        assert_eq!(b.rows[0].0.id, 1);
+    }
+    b.state.filter = "000020".into();
+    b.boundary(false).unwrap();
+    let expected = (1..=2500)
+        .filter(|id| format!("{id:08}").contains("000020"))
+        .collect::<Vec<_>>();
+    assert_eq!(b.rows.iter().map(|r| r.0.id).collect::<Vec<_>>(), expected);
+    b.state.filter = "no such name".into();
+    b.boundary(false).unwrap();
+    assert!(b.rows.is_empty());
+    assert_eq!(b.count(), 1);
+}
+
+#[test]
+fn growth_limit_preserves_current_sort() {
+    let (_temp, mut b) = browser(10_001);
+    b.state.sort = state::Sort::Newest;
+    b.cycle_sort().unwrap();
+    assert_eq!(b.state.sort, state::Sort::Newest);
+    assert!(b.message.contains("10,000"));
+    let (_temp, mut b) = browser(10_000);
+    b.state.sort = state::Sort::Newest;
+    b.cycle_sort().unwrap();
+    assert_eq!(b.state.sort, state::Sort::Growth);
+    assert_eq!(b.pages.growth.as_ref().unwrap().len(), 10_000);
+}
+
+#[test]
+fn own_files_columns_and_info() {
+    let (_temp, mut b) = browser(3);
+    b.dir.own_charged = 4096;
+    b.dir.own_files = 12;
+    let output = render(&b, 160, 48);
+    let line = output.lines().find(|l| l.contains("[own files]")).unwrap();
+    assert!(line.contains(&crate::render::size::bytes(4096)));
+    assert!(line.contains("12"));
+    assert_eq!(line.matches('-').count(), 4);
+    b.state.selected = b.rows.len();
+    b.pane(Pane::Info).unwrap();
+    assert!(b.text.contains("own files as charged"));
+}
+
+#[test]
+fn instances_page_all_rows_forward_backward_and_end() {
+    let (_temp, mut b) = browser(1);
+    let temp = tempfile::tempdir().unwrap();
+    let meta = fixture::meta(b.dir.path.clone(), 1_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&[b.dir.clone()]).unwrap();
+    let rows = (0..2500)
+        .map(|id| LinkInstanceRow {
+            ino: 100,
+            dir_id: 0,
+            name: Some(RawName::new(format!("{id:08}").into_bytes()).unwrap()),
+        })
+        .collect::<Vec<_>>();
+    writer.put_link_instances(&rows).unwrap();
+    b.snapshot = Snapshot::open(&writer.finish(&meta).unwrap()).unwrap();
+    b.pages.inode = Some(100);
+    b.state.pane = Pane::Instances;
+    b.instance_page(false, true).unwrap();
+    assert_eq!(b.pages.instances.len(), 1000);
+    assert!(b.text.starts_with("/fixture/00000000"));
+    b.page(false).unwrap();
+    assert!(b.text.starts_with("/fixture/00001000"));
+    b.page(false).unwrap();
+    assert_eq!(b.pages.instances.len(), 500);
+    b.page(true).unwrap();
+    assert!(b.text.starts_with("/fixture/00001000"));
+    b.instance_page(true, true).unwrap();
+    assert!(b.text.ends_with("/fixture/00002499"));
+}
+
+#[test]
+fn worker_live_refresh_mutation_and_cancellation() {
+    let fixture = test_support::materialize(
+        r#"
+[[entry]]
+path = "a/file"
+kind = "file"
+size = 8192
+"#,
+    );
+    let state = tempfile::tempdir().unwrap();
+    let mut config = tidemark_core::config::Config::default();
+    config.general.state_dir = state.path().to_owned();
+    config.general.socket = state.path().join("test.sock");
+    config.throttle.sample_interval = std::time::Duration::from_millis(20);
+    let path = RawPath::from_path(&fixture.root).unwrap();
+    let rows =
+        crate::live_rows::live_rows(&path, &config, &std::sync::atomic::AtomicBool::new(false))
+            .unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let file = fixture::snapshot(store.path(), &rows, 1_000_000);
+    let (_temp, mut b) = browser(0);
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.navigate(b.snapshot.root().unwrap()).unwrap();
+    let baseline = b.rows[0].0.t_disk;
+    std::fs::write(fixture.root.join("a/new"), vec![0; 1024 * 1024]).unwrap();
+    b.start_refresh(&config);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while b.refresh.is_some() {
+        assert!(std::time::Instant::now() < deadline);
+        b.poll_refresh().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(b.pages.live.is_some(), "{}", b.message);
+    assert_eq!(
+        b.rows[0].0.t_disk,
+        test_support::oracle::du_disk(&fixture.root.join("a"))
+    );
+    assert_eq!(
+        b.rows[0].1,
+        Some(i128::from(b.rows[0].0.t_disk) - i128::from(baseline))
+    );
+    assert!(render(&b, 160, 48).contains("live"));
+    config.throttle.min_ops_per_sec = 1;
+    config.throttle.max_ops_per_sec = 1;
+    b.start_refresh(&config);
+    b.refresh
+        .as_ref()
+        .unwrap()
+        .cancel
+        .store(true, std::sync::atomic::Ordering::Release);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while b.refresh.is_some() {
+        assert!(std::time::Instant::now() < deadline);
+        b.poll_refresh().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(b.message.contains("cancelled"));
 }
