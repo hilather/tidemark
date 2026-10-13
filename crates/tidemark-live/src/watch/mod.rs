@@ -243,7 +243,10 @@ impl WatcherRows {
                 events: r.events,
                 files: r.files,
                 bytes_delta: r.bytes_delta,
-                top_unit: r.top_unit.clone(),
+                top_unit: match r.top_unit.as_deref() {
+                    Some(unit) => Some(budget::copy_string(unit)?),
+                    None => None,
+                },
                 lossy: r.lossy,
             });
         }
@@ -1410,6 +1413,54 @@ impl std::fmt::Display for WatchMode {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn concurrent_shutdown_joins_once_and_reclaims_retained_windows() {
+        let descriptor = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC).unwrap();
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let recorded = steps.clone();
+        let watcher = Arc::new(
+            Watcher::from_injected_events_with_shutdown_probe(
+                raw("/data"),
+                descriptor,
+                move |step| recorded.lock().push(step),
+            )
+            .unwrap(),
+        );
+        let baseline = watcher.retained_key_bytes();
+        let rows = watcher
+            .retain_window_rows(vec![HotEntry {
+                key: vec![b'x'; 4096],
+                events: 1,
+                files: 1,
+                bytes_delta: 7,
+                top_unit: Some("writer".into()),
+                lossy: false,
+            }])
+            .unwrap();
+        assert_eq!(
+            rows.copy_rows().unwrap()[0].top_unit.as_deref(),
+            Some("writer")
+        );
+        let callers: Vec<_> = (0..4)
+            .map(|_| {
+                let watcher = watcher.clone();
+                std::thread::spawn(move || watcher.shutdown())
+            })
+            .collect();
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        assert_eq!(*steps.lock(), vec!["worker stopped", "group closed"]);
+        assert!(watcher.thread.lock().is_none());
+        assert!(watcher.shutdown.lock().is_none());
+        assert!(watcher.mount_fd.lock().is_none());
+        assert!(rows.copy_rows().is_none());
+        assert_eq!(watcher.retained_key_bytes(), baseline);
+        watcher.enable_events();
+        assert!(watcher.state.lock().stream.is_none());
+        watcher.shutdown();
+        assert_eq!(steps.lock().len(), 2);
+    }
     #[test]
     fn injected_fallback_root_must_fit_the_emergency_reserve() {
         let path = raw(&format!("/{}", "x".repeat(WATCH_ROOT_BYTES)));
