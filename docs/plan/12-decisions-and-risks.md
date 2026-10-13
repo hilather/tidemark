@@ -100,6 +100,14 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 - *Decision:* remove the collector and `tidemark-pg`, `tidemark pg`, probe integration, `[postgres]` and PostgreSQL-only keys, `pg.pass`, the three alert kinds and defaults, core types/fields/API, sample table/store functions, service thread, first-boot component, metrics, deploy checks and workspace `postgres` dependency. `[postgres]` is rejected as unknown. The reference design and former wave tasks live in `14-postgres-deferred.md`. The database benchmark gate was removed with PostgreSQL tracking and replaced by a device utilisation and average-wait gate using the adaptive throttle samples.
 - *Consequences:* no migration because nothing has been released. Generic annotations and path exclusions remain. A PostgreSQL data directory is scanned normally. Adaptive throttling, scan windows, one scan at a time, `O_NOATIME`, R2 and the device utilisation and wait gate remain to protect the shared-disk workload. R11 no longer applies; ADR-005 needs no client-runtime exception.
 
+**ADR-020 — No HTTP in v1.**
+- *Decision:* Tidemark v1 exposes and requires no HTTP. Metrics use only the node_exporter textfile collector; alerts use the journal, with active alerts and history through the Unix API and CLI.
+- *Date:* 2026-10-12.
+- *Reason:* A root daemon on database servers should expose and need no network. Textfile and journal cover the need, and removing HTTP gives a smaller dependency tree.
+- *Removed:* inbound Prometheus endpoint and `metrics.listen`; outbound alert webhook and `alerts.webhook`; HTTP client/server code, tests and TLS dependencies. Old keys are rejected with an ADR-020 removal message. The unit permits `AF_UNIX AF_NETLINK` only, retaining netlink for LVM reporting tools and udev.
+- *Consequences:* no replacement or hidden HTTP flag; the daemon opens only its Unix API socket.
+- *Revisit if:* a concrete requirement cannot be met through the textfile collector, journal or Unix API, with a new owner-approved ADR and security review.
+
 ---
 
 ## Risk register

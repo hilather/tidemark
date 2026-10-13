@@ -155,7 +155,7 @@ Daemon validation (13 R4-11): One shared monotonic shutdown deadline governs rec
 
 Retained state storage is `/proc/self/fd/<n>/.`; tests bind storage as production does (R4-1).
 
-Durations use humantime (`30s`, `6h`); sizes use binary units (`1GiB`) or explicit SI suffixes, with checked u64 arithmetic and fractional-byte truncation. Unknown keys are rejected with a helpful error. `tidemark status` and `tidemarkd --check-config` validate the file.
+Durations use humantime (`30s`, `6h`); sizes use binary units (`1GiB`) or explicit SI suffixes, with checked u64 arithmetic and fractional-byte truncation. Unknown keys are rejected with a helpful error. Removed keys `metrics.listen` and `alerts.webhook` are rejected with a message naming the key and stating that the feature was removed in v1 (ADR-020). `tidemark status` and `tidemarkd --check-config` validate the file.
 
 ```toml
 [general]
@@ -229,13 +229,11 @@ exclude_prefixes = []
 
 [metrics]
 textfile              = "/var/lib/node_exporter/textfile_collector/tidemark.prom"   # "" = disabled
-listen                = ""             # e.g. "127.0.0.1:9877"; "" = disabled
 interval              = "60s"
 dir_metrics_depth     = 2
 max_series_per_metric = 500
 
 [alerts]
-webhook  = ""
 renotify = "4h"
 
   [[alerts.rule]]
@@ -269,7 +267,7 @@ Add `Config::from_toml_bytes(bytes: &[u8]) -> Result<Config, CoreError>` in `tid
 
 Absent roots use both example roots; absent per-root window is `None`, while built-in `/data` explicitly has its example window. `Config::load` reads one file capped at `MAX_CONFIG_BYTES = 1 MiB`; missing files return the original I/O error so CLI defaults apply. `Config::default` and deserialization produce effective defaults; default rule merge is idempotent and uses pure core `default_rules(cfg)` (`07` §6.4).
 
-Require `1 <= scan.max_notable <= u32::MAX`, with checked zero-based file-id assignment and SQL conversions. Empty `metrics.listen` disables HTTP; otherwise parse a `SocketAddr` and require `ip().is_loopback()`. Accept IPv4/IPv6 loopback, reject wildcard/external addresses; test each case.
+Require `1 <= scan.max_notable <= u32::MAX`, with checked zero-based file-id assignment and SQL conversions.
 
 ### Alert rule fields (`AlertRule`, normative)
 
@@ -296,7 +294,7 @@ Explicit `scan_stale` rules may target manually scanned roots; generated default
 
 ## 4. Metrics
 
-All metrics are written to the node_exporter textfile collector (atomic write-and-rename every `metrics.interval`) and served on `metrics.listen` if set. Label values are escaped per the Prometheus text format; non-UTF-8 path bytes are converted lossily.
+All metrics are written to the node_exporter textfile collector (atomic write-and-rename every `metrics.interval`) as the only metrics output (ADR-020). Label values are escaped per the Prometheus text format; non-UTF-8 path bytes are converted lossily.
 
 | Metric | Type | Labels |
 |--------|------|--------|
@@ -420,7 +418,7 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
 SystemCallArchitectures=native
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 # DO NOT add ProtectSystem=, ProtectHome=, PrivateTmp=, ReadWritePaths=, ProtectKernel*= or
 # other options that create a private mount namespace: fanotify mount marks would then attach
 # to the namespace's copies and the watcher would silently see nothing (ADR-013).

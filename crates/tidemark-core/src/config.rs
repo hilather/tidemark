@@ -283,8 +283,6 @@ impl Default for ProcscanConfig {
 pub struct MetricsConfig {
     /// textfile setting.
     pub textfile: PathBuf,
-    /// listen setting.
-    pub listen: String,
     /// interval setting.
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
@@ -297,7 +295,6 @@ impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             textfile: PathBuf::from("/var/lib/node_exporter/textfile_collector/tidemark.prom"),
-            listen: "".into(),
             interval: Duration::from_secs(60),
             dir_metrics_depth: 2,
             max_series_per_metric: 500,
@@ -532,8 +529,6 @@ impl Default for AlertRule {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AlertsConfig {
-    /// webhook setting.
-    pub webhook: String,
     /// renotify setting.
     #[serde(with = "humantime_serde")]
     pub renotify: Duration,
@@ -543,7 +538,6 @@ pub struct AlertsConfig {
 impl Default for AlertsConfig {
     fn default() -> Self {
         Self {
-            webhook: String::new(),
             renotify: Duration::from_secs(4 * 3600),
             rule: Vec::new(),
         }
@@ -705,6 +699,14 @@ impl Config {
                 "configuration exceeds the 1 MiB limit".into(),
             ));
         }
+        let value: toml::Value = toml::from_str(text)?;
+        for (table, key) in [("metrics", "listen"), ("alerts", "webhook")] {
+            if value.get(table).and_then(|v| v.get(key)).is_some() {
+                return Err(CoreError::Parse(format!(
+                    "{table}.{key}: feature was removed in v1 (ADR-020)"
+                )));
+            }
+        }
         let mut config: Self = toml::from_str(text)?;
         config.merge_default_rules();
         Ok(config)
@@ -816,16 +818,6 @@ impl Config {
         }
         if !self.metrics.textfile.as_os_str().is_empty() {
             absolute(issues, "metrics.textfile", &self.metrics.textfile);
-        }
-        if !self.metrics.listen.is_empty() {
-            match self.metrics.listen.parse::<std::net::SocketAddr>() {
-                Ok(addr) if addr.ip().is_loopback() => {}
-                _ => issue(
-                    issues,
-                    "metrics.listen",
-                    "expected loopback IP:port or empty string",
-                ),
-            }
         }
         if self.scan.max_notable > u32::MAX as usize {
             issue(

@@ -3,8 +3,7 @@
 use parking_lot::RwLock;
 use std::{
     collections::BTreeMap,
-    io::{Read, Write},
-    net::{Shutdown as SocketShutdown, SocketAddr, TcpListener, TcpStream},
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::Path,
     sync::{atomic::Ordering, Arc},
@@ -618,195 +617,7 @@ pub fn write_textfile(path: &Path, text: &str) -> std::io::Result<()> {
     renameat(&dir, &tmp, &dir, name)?;
     Ok(())
 }
-/// Bind the loopback-only metrics listener, with nonblocking admission.
-pub fn listen(address: &str) -> Result<TcpListener, crate::DaemonError> {
-    let address: SocketAddr = address.parse().map_err(|_| {
-        crate::DaemonError::Config("metrics.listen must be a loopback IP:port".into())
-    })?;
-    if !address.ip().is_loopback() {
-        return Err(crate::DaemonError::Config(
-            "metrics.listen must be loopback".into(),
-        ));
-    }
-    // Set reuse before bind so reload can reclaim a port with scrapes in TIME_WAIT.
-    // The responder and admission loop use std::net::TcpListener/TcpStream.
-    let bind = || -> std::io::Result<TcpListener> {
-        use rustix::net::{AddressFamily, SocketFlags, SocketType};
-        let fd = rustix::net::socket_with(
-            if address.is_ipv4() {
-                AddressFamily::INET
-            } else {
-                AddressFamily::INET6
-            },
-            SocketType::STREAM,
-            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-            None,
-        )?;
-        rustix::net::sockopt::set_socket_reuseaddr(&fd, true)?;
-        rustix::net::bind(&fd, &address)?;
-        rustix::net::listen(&fd, HTTP_CONNECTIONS as i32)?;
-        Ok(TcpListener::from(fd))
-    };
-    bind().map_err(|e| crate::DaemonError::Unavailable(e.to_string()))
-}
-const HTTP_CONNECTIONS: usize = 8;
-const HTTP_DEADLINE: Duration = Duration::from_secs(5);
-fn transient(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::Interrupted
-    )
-}
-/// Answer one request with a fixed 8 KiB head and absolute read/write deadlines.
-pub fn respond(mut stream: TcpStream, text: &str, stop: &crate::Shutdown) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_millis(50)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(50)))?;
-    let mut head = [0u8; 8192];
-    let mut len = 0;
-    let deadline = Instant::now() + HTTP_DEADLINE;
-    let code = loop {
-        if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
-            return Ok(());
-        }
-        if len == head.len() {
-            break 400;
-        }
-        match stream.read(&mut head[len..]) {
-            Ok(0) => return Ok(()),
-            Ok(n) => len += n,
-            Err(e) if transient(&e) => continue,
-            Err(e) => return Err(e),
-        }
-        if let Some(end) = head[..len].windows(4).position(|w| w == b"\r\n\r\n") {
-            let mut lines = head[..end + 2].split(|b| *b == b'\n');
-            let line = lines.next().unwrap_or_default();
-            let Some(line) = line.strip_suffix(b"\r") else {
-                break 400;
-            };
-            let mut fields = line.split(|b| *b == b' ');
-            let method = fields.next().unwrap_or_default();
-            let path = fields.next().unwrap_or_default();
-            let version = fields.next().unwrap_or_default();
-            let headers_valid = lines.filter(|line| !line.is_empty()).all(|line| {
-                let Some(line) = line.strip_suffix(b"\r") else {
-                    return false;
-                };
-                let Some(colon) = line.iter().position(|b| *b == b':') else {
-                    return false;
-                };
-                colon > 0
-                    && line[..colon]
-                        .iter()
-                        .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b))
-                    && line[colon + 1..]
-                        .iter()
-                        .all(|b| *b == b'\t' || *b >= 32 && *b != 127)
-            });
-            break if fields.next().is_some()
-                || method.is_empty()
-                || path.is_empty()
-                || !matches!(version, b"HTTP/1.1" | b"HTTP/1.0")
-                || !headers_valid
-            {
-                400
-            } else if path != b"/metrics" {
-                404
-            } else if !matches!(method, b"GET" | b"HEAD") {
-                405
-            } else {
-                200
-            };
-        }
-    };
-    let is_head = head[..len].starts_with(b"HEAD ");
-    let body = if code == 200 { text.as_bytes() } else { b"" };
-    let reason = match code {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        _ => "Method Not Allowed",
-    };
-    let header = format!("HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
-    let deadline = Instant::now() + HTTP_DEADLINE;
-    for bytes in [header.as_bytes(), if is_head { b"" } else { body }] {
-        let mut offset = 0;
-        while offset < bytes.len() {
-            if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
-                return Ok(());
-            }
-            match stream.write(&bytes[offset..]) {
-                Ok(0) => return Ok(()),
-                Ok(n) => offset += n,
-                Err(e) if transient(&e) => {}
-                Err(e) => return Err(e),
-            }
-        }
-    }
-    Ok(())
-}
-struct HttpWorkers(Vec<(TcpStream, std::thread::JoinHandle<()>)>);
-impl HttpWorkers {
-    fn reap(&mut self) {
-        let mut i = 0;
-        while i < self.0.len() {
-            if self.0[i].1.is_finished() {
-                let (_, worker) = self.0.swap_remove(i);
-                let _ = worker.join();
-            } else {
-                i += 1;
-            }
-        }
-    }
-    fn admit(
-        &mut self,
-        stream: TcpStream,
-        text: Arc<RwLock<String>>,
-        stop: crate::Shutdown,
-    ) -> std::io::Result<()> {
-        self.reap();
-        if self.0.len() >= HTTP_CONNECTIONS {
-            let _ = stream.shutdown(SocketShutdown::Both);
-            return Ok(());
-        }
-        let control = stream.try_clone()?;
-        let worker = std::thread::Builder::new()
-            .name("metrics-client".into())
-            .spawn(move || {
-                let output = text.read().clone();
-                let _ = respond(stream, &output, &stop);
-            })?;
-        self.0.push((control, worker));
-        Ok(())
-    }
-    fn close(&mut self) {
-        for (stream, _) in &self.0 {
-            let _ = stream.shutdown(SocketShutdown::Both);
-        }
-        for (_, worker) in self.0.drain(..) {
-            let _ = worker.join();
-        }
-    }
-}
-impl Drop for HttpWorkers {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-struct HttpService {
-    stop: crate::Shutdown,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-impl Drop for HttpService {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-/// Start reload-aware textfile and HTTP exporters with bounded shutdown polling.
+/// Start the reload-aware textfile exporter with bounded shutdown polling.
 pub fn start(
     _config: Arc<tidemark_core::config::Config>,
     state: crate::state::LiveState,
@@ -816,86 +627,9 @@ pub fn start(
         .name("metrics".into())
         .spawn(move || {
             let empty = SnapshotMetrics::default();
-            let initial_now = crate::unix_now();
-            let initial_view = state.view_at(initial_now);
-            let (initial_config, _) = initial_view.config();
+            let (initial_config, _) = state.config();
             // Failed seeding is retried and reported by the first export below.
             let _ = reconcile(&state, &initial_config);
-            let initial_cache = initial_view.snapshot_metrics_handle();
-            let text = Arc::new(RwLock::new(render(
-                &initial_view,
-                initial_cache.as_deref().unwrap_or(&empty),
-                &initial_config.metrics,
-                initial_now,
-            )?));
-            let http_error = Arc::new(RwLock::new(None::<String>));
-            let http_text = text.clone();
-            let http_health = http_error.clone();
-            let http_state = state.clone();
-            let http_shutdown = shutdown.clone();
-            let http_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let worker_stop = http_stop.clone();
-            // Admission owns at most eight clients; every worker is joined on reload/shutdown.
-            let http = std::thread::Builder::new()
-                .name("metrics-http".into())
-                .spawn(move || {
-                    let mut listener = None;
-                    let mut generation = None;
-                    let mut workers = HttpWorkers(Vec::with_capacity(HTTP_CONNECTIONS));
-                    while !http_shutdown.load(Ordering::Acquire)
-                        && !worker_stop.load(Ordering::Acquire)
-                    {
-                        let (config, g) = http_state.config();
-                        if generation != Some(g) {
-                            listener = None;
-                            workers.close();
-                            *http_health.write() = None;
-                            if !config.metrics.listen.is_empty() {
-                                match listen(&config.metrics.listen) {
-                                    Ok(server) => listener = Some(server),
-                                    Err(error) => *http_health.write() = Some(error.to_string()),
-                                }
-                            }
-                            generation = Some(g);
-                        }
-                        if let Some(server) = &listener {
-                            workers.reap();
-                            match server.accept() {
-                                Ok((stream, _)) => {
-                                    if let Err(error) = workers.admit(
-                                        stream,
-                                        http_text.clone(),
-                                        worker_stop.clone(),
-                                    ) {
-                                        *http_health.write() = Some(error.to_string());
-                                    }
-                                }
-                                Err(error) if transient(&error) => {
-                                    std::thread::sleep(Duration::from_millis(10))
-                                }
-                                Err(error) => {
-                                    *http_health.write() = Some(error.to_string());
-                                    listener = None;
-                                }
-                            }
-                        } else {
-                            crate::wait_service(
-                                &http_state,
-                                g,
-                                &http_shutdown,
-                                Duration::from_millis(50),
-                            );
-                        }
-                    }
-                })
-                .map_err(|source| crate::DaemonError::Io {
-                    context: "start metrics HTTP".into(),
-                    source,
-                })?;
-            let http = HttpService {
-                stop: http_stop,
-                worker: Some(http),
-            };
             let mut generation = None;
             let mut next = Some(Instant::now());
             let mut last_log: Option<Instant> = None;
@@ -933,9 +667,7 @@ pub fn start(
                     let error = write_textfile(&config.metrics.textfile, &output)
                         .err()
                         .map(|e| e.to_string())
-                        .or_else(|| http_error.read().clone())
                         .or_else(|| cache_error.clone());
-                    *text.write() = output;
                     if let Some(error) = error {
                         if last_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
                             tracing::warn!(%error,"metrics exporter degraded");
@@ -943,8 +675,7 @@ pub fn start(
                         }
                         state.publish_component(crate::component("metrics", "degraded", error))?;
                     } else {
-                        let disabled = config.metrics.textfile.as_os_str().is_empty()
-                            && config.metrics.listen.is_empty();
+                        let disabled = config.metrics.textfile.as_os_str().is_empty();
                         state.publish_component(crate::component(
                             "metrics",
                             if disabled { "disabled" } else { "ok" },
@@ -966,7 +697,6 @@ pub fn start(
                 }
                 crate::wait_service(&state, g, &shutdown, Duration::from_millis(50));
             }
-            drop(http);
             Ok(())
         })
         .map_err(|source| crate::DaemonError::Io {

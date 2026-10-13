@@ -1,12 +1,11 @@
 //! Owned by: W6-B
-//! Exporter contract, snapshot cache, atomic publication and HTTP evidence.
+//! Exporter contract, snapshot cache, atomic publication evidence.
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used)]
 #[path = "w6b/fixtures.rs"]
 mod fixtures;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Read, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -290,63 +289,7 @@ fn atomic_publication_and_modes() {
     assert!(metrics::write_textfile(&path, "refused").is_err());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
 }
-#[test]
-fn loopback_http_only_get_metrics() {
-    assert!(metrics::listen("0.0.0.0:0").is_err());
-    let server = match metrics::listen("127.0.0.1:0") {
-        Ok(server) => server,
-        Err(error) => {
-            eprintln!("TCP bind unavailable: {error}");
-            return;
-        }
-    };
-    let address = server.local_addr().unwrap();
-    let worker = std::thread::spawn(move || {
-        for _ in 0..6 {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let stream = loop {
-                match server.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline);
-                        std::thread::yield_now();
-                    }
-                    Err(e) => panic!("accept: {e}"),
-                }
-            };
-            metrics::respond(stream, "tidemark_up 1\n", &Arc::new(AtomicBool::new(false))).unwrap();
-        }
-    });
-    for (method, url, code) in [
-        ("GET", "/metrics", 200),
-        ("HEAD", "/metrics", 200),
-        ("POST", "/metrics", 405),
-        ("G ET", "/metrics", 400),
-        ("GET", "/", 404),
-        ("GET", "/metrics?x", 404),
-    ] {
-        let mut stream = std::net::TcpStream::connect(address).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        stream.write_all(format!("{method} {url} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes()).unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        assert!(
-            response.starts_with(&format!("HTTP/1.1 {code}")),
-            "{response}"
-        );
-        if code == 200 {
-            assert!(response.contains("version=0.0.4"));
-            if method == "HEAD" {
-                assert!(response.ends_with("\r\n\r\n"));
-            } else {
-                assert!(response.ends_with("tidemark_up 1\n"));
-            }
-        }
-    }
-    worker.join().unwrap();
-}
+
 #[test]
 fn exporter_reload_health_and_shutdown() {
     let tmp = tempfile::tempdir().unwrap();
@@ -668,91 +611,42 @@ fn global_candidates_across_roots_and_replacement_uncover_previous_rows() {
 }
 
 #[test]
-fn exporter_http_scrape_matches_textfile_and_idle_shutdown_is_bounded() {
-    let listener = match metrics::listen("127.0.0.1:0") {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("TCP bind unavailable: {error}");
-            return;
-        }
-    };
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    let tmp = tempfile::tempdir().unwrap();
-    let mut config = Config::default();
-    config.roots.clear();
-    config.metrics.listen = address.to_string();
-    config.metrics.textfile = tmp.path().join("out.prom");
-    config.metrics.interval = Duration::from_millis(10);
-    let state = LiveState::new(&config, 0);
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker = metrics::start(Arc::new(config.clone()), state.clone(), stop.clone()).unwrap();
-    wait(|| config.metrics.textfile.exists());
-    let readiness_deadline = Instant::now() + Duration::from_secs(2);
-    let mut scrape = loop {
-        if let Ok(stream) = std::net::TcpStream::connect(address) {
-            break stream;
-        }
-        assert!(
-            !worker.is_finished() && Instant::now() < readiness_deadline,
-            "HTTP readiness failed: {:?}",
-            state.view().status(0)
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    scrape
-        .set_read_timeout(Some(Duration::from_secs(1)))
+fn resolved_workspace_has_no_http_or_tls_packages() {
+    let output = std::process::Command::new("cargo")
+        .args(["metadata", "--offline", "--format-version", "1"])
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .output()
         .unwrap();
-    scrape
-        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        .unwrap();
-    let mut response = String::new();
-    scrape.read_to_string(&mut response).unwrap();
-    let body = response.split_once("\r\n\r\n").unwrap().1;
-    assert_eq!(
-        body,
-        std::fs::read_to_string(&config.metrics.textfile).unwrap()
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    drop(scrape);
-    let clients: Vec<_> = (0..8)
-        .map(|_| std::net::TcpStream::connect(address).unwrap())
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for package in metadata["packages"].as_array().unwrap() {
+        let name = package["name"].as_str().unwrap();
+        assert!(
+            ![
+                "ureq",
+                "tiny_http",
+                "rustls",
+                "ring",
+                "hyper",
+                "reqwest",
+                "webpki-roots"
+            ]
+            .contains(&name),
+            "unexpected package {name}"
+        );
+    }
+}
+
+#[test]
+fn unit_allows_only_unix_and_netlink() {
+    let unit = include_str!("../../../packaging/systemd/tidemarkd.service");
+    let families: Vec<_> = unit
+        .lines()
+        .filter_map(|l| l.strip_prefix("RestrictAddressFamilies="))
         .collect();
-    std::thread::sleep(Duration::from_millis(100));
-    config.metrics.listen.clear();
-    state.replace_config(config.clone()).unwrap();
-    wait(|| std::net::TcpStream::connect(address).is_err());
-    for mut client in clients {
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        assert_eq!(client.read(&mut [0; 1]).unwrap(), 0);
-    }
-    config.metrics.listen = address.to_string();
-    state.replace_config(config).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let first = loop {
-        if let Ok(stream) = std::net::TcpStream::connect(address) {
-            break stream;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "same-address metrics reload did not bind"
-        );
-        std::thread::yield_now();
-    };
-    let mut clients = vec![first];
-    clients.extend((0..7).map(|_| std::net::TcpStream::connect(address).unwrap()));
-    std::thread::sleep(Duration::from_millis(100));
-    let start = Instant::now();
-    stop.store(true, Ordering::Release);
-    while !worker.is_finished() {
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "HTTP idle clients delayed shutdown"
-        );
-        std::thread::yield_now();
-    }
-    worker.join().unwrap().unwrap();
-    assert!(std::net::TcpStream::connect(address).is_err());
-    drop(clients);
+    assert_eq!(families, ["AF_UNIX AF_NETLINK"]);
 }

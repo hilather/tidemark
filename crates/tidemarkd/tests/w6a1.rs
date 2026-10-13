@@ -1493,3 +1493,25 @@ fn process_publication_is_independent_of_collector_and_clears_on_invalidation() 
     let now = state.view_at(2).now(&NowParams { mount: None }, 2).unwrap();
     assert!(now.degraded.iter().any(|s| s == "phantom: not measured"));
 }
+
+#[test]
+fn check_config_rejects_removed_http_keys() {
+    let (_dir, path, _cfg) = fixture();
+    for (table, key) in [("metrics", "listen"), ("alerts", "webhook")] {
+        std::fs::write(&path, format!("[{table}]\n{key} = \"\"\n")).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_tidemarkd"))
+            .arg("--config")
+            .arg(&path)
+            .arg("--check-config")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let message = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(message.contains(&format!("{table}.{key}")), "{message}");
+        assert!(message.contains("removed in v1 (ADR-020)"), "{message}");
+    }
+}

@@ -26,25 +26,22 @@ fn roundtrip<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(valu
 }
 
 #[test]
-fn metrics_requires_loopback_or_disabled() {
-    for (listen, valid) in [
-        ("", true),
-        ("127.0.0.1:9877", true),
-        ("127.1.2.3:9877", true),
-        ("[::1]:9877", true),
-        ("0.0.0.0:9877", false),
-        ("[::]:9877", false),
-        ("192.0.2.1:9877", false),
-        ("[2001:db8::1]:9877", false),
-        ("localhost:9877", false),
-    ] {
-        let mut cfg = Config::default();
-        cfg.metrics.listen = listen.into();
-        assert_eq!(
-            !cfg.validate().iter().any(|i| i.field == "metrics.listen"),
-            valid,
-            "{listen}"
-        );
+fn removed_http_keys_have_actionable_errors() {
+    for (table, key) in [("metrics", "listen"), ("alerts", "webhook")] {
+        for value in ["\"\"", "\"http://localhost\"", "42"] {
+            let input = format!("[{table}]\n{key} = {value}\n");
+            let error = Config::from_toml_bytes(input.as_bytes())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("{table}.{key}")), "{error}");
+            assert!(error.contains("removed in v1 (ADR-020)"), "{error}");
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), input).unwrap();
+            assert!(Config::load(tmp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("ADR-020"));
+        }
     }
 }
 
