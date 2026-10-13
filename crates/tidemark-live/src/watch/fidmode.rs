@@ -1,6 +1,6 @@
 //! Owned by: W5-A
 //! Resolve kernel file handles without reading file data or following names.
-use super::budget::Budget;
+use super::budget::{Budget, Reservation};
 // Include hash growth overlap, queue capacity slack and allocator headers.
 const PATH_NODE: usize = 256;
 const PATH_QUEUE: usize = 160;
@@ -120,7 +120,11 @@ impl PathSizes {
         self.nodes += nodes;
         self.charged += bytes;
         self.sequence = self.sequence.wrapping_add(1);
-        self.entries.insert(path.clone(), (id, disk, self.sequence));
+        if let Some(value) = self.entries.get_mut(path) {
+            *value = (id, disk, self.sequence);
+        } else {
+            self.entries.insert(path.clone(), (id, disk, self.sequence));
+        }
         self.order.push_back((path.clone(), self.sequence));
         if self.order.len() > self.cap.saturating_mul(2) {
             let old_len = self.order.len();
@@ -148,6 +152,7 @@ impl PathSizes {
                     nodes += PATH_NODE;
                     released += p.as_bytes().len();
                 }
+                drop(p);
                 self.nodes -= nodes;
                 self.budget.release_nodes(nodes);
                 self.charged -= released;
@@ -202,7 +207,18 @@ impl HandlePaths {
         self.nodes = 0;
     }
     pub fn get(&mut self, key: &(i32, Vec<u8>)) -> Option<RawPath> {
-        let path = self.entries.get(key)?.0.clone();
+        let cached = &self.entries.get(key)?.0;
+        // Refreshing passes owned scratch to put; admit every temporary path/key
+        // copy before allocation, independently of retained cache credits.
+        let _scratch = Reservation::normal(
+            &self.budget,
+            cached
+                .as_bytes()
+                .len()
+                .saturating_mul(3)
+                .saturating_add(key.1.len().saturating_mul(2)),
+        )?;
+        let path = cached.clone();
         self.put(key.clone(), path.clone());
         Some(path)
     }
@@ -210,6 +226,9 @@ impl HandlePaths {
         if self.cap == 0 {
             return;
         }
+        let Some(_scratch) = Reservation::normal(&self.budget, key.1.len()) else {
+            return;
+        };
         let Some(handle) = super::budget::copy(&key.1) else {
             return;
         };
@@ -268,6 +287,7 @@ impl HandlePaths {
                         nodes += HANDLE_NODE;
                     }
                 }
+                drop(k);
                 self.nodes -= nodes;
                 self.budget.release_nodes(nodes);
                 self.charged -= released;
@@ -290,6 +310,25 @@ impl Drop for HandlePaths {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn handle_lookup_scratch_is_admitted_before_refresh_copies() {
+        let budget = Budget::with_limit(4096);
+        let mut cache = HandlePaths::new(2);
+        cache.set_budget(budget.clone());
+        let path = RawPath::new(format!("/{}", "x".repeat(100)).into_bytes()).unwrap();
+        cache.put((1, vec![1; 100]), path);
+        let normal_limit = 4096 - 4096 / 64;
+        let pressure = normal_limit - budget.committed();
+        assert!(budget.reserve(pressure));
+        let before = budget.used();
+        assert!(cache.get(&(1, vec![1; 100])).is_none());
+        assert_eq!(budget.used(), before);
+        assert_eq!(cache.order.len(), 1);
+        budget.release(pressure);
+        assert!(cache.get(&(1, vec![1; 100])).is_some());
+        cache.clear();
+        assert_eq!(budget.used(), 0);
+    }
     #[test]
     fn shared_cache_budget_tracks_repeated_entries_eviction_and_clear() {
         let budget = Budget::with_limit(2048);

@@ -309,11 +309,13 @@ struct State {
 }
 impl State {
     fn mark_loss(&mut self) {
+        // Destroy retained allocations before returning shared credits: the FID
+        // worker can reserve against this budget without taking the state lock.
+        self.dirty.clear();
         self.rings.budget().release(self.dirty_bytes);
         self.dirty_bytes = 0;
         self.rings.budget().release_nodes(self.dirty_nodes);
         self.dirty_nodes = 0;
-        self.dirty.clear();
         self.loss_pending = true;
         self.loss_taken = VecDeque::new();
         self.rings.budget().release(self.loss_taken_bytes);

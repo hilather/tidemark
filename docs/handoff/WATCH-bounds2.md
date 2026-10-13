@@ -6,7 +6,7 @@ Run the guest checks below on Rocky 8.8 and 8.10, and run CI on the merged candi
 
 - Attempt: attempt-45e84eaf7bec39644669ebb38bd58a95601f9cdb5c717e9dbfd0945ef9d11c2b
 - Baseline: `7345c80b585933164cf7b55fd3fcd68badeff819`, including the nine WATCH-bounds commits after `5ca024e`.
-- Date: 2026-10-13. Status: review and local validation in progress; final results recorded below before submission.
+- Date: 2026-10-13. Status: implemented follow-up fixes; local check results below, guest and independent acceptance pending.
 
 ## Review and changes
 
@@ -23,10 +23,12 @@ Reviewed the nine retained commits against the six coordinator decisions, includ
 
 New changes in this attempt:
 
-1. Output admission previously ranked into an allocated reference vector before reserving output storage. Replaced that pre-admission ranking with a no-allocation conservative upper bound: largest row payload cost times requested count. Ranking scratch is explicitly included in the output node reservation. Ranked copies use fallible vector reserves and fallible key/unit copies; unstable sorting avoids extra sort scratch. `output_admission_bounds_unequal_rows_before_ranking` checks the bound for unequal rows and multiple limits; all ring regressions passed. This is an allocation-order review fix; no allocator-failure injection is claimed.
+1. Output admission previously ranked into an allocated reference vector before reserving output storage. Replaced that pre-admission ranking with a no-allocation conservative upper bound: largest row payload cost times requested count. Ranking scratch is explicitly included in the output node reservation. Zero-row drains return before allocating ranking scratch. Ranked copies use fallible vector reserves and fallible key/unit copies; unstable sorting avoids extra sort scratch. `output_admission_bounds_unequal_rows_before_ranking` checks the bound for unequal rows and multiple limits; all ring regressions passed. This is an allocation-order review fix; no allocator-failure injection is claimed.
 2. Immutable window copies now copy unit strings fallibly. Added `concurrent_shutdown_joins_once_and_reclaims_retained_windows`: four shutdown callers, exactly one stop/close sequence, empty join/signal/mount slots, reclaimed window payload, no foreground-buffer restart, and repeated shutdown safety.
 
 3. Added `emergency_root_headroom_preserves_sixty_undrained_minutes`: maximum 4,096-byte fallback root, actual default budget exhausted with 300 long distinct keys (below the completed-key count cap), sixty undrained minutes, exact event/byte totals and zero-tolerance payload accounting. Its initial fixture used 6,000 keys and wrongly expected totals to survive the separate completed top-1,000 truncation; that fixture failed. The corrected fixture isolates byte-budget headroom; both logs are retained.
+
+4. Dirty-set collapse now destroys retained paths before returning shared credits; a FID worker can reserve against the shared budget without the state lock. FID cache lookups reserve scratch before refreshing owned path/handle copies, and handle normalization is admitted before its copy. Updating a remembered existing path now changes its numeric value in place instead of cloning a redundant map key. Eviction destroys popped path/handle keys before releasing credits. `handle_lookup_scratch_is_admitted_before_refresh_copies` fails on the prior implementation under a fully reserved budget; all 48 watcher regressions passed after these changes.
 
 Lock review: service shutdown does not hold the global state lock while joining. Worker processing never takes the join mutex. Window copies take their own data lock and the budget lock; they do not acquire watcher state. Mount-identity queries serialize with descriptor release and fail without kernel access after teardown. Other old-view queries may answer empty data and read clocks but do not reopen the group or mount. Read-only queries can create empty numeric minute buckets after retirement; retained window pathname payload is reclaimed.
 
