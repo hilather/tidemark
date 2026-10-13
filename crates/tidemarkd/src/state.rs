@@ -38,6 +38,7 @@ struct Inner {
     fs_failures: BTreeMap<String, u64>,
     fs_failure_epoch: u64,
     lvm_failures: u64,
+    alert_revision: u64,
     lvm_available: bool,
     lvm: Option<LvmResult>,
     watchers: BTreeMap<String, Arc<tidemark_live::watch::Watcher>>,
@@ -58,6 +59,7 @@ struct Inner {
 }
 #[derive(Clone)]
 struct WindowFacts {
+    warming: bool,
     at: i64,
     hot: Option<Vec<HotEntry>>,
     overflows: Option<u64>,
@@ -151,6 +153,7 @@ impl LiveState {
             fs_failures: BTreeMap::new(),
             fs_failure_epoch: 0,
             lvm_failures: 0,
+            alert_revision: 0,
             lvm_available: false,
             lvm: None,
             watchers: BTreeMap::new(),
@@ -311,7 +314,41 @@ impl LiveState {
                 .chain(&config.watch.mounts)
                 .any(|p| p.to_string_lossy() == m.as_str())
         });
-        d.windows.clear();
+        if d.config.watch != config.watch {
+            d.windows.clear();
+        } else {
+            d.windows.retain(|(mount, window), _| {
+                config.alerts.rule.iter().any(|r| {
+                    r.enabled
+                        && r.mount
+                            .as_ref()
+                            .is_some_and(|p| p.to_string_lossy() == mount.as_str())
+                        && r.window
+                            .as_deref()
+                            .and_then(|w| humantime::parse_duration(w).ok())
+                            == Some(*window)
+                })
+            });
+        }
+        // Failed startup attempts also have components, even without watcher handles.
+        let retired: Vec<_> = d
+            .components
+            .keys()
+            .filter(|name| {
+                name.strip_prefix("watcher:").is_some_and(|mount| {
+                    !config
+                        .watch
+                        .mounts
+                        .iter()
+                        .any(|p| p.to_string_lossy() == mount)
+                })
+            })
+            .cloned()
+            .collect();
+        for name in retired {
+            d.components.remove(&name);
+            d.errors.remove(&name);
+        }
         d.config = Arc::new(config);
         d.generation = d.generation.saturating_add(1);
         Ok(())
@@ -400,7 +437,21 @@ impl LiveState {
         result: Publication,
         component: ComponentState,
     ) -> Result<(), crate::DaemonError> {
+        self.publish_window_health(result, component, false, None)
+    }
+    pub(crate) fn publish_window_health(
+        &self,
+        result: Publication,
+        component: ComponentState,
+        warming: bool,
+        observed_config: Option<&Config>,
+    ) -> Result<(), crate::DaemonError> {
         let mut d = self.0.write();
+        if observed_config
+            .is_some_and(|c| c.watch != d.config.watch || c.alerts.rule != d.config.alerts.rule)
+        {
+            return Ok(());
+        }
         check_key(&d.components, &component.name, MAX_SUBJECTS)?;
         let result = match result {
             Publication::FsAttempt {
@@ -442,6 +493,7 @@ impl LiveState {
                 } else {
                     d.lvm_failures = d.lvm_failures.saturating_add(1);
                     d.lvm_available = false;
+                    d.alert_revision = d.alert_revision.saturating_add(1);
                     health(&mut d, component);
                     return Ok(());
                 }
@@ -491,10 +543,12 @@ impl LiveState {
                 }
                 d.lvm_available = true;
                 d.lvm = Some(r);
+                d.alert_revision = d.alert_revision.saturating_add(1);
             }
             Publication::Watcher((mount, w)) => {
                 check_key(&d.watchers, &mount, MAX_SUBJECTS)?;
                 d.watchers.insert(mount, w);
+                d.alert_revision = d.alert_revision.saturating_add(1);
             }
             Publication::Procscan(p) => d.procscan = Some(p),
             Publication::ProcscanAttempt { generation, report } => {
@@ -564,11 +618,13 @@ impl LiveState {
                 d.windows.insert(
                     key,
                     WindowFacts {
+                        warming,
                         at: measured_at,
                         hot,
                         overflows,
                     },
                 );
+                d.alert_revision = d.alert_revision.saturating_add(1);
             }
             Publication::AlertEvent(e) => {
                 if d.history.len() == MAX_INVENTORY {
@@ -637,11 +693,26 @@ impl LiveState {
     }
     /// Remove a watcher publication before restart/shutdown; the final Arc drop stops its worker.
     pub fn remove_watcher(&self, mount: &str) {
-        self.0.write().watchers.remove(mount);
+        let mut d = self.0.write();
+        d.watchers.remove(mount);
+        d.windows.retain(|(m, _), _| m != mount);
+        d.alert_revision = d.alert_revision.saturating_add(1);
     }
     /// Release every watcher publication during ordered shutdown.
     pub fn clear_watchers(&self) {
-        self.0.write().watchers.clear();
+        let mut d = self.0.write();
+        d.watchers.clear();
+        d.windows.clear();
+        d.alert_revision = d.alert_revision.saturating_add(1);
+    }
+    /// Remove retired component health and its error history, releasing bounded slots.
+    pub fn remove_component(&self, name: &str) {
+        let mut d = self.0.write();
+        d.components.remove(name);
+        d.errors.remove(name);
+    }
+    pub(crate) fn alert_revision(&self) -> u64 {
+        self.0.read().alert_revision
     }
     /// Publish component health without implying a successful measurement.
     pub fn publish_component(&self, component: ComponentState) -> Result<(), crate::DaemonError> {
@@ -687,9 +758,79 @@ pub fn validate_bounds(c: &Config) -> Result<(), crate::DaemonError> {
     for n in [c.sampler.mounts.len(), c.watch.mounts.len(), c.roots.len()] {
         check_len(n, MAX_SUBJECTS)?;
     }
+    // Reserve the 17 non-mount names used by lifecycle, services and post-scan:
+    // daemon, catalog, state_space, config, sampler, lvm, watcher, procscan,
+    // alerts, scheduler, metrics, api, tswriter, growth, snapshot_metrics,
+    // post_scan, firstboot (reserved for firstboot diagnostics).
+    check_len(c.watch.mounts.len().saturating_add(17), MAX_SUBJECTS)?;
+    let windows: std::collections::BTreeSet<_> = c
+        .alerts
+        .rule
+        .iter()
+        .filter(|r| {
+            r.enabled
+                && matches!(
+                    r.kind,
+                    tidemark_core::config::AlertKind::HotDirGrowth
+                        | tidemark_core::config::AlertKind::WatchLossy
+                )
+        })
+        .filter_map(|r| {
+            Some((
+                r.mount.clone()?,
+                humantime::parse_duration(r.window.as_deref()?).ok()?,
+            ))
+        })
+        .filter(|(_, w)| crate::services::alerts::minute_window(*w))
+        .collect();
+    check_len(windows.len(), MAX_WINDOWS)?;
     check_len(c.alerts.rule.len(), MAX_INVENTORY)
 }
 impl LiveStateView {
+    /// Timestamp of a supported exact watcher observation usable at this view's clock.
+    /// Completed-minute observations remain usable for 0 through 90 seconds inclusive;
+    /// future observations and other durations are unavailable, never rounded.
+    pub fn watch_window_at(&self, mount: &str, window: Duration) -> Option<i64> {
+        if !crate::services::alerts::minute_window(window) {
+            return None;
+        }
+        let facts = self.data.windows.get(&(mount.into(), window))?;
+        (facts.at <= self.now && i128::from(self.now) - i128::from(facts.at) <= 90)
+            .then_some(facts.at)
+    }
+    /// Whether missing watcher facts can be attributed solely to initial collection.
+    /// Startup's partial minute is excluded, so n full minutes fill at the next
+    /// minute boundary plus n minutes. Known unavailable facts are never warmup.
+    pub(crate) fn watch_warming_up(&self, mount: &str, window: Duration) -> bool {
+        if !self.data.config.watch.enabled || !crate::services::alerts::minute_window(window) {
+            return false;
+        }
+        let running = self.data.watchers.get(mount).is_some_and(|w| {
+            let stats = w.stats();
+            stats.mode != tidemark_live::watch::WatchMode::Failed
+                && !stats.recovering
+                && stats.overflows_total == 0
+                && stats.lossy_minutes_15m == 0
+        });
+        // Compute the next boundary in the wider domain, including extreme injected clocks.
+        let first_boundary = i128::from(self.data.started).div_euclid(60) * 60 + 60;
+        let elapsed = i128::from(self.now) - first_boundary;
+        running
+            && elapsed >= -60
+            && elapsed < i128::from(window.as_secs())
+            && self
+                .data
+                .windows
+                .get(&(mount.into(), window))
+                .is_none_or(|f| f.warming && self.watch_window_at(mount, window).is_some())
+    }
+    pub(crate) fn rate_warming_up(&self, mount: &str, window: Duration) -> bool {
+        let elapsed = i128::from(self.now) - i128::from(self.data.started);
+        elapsed >= 0
+            && elapsed < i128::from(window.as_secs())
+            && self.fs_sample(mount).is_some()
+            && self.fs_rate(mount, window).is_none()
+    }
     /// Current snapshot config and generation.
     pub fn config(&self) -> (Arc<Config>, u64) {
         (self.data.config.clone(), self.data.generation)
@@ -900,7 +1041,15 @@ impl LiveStateView {
         };
         let alerts = v.active_alerts();
         let scans = v.scans();
-        let diagnostics = v.alert_diagnostics().unwrap_or_default();
+        let mut diagnostics = v.alert_diagnostics().unwrap_or_default();
+        diagnostics.retain(|d| {
+            if d.reason.starts_with("warming up") {
+                degraded.push(format!("alert {}: {}", d.rule, d.reason));
+                false
+            } else {
+                true
+            }
+        });
         Some(build_now(
             &NowInputs {
                 host: rustix::system::uname()
@@ -1094,16 +1243,12 @@ impl AlertSource for LiveStateView {
     }
     fn hot_dirs(&self, mount: &str, window: Duration) -> Option<Vec<HotEntry>> {
         let f = self.data.windows.get(&(mount.into(), window))?;
-        if f.at != self.now {
-            return None;
-        }
+        self.watch_window_at(mount, window)?;
         f.hot.clone()
     }
     fn watch_overflows(&self, mount: &str, window: Duration) -> Option<u64> {
         let f = self.data.windows.get(&(mount.into(), window))?;
-        if f.at != self.now {
-            return None;
-        }
+        self.watch_window_at(mount, window)?;
         f.overflows
     }
     fn phantom_bytes(&self, mount: &str) -> Option<u64> {
