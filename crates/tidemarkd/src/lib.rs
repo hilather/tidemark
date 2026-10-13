@@ -142,6 +142,16 @@ pub fn main_entry() -> std::process::ExitCode {
 mod tests {
     use super::*;
     #[test]
+    fn typed_memory_pressure_is_degraded() {
+        assert!(resource_pressure(&std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "budget"
+        )));
+        assert!(!resource_pressure(&std::io::Error::other(
+            "ordinary failure"
+        )));
+    }
+    #[test]
     fn recovery_wait_preserves_busy_database_and_sidecars() {
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
@@ -604,16 +614,17 @@ fn retry_start<T>(
 
 // Resource pressure must be contained by the component owning the retry loop.
 pub(crate) fn resource_pressure(error: &std::io::Error) -> bool {
-    error.raw_os_error().is_some_and(|code| {
-        [
-            rustix::io::Errno::MFILE,
-            rustix::io::Errno::NFILE,
-            rustix::io::Errno::NOMEM,
-            rustix::io::Errno::NOBUFS,
-        ]
-        .iter()
-        .any(|errno| errno.raw_os_error() == code)
-    })
+    error.kind() == std::io::ErrorKind::OutOfMemory
+        || error.raw_os_error().is_some_and(|code| {
+            [
+                rustix::io::Errno::MFILE,
+                rustix::io::Errno::NFILE,
+                rustix::io::Errno::NOMEM,
+                rustix::io::Errno::NOBUFS,
+            ]
+            .iter()
+            .any(|errno| errno.raw_os_error() == code)
+        })
 }
 
 fn sqlite_pressure_code(code: i32) -> bool {

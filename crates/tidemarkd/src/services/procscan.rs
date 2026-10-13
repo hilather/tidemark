@@ -12,6 +12,20 @@ use std::{
 use tidemark_core::{config::Config, path::RawPath};
 use tidemark_live::procscan::{ProcScanner, ProcScannerOptions};
 
+fn failure_detail(error: &std::io::Error) -> String {
+    if let Some(budget) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<tidemark_fs::procfs::InventoryBudgetExceeded>())
+    {
+        format!(
+            "process inventory over its memory budget: {} descriptors, {} bytes retained",
+            budget.count, budget.bytes
+        )
+    } else {
+        format!("process scan failed: {error}")
+    }
+}
+
 fn scanner(config: &Config) -> Result<ProcScanner, DaemonError> {
     let table = tidemark_fs::mount::read_mountinfo().map_err(|source| DaemonError::Io {
         context: "procscan mount table".into(),
@@ -117,7 +131,7 @@ fn start_with(
                             state.publish(Publication::ProcscanCompleted { generation, report: Arc::new(report), completed_at: clock() }, crate::component("procscan", if dropped || result.writers_full { "degraded" } else { "ok" }, format!("fds_seen={} writers_full={} writer_evictions={} persistence_dropped={dropped}", result.fds_seen, result.writers_full, result.writer_evictions)))?;
                         }
                         Err(e) if crate::resource_pressure(&e) => {
-                            state.publish(Publication::ProcscanAttempt { generation, report: None }, crate::component("procscan", "degraded", e.to_string()))?;
+                            state.publish(Publication::ProcscanAttempt { generation, report: None }, crate::component("procscan", "degraded", failure_detail(&e)))?;
                         }
                         Err(e) => { state.publish(Publication::ProcscanAttempt { generation, report: None }, crate::component("procscan", "error", e.to_string()))?; }
                     }
@@ -136,6 +150,21 @@ mod tests {
     use super::*;
     use tidemark_core::config::{AlertKind, AlertRule, AlertThreshold};
     use tidemark_live::alerts::{AlertEngine, AlertSource};
+    #[test]
+    fn inventory_budget_detail_keeps_counts() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            tidemark_fs::procfs::InventoryBudgetExceeded {
+                count: 34000,
+                bytes: 134217000,
+            },
+        );
+        assert!(crate::resource_pressure(&error));
+        assert_eq!(
+            failure_detail(&error),
+            "process inventory over its memory budget: 34000 descriptors, 134217000 bytes retained"
+        );
+    }
     #[test]
     fn emfile_invalidates_process_input_recovery_restarts_continuity_and_report_expires() {
         let dir = tempfile::tempdir().unwrap();
