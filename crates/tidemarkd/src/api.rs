@@ -51,6 +51,7 @@ impl Cancellation {
                 matches!(phase, 0 | 3).then_some(1)
             });
     }
+    /// Claim scan admission against cancellation while keeping the request cancellable.
     pub(crate) fn begin_scan_admission(&self) -> Result<(), DaemonError> {
         self.check()?;
         self.phase
@@ -157,6 +158,7 @@ pub fn dispatch(
         &Cancellation::new(Arc::new(std::sync::atomic::AtomicBool::new(false)), TIMEOUT),
     )
 }
+/// Dispatch an authenticated request with its caller-supplied execution budget.
 pub(crate) fn dispatch_controlled(
     request: &Request,
     peer_uid: u32,
