@@ -562,7 +562,7 @@ Deleting files without reconciling the catalog left stale query entries. A scope
 
 **Decision: accepted as specified below.**
 
-Prune deletes retention-selected files and globally rebuilds the catalog from surviving snapshots; dry-run only reports deletions. Automatic retention and emergency pruning reconcile the catalog too; expired partial/failed artifacts are considered before protected complete snapshots. `snapshots rebuild-catalog --root PATH` is refused before recovery or mutation: omit `--root` for an explicit global rebuild. This follows W2-C-fix more precisely than the older D5 text, because the global store rebuild cannot preserve another root's historical failed/running rows.
+Prune deletes retention-selected files and globally rebuilds the catalog from surviving snapshots; dry-run only reports deletions. Automatic retention and emergency pruning reconcile the catalog too; R5-6 supersedes automatic rebuild behavior to preserve failed/running no-file lifecycle rows through Catalog::rebuild_after_scan; explicit rebuild_from_files remains global. expired partial/failed artifacts are considered before protected complete snapshots. `snapshots rebuild-catalog --root PATH` is refused before recovery or mutation: omit `--root` for an explicit global rebuild. This follows W2-C-fix more precisely than the older D5 text, because the global store rebuild cannot preserve another root's historical failed/running rows.
 
 Source notes: W2-C-fix (under docs/handoff/).
 
@@ -1214,7 +1214,7 @@ Sources: `docs/handoff/STATE-trust-A.md`, `docs/handoff/STATE-trust-A2.md`, `doc
 
 **Decision: accepted; open gates explicitly retained.**
 
-ADR-020 supersedes endpoint/webhook deliverables everywhere in v1. R3-1 lifecycle completion, R4-7 exact windows, R4-9 mount state and R4-16 finding status must be read with R5-2/8/9/19/21. Historical review evidence remains historical; implementation closure is not a guest gate.
+ADR-020 supersedes endpoint/webhook deliverables everywhere in v1. R3-1 watcher-window completion, R4-7 exact windows, R4-9 mount state and R4-16 finding status must be read with R5-2/8/9/19/21. Historical review evidence remains historical; implementation closure is not a guest gate.
 
 Sources: `docs/handoff/CODE-drop-http.md`, `docs/handoff/RECHECK-life.md`, `docs/handoff/RECHECK-state.md`, `docs/handoff/RECHECK-edge.md`.
 

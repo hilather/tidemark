@@ -106,7 +106,7 @@ Follow `13` R2-8: retry transient descriptor shortages, report failed workers, a
 
 ---
 
-CompletedMinute, drain_minutes and mount_identity are adopted by 13 R4-7 / LIVE-minutes; legacy drains share the persistence cursor. Exact daemon window consumption remains open.
+CompletedMinute, drain_minutes and mount_identity are adopted by 13 R4-7 / LIVE-minutes; legacy drains share the persistence cursor. Exact daemon window consumption/freshness is implemented; superseded by R5-9/19.
 
 Watcher window and dirty-root contracts follow 07 §3.3 and 13 R3-1/R3-2: supported whole minutes only, unavailable lossy/truncated hot windows, and independent post-publication dirty takes. No permission-error count is reported in v1 (R3-5).
 

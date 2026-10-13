@@ -101,7 +101,7 @@ Wave files reference these IDs. FR-10 to FR-13 (project quotas) and FR-16 (colle
 | NFR-5 | **Safety**: scans never follow found symlinks or read regular-file payloads; no intentional scanned metadata writes. Request O_NOATIME for directories with charged EPERM fallback; symlink inspection/path-resolution atime limits are documented (R5-23/25). | Code review checklist, tests, strace audit (W7-C) |
 | NFR-6 | **Crash safety**: a crash never leaves a corrupt "latest" snapshot. The time-series DB survives power loss (SQLite WAL). | Fault-injection tests |
 | NFR-7 | **Self-protection**: Tidemark never fills a disk it monitors (state-size cap, free-space floor). It excludes its own state directory from scans and watches. | Tests (W6) |
-| NFR-8 | **Security**: root daemon with a minimal capability set; no network listeners by default; API socket `0600 root:root`; config and snapshot files `0600 root:root`; state and runtime directories `0700 root:root`; installed files are root-only, so administrators use `sudo` (path names are sensitive); no uid gate in the CLI or daemon. | Review (W7) |
+| NFR-8 | **Security**: root daemon with a minimal capability set; no network listeners (ADR-020); API socket `0600 root:root`; config and snapshot files `0600 root:root`; state and runtime directories `0700 root:root`; installed files are root-only, so administrators use `sudo` (path names are sensitive); no uid gate in the CLI or daemon. | Review (W7) |
 | NFR-9 | **Operability**: journald logs, metrics, runbooks, `tidemark status` self-check, `deploy verify` for automation. | W4/W6/W7 |
 | NFR-10 | **Compatibility**: Rocky/RHEL 8.8–8.10 first-class; should also run on EL9; builds on a `rockylinux:8` container (glibc 2.28). | CI + VM matrix |
 
