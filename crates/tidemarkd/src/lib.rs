@@ -585,7 +585,7 @@ pub fn run_controlled(
             &state,
             &mut handles,
         )?;
-        let reload = reload_callback(options.config_path.clone(), state.clone());
+        let reload = cooperative_reload_callback(options.config_path.clone(), state.clone());
         let context = api::Context {
             state: state.clone(),
             scans: scans.clone(),
@@ -613,7 +613,10 @@ pub fn run_controlled(
             tracing::info!("daemon ready");
             while !shutdown.load(Ordering::Acquire) {
                 if reload_flag.swap(false, Ordering::AcqRel) {
-                    match reload() {
+                    match reload.call(&api::Cancellation::new(
+                        shutdown.clone(),
+                        std::time::Duration::from_secs(10),
+                    )) {
                         Ok(r) if r.reloaded => {
                             tracing::info!(reloaded = true, "config reload")
                         }
@@ -828,55 +831,78 @@ pub fn protect_config(c: &mut tidemark_core::config::Config) -> Result<(), Daemo
 }
 /// API/SIGHUP reload callback. Invalid config returns reloaded=false with all issues.
 /// Services observe LiveState::config generation; state_dir/socket require restart.
-pub fn reload_callback(path: std::path::PathBuf, state: state::LiveState) -> api::Reload {
+pub fn reload_callback(
+    path: std::path::PathBuf,
+    state: state::LiveState,
+) -> std::sync::Arc<
+    dyn Fn() -> Result<tidemark_core::api::ConfigReloadResult, DaemonError> + Send + Sync,
+> {
+    let callback = cooperative_reload_callback(path, state);
     std::sync::Arc::new(move || {
-        let result = (|| {
-            let (mut config, hash) = load_config(&path)?;
-            validate_config(&config)?;
-            validate_state_paths(&config)?;
-            protect_config(&mut config)?;
-            scheduler::preflight_reload(&state, &config)?;
-            state.replace_config(config)?;
-            let started = state
-                .view()
-                .firstboot_inputs()
-                .map_or(0, |i| i.daemon_started_at);
-            state.publish(
-                state::Publication::Deployment {
-                    config_sha256: hash,
-                    started_at: started,
-                },
-                component("config", "ok", "reloaded"),
-            )?;
-            Ok::<_, DaemonError>(())
-        })();
-        match result {
-            Ok(()) => {
-                let _ = sd_notify::notify(
-                    false,
-                    &[sd_notify::NotifyState::Status("Configuration reloaded")],
-                );
-                Ok(tidemark_core::api::ConfigReloadResult {
-                    reloaded: true,
-                    warnings: Vec::new(),
-                })
-            }
-            Err(e) => {
-                tracing::error!(reloaded=false,error=%e,"keeping previous config");
-                let _ = sd_notify::notify(
-                    false,
-                    &[sd_notify::NotifyState::Status(
-                        "Configuration invalid; retaining previous configuration",
-                    )],
-                );
-                state.publish_component(component("config", "error", e.to_string()))?;
-                Ok(tidemark_core::api::ConfigReloadResult {
-                    reloaded: false,
-                    warnings: vec![e.to_string()],
-                })
-            }
-        }
+        callback.call(&api::Cancellation::new(
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::time::Duration::from_secs(10),
+        ))
     })
+}
+fn cooperative_reload_callback(path: std::path::PathBuf, state: state::LiveState) -> api::Reload {
+    std::sync::Arc::new(api::CooperativeReload(
+        move |cancellation: &api::Cancellation| {
+            let result = (|| {
+                cancellation.check()?;
+                let (mut config, hash) = load_config(&path)?;
+                cancellation.check()?;
+                validate_config(&config)?;
+                validate_state_paths(&config)?;
+                protect_config(&mut config)?;
+                cancellation.check()?;
+                scheduler::preflight_reload(&state, &config)?;
+                // Atomic request cancellation wins before this commit boundary, or
+                // publication completes afterward. In-flight kernel I/O cannot be
+                // interrupted; a timeout after commit begins has uncertain outcome.
+                cancellation.begin_commit()?;
+                state.replace_config(config)?;
+                let started = state
+                    .view()
+                    .firstboot_inputs()
+                    .map_or(0, |i| i.daemon_started_at);
+                state.publish(
+                    state::Publication::Deployment {
+                        config_sha256: hash,
+                        started_at: started,
+                    },
+                    component("config", "ok", "reloaded"),
+                )?;
+                Ok::<_, DaemonError>(())
+            })();
+            match result {
+                Ok(()) => {
+                    let _ = sd_notify::notify(
+                        false,
+                        &[sd_notify::NotifyState::Status("Configuration reloaded")],
+                    );
+                    Ok(tidemark_core::api::ConfigReloadResult {
+                        reloaded: true,
+                        warnings: Vec::new(),
+                    })
+                }
+                Err(e) => {
+                    tracing::error!(reloaded=false,error=%e,"keeping previous config");
+                    let _ = sd_notify::notify(
+                        false,
+                        &[sd_notify::NotifyState::Status(
+                            "Configuration invalid; retaining previous configuration",
+                        )],
+                    );
+                    state.publish_component(component("config", "error", e.to_string()))?;
+                    Ok(tidemark_core::api::ConfigReloadResult {
+                        reloaded: false,
+                        warnings: vec![e.to_string()],
+                    })
+                }
+            }
+        },
+    ))
 }
 #[path = "../../tidemark-cli/src/deploy/files.rs"]
 // firstboot::files is private; both inclusions share the CLI-owned policy source.

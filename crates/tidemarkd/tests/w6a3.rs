@@ -210,8 +210,13 @@ fn controllable_handler_timeout_keeps_admission_bounded() {
         ApiErrorCode::Unavailable
     );
     stop.store(true, Ordering::Release);
-    handle.join().unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(80));
+    assert!(
+        !handle.is_finished(),
+        "service abandoned its blocked callback"
+    );
     release_tx.send(()).unwrap();
+    handle.join().unwrap().unwrap();
 }
 #[test]
 fn refuses_non_socket_and_active_socket_removes_stale_socket() {
