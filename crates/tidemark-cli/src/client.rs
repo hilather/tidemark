@@ -204,7 +204,9 @@ fn connect_deadline(socket: &Path, timeout: Duration) -> Result<UnixStream, Clie
         .recv_timeout(timeout)
         .map_err(|error| match error {
             mpsc::RecvTimeoutError::Timeout => ClientError::Timeout,
-            mpsc::RecvTimeoutError::Disconnected => ClientError::Unavailable,
+            mpsc::RecvTimeoutError::Disconnected => {
+                ClientError::Protocol("connection worker disconnected")
+            }
         })?
         .map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
