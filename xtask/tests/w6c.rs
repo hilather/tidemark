@@ -5,7 +5,7 @@
 
 #[path = "../src/rpm.rs"]
 mod rpm;
-use std::{collections::BTreeMap, path::Path, process::Command};
+use std::{collections::BTreeMap, io::Write, path::Path, process::Command};
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
 }
@@ -236,11 +236,19 @@ fn shell_syntax_and_vm_guard() {
                 .arg(root().join(file))
                 .output()
                 .unwrap();
-            eprintln!(
-                "shellcheck notes for {file}:\n{}{}",
-                String::from_utf8_lossy(&notes.stdout),
-                String::from_utf8_lossy(&notes.stderr),
-            );
+            let mut stderr = std::io::stderr().lock();
+            stderr
+                .write_all(
+                    format!(
+                        "shellcheck notes for {file}:\n{}{}",
+                        String::from_utf8_lossy(&notes.stdout),
+                        String::from_utf8_lossy(&notes.stderr),
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stderr.write_all(b"\n").unwrap();
+            drop(stderr);
             let output = Command::new("shellcheck")
                 .arg("--severity=warning")
                 .arg(root().join(file))
@@ -420,4 +428,41 @@ fn upgrade_fixture_options_and_drift() {
             read("packaging/config/tidemark.toml")
         )
     );
+}
+
+#[test]
+fn shellcheck_advisories_survive_passing_harness_and_warnings_fail() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let stub = dir.path().join("shellcheck");
+    let path = std::env::join_paths(std::iter::once(dir.path().to_owned()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    for fail_warning in [false, true] {
+        std::fs::write(&stub, format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nfor arg in \"$@\"; do\nif [ \"$arg\" = --severity=warning ]; then echo WARNING_GATE >&2; exit {}; fi\ndone\necho ADVISORY_STDOUT\necho ADVISORY_STDERR >&2\nexit 1\n",
+            u8::from(fail_warning),
+        )).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Exact filtering avoids recursively invoking this regression. No nocapture.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "shell_syntax_and_vm_guard", "--test-threads=1"])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            !fail_warning,
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("ADVISORY_STDOUT"), "{stderr}");
+        assert!(stderr.contains("ADVISORY_STDERR"), "{stderr}");
+        if fail_warning {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("WARNING_GATE"));
+        }
+    }
 }
