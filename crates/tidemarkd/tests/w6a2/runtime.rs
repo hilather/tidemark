@@ -38,6 +38,15 @@ impl Harness {
         Self::with_clock(schedule, throttle, nested, Arc::new(tidemarkd::unix_now))
     }
     fn with_clock(schedule: &str, throttle: &str, nested: bool, clock: tidemarkd::Clock) -> Self {
+        Self::with_root_count(schedule, throttle, nested, clock, 1)
+    }
+    fn with_root_count(
+        schedule: &str,
+        throttle: &str,
+        nested: bool,
+        clock: tidemarkd::Clock,
+        root_count: usize,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("child")).unwrap();
         std::fs::write(root.path().join("child/file"), b"fixture").unwrap();
@@ -56,6 +65,11 @@ impl Harness {
             throttle: throttle.into(),
             ..RootConfig::default()
         }];
+        for n in 1..root_count {
+            let mut extra = cfg.roots[0].clone();
+            extra.path = root.path().join(format!("root-{n}"));
+            cfg.roots.push(extra);
+        }
         cfg.scan.threads = 1;
         let state = LiveState::new(&cfg, tidemarkd::unix_now());
         state.bind_storage(std::fs::File::open(storage.path()).unwrap().into());
@@ -531,6 +545,7 @@ fn failure_health_survives_idle_other_root_and_reload_until_recovery() {
     removed.roots.clear();
     h.state.replace_config(removed).unwrap();
     wait(|| !degraded());
+    assert!(h.state.view().scans().unwrap().is_empty());
     h.state.replace_config(cfg).unwrap();
     wait(degraded);
     wait(|| {
@@ -754,4 +769,32 @@ fn bound_storage_snapshot_readable_in_separate_process_without_sockets() {
             .any(|w| w == entry.scan_id.as_bytes()));
         assert_eq!(json["schema"], "tidemark.snapshots.v1");
     }
+}
+
+#[test]
+fn exact_capacity_root_replacement_and_cumulative_churn_keep_scheduler_alive() {
+    let h = Harness::with_root_count("off", "max", false, Arc::new(tidemarkd::unix_now), 128);
+    wait(|| {
+        h.state
+            .view()
+            .scans()
+            .is_some_and(|scans| scans.len() == 128)
+    });
+    for n in 0..140 {
+        let mut cfg = h.cfg.clone();
+        cfg.roots.truncate(1);
+        cfg.roots[0].path = h.cfg.roots[0].path.join(format!("replacement-{n}"));
+        let label = cfg.roots[0].path.to_string_lossy().into_owned();
+        h.state.replace_config(cfg).unwrap();
+        wait(|| {
+            h.state
+                .view()
+                .scans()
+                .is_some_and(|scans| scans.len() == 1 && scans[0].root == label)
+        });
+        assert!(!h.stop.load(Ordering::Acquire));
+    }
+    // Allow a real scheduler boundary after the last replacement.
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!h.stop.load(Ordering::Acquire));
 }

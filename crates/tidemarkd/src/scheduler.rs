@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tidemark_core::{
     api::{ScanCancelParams, ScanCancelResult, ScanStartParams, ScanStartResult, ScanStatusParams},
@@ -202,6 +202,7 @@ struct Shared {
     state: LiveState,
     shutdown: Shutdown,
     active: Mutex<Option<Active>>,
+    deadline: Arc<Mutex<Option<Instant>>>,
     commands: Sender<Command>,
     clock: crate::Clock,
     // Same MAX_SUBJECTS cap as the scan-status inventory.
@@ -246,6 +247,15 @@ pub struct ScanControl {
     shared: Option<Arc<Shared>>,
 }
 impl ScanControl {
+    pub(crate) fn begin_shutdown(&self, deadline: Instant) {
+        if let Some(shared) = &self.shared {
+            *shared.deadline.lock() = Some(deadline);
+            if let Some(active) = shared.active.lock().as_ref() {
+                active.cancel.store(true, Ordering::Release);
+            }
+        }
+    }
+
     /// Start one root, acknowledging only after the writer persists
     /// scan_started. Host lock conflicts return `DaemonError::Scan("Busy")`.
     pub fn start(&self, params: &ScanStartParams) -> Result<ScanStartResult, DaemonError> {
@@ -284,6 +294,7 @@ impl ScanControl {
                 "scan root inventory cap reached".into(),
             ));
         }
+        shared.state.reserve_scan(root_label(&params.root))?;
         let (tx, rx) = bounded(1);
         *active = Some(Active {
             root: params.root.clone(),
@@ -300,21 +311,40 @@ impl ScanControl {
             .is_err()
         {
             *active = None;
+            shared.state.release_scan();
             return Err(DaemonError::Unavailable(
                 "scheduler queue unavailable".into(),
             ));
         }
         drop(active);
-        match rx.recv_timeout(ACK_TIMEOUT) {
-            Ok(result) => result,
-            Err(_) => {
+        let end = Instant::now() + ACK_TIMEOUT;
+        loop {
+            if shared.shutdown.load(Ordering::Acquire)
+                || shared.deadline.lock().is_some_and(|d| Instant::now() >= d)
+            {
                 cancel.store(true, Ordering::Release);
-                Err(DaemonError::Unavailable(
+                return Err(DaemonError::Shutdown);
+            }
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                cancel.store(true, Ordering::Release);
+                return Err(DaemonError::Unavailable(
                     "scan start acknowledgement timed out".into(),
-                ))
+                ));
+            }
+            match rx.recv_timeout(remaining.min(POLL)) {
+                Ok(result) => return result,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(_) => {
+                    cancel.store(true, Ordering::Release);
+                    return Err(DaemonError::Unavailable(
+                        "scan start acknowledgement disconnected".into(),
+                    ));
+                }
             }
         }
     }
+
     /// Cancel the active scan for exactly this root, keeping no partial output.
     pub fn cancel(&self, params: &ScanCancelParams) -> Result<ScanCancelResult, DaemonError> {
         let shared = self
@@ -345,6 +375,9 @@ impl ScanControl {
 }
 
 struct Recorder {
+    cancel: Shutdown,
+    shutdown: Shutdown,
+    deadline: Arc<Mutex<Option<Instant>>>,
     state: LiveState,
     writer: tswriter::Sender,
     config: Arc<Config>,
@@ -364,13 +397,54 @@ impl Recorder {
         } else {
             Message::ScanStarted(copy_entry(entry), tx)
         };
-        self.writer
-            .send_timeout(message, ACK_TIMEOUT)
-            .map_err(scan_error)?;
-        rx.recv_timeout(ACK_TIMEOUT)
-            .map_err(scan_error)?
-            .map_err(scan_error)
+        self.send(message)?;
+        self.ack(&rx)?.map_err(scan_error)
     }
+    fn stopped(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+            || self.shutdown.load(Ordering::Acquire)
+            || self.deadline.lock().is_some_and(|d| Instant::now() >= d)
+    }
+    fn send(&self, mut message: Message) -> Result<(), ScanError> {
+        let end = Instant::now() + ACK_TIMEOUT;
+        loop {
+            if self.stopped() {
+                return Err(ScanError::Cancelled);
+            }
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(scan_error("writer queue timed out; message not committed"));
+            }
+            match self.writer.send_timeout(message, remaining.min(POLL)) {
+                Ok(()) => return Ok(()),
+                Err(crossbeam_channel::SendTimeoutError::Timeout(m)) => message = m,
+                Err(e) => return Err(scan_error(e)),
+            }
+        }
+    }
+    fn ack<T>(&self, rx: &Receiver<T>) -> Result<T, ScanError> {
+        let end = Instant::now() + ACK_TIMEOUT;
+        loop {
+            // Once enqueued, interruption cannot prove the writer did not commit.
+            if self.stopped() {
+                return Err(scan_error(
+                    "persistence uncertain: acknowledgement interrupted",
+                ));
+            }
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(scan_error(
+                    "persistence uncertain: acknowledgement timed out",
+                ));
+            }
+            match rx.recv_timeout(remaining.min(POLL)) {
+                Ok(value) => return Ok(value),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(e) => return Err(scan_error(format!("persistence uncertain: {e}"))),
+            }
+        }
+    }
+
     fn status(&self, entry: &ScanEntry, running: bool) -> Result<(), ScanError> {
         let root = root_label(&entry.root);
         let previous = self.previous.lock();
@@ -583,18 +657,20 @@ impl ScanRecorder for Recorder {
         if rows.len() > 20_000 {
             return Err(scan_error("directory series exceeds 20,000 rows"));
         }
-        self.writer
-            .send_timeout(
-                Message::DirSeries((root.clone(), scan_id.into(), ts, rows.to_vec())),
-                ACK_TIMEOUT,
-            )
-            .map_err(scan_error)?;
+        self.send(Message::DirSeries((
+            root.clone(),
+            scan_id.into(),
+            ts,
+            rows.to_vec(),
+        )))?;
         // Barrier preserves series-before-retention ordering on the one writer.
         let (tx, rx) = bounded(1);
-        self.writer
-            .send_timeout(Message::Flush(tx), ACK_TIMEOUT)
-            .map_err(scan_error)?;
-        rx.recv_timeout(ACK_TIMEOUT).map_err(scan_error)?;
+        self.send(Message::Flush(tx)).map_err(|e| {
+            scan_error(format!(
+                "persistence uncertain: series queued but barrier not acknowledged: {e}"
+            ))
+        })?;
+        self.ack(&rx)?;
         Ok(())
     }
 }
@@ -602,7 +678,9 @@ impl ScanRecorder for Recorder {
 struct ReleaseActive(Arc<Shared>);
 impl Drop for ReleaseActive {
     fn drop(&mut self) {
-        *self.0.active.lock() = None;
+        let mut active = self.0.active.lock();
+        self.0.state.release_scan();
+        *active = None;
     }
 }
 
@@ -651,6 +729,9 @@ fn launch(
                 annotations: vec![],
             };
             let recorder = Recorder {
+                cancel: command.cancel.clone(),
+                shutdown: shared.shutdown.clone(),
+                deadline: shared.deadline.clone(),
                 state: shared.state.clone(),
                 writer,
                 config: config.clone(),
@@ -826,6 +907,39 @@ pub fn start_with_clock(
     shutdown: Shutdown,
     clock: crate::Clock,
 ) -> Result<(ScanControl, crate::ServiceHandle), DaemonError> {
+    start_inner(
+        config,
+        state,
+        writer,
+        shutdown,
+        clock,
+        Arc::new(Mutex::new(None)),
+    )
+}
+pub(crate) fn start_with_deadline(
+    config: Arc<Config>,
+    state: LiveState,
+    writer: tswriter::Sender,
+    shutdown: Shutdown,
+    deadline: Arc<Mutex<Option<Instant>>>,
+) -> Result<(ScanControl, crate::ServiceHandle), DaemonError> {
+    start_inner(
+        config,
+        state,
+        writer,
+        shutdown,
+        Arc::new(crate::unix_now),
+        deadline,
+    )
+}
+fn start_inner(
+    config: Arc<Config>,
+    state: LiveState,
+    writer: tswriter::Sender,
+    shutdown: Shutdown,
+    clock: crate::Clock,
+    deadline: Arc<Mutex<Option<Instant>>>,
+) -> Result<(ScanControl, crate::ServiceHandle), DaemonError> {
     crate::state::validate_bounds(&config)?;
     for root in &config.roots {
         parse_schedule(&root.schedule)?;
@@ -836,6 +950,7 @@ pub fn start_with_clock(
         state,
         shutdown,
         active: Mutex::new(None),
+        deadline,
         commands: tx,
         clock,
         failures: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
@@ -856,7 +971,7 @@ pub fn start_with_clock(
 // optional services. Populate every root before that first readiness check,
 // even when the first due scan will occupy the host slot for a long time.
 fn initialize_schedules(state: &LiveState, now: i64) -> Result<(), DaemonError> {
-    let (config, _) = state.config();
+    let (config, generation) = state.config();
     let catalog = Catalog::open(&state.storage_path(), false)
         .map_err(|e| DaemonError::Store(e.to_string()))?;
     for root in &config.roots {
@@ -875,14 +990,37 @@ fn initialize_schedules(state: &LiveState, now: i64) -> Result<(), DaemonError> 
             last.as_ref().and_then(|e| e.finished_at),
             now,
         )?;
-        state.publish(
-            Publication::Scan(ScanStatus {
+        state.publish_scheduled(
+            ScanStatus {
                 root: root_label(&raw),
                 running: None,
                 last_complete: last.as_ref().map(last_scan),
                 next_due,
-            }),
+            },
+            generation,
             component("scheduler", "ok", "initial schedules published"),
+        )?;
+    }
+    Ok(())
+}
+pub(crate) fn preflight_reload(state: &LiveState, config: &Config) -> Result<(), DaemonError> {
+    let catalog = Catalog::open(&state.storage_path(), false)
+        .map_err(|e| DaemonError::Store(e.to_string()))?;
+    for root in &config.roots {
+        let raw =
+            RawPath::from_path(&root.path).map_err(|e| DaemonError::Invalid(e.to_string()))?;
+        let last = catalog
+            .latest(&raw)
+            .map_err(|e| DaemonError::Store(e.to_string()))?;
+        next_run(
+            &parse_schedule(&root.schedule)?,
+            root.window
+                .as_deref()
+                .map(parse_window)
+                .transpose()?
+                .as_ref(),
+            last.as_ref().and_then(|e| e.finished_at),
+            crate::unix_now(),
         )?;
     }
     Ok(())
@@ -897,7 +1035,36 @@ impl Drop for SchedulerExit {
     }
 }
 struct Job {
-    handle: crate::ServiceHandle,
+    handle: Option<crate::ServiceHandle>,
+    shared: Arc<Shared>,
+}
+impl Job {
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(|handle| handle.is_finished())
+    }
+    fn join(mut self) -> Result<Result<(), DaemonError>, DaemonError> {
+        match self.handle.take() {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| DaemonError::Internal("scan worker panicked".into())),
+            None => Ok(Ok(())),
+        }
+    }
+}
+impl Drop for Job {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            if let Some(active) = self.shared.active.lock().as_ref() {
+                active.cancel.store(true, Ordering::Release);
+            }
+            // Also join on scheduler errors and unwinding, before releasing the writer.
+            if let Err(error) = handle.join() {
+                tracing::error!(?error, "scan worker panicked during scheduler cleanup");
+            }
+        }
+    }
 }
 fn scheduler(
     shared: Arc<Shared>,
@@ -915,13 +1082,9 @@ fn scheduler(
         .publish_component(component("scheduler", "ok", "scheduler started"))?;
     initialize_schedules(&shared.state, (shared.clock)())?;
     while !shared.shutdown.load(Ordering::Acquire) {
-        if job.as_ref().is_some_and(|j| j.handle.is_finished()) {
+        if job.as_ref().is_some_and(|j| j.is_finished()) {
             if let Some(j) = job.take() {
-                match j
-                    .handle
-                    .join()
-                    .map_err(|_| DaemonError::Internal("scan worker panicked".into()))?
-                {
+                match j.join()? {
                     Ok(()) | Err(DaemonError::Scan(_)) => {}
                     Err(e) => return Err(e),
                 }
@@ -959,7 +1122,8 @@ fn scheduler(
                     *shared.active.lock() = None;
                 } else {
                     job = Some(Job {
-                        handle: launch(command, shared.clone(), writer.clone())?,
+                        handle: Some(launch(command, shared.clone(), writer.clone())?),
+                        shared: shared.clone(),
                     });
                 }
             }
@@ -1014,15 +1178,22 @@ fn scheduler(
                     .get(&raw)
                     .map_or(scheduled, |r| r.due)
             });
-            shared.state.publish(
-                Publication::Scan(ScanStatus {
+            if let Err(error) = shared.state.publish_scheduled(
+                ScanStatus {
                     root: root_label(&raw),
                     running: None,
                     last_complete: last.as_ref().map(last_scan),
                     next_due,
-                }),
+                },
+                current_generation,
                 scheduler_health(&shared.failures, "waiting for scheduled scan"),
-            )?;
+            ) {
+                shared
+                    .state
+                    .publish_component(component("config", "error", error.to_string()))?;
+                tracing::error!(%error, "scan inventory publication rejected; scheduler continuing");
+                continue;
+            }
             if due.is_some_and(|d| d <= now)
                 && shared
                     .failures
@@ -1034,6 +1205,22 @@ fn scheduler(
                 if active.is_some() {
                     break;
                 }
+                match shared
+                    .state
+                    .reserve_scheduled(root_label(&raw), current_generation)
+                {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        shared.state.publish_component(component(
+                            "config",
+                            "error",
+                            error.to_string(),
+                        ))?;
+                        tracing::error!(%error, "scheduled scan capacity rejected; scheduler continuing");
+                        continue;
+                    }
+                }
                 let cancel = Arc::new(AtomicBool::new(false));
                 *active = Some(Active {
                     root: raw.clone(),
@@ -1042,7 +1229,7 @@ fn scheduler(
                 drop(active);
                 let (tx, _) = bounded(1);
                 job = Some(Job {
-                    handle: launch(
+                    handle: Some(launch(
                         Command {
                             params: ScanStartParams {
                                 root: raw,
@@ -1055,7 +1242,8 @@ fn scheduler(
                         },
                         shared.clone(),
                         writer.clone(),
-                    )?,
+                    )?),
+                    shared: shared.clone(),
                 });
                 break;
             }
@@ -1068,11 +1256,7 @@ fn scheduler(
         tracing::info!(
             "waiting for scan cancellation; daemon lifecycle enforces the shutdown deadline"
         );
-        match job
-            .handle
-            .join()
-            .map_err(|_| DaemonError::Internal("scan worker panicked during shutdown".into()))?
-        {
+        match job.join()? {
             Ok(()) | Err(DaemonError::Scan(_)) => {}
             Err(e) => return Err(e),
         }
@@ -1112,6 +1296,9 @@ mod tests {
         previous: Option<ScanEntry>,
     ) -> Recorder {
         Recorder {
+            cancel: Shutdown::default(),
+            shutdown: Shutdown::default(),
+            deadline: Arc::new(Mutex::new(None)),
             config: cfg,
             state,
             writer,
@@ -1179,6 +1366,139 @@ mod tests {
             .to_string()
             .contains("injected persistence failure"));
         worker.join().unwrap();
+    }
+    #[test]
+    fn recorder_interrupts_stalled_queue_and_uncertain_ack() {
+        for (enqueued, daemon_stop) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let cfg = Arc::new(config(root.path(), storage.path()));
+            let state = LiveState::new(&cfg, 0);
+            let (writer, rx) = bounded(1);
+            let rec = recorder(cfg, state, writer.clone(), None);
+            let cancel = if daemon_stop {
+                rec.shutdown.clone()
+            } else {
+                rec.cancel.clone()
+            };
+            if !enqueued {
+                let (tx, _) = bounded(1);
+                writer.send(Message::Flush(tx)).unwrap();
+            }
+            let entry = ScanEntry {
+                scan_id: "stalled".into(),
+                root: RawPath::from_path(root.path()).unwrap(),
+                mode: tidemark_core::scan::ScanMode::Walk,
+                started_at: 0,
+                finished_at: None,
+                status: "running".into(),
+                degraded: false,
+                file: None,
+                t_disk: None,
+                t_inodes: None,
+                t_dirs: None,
+                errors: None,
+                duration_ms: None,
+            };
+            let (done, result) = bounded(1);
+            let worker = std::thread::spawn(move || done.send(rec.persist(&entry, false)).unwrap());
+            // Keep acknowledgement sender alive, so disconnect cannot mask cancellation.
+            let held = if enqueued {
+                Some(rx.recv_timeout(Duration::from_secs(1)).unwrap())
+            } else {
+                None
+            };
+            cancel.store(true, Ordering::Release);
+            let error = result
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap()
+                .unwrap_err();
+            if enqueued {
+                assert!(
+                    error.to_string().contains("persistence uncertain"),
+                    "{error}"
+                );
+            } else {
+                assert!(matches!(error, ScanError::Cancelled));
+                assert!(matches!(rx.try_recv().unwrap(), Message::Flush(_)));
+                assert!(rx.try_recv().is_err());
+            }
+            worker.join().unwrap();
+            drop(held);
+        }
+    }
+    #[test]
+    fn recorder_shared_deadline_interrupts_series_queue_and_barrier_ack() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(config(root.path(), storage.path()));
+        let state = LiveState::new(&cfg, 0);
+        let (writer, rx) = bounded(1);
+        let rec = recorder(cfg, state, writer, None);
+        *rec.deadline.lock() = Some(Instant::now());
+        let (tx, ack) = bounded(1);
+        assert!(matches!(
+            rec.send(Message::Flush(tx)),
+            Err(ScanError::Cancelled)
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(rec
+            .ack(&ack)
+            .unwrap_err()
+            .to_string()
+            .contains("persistence uncertain"));
+    }
+    #[test]
+    fn series_cancellation_interrupts_each_queue_and_ack_wait() {
+        for phase in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let cfg = Arc::new(config(root.path(), storage.path()));
+            drop(Catalog::open(storage.path(), true).unwrap());
+            let state = LiveState::new(&cfg, 0);
+            let (writer, rx) = bounded(1);
+            let rec = recorder(cfg, state, writer.clone(), None);
+            let cancel = rec.cancel.clone();
+            if phase == 0 {
+                let (tx, _) = bounded(1);
+                writer.send(Message::Flush(tx)).unwrap();
+            }
+            let raw = RawPath::from_path(root.path()).unwrap();
+            let (done, result) = bounded(1);
+            let worker = std::thread::spawn(move || {
+                done.send(rec.dir_series(&raw, "series", 1, &[])).unwrap()
+            });
+            let mut held = Vec::new();
+            if phase == 1 {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while writer.is_empty() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                // Leave DirSeries occupying the slot, so Flush cannot enqueue.
+            } else if phase == 2 {
+                held.push(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+                held.push(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+                assert!(matches!(held[0], Message::DirSeries(_)));
+                assert!(matches!(held[1], Message::Flush(_)));
+            }
+            cancel.store(true, Ordering::Release);
+            let error = result
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap()
+                .unwrap_err();
+            if phase == 0 {
+                assert!(matches!(error, ScanError::Cancelled));
+                assert!(matches!(rx.try_recv().unwrap(), Message::Flush(_)));
+            } else {
+                assert!(
+                    error.to_string().contains("persistence uncertain"),
+                    "{error}"
+                );
+            }
+            worker.join().unwrap();
+        }
     }
     #[test]
     fn firstboot_waits_for_components_or_deadline_and_writes_once() {

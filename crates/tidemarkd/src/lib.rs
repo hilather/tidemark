@@ -72,11 +72,11 @@ pub fn run_args(args: &Args, output: &mut impl Write) -> u8 {
         }
         return 0;
     }
-    let config = match tidemark_core::config::Config::load(&args.config) {
-        Ok(config) => config,
+    let config = match load_config(&args.config) {
+        Ok((config, _)) => config,
         Err(error) => {
             let _ = writeln!(output, "{error}");
-            if let tidemark_core::error::CoreError::Io(error) = &error {
+            if let DaemonError::Io { source: error, .. } = &error {
                 if error.kind() == std::io::ErrorKind::PermissionDenied {
                     let _ = writeln!(
                         output,
@@ -87,14 +87,12 @@ pub fn run_args(args: &Args, output: &mut impl Write) -> u8 {
             return 2;
         }
     };
-    let issues = config.validate();
-    for issue in &issues {
-        let _ = writeln!(output, "{issue}");
-    }
-    if issues.is_empty() {
-        0
-    } else {
-        2
+    match validate_config(&config) {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(output, "{error}");
+            2
+        }
     }
 }
 /// Thin process entry point.
@@ -142,6 +140,119 @@ pub fn main_entry() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn operational_intervals_have_inclusive_366_day_cap() {
+        let max = std::time::Duration::from_secs(366 * 86400);
+        let setters: [fn(&mut tidemark_core::config::Config, std::time::Duration); 7] = [
+            |c, d| c.throttle.sample_interval = d,
+            |c, d| c.sampler.interval = d,
+            |c, d| c.lvm.interval = d,
+            |c, d| c.lvm.timeout = d,
+            |c, d| c.procscan.interval = d,
+            |c, d| c.metrics.interval = d,
+            |c, d| c.alerts.renotify = d,
+        ];
+        for set in setters {
+            let mut config = tidemark_core::config::Config::default();
+            set(&mut config, max);
+            validate_config(&config).unwrap();
+            set(&mut config, max + std::time::Duration::from_nanos(1));
+            assert!(validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("366 days"));
+        }
+        let mut config = tidemark_core::config::Config::default();
+        config.roots[0].schedule = "every 31622400s".into();
+        validate_config(&config).unwrap();
+        config.roots[0].schedule = "every 31622401s".into();
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("366 days"));
+    }
+    #[test]
+    fn captured_config_bytes_determine_both_parse_and_hash() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = b"[sampler]\ninterval='1h'\n";
+        std::fs::write(&path, original).unwrap();
+        // Mutate the same inode at the real loader's capture/parse boundary.
+        let (config, hash) = load_config_captured(&path, |captured| {
+            assert_eq!(captured, original);
+            std::fs::write(&path, b"[sampler]\ninterval='2h'\n").unwrap();
+        })
+        .unwrap();
+        assert_eq!(
+            config.sampler.interval,
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(hash, format!("{:x}", Sha256::digest(original)));
+        let (later, later_hash) = load_config(&path).unwrap();
+        assert_eq!(later.sampler.interval, std::time::Duration::from_secs(7200));
+        assert_ne!(hash, later_hash);
+    }
+    #[test]
+    fn expired_shutdown_deadline_still_joins_worker() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = completed.clone();
+        let (ready, started) = crossbeam_channel::bounded(1);
+        let handle = std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            flag.store(true, Ordering::Release);
+            Ok(())
+        });
+        started.recv().unwrap();
+        assert!(join_until("test", handle, std::time::Instant::now()).is_err());
+        assert!(completed.load(Ordering::Acquire));
+    }
+    #[test]
+    fn pending_scan_reservation_survives_reload_and_stale_schedule_cannot_reappear() {
+        use tidemark_core::{
+            config::{Config, RootConfig},
+            live::ScanStatus,
+        };
+        let config = Config::default();
+        let state = state::LiveState::new(&config, 0);
+        let old_root = config.roots[0].path.to_string_lossy().into_owned();
+        state.reserve_scan(old_root.clone()).unwrap();
+        let before = state.config();
+        let mut next = config;
+        next.roots = (0..128)
+            .map(|n| RootConfig {
+                path: format!("/replacement/{n}").into(),
+                schedule: "off".into(),
+                ..RootConfig::default()
+            })
+            .collect();
+        assert!(state.replace_config(next.clone()).is_err());
+        assert_eq!(state.config(), before);
+        state.release_scan();
+        state.replace_config(next).unwrap();
+        state
+            .publish_scheduled(
+                ScanStatus {
+                    root: old_root,
+                    running: None,
+                    last_complete: None,
+                    next_due: None,
+                },
+                before.1,
+                component("scheduler", "ok", "stale"),
+            )
+            .unwrap();
+        assert_eq!(state.view().scans().unwrap().len(), 128);
+        assert!(!state
+            .reserve_scheduled("/retired".into(), before.1)
+            .unwrap());
+        assert_eq!(state.view().scans().unwrap().len(), 128);
+    }
     #[test]
     fn example_and_unknown_key() {
         let doc = include_str!("../../../docs/plan/08-interfaces.md");
@@ -387,6 +498,7 @@ pub fn run_controlled(
         services::tswriter::start(config.clone(), state.clone(), writer_shutdown.clone())?;
     // Any startup error stops already-started services before returning.
     let mut handles = Vec::new();
+    let recorder_deadline = Arc::new(parking_lot::Mutex::new(None));
     let started = (|| -> Result<_, DaemonError> {
         add_service(
             "sampler",
@@ -443,11 +555,12 @@ pub fn run_controlled(
             &state,
             &mut handles,
         )?;
-        let scans = match scheduler::start(
+        let scans = match scheduler::start_with_deadline(
             config.clone(),
             state.clone(),
             writer.clone(),
             shutdown.clone(),
+            recorder_deadline.clone(),
         ) {
             Ok((scans, h)) => {
                 handles.push(("scheduler", h));
@@ -498,9 +611,10 @@ pub fn run_controlled(
             while !shutdown.load(Ordering::Acquire) {
                 if reload_flag.swap(false, Ordering::AcqRel) {
                     match reload() {
-                        Ok(r) => {
-                            tracing::info!(reloaded=r.reloaded,warnings=?r.warnings,"config reload")
+                        Ok(r) if r.reloaded => {
+                            tracing::info!(reloaded = true, "config reload")
                         }
+                        Ok(_) => {}
                         Err(e) => tracing::error!(error=%e,"config reload rejected"),
                     }
                 }
@@ -515,7 +629,10 @@ pub fn run_controlled(
                 }
                 std::thread::park_timeout(Duration::from_millis(50));
             }
-            shutdown_deadline = Some(Instant::now() + Duration::from_secs(9));
+            let deadline = Instant::now() + Duration::from_secs(9);
+            shutdown_deadline = Some(deadline);
+            *recorder_deadline.lock() = Some(deadline);
+            scans.begin_shutdown(deadline);
             // API observes shutdown first; cancellation precedes producer joins and writer drain.
             for scan in state
                 .view()
@@ -542,6 +659,7 @@ pub fn run_controlled(
     tracing::info!("daemon stopping");
     shutdown.store(true, Ordering::Release);
     let deadline = shutdown_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(9));
+    *recorder_deadline.lock() = Some(deadline);
     // API first, then scheduler/watchers and the other producers.
     handles.sort_by_key(|(name, _)| match *name {
         "api" => 0,
@@ -595,17 +713,24 @@ fn join_until(
     handle: ServiceHandle,
     deadline: std::time::Instant,
 ) -> Result<(), DaemonError> {
+    let mut expired = false;
     while !handle.is_finished() {
         if std::time::Instant::now() >= deadline {
-            return Err(DaemonError::Internal(format!(
-                "{name} did not stop before shutdown deadline"
-            )));
+            expired = true;
+            break;
         }
         std::thread::park_timeout(std::time::Duration::from_millis(10));
     }
-    handle
+    // Never detach a producer: resources and the writer remain alive until it exits.
+    let result = handle
         .join()
-        .map_err(|_| DaemonError::Internal(format!("{name} thread panicked")))?
+        .map_err(|_| DaemonError::Internal(format!("{name} thread panicked")))?;
+    if expired {
+        return Err(DaemonError::Internal(format!(
+            "{name} did not stop before shutdown deadline"
+        )));
+    }
+    result
 }
 fn corrupt(e: &tidemark_store::StoreError) -> bool {
     // Match the exposed SQLite error code without adding a direct rusqlite dependency.
@@ -622,7 +747,52 @@ fn validate_config(c: &tidemark_core::config::Config) -> Result<(), DaemonError>
                 .join("; "),
         ));
     }
-    state::validate_bounds(c)
+    state::validate_bounds(c)?;
+    for (index, root) in c.roots.iter().enumerate() {
+        scheduler::parse_schedule(&root.schedule)
+            .map_err(|e| DaemonError::Config(format!("roots[{index}].schedule: {e}")))?;
+        if let Some(window) = &root.window {
+            scheduler::parse_window(window)
+                .map_err(|e| DaemonError::Config(format!("roots[{index}].window: {e}")))?;
+        }
+    }
+    // Retention horizons are wall-clock history, not runtime wait intervals.
+    for (field, duration) in [
+        ("throttle.sample_interval", c.throttle.sample_interval),
+        ("sampler.interval", c.sampler.interval),
+        ("lvm.interval", c.lvm.interval),
+        ("lvm.timeout", c.lvm.timeout),
+        ("procscan.interval", c.procscan.interval),
+        ("metrics.interval", c.metrics.interval),
+        ("alerts.renotify", c.alerts.renotify),
+    ] {
+        validate_interval(field, duration)?;
+    }
+    for (index, root) in c.roots.iter().enumerate() {
+        if let Some(duration) = root.schedule.strip_prefix("every ") {
+            let duration = humantime::parse_duration(duration)
+                .map_err(|e| DaemonError::Config(e.to_string()))?;
+            validate_interval(&format!("roots[{index}].schedule"), duration)?;
+        }
+    }
+    for (index, rule) in c.alerts.rule.iter().enumerate() {
+        validate_interval(&format!("alerts.rule[{index}].for"), rule.for_)?;
+        validate_interval(
+            &format!("alerts.rule[{index}].resolve_for"),
+            rule.resolve_for,
+        )?;
+    }
+    tidemark_live::alerts::AlertEngine::new(&c.alerts.rule, c.alerts.renotify)
+        .map_err(|e| DaemonError::Config(format!("alerts: {e}")))?;
+    Ok(())
+}
+fn validate_interval(field: &str, duration: std::time::Duration) -> Result<(), DaemonError> {
+    if duration > std::time::Duration::from_secs(366 * 24 * 60 * 60) {
+        return Err(DaemonError::Config(format!(
+            "{field}: interval must not exceed 366 days"
+        )));
+    }
+    Ok(())
 }
 /// Add state_dir to all collector and scan exclusions before publishing config.
 pub fn protect_config(c: &mut tidemark_core::config::Config) -> Result<(), DaemonError> {
@@ -662,6 +832,7 @@ pub fn reload_callback(path: std::path::PathBuf, state: state::LiveState) -> api
             validate_config(&config)?;
             validate_state_paths(&config)?;
             protect_config(&mut config)?;
+            scheduler::preflight_reload(&state, &config)?;
             state.replace_config(config)?;
             let started = state
                 .view()
@@ -688,7 +859,7 @@ pub fn reload_callback(path: std::path::PathBuf, state: state::LiveState) -> api
                 })
             }
             Err(e) => {
-                tracing::error!(error=%e,"keeping previous config");
+                tracing::error!(reloaded=false,error=%e,"keeping previous config");
                 let _ = sd_notify::notify(
                     false,
                     &[sd_notify::NotifyState::Status(
@@ -807,12 +978,14 @@ fn prepare_state(c: &tidemark_core::config::Config) -> Result<std::os::fd::Owned
 fn load_config(
     path: &std::path::Path,
 ) -> Result<(tidemark_core::config::Config, String), DaemonError> {
+    load_config_captured(path, |_| {})
+}
+fn load_config_captured(
+    path: &std::path::Path,
+    after_capture: impl FnOnce(&[u8]),
+) -> Result<(tidemark_core::config::Config, String), DaemonError> {
     use rustix::fs::{self, FileType, Mode, OFlags};
-    use sha2::{Digest, Sha256};
-    use std::{
-        io::{Read, Seek},
-        os::fd::AsRawFd,
-    };
+    use std::io::Read;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -862,23 +1035,16 @@ fn load_config(
     if bytes.len() > 1024 * 1024 {
         return Err(DaemonError::Config("config exceeds 1 MiB".into()));
     }
-    let config = tidemark_core::config::Config::load(std::path::Path::new(&format!(
-        "/proc/self/fd/{}",
-        file.as_raw_fd()
-    )))
-    .map_err(|e| DaemonError::Config(e.to_string()))?;
-    file.rewind()
+    after_capture(&bytes);
+    parse_config_bytes(&bytes)
+}
+fn parse_config_bytes(
+    bytes: &[u8],
+) -> Result<(tidemark_core::config::Config, String), DaemonError> {
+    use sha2::{Digest, Sha256};
+    let config = tidemark_core::config::Config::from_toml_bytes(bytes)
         .map_err(|e| DaemonError::Config(e.to_string()))?;
-    let mut after = Vec::new();
-    file.take(1024 * 1024 + 1)
-        .read_to_end(&mut after)
-        .map_err(|e| DaemonError::Config(e.to_string()))?;
-    if bytes != after {
-        return Err(DaemonError::Config(
-            "config changed during load; retry".into(),
-        ));
-    }
-    Ok((config, format!("{:x}", Sha256::digest(&bytes))))
+    Ok((config, format!("{:x}", Sha256::digest(bytes))))
 }
 
 /// Injectable Unix clock for service scheduling and compaction tests.

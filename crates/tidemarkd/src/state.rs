@@ -38,6 +38,8 @@ struct Inner {
     procscan: Option<Arc<parking_lot::Mutex<tidemark_live::procscan::ProcScanner>>>,
     alerts: Option<(Vec<AlertSummary>, Vec<AlertDiagnostic>)>,
     scans: BTreeMap<String, ScanStatus>,
+    retired_scans: std::collections::BTreeSet<String>,
+    pending_scan: Option<String>,
     growth: BTreeMap<(String, u32), Vec<(RawPath, i64)>>,
     windows: BTreeMap<(String, Duration), WindowFacts>,
     components: BTreeMap<String, ComponentState>,
@@ -120,6 +122,8 @@ impl LiveState {
             procscan: None,
             alerts: None,
             scans: BTreeMap::new(),
+            retired_scans: Default::default(),
+            pending_scan: None,
             growth: BTreeMap::new(),
             windows: BTreeMap::new(),
             components: BTreeMap::new(),
@@ -166,6 +170,71 @@ impl LiveState {
                 "state_dir and socket changes require restart".into(),
             ));
         }
+        // Remove retired configured roots, retaining an in-flight scan until completion.
+        // Reserve slots for every new root before swapping config; inactive manual
+        // history is expendable, active work is not.
+        let current: std::collections::BTreeSet<String> = config
+            .roots
+            .iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+        let old: std::collections::BTreeSet<String> = d
+            .config
+            .roots
+            .iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+        let mut scans = d.scans.clone();
+        scans.retain(|name, status| {
+            !old.contains(name)
+                || current.contains(name)
+                || status.running.is_some()
+                || d.pending_scan.as_ref() == Some(name)
+        });
+        let needed = current
+            .iter()
+            .filter(|name| !scans.contains_key(*name))
+            .count();
+        while scans.len() + needed > MAX_SUBJECTS {
+            let candidate = scans
+                .iter()
+                .find(|(name, status)| {
+                    !current.contains(*name)
+                        && status.running.is_none()
+                        && d.pending_scan.as_ref() != Some(*name)
+                })
+                .map(|(name, _)| name.clone());
+            let Some(candidate) = candidate else {
+                return Err(crate::DaemonError::Config(
+                    "scan inventory capacity occupied by active scans".into(),
+                ));
+            };
+            scans.remove(&candidate);
+        }
+        for root in &current {
+            scans.entry(root.clone()).or_insert_with(|| ScanStatus {
+                root: root.clone(),
+                running: None,
+                last_complete: None,
+                next_due: None,
+            });
+        }
+        d.retired_scans = scans
+            .iter()
+            .filter(|(name, status)| {
+                old.contains(*name)
+                    && !current.contains(*name)
+                    && (status.running.is_some() || d.pending_scan.as_ref() == Some(*name))
+            })
+            .map(|(name, _)| name.clone())
+            .chain(
+                d.retired_scans
+                    .iter()
+                    .filter(|name| scans.contains_key(*name) && !current.contains(*name))
+                    .cloned(),
+            )
+            .collect();
+        d.scans = scans;
         d.fs.retain(|m, _| {
             config
                 .sampler
@@ -236,8 +305,12 @@ impl LiveState {
                 d.alerts = Some((a, diagnostics));
             }
             Publication::Scan(s) => {
-                check_key(&d.scans, &s.root, MAX_SUBJECTS)?;
-                d.scans.insert(s.root.clone(), s);
+                if s.running.is_none() && d.retired_scans.remove(&s.root) {
+                    d.scans.remove(&s.root);
+                } else {
+                    check_key(&d.scans, &s.root, MAX_SUBJECTS)?;
+                    d.scans.insert(s.root.clone(), s);
+                }
             }
             Publication::DirGrowth((root, depth, mut rows)) => {
                 check_len(rows.len(), MAX_INVENTORY)?;
@@ -290,6 +363,61 @@ impl LiveState {
                 d.history.push_back(e);
             }
         }
+        health(&mut d, component);
+        Ok(())
+    }
+    pub(crate) fn reserve_scan(&self, root: String) -> Result<(), crate::DaemonError> {
+        let mut d = self.0.write();
+        check_key(&d.scans, &root, MAX_SUBJECTS)?;
+        d.scans.entry(root.clone()).or_insert_with(|| ScanStatus {
+            root: root.clone(),
+            running: None,
+            last_complete: None,
+            next_due: None,
+        });
+        d.pending_scan = Some(root);
+        Ok(())
+    }
+    pub(crate) fn reserve_scheduled(
+        &self,
+        root: String,
+        generation: u64,
+    ) -> Result<bool, crate::DaemonError> {
+        let mut d = self.0.write();
+        if d.generation != generation {
+            return Ok(false);
+        }
+        check_key(&d.scans, &root, MAX_SUBJECTS)?;
+        d.scans.entry(root.clone()).or_insert_with(|| ScanStatus {
+            root: root.clone(),
+            running: None,
+            last_complete: None,
+            next_due: None,
+        });
+        d.pending_scan = Some(root);
+        Ok(true)
+    }
+    pub(crate) fn release_scan(&self) {
+        let mut d = self.0.write();
+        if let Some(root) = d.pending_scan.take() {
+            if d.retired_scans.remove(&root) {
+                d.scans.remove(&root);
+            }
+        }
+    }
+    pub(crate) fn publish_scheduled(
+        &self,
+        status: ScanStatus,
+        generation: u64,
+        component: ComponentState,
+    ) -> Result<(), crate::DaemonError> {
+        let mut d = self.0.write();
+        if d.generation != generation {
+            return Ok(());
+        }
+        check_key(&d.components, &component.name, MAX_SUBJECTS)?;
+        check_key(&d.scans, &status.root, MAX_SUBJECTS)?;
+        d.scans.insert(status.root.clone(), status);
         health(&mut d, component);
         Ok(())
     }
