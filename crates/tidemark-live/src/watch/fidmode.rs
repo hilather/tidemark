@@ -1,6 +1,11 @@
 //! Owned by: W5-A
 //! Resolve kernel file handles without reading file data or following names.
 use super::budget::Budget;
+// Include hash growth overlap, queue capacity slack and allocator headers.
+const PATH_NODE: usize = 256;
+const PATH_QUEUE: usize = 160;
+const HANDLE_NODE: usize = 320;
+const HANDLE_QUEUE: usize = 192;
 use std::{
     io,
     os::fd::{AsFd, BorrowedFd},
@@ -68,6 +73,7 @@ pub(super) struct PathSizes {
     cap: usize,
     budget: Budget,
     charged: usize,
+    nodes: usize,
 }
 impl PathSizes {
     pub fn new(cap: usize) -> Self {
@@ -78,16 +84,19 @@ impl PathSizes {
             cap,
             budget: Budget::new(),
             charged: 0,
+            nodes: 0,
         }
     }
     pub fn set_budget(&mut self, budget: Budget) {
         self.budget = budget;
     }
     pub fn clear(&mut self) {
+        self.entries = Default::default();
+        self.order = Default::default();
         self.budget.release(self.charged);
+        self.budget.release_nodes(self.nodes);
         self.charged = 0;
-        self.entries.clear();
-        self.order.clear();
+        self.nodes = 0;
     }
     pub fn remember(&mut self, path: &RawPath, id: (u64, u64), disk: i64) {
         if self.cap == 0 {
@@ -98,15 +107,23 @@ impl PathSizes {
         if !self.budget.reserve(bytes) {
             return;
         }
-        if self.entries.try_reserve(1).is_err() || self.order.try_reserve(1).is_err() {
+        let nodes = PATH_QUEUE + usize::from(!old) * PATH_NODE;
+        if !self.budget.reserve_nodes(nodes, false) {
             self.budget.release(bytes);
             return;
         }
+        if self.entries.try_reserve(1).is_err() || self.order.try_reserve(1).is_err() {
+            self.budget.release(bytes);
+            self.budget.release_nodes(nodes);
+            return;
+        }
+        self.nodes += nodes;
         self.charged += bytes;
         self.sequence = self.sequence.wrapping_add(1);
         self.entries.insert(path.clone(), (id, disk, self.sequence));
         self.order.push_back((path.clone(), self.sequence));
         if self.order.len() > self.cap.saturating_mul(2) {
+            let old_len = self.order.len();
             let mut released = 0;
             self.order.retain(|(p, s)| {
                 let keep = self.entries.get(p).is_some_and(|v| v.2 == *s);
@@ -115,16 +132,24 @@ impl PathSizes {
                 }
                 keep
             });
+            self.order.shrink_to_fit();
+            let nodes = (old_len - self.order.len()) * PATH_QUEUE;
+            self.nodes -= nodes;
+            self.budget.release_nodes(nodes);
             self.charged -= released;
             self.budget.release(released);
         }
         while self.entries.len() > self.cap {
             if let Some((p, s)) = self.order.pop_front() {
                 let mut released = p.as_bytes().len();
+                let mut nodes = PATH_QUEUE;
                 if self.entries.get(&p).is_some_and(|v| v.2 == s) {
                     self.entries.remove(&p);
+                    nodes += PATH_NODE;
                     released += p.as_bytes().len();
                 }
+                self.nodes -= nodes;
+                self.budget.release_nodes(nodes);
                 self.charged -= released;
                 self.budget.release(released);
             }
@@ -132,6 +157,9 @@ impl PathSizes {
     }
     pub fn remove(&mut self, path: &RawPath) -> Option<((u64, u64), i64)> {
         self.entries.remove(path).map(|(id, disk, _)| {
+            self.entries.shrink_to_fit();
+            self.nodes -= PATH_NODE;
+            self.budget.release_nodes(PATH_NODE);
             let bytes = path.as_bytes().len();
             self.charged -= bytes;
             self.budget.release(bytes);
@@ -148,6 +176,7 @@ pub(super) struct HandlePaths {
     cap: usize,
     budget: Budget,
     charged: usize,
+    nodes: usize,
 }
 impl HandlePaths {
     pub fn new(cap: usize) -> Self {
@@ -158,16 +187,19 @@ impl HandlePaths {
             cap,
             budget: Budget::new(),
             charged: 0,
+            nodes: 0,
         }
     }
     pub fn set_budget(&mut self, budget: Budget) {
         self.budget = budget;
     }
     pub fn clear(&mut self) {
+        self.entries = Default::default();
+        self.order = Default::default();
         self.budget.release(self.charged);
+        self.budget.release_nodes(self.nodes);
         self.charged = 0;
-        self.entries.clear();
-        self.order.clear();
+        self.nodes = 0;
     }
     pub fn get(&mut self, key: &(i32, Vec<u8>)) -> Option<RawPath> {
         let path = self.entries.get(key)?.0.clone();
@@ -191,10 +223,17 @@ impl HandlePaths {
         if !self.budget.reserve(bytes) {
             return;
         }
-        if self.entries.try_reserve(1).is_err() || self.order.try_reserve(1).is_err() {
+        let nodes = HANDLE_QUEUE + usize::from(!self.entries.contains_key(&key)) * HANDLE_NODE;
+        if !self.budget.reserve_nodes(nodes, false) {
             self.budget.release(bytes);
             return;
         }
+        if self.entries.try_reserve(1).is_err() || self.order.try_reserve(1).is_err() {
+            self.budget.release(bytes);
+            self.budget.release_nodes(nodes);
+            return;
+        }
+        self.nodes += nodes;
         self.charged += bytes;
         self.sequence = self.sequence.wrapping_add(1);
         self.entries
@@ -203,6 +242,7 @@ impl HandlePaths {
         self.budget.release(old_bytes);
         self.order.push_back((key, self.sequence));
         if self.order.len() > self.cap.saturating_mul(2) {
+            let old_len = self.order.len();
             let mut released = 0;
             self.order.retain(|(k, s)| {
                 let keep = self.entries.get(k).is_some_and(|v| v.1 == *s);
@@ -211,17 +251,25 @@ impl HandlePaths {
                 }
                 keep
             });
+            self.order.shrink_to_fit();
+            let nodes = (old_len - self.order.len()) * HANDLE_QUEUE;
+            self.nodes -= nodes;
+            self.budget.release_nodes(nodes);
             self.charged -= released;
             self.budget.release(released);
         }
         while self.entries.len() > self.cap {
             if let Some((k, s)) = self.order.pop_front() {
                 let mut released = k.1.capacity();
+                let mut nodes = HANDLE_QUEUE;
                 if self.entries.get(&k).is_some_and(|v| v.1 == s) {
                     if let Some((p, _)) = self.entries.remove(&k) {
                         released += k.1.len() + p.as_bytes().len();
+                        nodes += HANDLE_NODE;
                     }
                 }
+                self.nodes -= nodes;
+                self.budget.release_nodes(nodes);
                 self.charged -= released;
                 self.budget.release(released);
             }
@@ -230,12 +278,12 @@ impl HandlePaths {
 }
 impl Drop for PathSizes {
     fn drop(&mut self) {
-        self.budget.release(self.charged);
+        self.clear();
     }
 }
 impl Drop for HandlePaths {
     fn drop(&mut self) {
-        self.budget.release(self.charged);
+        self.clear();
     }
 }
 #[cfg(test)]

@@ -64,7 +64,7 @@ struct Inner {
 struct WindowFacts {
     warming: bool,
     at: i64,
-    hot: Option<Vec<HotEntry>>,
+    hot: Option<Arc<tidemark_live::watch::WatcherRows>>,
     overflows: Option<u64>,
 }
 impl Default for LiveState {
@@ -478,7 +478,7 @@ impl LiveState {
     pub(crate) fn publish_window_health(
         &self,
         result: Publication,
-        component: ComponentState,
+        mut component: ComponentState,
         warming: bool,
         observed_config: Option<&Config>,
     ) -> Result<(), crate::DaemonError> {
@@ -667,6 +667,22 @@ impl LiveState {
                 }
                 let key = (mount, window);
                 check_key(&d.windows, &key, MAX_WINDOWS)?;
+                let hot = hot.and_then(|rows| {
+                    let retained = match d.watchers.get(&key.0) {
+                        Some(w) => w.retain_window_rows(rows),
+                        None => tidemark_live::watch::WatcherRows::from_unwatched_rows(rows),
+                    };
+                    if retained.is_none() {
+                        component.state = "degraded".into();
+                        component
+                            .detail
+                            .push_str("; truncated: key bytes over the memory budget");
+                        if let Some(w) = d.watchers.get(&key.0) {
+                            w.key_memory_budget_exceeded();
+                        }
+                    }
+                    retained
+                });
                 d.windows.insert(
                     key,
                     WindowFacts {
@@ -1322,7 +1338,7 @@ impl AlertSource for LiveStateView {
     fn hot_dirs(&self, mount: &str, window: Duration) -> Option<Vec<HotEntry>> {
         let f = self.data.windows.get(&(mount.into(), window))?;
         self.watch_window_at(mount, window)?;
-        f.hot.clone()
+        f.hot.as_ref()?.copy_rows()
     }
     fn watch_overflows(&self, mount: &str, window: Duration) -> Option<u64> {
         let f = self.data.windows.get(&(mount.into(), window))?;
