@@ -97,6 +97,18 @@ fn snapshot_reads_refuse_hostile_leaves_and_hierarchy() {
             std::fs::read_dir(state.path()).unwrap().count(),
             before_entries
         );
+        drop(catalog);
+        let database_before = std::fs::read(state.path().join("timeseries.db")).unwrap();
+        let entries_before = std::fs::read_dir(state.path()).unwrap().count();
+        assert!(tidemark_store::catalog::recover_catalog(state.path()).is_err());
+        assert_eq!(
+            std::fs::read(state.path().join("timeseries.db")).unwrap(),
+            database_before
+        );
+        assert_eq!(
+            std::fs::read_dir(state.path()).unwrap().count(),
+            entries_before
+        );
         assert_eq!(std::fs::read(&victim).unwrap(), b"sentinel");
         assert_eq!(
             std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,

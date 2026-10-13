@@ -422,6 +422,11 @@ pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError> {
     ] {
         verified.check_leaf(std::ffi::OsStr::new(name))?;
     }
+    match verified.subdir(std::ffi::OsStr::new("snapshots"), false) {
+        Ok(directory) => verify_snapshot_tree(&directory, &state_dir.join("snapshots"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let lock = verified.open_leaf(std::ffi::OsStr::new("scan.lock"), true, true)?;
     recover_catalog_with_lock(state_dir, &lock)
 }
