@@ -1172,3 +1172,54 @@ fn appended_watcher_cap_detail_wraps_without_losing_reason() {
         assert_eq!(detail, DETAIL);
     }
 }
+
+#[test]
+fn unavailable_process_measurements_keep_daemon_reason_and_name_method() {
+    if !socket_available() {
+        return;
+    }
+    for method in ["writers", "phantom"] {
+        let dir = test_support::private_tempdir().unwrap();
+        let p = config(&dir);
+        let listener = UnixListener::bind(dir.path().join("api.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fake unavailable daemon accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            let request: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, method);
+            serde_json::to_writer(stream.get_mut(), &serde_json::json!({"v":1,"id":request.id,"ok":false,"error":{"code":"unavailable","message":"unavailable: measurement unavailable"}})).unwrap();
+            stream.get_mut().write_all(b"\n").unwrap();
+        });
+        let out = cli(&p, &[method]);
+        server.join().unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(4), "{text}");
+        assert!(
+            text.contains(&format!("daemon request {method}"))
+                && text.contains("unavailable: measurement unavailable"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&dir.path().join("api.sock").display().to_string()),
+            "{text}"
+        );
+    }
+}
