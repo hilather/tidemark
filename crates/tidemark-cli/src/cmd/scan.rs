@@ -276,22 +276,6 @@ impl tidemark_scan::orchestrator::ScanRecorder for DirectRecorder {
 }
 
 fn daemon_connection(context: &crate::Context) -> anyhow::Result<Option<crate::client::Client>> {
-    // A definitively absent endpoint needs no socket syscall. Recheck under the scan lock.
-    match std::fs::symlink_metadata(&context.config.general.socket) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            let hint = if error.kind() == std::io::ErrorKind::PermissionDenied {
-                format!("\n{}", crate::ACCESS_HINT)
-            } else {
-                String::new()
-            };
-            return Err(
-                crate::CliError::Unavailable(format!("daemon unavailable: {error}{hint}")).into(),
-            );
-        }
-        Ok(_) => {}
-    }
-
     match crate::client::Client::connect(
         &context.config.general.socket,
         std::time::Duration::from_secs(11),

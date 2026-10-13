@@ -26,8 +26,6 @@ impl Client {
             return Err(ClientError::Timeout);
         }
         let stream = connect_deadline(socket, timeout)?;
-        stream.set_read_timeout(Some(timeout)).map_err(map_io)?;
-        stream.set_write_timeout(Some(timeout)).map_err(map_io)?;
         Ok(Self {
             stream: BufReader::with_capacity(8192, stream),
             timeout,
@@ -195,7 +193,33 @@ fn connect_deadline(socket: &Path, timeout: Duration) -> Result<UnixStream, Clie
         .name("tidemark-api-connect".into())
         .spawn(move || {
             let _permit = permit;
-            let result = UnixStream::connect(path);
+            let result: Result<UnixStream, ClientError> = (|| {
+                // Keep endpoint inspection within the same caller deadline. A missing
+                // endpoint needs no socket syscall (including in restricted sandboxes).
+                match std::fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(ClientError::Unavailable)
+                    }
+                    Err(error) => return Err(ClientError::Io(error)),
+                    Ok(_) => {}
+                }
+                let stream = UnixStream::connect(path).map_err(|error| match error.kind() {
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                        ClientError::Unavailable
+                    }
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                        ClientError::Timeout
+                    }
+                    _ => ClientError::Io(error),
+                })?;
+                stream
+                    .set_read_timeout(Some(timeout))
+                    .map_err(ClientError::Io)?;
+                stream
+                    .set_write_timeout(Some(timeout))
+                    .map_err(ClientError::Io)?;
+                Ok(stream)
+            })();
             // A timed-out caller has dropped the receiver; dropping the result closes its fd.
             let _ = sender.send(result);
         })
@@ -208,13 +232,6 @@ fn connect_deadline(socket: &Path, timeout: Duration) -> Result<UnixStream, Clie
                 ClientError::Protocol("connection worker disconnected")
             }
         })?
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-                ClientError::Unavailable
-            }
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => ClientError::Timeout,
-            _ => ClientError::Io(error),
-        })
 }
 fn deadline(timeout: Duration, started: Instant) -> Result<Duration, ClientError> {
     timeout
