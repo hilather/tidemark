@@ -4,6 +4,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::{
@@ -11,6 +12,7 @@ use std::{
         io::AsRawFd,
     },
     path::{Component, Path, PathBuf},
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -189,6 +191,8 @@ struct Marker {
 /// Unique-inode totals (hard-link aliases do not add bytes or inodes).
 #[derive(Default, Serialize, Deserialize, Debug)]
 pub struct Summary {
+    /// Snapshot phase; mutation starts after this summary is written.
+    pub state: String,
     /// Directory inodes, including the root.
     pub directories: u64,
     /// Unique regular data-file inodes.
@@ -230,11 +234,86 @@ fn create(path: &Path) -> Result<File> {
         .custom_flags(NOFOLLOW)
         .open(path)?)
 }
-fn add_bytes(s: &mut Summary, path: &Path) -> Result<()> {
-    let m = fs::symlink_metadata(path)?;
-    s.apparent_bytes += m.len();
-    s.allocated_bytes += m.blocks() * 512;
+/// Flush the fixture filesystem after closing writers, outside measured runs.
+pub fn flush_fixture(dir: &Dir) -> Result<()> {
+    // xtask has no rustix dependency. The child cannot use /proc/self/fd:
+    // Rust closes these fds on exec, so address the parent capability instead.
+    if !Command::new("sync")
+        .arg("-f")
+        .arg(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            dir.file.as_raw_fd()
+        ))
+        .status()?
+        .success()
+    {
+        bail!("fixture filesystem flush failed");
+    }
     Ok(())
+}
+
+fn finished_summary(dir: &Dir) -> Result<Summary> {
+    let mut s = Summary {
+        state: "before_mutation".into(),
+        ..Summary::default()
+    };
+    // Only multi-link non-directory inodes are retained. At 20M inodes the
+    // reports profile has <=4M link sets: a HashSet<(u64,u64)> uses about
+    // 136 MiB (8M buckets, 16-byte keys + control bytes), <204 MiB while growing.
+    // Cap at 20M sets for the supported 100M-inode profile; never retain paths.
+    let mut linked = HashSet::new();
+    let device = dir.file.metadata()?.dev();
+    let mut account = |path: &Path, m: &fs::Metadata| -> Result<bool> {
+        if m.dev() != device {
+            bail!("fixture changed filesystem");
+        }
+        if !m.is_dir() && m.nlink() > 1 {
+            let key = (m.dev(), m.ino());
+            if linked.contains(&key) {
+                s.hard_link_entries += 1;
+                return Ok(false);
+            }
+            if linked.len() >= 20_000_000 {
+                bail!("fixture exceeds multi-link inode accounting cap");
+            }
+            linked.insert(key);
+            s.link_sets += 1;
+        }
+        s.apparent_bytes += m.len();
+        s.allocated_bytes += m.blocks() * 512;
+        if m.is_dir() {
+            s.directories += 1;
+        } else if m.file_type().is_symlink() {
+            s.symlinks += 1;
+        } else if path
+            .file_name()
+            .is_some_and(|n| n == MARKER || n == ".tidemark-fixture.json")
+        {
+            s.control_files += 1;
+        } else {
+            s.regular += 1;
+        }
+        Ok(m.is_dir())
+    };
+    // The procfs capability path is itself a symlink: fstat the held root.
+    account(&dir.original, &dir.file.metadata()?)?;
+    // Generated fixtures are flat: stream each report directory without a
+    // width-dependent queue or recursion. Dir::open preserves no-follow/noatime.
+    for entry in fs::read_dir(dir.path())? {
+        let path = entry?.path();
+        // lstat includes symlink inodes without following their targets.
+        if account(&path, &fs::symlink_metadata(&path)?)? {
+            let child = Dir::open(&path)?;
+            for entry in fs::read_dir(child.path())? {
+                let path = entry?.path();
+                if account(&path, &fs::symlink_metadata(&path)?)? {
+                    bail!("unexpected nested directory in fixture summary");
+                }
+            }
+        }
+    }
+    Ok(s)
 }
 fn marker(dir: &Dir) -> Result<Marker> {
     let mut f = OpenOptions::new()
@@ -284,7 +363,7 @@ fn clear(dir: &Dir) -> Result<()> {
     }
     Ok(())
 }
-/// Generate a fixture using constant memory, then optionally mutate it.
+/// Generate a fixture with bounded link accounting, then optionally mutate it.
 pub fn generate(o: &Options) -> Result<Summary> {
     let dir = safe_root(&o.root)?;
     let populated = fs::read_dir(dir.path())?.next().is_some();
@@ -315,13 +394,6 @@ pub fn generate(o: &Options) -> Result<Summary> {
     for i in 0..dirs {
         fs::create_dir(dir.path().join(format!("report-{i:04}")))?;
     }
-    let mut s = Summary {
-        directories: dirs + 1,
-        regular,
-        symlinks: syms,
-        control_files: 2,
-        ..Summary::default()
-    };
     let mut rng = Random(o.seed);
     let report_for = |i: u64| {
         if i < 3 * wide {
@@ -347,15 +419,13 @@ pub fn generate(o: &Options) -> Result<Summary> {
         } else {
             f.set_len(size)?;
         }
-        add_bytes(&mut s, &p)?;
+        drop(f);
         if i % 5 == 0 {
             let links = 2 + rng.next() % 3;
-            s.link_sets += 1;
             for n in 1..=links {
                 let target = (d + n) % dirs;
                 let dest = Dir::open(&dir.path().join(format!("report-{target:04}")))?;
                 fs::hard_link(&p, dest.path().join(format!("link-{i:012}")))?;
-                s.hard_link_entries += 1;
             }
         }
     }
@@ -369,26 +439,26 @@ pub fn generate(o: &Options) -> Result<Summary> {
             format!("../report-0000/file-{:012}", i % wide)
         };
         symlink(target, p.clone())?;
-        add_bytes(&mut s, &p)?;
     }
     // Fixed-size JSON control files make their own size/blocks non-circular.
     let summary_path = dir.path().join(".tidemark-fixture.json");
     let mut summary_file = create(&summary_path)?;
     summary_file.write_all(&[b' '; 4096])?;
-    add_bytes(&mut s, &dir.path().join(MARKER))?;
-    add_bytes(&mut s, &summary_path)?;
-    let root_metadata = dir.file.metadata()?;
-    s.apparent_bytes += root_metadata.len();
-    s.allocated_bytes += root_metadata.blocks() * 512;
-    for i in 0..dirs {
-        add_bytes(&mut s, &dir.path().join(format!("report-{i:04}")))?;
-    }
+    drop(summary_file);
+    flush_fixture(&dir)?;
+    let s = finished_summary(&dir)?;
+    let mut summary_file = OpenOptions::new()
+        .write(true)
+        .custom_flags(NOFOLLOW)
+        .open(&summary_path)?;
     let encoded = serde_json::to_vec_pretty(&s)?;
     if encoded.len() > 4096 {
         bail!("summary exceeds fixed control-file size");
     }
     summary_file.seek(SeekFrom::Start(0))?;
     summary_file.write_all(&encoded)?;
+    drop(summary_file);
+    flush_fixture(&dir)?;
     println!("{}", serde_json::to_string(&s)?);
     if o.rate > 0 {
         mutate(&dir, o.rate, o.duration)?;
@@ -481,6 +551,46 @@ pub fn os_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn finished_summary_counts_three_links_once() {
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        fs::create_dir(p.join("report")).unwrap();
+        fs::write(p.join("one"), [0u8; 4096]).unwrap();
+        fs::write(p.join("two"), [0u8; 8192]).unwrap();
+        fs::hard_link(p.join("one"), p.join("alias")).unwrap();
+        fs::hard_link(p.join("one"), p.join("report/alias")).unwrap();
+        symlink("one", p.join("sym")).unwrap();
+        let dir = safe_root(p).unwrap();
+        flush_fixture(&dir).unwrap();
+        let s = finished_summary(&dir).unwrap();
+        assert_eq!((s.directories, s.regular, s.symlinks), (2, 2, 1));
+        assert_eq!((s.link_sets, s.hard_link_entries), (1, 2));
+        let unique = [
+            p.to_path_buf(),
+            p.join("report"),
+            p.join("one"),
+            p.join("two"),
+            p.join("sym"),
+        ];
+        let metadata: Vec<_> = unique
+            .iter()
+            .map(|p| fs::symlink_metadata(p).unwrap())
+            .collect();
+        assert_eq!(
+            s.allocated_bytes,
+            metadata.iter().map(|m| m.blocks() * 512).sum::<u64>()
+        );
+        assert_eq!(
+            s.apparent_bytes,
+            metadata.iter().map(MetadataExt::size).sum::<u64>()
+        );
+        assert_eq!(s.allocated_bytes, test_support::oracle::du_disk(p));
+        assert_eq!(
+            s.apparent_bytes,
+            test_support::oracle::du_apparent_normalized(p).unwrap()
+        );
+    }
     #[test]
     fn mutation_requires_marker() {
         let root = tempfile::tempdir().unwrap();
