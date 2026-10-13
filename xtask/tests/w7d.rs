@@ -81,8 +81,9 @@ fn deterministic_pages_cover_real_command_tree_and_sections() {
 
 #[test]
 fn packaged_manuals_exactly_match_generated_files() {
-    let out = tempfile::tempdir().unwrap();
-    man::generate(out.path()).unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    man::run(workspace.path(), std::iter::empty()).unwrap();
+    let out = workspace.path().join("target/man");
     let metadata: toml::Value =
         toml::from_str(&std::fs::read_to_string(root().join("packaging/rpm/rpm.toml")).unwrap())
             .unwrap();
@@ -90,7 +91,7 @@ fn packaged_manuals_exactly_match_generated_files() {
     for asset in metadata["assets"].as_array().unwrap() {
         let source = asset["source"].as_str().unwrap();
         if let Some(name) = source.strip_prefix("target/man/") {
-            assert!(out.path().join(name).is_file());
+            assert!(workspace.path().join(source).is_file());
             let section = if name.ends_with(".8") { "man8" } else { "man1" };
             assert_eq!(
                 asset["dest"].as_str().unwrap(),
@@ -103,7 +104,7 @@ fn packaged_manuals_exactly_match_generated_files() {
             packaged.insert(name.to_owned());
         }
     }
-    assert_eq!(packaged, files(out.path()));
+    assert_eq!(packaged, files(&out));
 }
 
 #[test]
