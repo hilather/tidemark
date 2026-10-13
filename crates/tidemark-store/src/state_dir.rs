@@ -79,7 +79,7 @@ fn policy(input: PolicyInput) -> Result<bool, &'static str> {
         owner == 0 || owner == effective_uid || (user_namespace && owner == overflow_uid);
     let owner_ok = match role {
         Role::Ancestor => ancestor_owner || read_only_mount,
-        Role::StickyChild => owner == 0 || owner == effective_uid,
+        Role::StickyChild => ancestor_owner,
         _ => owner == effective_uid,
     };
     if !owner_ok {
@@ -579,6 +579,25 @@ mod tests {
                     role: Role::StickyChild,
                     owner: 65534,
                     user_namespace: true,
+                    ..base
+                },
+                Ok(false),
+            ),
+            (
+                "initial overflow child",
+                PolicyInput {
+                    role: Role::StickyChild,
+                    owner: 65534,
+                    ..base
+                },
+                Err("untrusted owner"),
+            ),
+            (
+                "readonly foreign child",
+                PolicyInput {
+                    role: Role::StickyChild,
+                    owner: 2000,
+                    read_only_mount: true,
                     ..base
                 },
                 Err("untrusted owner"),
