@@ -57,6 +57,51 @@ pub fn needs_report(state_dir: &Path, config_sha256: &str) -> bool {
     read_report(&state_dir.join("deploy/firstboot.json"))
         .map_or(true, |report| report.config_sha256 != config_sha256)
 }
+/// Retry an existing unhealthy report when component facts change, at most every ten seconds.
+/// Initial publication remains coordinated by the scheduler's readiness deadline.
+#[derive(Default)]
+pub(crate) struct Followup {
+    next: Option<i64>,
+}
+impl Followup {
+    pub(crate) fn poll(
+        &mut self,
+        state_dir: &Path,
+        inputs: &FirstbootInputs,
+        now: i64,
+    ) -> io::Result<()> {
+        if self.next.is_some_and(|next| now < next) {
+            return Ok(());
+        }
+        self.next = Some(now.saturating_add(10));
+        if files::read(&state_dir.join("deploy/staged.json")).is_err() {
+            return Ok(());
+        }
+        let Ok(previous) = read_report(&state_dir.join("deploy/firstboot.json")) else {
+            return Ok(());
+        };
+        if previous.config_sha256 == inputs.config_sha256 && previous.healthy {
+            return Ok(());
+        }
+        if previous.config_sha256 == inputs.config_sha256
+            && now < previous.written_at.saturating_add(10)
+        {
+            return Ok(());
+        }
+        // Ignore volatile sample/scan timestamps: retries are driven by component changes.
+        let same_components = previous.components.len() == inputs.components.len()
+            && previous
+                .components
+                .iter()
+                .zip(&inputs.components)
+                .all(|(a, b)| a.name == b.name && a.state == b.state && a.detail == b.detail);
+        if previous.config_sha256 == inputs.config_sha256 && same_components {
+            return Ok(());
+        }
+        let report = build_with_boot(inputs, now, previous.booted_at);
+        write(state_dir, &report)
+    }
+}
 fn read_report(path: &Path) -> io::Result<FirstbootReport> {
     let bytes = files::read(path)?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
@@ -157,6 +202,53 @@ mod tests {
             first_lvm_sample: None,
             next_scans: vec![("/data".into(), 100)],
         }
+    }
+    #[test]
+    fn unhealthy_followup_throttles_resumes_and_finalizes() {
+        let dir = private_tempdir();
+        let mut input = inputs();
+        input.components[0].state = "degraded".into();
+        write(dir.path(), &build_with_boot(&input, 20, 5)).unwrap();
+        std::fs::write(dir.path().join("deploy/staged.json"), b"{}").unwrap();
+        assert!(!needs_report(dir.path(), "abc"));
+        let mut followup = Followup::default();
+        followup.poll(dir.path(), &input, 30).unwrap();
+        assert_eq!(
+            read_report(&dir.path().join("deploy/firstboot.json"))
+                .unwrap()
+                .written_at,
+            20
+        );
+        input.components[0].state = "ok".into();
+        followup.poll(dir.path(), &input, 39).unwrap();
+        assert!(
+            !read_report(&dir.path().join("deploy/firstboot.json"))
+                .unwrap()
+                .healthy
+        );
+        // A new coordinator resumes a persisted unhealthy report.
+        let mut restarted = Followup::default();
+        restarted.poll(dir.path(), &input, 40).unwrap();
+        let report = read_report(&dir.path().join("deploy/firstboot.json")).unwrap();
+        assert!(report.healthy);
+        assert_eq!(report.written_at, 40);
+        assert_eq!(report.booted_at, 5);
+        input.components[0].state = "degraded".into();
+        restarted.poll(dir.path(), &input, 50).unwrap();
+        assert_eq!(
+            read_report(&dir.path().join("deploy/firstboot.json"))
+                .unwrap()
+                .written_at,
+            40
+        );
+        input.config_sha256 = "changed".into();
+        restarted.poll(dir.path(), &input, 60).unwrap();
+        assert_eq!(
+            read_report(&dir.path().join("deploy/firstboot.json"))
+                .unwrap()
+                .config_sha256,
+            "changed"
+        );
     }
     #[test]
     fn unsafe_existing_directory_permissions_refused() {

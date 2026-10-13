@@ -318,7 +318,14 @@ fn watcher_follows_mount_arrival_detach_and_remount_on_vm() {
                 .watch_stats()
                 .is_some_and(|s| s.len() == 1)
         });
-        std::fs::write(target.join(format!("event-{n}")), vec![42; 4096]).unwrap();
+        assert!(Command::new("sh")
+            .arg("-c")
+            .arg("printf event > \"$1\"")
+            .arg("writer")
+            .arg(target.join(format!("event-{n}")))
+            .status()
+            .unwrap()
+            .success());
         wait(|| {
             state
                 .view_at(100)

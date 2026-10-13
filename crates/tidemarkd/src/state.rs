@@ -33,6 +33,7 @@ struct Inner {
     started: i64,
     hash: Option<String>,
     fs: BTreeMap<String, VecDeque<FsSample>>,
+    presence: BTreeMap<String, Option<crate::mounts::Identity>>,
     fs_available: BTreeMap<String, bool>,
     fs_failures: BTreeMap<String, u64>,
     fs_failure_epoch: u64,
@@ -145,6 +146,7 @@ impl LiveState {
             started: started_at,
             hash: None,
             fs: BTreeMap::new(),
+            presence: BTreeMap::new(),
             fs_available: BTreeMap::new(),
             fs_failures: BTreeMap::new(),
             fs_failure_epoch: 0,
@@ -301,9 +303,64 @@ impl LiveState {
         if d.config.procscan != config.procscan || d.config.watch.mounts != config.watch.mounts {
             d.procscan = None;
         }
+        d.presence.retain(|m, _| {
+            config
+                .sampler
+                .mounts
+                .iter()
+                .chain(&config.watch.mounts)
+                .any(|p| p.to_string_lossy() == m.as_str())
+        });
         d.windows.clear();
         d.config = Arc::new(config);
         d.generation = d.generation.saturating_add(1);
+        Ok(())
+    }
+    /// Atomically record configured presence and discard history across identities.
+    pub fn publish_mount_presence(
+        &self,
+        generation: u64,
+        mounts: &[tidemark_fs::mount::MountInfo],
+    ) -> Result<(), crate::DaemonError> {
+        let mut d = self.0.write();
+        if generation != d.generation {
+            return Ok(());
+        }
+        let mut paths = d.config.sampler.mounts.clone();
+        paths.extend(d.config.watch.mounts.clone());
+        paths.sort();
+        paths.dedup();
+        let mut resolved = BTreeMap::new();
+        for path in &paths {
+            resolved.insert(
+                path.to_string_lossy().into_owned(),
+                crate::mounts::live_identity(mounts, path)?,
+            );
+        }
+        for (mount, current) in &resolved {
+            if d.presence.get(mount) != Some(current) {
+                let previous = d.presence.get(mount).copied().flatten();
+                if d.config
+                    .sampler
+                    .mounts
+                    .iter()
+                    .any(|p| p.to_string_lossy() == mount.as_str())
+                {
+                    interrupt_fs(&mut d, mount)?;
+                }
+                d.fs.remove(mount);
+                d.fs_available.remove(mount);
+                crate::mounts::log(
+                    &[crate::mounts::Transition {
+                        path: mount.into(),
+                        previous,
+                        current: *current,
+                    }],
+                    "presence",
+                );
+            }
+        }
+        d.presence = resolved;
         Ok(())
     }
     /// Clear a mount's current samples on a presence/identity transition.
@@ -735,8 +792,16 @@ impl LiveStateView {
                 .map(|s| {
                     let rate = v.fs_rate(&s.mount, Duration::from_secs(3600));
                     MountRates {
-                        rate_15m: v.fs_rate(&s.mount, Duration::from_secs(900)),
-                        rate_1h: rate,
+                        rate_15m: if v.rate_ready(&s.mount) {
+                            v.fs_rate(&s.mount, Duration::from_secs(900))
+                        } else {
+                            Some(0.0)
+                        },
+                        rate_1h: if v.rate_ready(&s.mount) {
+                            rate
+                        } else {
+                            Some(0.0)
+                        },
                         ttf: rate.and_then(|r| time_to_full(s.avail, r)),
                         mount: s.mount,
                         size: s.size,
@@ -767,6 +832,16 @@ impl LiveStateView {
             })
             .collect();
         let mut degraded = v.data.degraded.clone();
+        for (mount, identity) in &v.data.presence {
+            if identity.is_none() && p.mount.as_ref().is_none_or(|m| m == mount) {
+                degraded.push(format!("mount not present: {mount}"));
+            }
+        }
+        for mount in rates.as_deref().unwrap_or(&[]) {
+            if !v.rate_ready(&mount.mount) {
+                degraded.push(format!("rate: collecting {}", mount.mount));
+            }
+        }
         for mount in rates.as_deref().unwrap_or(&[]) {
             if !hot.iter().any(|(m, _)| m == &mount.mount) {
                 degraded.push(format!("hot_dirs_5m {}: not measured", mount.mount));
@@ -846,6 +921,18 @@ impl LiveStateView {
             },
             now,
         ))
+    }
+    fn rate_ready(&self, mount: &str) -> bool {
+        let Some(rows) = self.data.fs.get(mount) else {
+            return false;
+        };
+        let mut samples = rows.iter().filter(|s| s.ts <= self.now);
+        let Some(first) = samples.next() else {
+            return false;
+        };
+        samples
+            .next_back()
+            .is_some_and(|last| last.ts.saturating_sub(first.ts) >= 300)
     }
     /// Bounded API hot list; integral API windows map exactly to watcher minutes.
     pub fn hot(&self, p: &HotParams) -> Option<Vec<HotEntry>> {
@@ -989,7 +1076,7 @@ impl AlertSource for LiveStateView {
             .cloned()
     }
     fn fs_rate(&self, mount: &str, window: Duration) -> Option<f64> {
-        if window.is_zero() || self.fs_sample(mount).is_none() {
+        if window.is_zero() || !self.rate_ready(mount) || self.fs_sample(mount).is_none() {
             return None;
         }
         let start = i128::from(self.now) * 1_000_000_000

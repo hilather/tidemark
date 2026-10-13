@@ -146,19 +146,27 @@ fn measured_state_and_unavailable_omission() {
     let cache = SnapshotMetrics::default();
     let empty = parse(&metrics::render(&state.view_at(0), &cache, &config.metrics, 0).unwrap());
     assert_eq!(empty.len(), 2);
-    for ts in [0, 60, 120] {
-        publish(
-            &state,
-            Publication::Fs(FsSample {
-                ts,
-                mount: "/fixture".into(),
-                size: 10000,
-                used: 1000 + ts as u64,
-                avail: 9000 - ts as u64,
-                inodes: 100,
-                inodes_used: 3,
-            }),
-        );
+    for (pass, timestamps) in [[0, 60, 120], [-180, -30, 120]].into_iter().enumerate() {
+        for ts in timestamps {
+            publish(
+                &state,
+                Publication::Fs(FsSample {
+                    ts,
+                    mount: "/fixture".into(),
+                    size: 10000,
+                    used: (1000 + ts) as u64,
+                    avail: (9000 - ts) as u64,
+                    inodes: 100,
+                    inodes_used: 3,
+                }),
+            );
+        }
+        if pass == 0 {
+            let short =
+                parse(&metrics::render(&state.view_at(120), &cache, &config.metrics, 120).unwrap());
+            assert!(!short.contains_key("tidemark_fs_growth_bytes_per_second"));
+            assert!(!short.contains_key("tidemark_fs_time_to_full_seconds"));
+        }
     }
     publish(
         &state,

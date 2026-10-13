@@ -611,6 +611,8 @@ pub fn run_controlled(
                 ],
             );
             tracing::info!("daemon ready");
+            let mut firstboot_followup = firstboot::Followup::default();
+            let mut firstboot_due = Instant::now();
             while !shutdown.load(Ordering::Acquire) {
                 if reload_flag.swap(false, Ordering::AcqRel) {
                     match reload.call(&api::Cancellation::new(
@@ -622,6 +624,18 @@ pub fn run_controlled(
                         }
                         Ok(_) => {}
                         Err(e) => tracing::error!(error=%e,"config reload rejected"),
+                    }
+                }
+                if Instant::now() >= firstboot_due {
+                    firstboot_due = Instant::now() + Duration::from_secs(10);
+                    if let Some(inputs) = state.view().firstboot_inputs() {
+                        if let Err(error) = firstboot_followup.poll(
+                            &state.config().0.general.state_dir,
+                            &inputs,
+                            unix_now(),
+                        ) {
+                            tracing::warn!(%error, "firstboot followup failed");
+                        }
                     }
                 }
                 for (name, h) in &handles {
