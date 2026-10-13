@@ -2,7 +2,10 @@
 # Owned by: CI-rpm. Inspect an RPM without installing it.
 set -eu
 export LC_ALL=C
-[ "$#" -ge 1 ] && [ "$#" -le 2 ] || { echo 'Usage: check-rpm.sh file.rpm [version]' >&2; exit 1; }
+if ! { [ "$#" -ge 1 ] && [ "$#" -le 2 ]; }; then
+    echo 'Usage: check-rpm.sh file.rpm [version]' >&2
+    exit 1
+fi
 package=$(realpath "$1")
 version=${2:-0.1.0}
 cd "$(dirname "$0")/.."
@@ -58,7 +61,9 @@ mkdir "$tmp/payload"
 (cd "$tmp/payload" && cpio -idm --quiet < "$tmp/payload.cpio")
 for binary in tidemark tidemarkd; do
     file="$tmp/payload/usr/bin/$binary"
-    [ -f "$file" ] && [ -x "$file" ] || fail "executable: $binary"
+    if ! { [ -f "$file" ] && [ -x "$file" ]; }; then
+        fail "executable: $binary"
+    fi
     magic=$(od -An -tx1 -N4 "$file" | tr -d ' \n')
     [ "$magic" = 7f454c46 ] || fail "ELF: $binary"
     # ELF e_type is ET_EXEC (2) or ET_DYN (3, PIE), little-endian x86_64.
