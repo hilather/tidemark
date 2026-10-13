@@ -45,14 +45,30 @@ fn read_batch<T>(
 
 fn descriptor_limit_reached() -> bool {
     let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
-    descriptor_limit_with(limit, |limit| {
-        std::fs::read_dir("/proc/self/fd").map(|entries| {
-            entries
-                .take(usize::try_from(limit).unwrap_or(usize::MAX))
-                .count() as u64
-        })
-    })
+    descriptor_limit_with(limit, count_descriptors)
 }
+fn count_descriptors(limit: u64) -> io::Result<u64> {
+    use rustix::fs::{Mode, OFlags, RawDir};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let fd = match rustix::fs::open("/proc/self/fd", flags | OFlags::NOATIME, Mode::empty()) {
+        Err(rustix::io::Errno::PERM) => rustix::fs::open("/proc/self/fd", flags, Mode::empty()),
+        result => result,
+    }?;
+    let mut buffer = [std::mem::MaybeUninit::<u8>::uninit(); 8192];
+    let mut entries = RawDir::new(&fd, &mut buffer);
+    let mut count = 0u64;
+    while count < limit {
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        let entry = entry?;
+        if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn descriptor_limit_with(limit: Option<u64>, count: impl FnOnce(u64) -> io::Result<u64>) -> bool {
     let Some(limit) = limit else {
         return false;
