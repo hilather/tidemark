@@ -23,6 +23,8 @@ jobs:
             ~/.cargo/git
             target
           key: ci-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Fetch every locked crate (tests resolve the workspace offline)
+        run: cargo fetch --locked
       - run: tools/ci.sh
   rpm:
     if: github.event_name != 'push' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
