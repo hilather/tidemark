@@ -244,4 +244,5 @@ pub mod client;
 /// Staged deployment.
 pub mod deploy;
 
+mod live_rows;
 mod tui;

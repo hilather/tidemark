@@ -65,7 +65,16 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     // Apply filters before the final limit, especially for cross-snapshot growth.
     let rows = snapshot.subtree_dirs(dir.id, depth, key, 1_000_001)?;
     let live = if args.live {
-        Some(live_rows(&path, context)?)
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sig = signal_hook::flag::register(signal_hook::consts::SIGINT, cancel.clone())?;
+        let result = crate::live_rows::live_rows(&path, &context.config, &cancel);
+        signal_hook::low_level::unregister(sig);
+        Some(
+            result?
+                .into_iter()
+                .map(|r| (r.path, r.t_disk))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
     } else {
         None
     };
@@ -141,103 +150,6 @@ fn older_snapshot(
         .map(|p| tidemark_store::reader::Snapshot::open(&p).map_err(Into::into))
         .transpose()
 }
-fn live_rows(
-    path: &tidemark_core::path::RawPath,
-    context: &crate::Context,
-) -> anyhow::Result<std::collections::BTreeMap<tidemark_core::path::RawPath, u64>> {
-    use tidemark_scan::agg::{AggConfig, Aggregator, VecSink};
-    let _lock = tidemark_scan::orchestrator::ScanLock::acquire(&context.config.general.state_dir)
-        .map_err(super::scan::scan_error)?;
-    let mounts = tidemark_fs::mount::read_mountinfo()?;
-    let mount = tidemark_fs::mount::mount_for_path(&mounts, path)
-        .ok_or_else(|| crate::CliError::Precondition("live root mount unknown".into()))?;
-    let leaves = tidemark_fs::blockdev::resolve_leaves(mount.dev).unwrap_or_default();
-    let sample_leaves = leaves.clone();
-    let scan_gate = tidemark_fs::throttle::gate_from_config(
-        "gentle",
-        &context.config.throttle,
-        &leaves,
-        Box::new(move || tidemark_fs::blockdev::read_disk_stats(&sample_leaves)),
-    )?;
-    let gate = scan_gate.gate();
-    let root = context
-        .config
-        .roots
-        .iter()
-        .find(|r| r.path == path.as_path())
-        .cloned()
-        .unwrap_or_default();
-    let now = tidemark_core::time::unix_now();
-    let threads = context.config.scan.threads as usize;
-    let capacity = tidemark_scan::orchestrator::channel_capacity(
-        context.config.scan.memory_budget.0,
-        threads,
-        root.top_files,
-        context.config.scan.getdents_buf.0,
-    )?;
-    let mut globs = globset::GlobSetBuilder::new();
-    for g in &root.exclude {
-        globs.add(globset::Glob::new(g)?);
-    }
-    let mut skips = tidemark_fs::mount::submounts_under(&mounts, path);
-    let state = tidemark_fs::canon::canonicalize(&context.config.general.state_dir)?;
-    if &state == path {
-        return Err(crate::CliError::Precondition("cannot scan state directory".into()).into());
-    }
-    if state.starts_with(path) {
-        skips.push(state);
-    }
-    let cfg = tidemark_fs::walk::WalkConfig {
-        root: path.clone(),
-        threads,
-        stat_entries: true,
-        exclude: globs.build()?,
-        skip_mounts: skips,
-        big_file_threshold: root.big_file_threshold.0,
-        top_files: root.top_files,
-        scan_start: now,
-        getdents_buf: usize::try_from(context.config.scan.getdents_buf.0)?,
-        io_idle: true,
-        max_record_bytes: tidemark_scan::orchestrator::record_limits(
-            context.config.scan.memory_budget.0,
-            threads,
-        )?
-        .1,
-    };
-    let mut agg = Aggregator::new(AggConfig {
-        root: path.clone(),
-        scan_start: now,
-        top_files: root.top_files,
-        big_file_threshold: root.big_file_threshold.0,
-        max_notable: context.config.scan.max_notable,
-        link_instances: false,
-        max_stored_errors: context.config.scan.max_stored_errors,
-    });
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sig = signal_hook::flag::register(signal_hook::consts::SIGINT, cancel.clone())?;
-    let walked = std::thread::scope(|scope| {
-        let (tx, rx) = crossbeam_channel::bounded(capacity);
-        let worker = scope.spawn(|| tidemark_fs::walk::walk(&cfg, gate.as_ref(), &cancel, tx));
-        for record in rx {
-            match record {
-                tidemark_core::scan::WalkOutput::Dir(d) => agg.add_dir_record(d),
-                tidemark_core::scan::WalkOutput::Gone(g) => agg.add_gone(&g),
-                _ => {}
-            }
-        }
-        worker
-            .join()
-            .map_err(|_| anyhow::anyhow!("live walker panicked"))?
-            .map_err(anyhow::Error::from)
-    });
-    signal_hook::low_level::unregister(sig);
-    walked?;
-    scan_gate.stop();
-    let mut sink = VecSink::default();
-    agg.prepare()?.write(&mut sink)?;
-    Ok(sink.dirs.into_iter().map(|r| (r.path, r.t_disk)).collect())
-}
-
 /// CLI directory ordering, including the cross-snapshot growth metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Sort {
