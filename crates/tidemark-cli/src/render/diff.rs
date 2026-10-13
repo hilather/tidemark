@@ -42,11 +42,11 @@ pub fn inputs_header(
     for (label, input) in [("From", old), ("To", new)] {
         writeln!(
             out,
-            "{label}: Snapshot {} · {:?} · {}s ago · {}{}",
+            "{label}: Snapshot {} · {} · {}s ago · {}{}",
             input.scan_id,
-            input.mode,
+            super::enum_label(input.mode),
             now.saturating_sub(input.started_at).max(0),
-            input.status,
+            input.status.to_ascii_lowercase(),
             if input.degraded { " (degraded)" } else { "" }
         )?;
     }
@@ -64,7 +64,7 @@ pub fn coverage_notice(
             format!(
                 "{label} snapshot {} is {}{}",
                 input.scan_id,
-                input.status,
+                input.status.to_ascii_lowercase(),
                 if input.degraded { " (degraded)" } else { "" }
             )
         })

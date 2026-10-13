@@ -1,6 +1,8 @@
 //! Owned by: W2-C
 //! Command surface and shared CLI support.
 
+use anyhow::Context as _;
+
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -159,18 +161,31 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         // or catalog connections are retained.
         let lock =
             tidemark_scan::orchestrator::ScanLock::acquire(&context.config.general.state_dir)
-                .map_err(scan_error)?;
+                .map_err(scan_error)
+                .with_context(|| {
+                    format!(
+                        "scan state: {}",
+                        super::display_path(&context.config.general.state_dir)
+                    )
+                })?;
         require_absent_daemon(context)?;
         drop(
             lock.open_catalog(&context.config.general.state_dir)
-                .map_err(scan_error)?,
+                .map_err(scan_error)
+                .with_context(|| {
+                    format!(
+                        "open scan catalog: {}",
+                        super::display_path(&context.config.general.state_dir)
+                    )
+                })?,
         );
     }
     let path = args
         .root
         .as_deref()
         .unwrap_or_else(|| std::path::Path::new("/data"));
-    let root = tidemark_fs::canon::canonicalize(path)?;
+    let root = tidemark_fs::canon::canonicalize(path)
+        .with_context(|| format!("resolve scan root: {}", super::display_path(path)))?;
     let configured = context
         .config
         .roots
@@ -219,7 +234,12 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     if let Ok(mut display) = display.lock() {
         display.finish()?;
     }
-    let outcome = result.map_err(scan_error)?;
+    let outcome = result.map_err(scan_error).with_context(|| {
+        format!(
+            "scan state: {}",
+            super::display_path(&context.config.general.state_dir)
+        )
+    })?;
     crate::render::scan_progress::outcome(&outcome, context.json, &mut std::io::stdout().lock())?;
     if outcome.degraded || outcome.status == tidemark_core::scan::SnapshotStatus::Partial {
         return Err(crate::CliError::Partial(
@@ -309,7 +329,11 @@ pub(crate) fn daemon_connection(
             } else {
                 String::new()
             };
-            Err(crate::CliError::Unavailable(format!("daemon unavailable: {error}{hint}")).into())
+            Err(crate::CliError::Unavailable(format!(
+                "connect socket {}: daemon unavailable: {error}{hint}",
+                super::display_path(&context.config.general.socket)
+            ))
+            .into())
         }
     }
 }

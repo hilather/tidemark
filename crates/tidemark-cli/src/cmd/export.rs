@@ -1,6 +1,8 @@
 //! Owned by: W3-C
 //! Command surface and shared CLI support.
 
+use anyhow::Context as _;
+
 /// Command arguments.
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -50,13 +52,16 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         max_depth,
     };
     if let Some(output) = output {
-        let (mut file, target) = create_output(output, &context.config.general.state_dir)?;
+        let (mut file, target) = create_output(output, &context.config.general.state_dir)
+            .with_context(|| format!("create export: {}", super::display_path(output)))?;
         {
             let mut out = std::io::BufWriter::new(file.as_file_mut());
             tidemark_store::export_ncdu(&snap, &path, &mut out, &opts)?;
-            out.flush()?;
+            out.flush()
+                .with_context(|| format!("write export: {}", super::display_path(&target)))?;
         }
-        publish_output(&file, &target)?;
+        publish_output(&file, &target)
+            .with_context(|| format!("publish export: {}", super::display_path(&target)))?;
     } else {
         let mut out = std::io::BufWriter::new(std::io::stdout().lock());
         tidemark_store::export_ncdu(&snap, &path, &mut out, &opts)?;
@@ -72,12 +77,14 @@ fn create_output(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    let parent = std::fs::canonicalize(parent)?;
+    let parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolve parent: {}", super::display_path(parent)))?;
     let name = output
         .file_name()
         .ok_or_else(|| crate::CliError::Configuration("output requires a file name".into()))?;
     let target = parent.join(name);
-    let state = std::fs::canonicalize(state)?;
+    let state = std::fs::canonicalize(state)
+        .with_context(|| format!("resolve state directory: {}", super::display_path(state)))?;
     if target.starts_with(&state) {
         return Err(
             crate::CliError::Precondition("refusing export inside state_dir".into()).into(),

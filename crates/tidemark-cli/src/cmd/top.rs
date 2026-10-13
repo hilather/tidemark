@@ -1,6 +1,8 @@
 //! Owned by: W2-C
 //! Command surface and shared CLI support.
 
+use anyhow::Context as _;
+
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -54,7 +56,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         Sort::Newest => SortKey::Newest,
         Sort::Name => SortKey::Name,
     };
-    let catalog = tidemark_store::catalog::Catalog::open(&context.config.general.state_dir, false)?;
+    let catalog = tidemark_store::catalog::Catalog::open(&context.config.general.state_dir, false)
+        .with_context(|| {
+            format!(
+                "open catalog: {}",
+                super::display_path(&context.config.general.state_dir)
+            )
+        })?;
     let old = older_snapshot(&catalog, &snapshot, tidemark_core::time::unix_now())?;
     if sort == Sort::Growth && old.is_none() {
         return Err(crate::CliError::Precondition(
@@ -147,7 +155,10 @@ fn older_snapshot(
         });
     entry
         .and_then(|e| e.file)
-        .map(|p| tidemark_store::reader::Snapshot::open(&p).map_err(Into::into))
+        .map(|p| {
+            tidemark_store::reader::Snapshot::open(&p)
+                .with_context(|| format!("open older snapshot: {}", super::display_path(&p)))
+        })
         .transpose()
 }
 /// CLI directory ordering, including the cross-snapshot growth metric.

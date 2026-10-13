@@ -133,6 +133,15 @@ pub fn aligned_width(rows: &[Vec<String>], width: usize) -> String {
 /// Align a table, wrapping free text and shortening only the named path/unit columns.
 /// Continuations begin at each cell's column. Oversized words remain whole.
 pub fn aligned_wrapped(rows: &[Vec<String>], width: usize, short_columns: &[usize]) -> String {
+    aligned_wrapped_right(rows, width, short_columns, &[])
+}
+/// Align and wrap a table, right-aligning the named numeric data columns.
+pub fn aligned_wrapped_right(
+    rows: &[Vec<String>],
+    width: usize,
+    short_columns: &[usize],
+    right_columns: &[usize],
+) -> String {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     if columns == 0 {
         return String::new();
@@ -233,8 +242,13 @@ pub fn aligned_wrapped(rows: &[Vec<String>], width: usize, short_columns: &[usiz
         for line in 0..height {
             let mut position = 0;
             for (i, cell) in cells.iter().enumerate() {
-                let start: usize = widths[..i].iter().sum::<usize>() + 2 * i;
                 let text = cell.get(line).map_or("", String::as_str);
+                let padding = if row_index > 0 && right_columns.contains(&i) {
+                    widths[i].saturating_sub(display_width(text))
+                } else {
+                    0
+                };
+                let start: usize = widths[..i].iter().sum::<usize>() + 2 * i + padding;
                 if text.is_empty() {
                     continue;
                 }
@@ -337,4 +351,21 @@ mod fitting_tests {
             }
         }
     }
+}
+
+/// Escape control characters in one human diagnostic cell, preserving prior path escapes.
+/// Layout newlines are emitted by the caller separately from untrusted message text.
+pub fn diagnostic(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            let mut bytes = [0; 4];
+            output.push_str(&tidemark_core::path::display_lossy_bytes(
+                ch.encode_utf8(&mut bytes).as_bytes(),
+            ));
+        } else {
+            output.push(ch);
+        }
+    }
+    output
 }

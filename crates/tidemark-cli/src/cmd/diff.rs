@@ -1,6 +1,8 @@
 //! Owned by: W3-A
 //! Command surface and shared CLI support.
 
+use anyhow::Context as _;
+
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -63,7 +65,12 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     {
         return Err(crate::CliError::Configuration("explain ratio must be in (0,1]".into()).into());
     }
-    let catalog = Catalog::open(&context.config.general.state_dir, false)?;
+    let catalog = Catalog::open(&context.config.general.state_dir, false).with_context(|| {
+        format!(
+            "open catalog: {}",
+            super::display_path(&context.config.general.state_dir)
+        )
+    })?;
     // Removed targets cannot be canonicalized live. Canonicalize the nearest
     // existing ancestor, then append the missing byte names after rejecting unresolved parents.
     let target = query_path(
@@ -125,7 +132,8 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         .file
         .as_ref()
         .ok_or_else(|| crate::CliError::Precondition("new snapshot has no file".into()))?;
-    let new = tidemark_store::Snapshot::open(new_file)?;
+    let new = tidemark_store::Snapshot::open(new_file)
+        .with_context(|| format!("open snapshot: {}", super::display_path(new_file)))?;
     let depth = u32::try_from(args.depth)
         .map_err(|_| crate::CliError::Configuration("depth exceeds u32".into()))?;
     let rows = diff(

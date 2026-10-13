@@ -1,6 +1,8 @@
 //! Owned by: W6-A3
 //! Command surface and shared CLI support.
 
+use anyhow::Context as _;
+
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -29,7 +31,7 @@ pub(crate) fn connect(context: &crate::Context) -> anyhow::Result<crate::client:
     )
     .map_err(|e| {
         let hint = if matches!(&e, crate::client::ClientError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied) { format!("\n{}", crate::ACCESS_HINT) } else { String::new() };
-        crate::CliError::Unavailable(format!("daemon unavailable — is tidemarkd running? (systemctl status tidemarkd): {e}{hint}")).into()
+        crate::CliError::Unavailable(format!("daemon unavailable — is tidemarkd running? (systemctl status tidemarkd): connect socket {}: {e}{hint}", super::display_path(&context.config.general.socket))).into()
     })
 }
 pub(crate) fn call<P: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -37,33 +39,40 @@ pub(crate) fn call<P: serde::Serialize, R: serde::de::DeserializeOwned>(
     method: &str,
     params: &P,
 ) -> anyhow::Result<R> {
-    client.call(method, params).map_err(|e| {
-        use crate::client::ClientError;
-        use tidemark_core::api::ApiErrorCode;
-        match e {
-            ClientError::Unavailable => crate::CliError::Unavailable(
-                "daemon unavailable — is tidemarkd running? (systemctl status tidemarkd)".into(),
-            )
-            .into(),
-            ClientError::Remote(error) => match error.code {
-                ApiErrorCode::BadRequest => crate::CliError::Configuration(error.message).into(),
-                ApiErrorCode::Forbidden => crate::CliError::Precondition(format!(
-                    "{}\n{}",
-                    error.message,
-                    crate::ACCESS_HINT
-                ))
+    client
+        .call(method, params)
+        .map_err(|e| {
+            use crate::client::ClientError;
+            use tidemark_core::api::ApiErrorCode;
+            match e {
+                ClientError::Unavailable => crate::CliError::Unavailable(
+                    "daemon unavailable — is tidemarkd running? (systemctl status tidemarkd)"
+                        .into(),
+                )
                 .into(),
-                ApiErrorCode::Unavailable => crate::CliError::Unavailable(error.message).into(),
-                ApiErrorCode::Busy => crate::CliError::Precondition(error.message).into(),
-                _ => anyhow::anyhow!("daemon error: {}", error.message),
-            },
-            e => anyhow::Error::new(e),
-        }
-    })
+                ClientError::Remote(error) => match error.code {
+                    ApiErrorCode::BadRequest => {
+                        crate::CliError::Configuration(error.message).into()
+                    }
+                    ApiErrorCode::Forbidden => crate::CliError::Precondition(format!(
+                        "{}\n{}",
+                        error.message,
+                        crate::ACCESS_HINT
+                    ))
+                    .into(),
+                    ApiErrorCode::Unavailable => crate::CliError::Unavailable(error.message).into(),
+                    ApiErrorCode::Busy => crate::CliError::Precondition(error.message).into(),
+                    _ => anyhow::anyhow!("daemon error: {}", error.message),
+                },
+                e => anyhow::Error::new(e),
+            }
+        })
+        .with_context(|| format!("daemon request {method}"))
 }
 pub(crate) fn mount(path: Option<&std::path::Path>) -> anyhow::Result<Option<String>> {
     path.map(|p| {
-        let raw = tidemark_fs::canon::canonicalize(p)?;
+        let raw = tidemark_fs::canon::canonicalize(p)
+            .with_context(|| format!("resolve mount: {}", super::display_path(p)))?;
         raw.as_path().to_str().map(str::to_owned).ok_or_else(|| {
             crate::CliError::Configuration("API mount labels require UTF-8".into()).into()
         })

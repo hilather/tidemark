@@ -1,6 +1,8 @@
 //! Owned by: W5-B
 //! Command surface and shared CLI support.
 
+use anyhow::Context as _;
+
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -63,9 +65,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     }
     let mut scanner = super::phantom::scanner(context, args.mount.as_deref(), true)?;
     let first = super::phantom::timestamp()?;
-    scanner.scan_once(first)?;
+    scanner
+        .scan_once(first)
+        .context("measure open writers: /proc")?;
     std::thread::sleep(args.interval);
-    scanner.scan_once(super::phantom::timestamp()?)?;
+    scanner
+        .scan_once(super::phantom::timestamp()?)
+        .context("measure open writers: /proc")?;
     let rows = scanner.writers(None, args.window.unwrap_or(args.interval), 20);
     let mut out = std::io::stdout().lock();
     if context.json {

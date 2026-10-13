@@ -154,7 +154,7 @@ fn explicit_partial_or_degraded_diff_warns_and_shows_both_inputs() {
                     assert!(
                         text.contains(&a)
                             && text.contains(&b)
-                            && text.contains("Walk")
+                            && text.contains("walk")
                             && text.contains("s ago")
                     );
                     assert!(

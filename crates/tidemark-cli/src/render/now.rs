@@ -318,7 +318,7 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
                     "{} ({}s ago, {}, {}ms)",
                     crate::render::size::timestamp(l.finished_at),
                     r.generated_at.saturating_sub(l.finished_at).max(0),
-                    escape(&l.mode),
+                    escape(&l.mode.to_ascii_lowercase()),
                     l.duration_ms
                 ))
                 .unwrap_or_else(|| "none".into())
@@ -326,7 +326,7 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
         if let Some(p) = &s.running {
             lines.push(format!(
                 "  running {}: {} dirs, {} entries",
-                escape(&p.phase),
+                escape(&p.phase.to_ascii_lowercase()),
                 p.dirs,
                 p.entries
             ));
@@ -361,7 +361,7 @@ fn bytes_display(b: &[u8]) -> String {
     tidemark_core::path::display_lossy_bytes(b)
 }
 
-fn signed_bytes(bytes: i64) -> String {
+pub(crate) fn signed_bytes(bytes: i64) -> String {
     format!(
         "{}{}",
         if bytes < 0 { "-" } else { "+" },

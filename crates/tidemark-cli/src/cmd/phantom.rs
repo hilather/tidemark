@@ -1,6 +1,8 @@
 //! Owned by: W5-B
 //! Command surface and shared CLI support.
 
+use anyhow::Context as _;
+
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -49,7 +51,9 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         return Err(crate::CliError::Unavailable("daemon unavailable; use --direct".into()).into());
     }
     let mut scanner = scanner(context, args.mount.as_deref(), false)?;
-    scanner.scan_once(timestamp()?)?;
+    scanner
+        .scan_once(timestamp()?)
+        .context("measure deleted-open files: /proc")?;
     let rows = scanner.phantom(None);
     let mut out = std::io::stdout().lock();
     if context.json {
@@ -74,7 +78,8 @@ pub(super) fn scanner(
     writers: bool,
 ) -> anyhow::Result<tidemark_live::procscan::ProcScanner> {
     use tidemark_core::path::RawPath;
-    let table = tidemark_fs::mount::read_mountinfo()?;
+    let table = tidemark_fs::mount::read_mountinfo()
+        .context("read process scan mounts: /proc/self/mountinfo")?;
     let paths: Vec<_> = mount.map_or_else(
         || context.config.watch.mounts.clone(),
         |p| vec![p.to_path_buf()],
@@ -120,7 +125,8 @@ mod tests;
 
 fn canonical_mount(path: &std::path::Path) -> anyhow::Result<tidemark_core::path::RawPath> {
     Ok(tidemark_core::path::RawPath::from_path(
-        &std::fs::canonicalize(path)?,
+        &std::fs::canonicalize(path)
+            .with_context(|| format!("resolve path: {}", super::display_path(path)))?,
     )?)
 }
 fn visible_mount<'a>(

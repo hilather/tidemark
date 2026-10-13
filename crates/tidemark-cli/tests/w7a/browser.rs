@@ -595,3 +595,14 @@ fn live_additions_exceeding_growth_cap_fall_back_without_exiting() {
     assert_eq!(b.rows.len(), PAGE);
     assert!(b.message.contains("showing name"));
 }
+
+#[test]
+fn human_header_and_pane_labels_are_lowercase() {
+    let (_temp, b) = browser(1);
+    for width in [80, 100] {
+        let text = render(&b, width, 24);
+        assert!(text.contains("walk age"), "{text}");
+        assert!(text.contains("main | size | filter"), "{text}");
+        assert!(!text.contains("Walk") && !text.contains("Main | Size"));
+    }
+}

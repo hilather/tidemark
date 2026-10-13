@@ -53,7 +53,7 @@ pub fn write_width(
     for r in rows {
         table.push(vec![
             display(r.name.as_bytes()),
-            display(r.state.as_bytes()),
+            display(r.state.to_ascii_lowercase().as_bytes()),
             display(r.detail.as_bytes()),
         ]);
     }
@@ -67,7 +67,7 @@ pub fn write_width(
                 &format!(
                     "{}: {}",
                     crate::render::table::shorten(&display(mount.as_bytes()), width / 2),
-                    display(mode.as_bytes())
+                    display(mode.to_ascii_lowercase().as_bytes())
                 ),
                 width,
             )
@@ -139,7 +139,7 @@ pub fn scan_complete(status: &ScanStatus, json: bool, out: &mut impl Write) -> a
             "scan {} completed: {} · {} · {}ms",
             display(last.scan_id.as_bytes()),
             display(status.root.as_bytes()),
-            display(last.mode.as_bytes()),
+            display(last.mode.to_ascii_lowercase().as_bytes()),
             last.duration_ms
         )?;
     }

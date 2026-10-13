@@ -88,8 +88,8 @@ pub fn outcome(o: &ScanOutcome, json: bool, out: &mut impl Write) -> anyhow::Res
             out,
         )
     } else {
-        writeln!(out,"Mode: {:?} ({})\nDuration: {:.2}s\nDirectories: {}  Files: {}\nDisk: {}  Reclaimable: {}\nLink sets: {} ({} incomplete)\nErrors: {}  Races: {}\nSnapshot: {}",
-            o.mode,o.mode_reason,o.duration.as_secs_f64(),o.summary.dirs,o.summary.files,
+        writeln!(out,"Mode: {} ({})\nDuration: {:.2}s\nDirectories: {}  Files: {}\nDisk: {}  Reclaimable: {}\nLink sets: {} ({} incomplete)\nErrors: {}  Races: {}\nSnapshot: {}",
+            super::enum_label(o.mode),o.mode_reason,o.duration.as_secs_f64(),o.summary.dirs,o.summary.files,
             crate::render::size::bytes(o.summary.t_disk),crate::render::size::bytes(o.summary.t_reclaimable),
             o.summary.link_sets,o.summary.incomplete_link_sets,o.summary.errors,o.summary.races,
             o.file.as_ref().map(|p| tidemark_core::path::RawPath::from_path(p).map(|p|p.display_lossy())).transpose()?.unwrap_or_else(|| "none".into()))?;

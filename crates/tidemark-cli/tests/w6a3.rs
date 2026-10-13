@@ -1070,3 +1070,156 @@ fn catalog_mutations_preserve_existing_corrupt_state_on_uncertain_endpoint() {
         }
     }
 }
+
+#[test]
+fn live_human_state_and_scan_labels_are_lowercase() {
+    let mut report = example_now();
+    report.scans[0].last_complete.as_mut().unwrap().mode = "Walk".into();
+    let context = tidemark_cli::Context {
+        config: Default::default(),
+        config_path: "/fixture".into(),
+        json: false,
+        color: false,
+    };
+    let status = serde_json::from_value(serde_json::json!({"version":"fixture","uptime_s":1,"components":[{"name":"scan","state":"Complete","detail":"ready"}],"watch_modes":[["/data","Fid"]],"last_errors":[]})).unwrap();
+    for width in [80, 100] {
+        let text = tidemark_cli::render::now::render_text(&report, width);
+        assert!(text.contains("walk"), "{text}");
+        assert!(!text.contains("Walk"));
+        let mut out = Vec::new();
+        tidemark_cli::render::status::write_width(&status, &[], &context, false, width, &mut out)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("complete") && text.contains("fid"), "{text}");
+        assert!(!text.contains("Complete") && !text.contains("Fid"));
+    }
+}
+
+#[test]
+fn writer_unit_key_json_uses_the_frozen_core_serializer() {
+    let mut report = example_now();
+    report.mounts[0].writers_5m[0].key = b"user-1000".to_vec();
+    let context = tidemark_cli::Context {
+        config: Default::default(),
+        config_path: "/fixture".into(),
+        json: true,
+        color: false,
+    };
+    let mut out = Vec::new();
+    tidemark_cli::render::now::write(&report, &context, &mut out).unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let entry = &report.mounts[0].writers_5m[0];
+    assert_eq!(
+        doc["data"]["mounts"][0]["writers_5m"][0],
+        serde_json::to_value(entry).unwrap()
+    );
+    assert_eq!(
+        doc["data"]["mounts"][0]["writers_5m"][0]["key"],
+        serde_json::json!(b"user-1000".to_vec())
+    );
+    assert!(doc["data"]["mounts"][0]["writers_5m"][0]
+        .get("path")
+        .is_none());
+}
+
+#[test]
+fn appended_watcher_cap_detail_wraps_without_losing_reason() {
+    const DETAIL: &str = "truncated: distinct-file cap reached in the minute 10:42 UTC (timestamp 1791888120) (events complete, per-file counts capped)";
+    let context = tidemark_cli::Context {
+        config: Default::default(),
+        config_path: "/fixture".into(),
+        json: false,
+        color: false,
+    };
+    let status = serde_json::from_value(serde_json::json!({"version":"fixture","uptime_s":1,"components":[{"name":"watcher:/data","state":"degraded","detail":DETAIL}],"watch_modes":[],"last_errors":[]})).unwrap();
+    let mut report = example_now();
+    report.mounts.clear();
+    report.scans.clear();
+    report.degraded = vec![DETAIL.into()];
+    for width in [80, 100] {
+        let mut out = Vec::new();
+        tidemark_cli::render::status::write_width(&status, &[], &context, false, width, &mut out)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.lines().all(|line| line.len() <= width), "{text}");
+        let lines: Vec<_> = text.lines().collect();
+        let column = lines[1].find("DETAIL").unwrap();
+        let end = lines
+            .iter()
+            .position(|line| line.starts_with("ROOT"))
+            .unwrap();
+        assert!(end > 3, "{text}");
+        assert!(lines[3..end]
+            .iter()
+            .all(|line| line.starts_with(&" ".repeat(column))));
+        assert_eq!(
+            lines[2..end]
+                .iter()
+                .flat_map(|line| line[column..].split_whitespace())
+                .collect::<Vec<_>>()
+                .join(" "),
+            DETAIL
+        );
+        let text = tidemark_cli::render::now::render_text(&report, width);
+        assert!(text.lines().all(|line| line.len() <= width), "{text}");
+        let lines: Vec<_> = text.lines().skip(1).collect();
+        assert!(lines.len() > 1);
+        assert!(lines[1..].iter().all(|line| line.starts_with("          ")));
+        let detail = std::iter::once(lines[0].strip_prefix("degraded: ").unwrap())
+            .chain(lines[1..].iter().map(|line| line.trim_start()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(detail, DETAIL);
+    }
+}
+
+#[test]
+fn unavailable_process_measurements_keep_daemon_reason_and_name_method() {
+    if !socket_available() {
+        return;
+    }
+    for method in ["writers", "phantom"] {
+        let dir = test_support::private_tempdir().unwrap();
+        let p = config(&dir);
+        let listener = UnixListener::bind(dir.path().join("api.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fake unavailable daemon accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            let request: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, method);
+            serde_json::to_writer(stream.get_mut(), &serde_json::json!({"v":1,"id":request.id,"ok":false,"error":{"code":"unavailable","message":"unavailable: measurement unavailable"}})).unwrap();
+            stream.get_mut().write_all(b"\n").unwrap();
+        });
+        let out = cli(&p, &[method]);
+        server.join().unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(4), "{text}");
+        assert!(
+            text.contains(&format!("daemon request {method}"))
+                && text.contains("unavailable: measurement unavailable"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&dir.path().join("api.sock").display().to_string()),
+            "{text}"
+        );
+    }
+}

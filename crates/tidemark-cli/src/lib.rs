@@ -32,11 +32,14 @@ pub struct Context {
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     /// Runtime failure.
-    #[error("{0}")]
+    #[error("{0:#}")]
     Runtime(#[source] anyhow::Error),
     /// Usage or configuration failure.
     #[error("{0}")]
     Configuration(String),
+    /// Configuration validation report, with separately escaped diagnostic lines.
+    #[error("{}", .0.join("\n"))]
+    ConfigurationLines(Vec<String>),
     /// Completed with errors.
     #[error("{0}")]
     Partial(String),
@@ -55,7 +58,7 @@ impl CliError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Runtime(_) => 1,
-            Self::Configuration(_) => 2,
+            Self::Configuration(_) | Self::ConfigurationLines(_) => 2,
             Self::Partial(_) => 3,
             Self::Unavailable(_) => 4,
             Self::Precondition(_) => 5,
@@ -64,9 +67,16 @@ impl CliError {
     }
 }
 fn command_error(error: anyhow::Error) -> CliError {
-    error
-        .downcast::<CliError>()
-        .unwrap_or_else(CliError::Runtime)
+    let message = format!("{error:#}");
+    let code = error.downcast_ref::<CliError>().map(CliError::exit_code);
+    match code {
+        Some(2) => CliError::Configuration(message),
+        Some(3) => CliError::Partial(message),
+        Some(4) => CliError::Unavailable(message),
+        Some(5) => CliError::Precondition(message),
+        Some(6) => CliError::Unhealthy(message),
+        _ => CliError::Runtime(error),
+    }
 }
 
 /// Root-only access hint for permission errors, without an effective-uid gate.
@@ -82,9 +92,15 @@ pub fn load_config(path: &std::path::Path) -> Result<Config, CliError> {
             Ok(config)
         }
         Err(CoreError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            Err(CliError::Configuration(format!("{e}\n{ACCESS_HINT}")))
+            Err(CliError::Configuration(format!(
+                "load configuration: {}: {e}\n{ACCESS_HINT}",
+                cmd::display_path(path)
+            )))
         }
-        Err(e) => Err(CliError::Configuration(e.to_string())),
+        Err(e) => Err(CliError::Configuration(format!(
+            "load configuration: {}: {e}",
+            cmd::display_path(path)
+        ))),
     }
 }
 /// Execute a parsed invocation.
@@ -100,7 +116,7 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
                 color: false,
             },
         )
-        .map_err(command_error);
+        .map_err(|error| command_error(error.context("completions: stdout")));
     }
     let staging = matches!(&cli.command, cli::Command::Deploy(args) if matches!(&args.command, cmd::deploy::Command::Stage(_)));
     let mut config = if staging {
@@ -113,12 +129,16 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
     }
     let issues = config.validate();
     if !issues.is_empty() {
-        return Err(CliError::Configuration(
+        return Err(CliError::ConfigurationLines(
             issues
                 .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
+                .map(|issue| {
+                    format!(
+                        "validate configuration: {}: {issue}",
+                        cmd::display_path(&cli.config)
+                    )
+                })
+                .collect::<Vec<_>>(),
         ));
     }
     let level = if cli.quiet > 0 {
@@ -142,6 +162,7 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
             cli::Color::Always => true,
             cli::Color::Never => false,
         };
+    let operation = cmd::error_context(&cli.command, &config, &cli.config);
     cli.command
         .run(&Context {
             config,
@@ -149,8 +170,30 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
             json: cli.json,
             color,
         })
-        .map_err(command_error)
+        .map_err(|error| command_error(error.context(operation)))
 }
+// Diagnostic messages are single human cells; only the separately appended
+// access hint owns a line break. Embedded newlines in paths are escaped.
+fn human_error(error: &CliError) -> String {
+    if let CliError::ConfigurationLines(lines) = error {
+        return lines
+            .iter()
+            .map(|line| render::table::diagnostic(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let message = match error {
+        CliError::Runtime(cause) => format!("{cause:#}"),
+        _ => error.to_string(),
+    };
+    let suffix = format!("\n{ACCESS_HINT}");
+    if let Some(message) = message.strip_suffix(&suffix) {
+        format!("{}\n{ACCESS_HINT}", render::table::diagnostic(message))
+    } else {
+        render::table::diagnostic(&message)
+    }
+}
+
 /// Process entry point with clap's help and usage statuses intact.
 pub fn main_entry() -> std::process::ExitCode {
     let cli = match cli::Cli::try_parse() {
@@ -164,7 +207,7 @@ pub fn main_entry() -> std::process::ExitCode {
     match run(cli) {
         Ok(()) => 0.into(),
         Err(error) => {
-            let _ = writeln!(std::io::stderr().lock(), "{error}");
+            let _ = writeln!(std::io::stderr().lock(), "{}", human_error(&error));
             if let CliError::Runtime(cause) = &error {
                 if cause.chain().any(|source| {
                     source
@@ -182,6 +225,29 @@ pub fn main_entry() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn human_diagnostics_escape_path_controls_and_keep_owned_line_breaks() {
+        let error = CliError::Runtime(anyhow::anyhow!(
+            "deploy: /tmp/admin\u{1b}[31m\nforged: not eligible"
+        ));
+        assert_eq!(
+            human_error(&error),
+            "deploy: /tmp/admin\\x1B[31m\\x0Aforged: not eligible"
+        );
+        let error =
+            CliError::Configuration(format!("load config /bad\npath: denied\n{ACCESS_HINT}"));
+        assert_eq!(
+            human_error(&error),
+            format!("load config /bad\\x0Apath: denied\n{ACCESS_HINT}")
+        );
+        let error = CliError::ConfigurationLines(vec![
+            "first: /bad\npath".into(),
+            "second: invalid".into(),
+        ]);
+        assert_eq!(human_error(&error), "first: /bad\\x0Apath\nsecond: invalid");
+        assert_eq!(render::table::diagnostic("/already\\xFF"), "/already\\xFF");
+    }
+
     #[test]
     fn configuration_loading_and_overrides() {
         let dir = ::test_support::private_tempdir().unwrap();
