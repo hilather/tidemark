@@ -706,19 +706,11 @@ impl ScanLock {
     }
     /// Create only inside state_dir and refuse a concurrent scan.
     pub fn acquire(state: &std::path::Path) -> Result<Self, ScanError> {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(state)?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(state.join("scan.lock"))?;
+        let directory = tidemark_store::state_dir::StateDir::open(state, true)?;
+        for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm", "timeseries.db-journal", "timeseries.db.bak-v0"] {
+            directory.check_leaf(std::ffi::OsStr::new(name))?;
+        }
+        let file = directory.open_leaf(std::ffi::OsStr::new("scan.lock"), true, true)?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(Self { _file: file }),
             Err(rustix::io::Errno::WOULDBLOCK) => Err(ScanError::Busy),
