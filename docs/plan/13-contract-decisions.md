@@ -1121,3 +1121,43 @@ Sources: `docs/handoff/W6-watch-windows.md`, `docs/handoff/RECHECK-edge.md`, `do
 Fd reads admit at most 256 event descriptors per mount: 6,144 bytes at 24 bytes/record; FID buffers remain 64 KiB. Raise soft NOFILE to hard at startup if permitted. The batch is clamp((soft−512)/configured mounts,16,256), recomputed after old workers retire. EMFILE, ENFILE, ENOMEM and ENOBUFS are transient throughout services: retry/back off and report degraded, never terminate merely for resource pressure. Accept also retries ECONNABORTED, using 50–800 ms backoff. Pressure loss is counted and the affected minute is lossy. Other accept errors are fatal; scheduler channel disconnection, worker panic, noncontained non-resource errors, invalid paths/invariants/caps and nontransient catalog failures retain terminal behavior. Invalid config, unsafe ownership/paths, lock conflicts, nonrecoverable malformed storage and non-resource startup failures remain fatal. On Rocky 8.8, a 64 KiB read with limit 1,024 filled the descriptor table and API accept ended the daemon in 3 of 13 runs; this motivated the cap, not a post-fix acceptance measurement.
 
 Sources: `docs/handoff/WATCH-fd-budget.md`.
+
+### R5-11 — CLI presentation and daemon LVM schema
+
+**Decision: accepted; open gates explicitly retained.**
+
+Free-text cells wrap at word boundaries with aligned continuations; oversized words remain whole. Only paths/unit names shorten in the middle, preserving escaped-byte tokens. Shared table alignment applies to all tables; redirected width is 100. Direct LVM retains tidemark.lvm.v1; reduced daemon LVM uses tidemark.lvm.daemon.v1, closing R4-12’s schema collision.
+
+Sources: `docs/handoff/CLI-display2.md`.
+
+### R5-12 — Snapshot browser and store paging
+
+**Decision: accepted; open gates explicitly retained.**
+
+The TUI uses keyset paging, up to 1,000 children/page, for size, reclaimable, files, newest, growth and name sorts, with reverse pages and whole-directory Home/End. Literal UTF-8 byte-substring filtering covers the entire directory. Growth reads a cache capped at 10,000 children; exceeding it refuses growth and permits advancing to name. R starts a gated cancellable worker rescan; Esc/navigation cancel, terminal restoration precedes teardown join. Live children cap at 1,000,000 and new live-only directories need a snapshot for descent. Link instances preserve duplicates/unresolved rows and navigate to containing directories. The own-files row uses charged bytes/counts, with unavailable reclaim/shared/newest/delta. Store adds children_count, children_page and link_instances_page, metric/raw-name keysets and (dir_id,nullable name,rowid) link cursors. OPEN RISK: million-child page queries exceed 100 ms because no covering sort index exists; indexes change snapshot size/write time and require measurement, not an implicit schema change.
+
+Sources: `docs/handoff/W7-A.md`, `docs/handoff/W7-A2-live.md`, `docs/handoff/W7-A2-store.md`, `docs/handoff/W7-A2-tui.md`.
+
+### R5-13 — Fixture and benchmark tooling
+
+**Decision: accepted; open gates explicitly retained.**
+
+cargo xtask gen-fixture streams deterministic marked fixtures with unique-inode counts, sparse files, hard links, symlinks and wide directories. cargo xtask bench [--tidemark PATH] measures du allocated/apparent totals and scan wall/CPU/RSS, block-device utilisation/await, cancellation and watcher throughput impact. GNU time supplies rusage; procfs fallback is explicitly sampled and can miss peaks. Gate statistics absent from frozen scan JSON remain unavailable, not invented. Cold-cache manipulation requires explicit staging consent and root; never on the worker host. CI readiness/benchmark fixes retain explicit private fixtures and bounded command behavior. OPEN: 5M/20M inode measurements and the 72-hour soak require owner staging hardware.
+
+Sources: `docs/handoff/W7-B1.md`, `docs/handoff/W7-B1-fix2.md`, `docs/handoff/CI-fix-readiness-bench.md`.
+
+### R5-14 — Guest fault suite
+
+**Decision: accepted; open gates explicitly retained.**
+
+tests/fault/01 through 06 cover disk full, killed scans, fanotify overflow, LVM failure, corrupt state and compaction. cargo xtask vm-test --suite fault runs the scripts only with TIDEMARK_DEPLOY_TEST_VM=1; optional environment guards select expensive/available scenarios. Scripts use Rocky 8 guest tools, repeat overflow bursts and include a low-NOFILE pass. Locale is fixed, unmount cleanup retries and overflow forcing is explicit. The real compaction case takes about four hours and needs guest scratch capacity; printed skips/compile-only are not acceptance.
+
+Sources: `docs/handoff/W7-C2-fault.md`, `docs/handoff/FAULT-fix.md`, `docs/handoff/FAULT-fix2.md`, `docs/handoff/WATCH-fd-budget.md`, `docs/handoff/GUEST-fix.md`.
+
+### R5-15 — Parser properties and fuzzing
+
+**Decision: accepted; open gates explicitly retained.**
+
+Stable property/smoke tests run in each CI pass; fuzz/ is a separate nightly libFuzzer workspace. Initial 13 targets and the three later safe seams total 16 (R5-24). Nightly builds/runs each target for 600 seconds with 1 MiB input, 2 GiB RSS and two-second execution limits. At the original handoff, fanotify buffers, mount-id and framing lacked safe seams; FUZZ-seams closes those coverage gaps. OPEN: first GitHub workflow/fuzz execution was unverified in the notes and the cumulative 24-hour crash-free release gate remains outstanding. Timing assertions are coarse regression guards, not complexity proofs.
+
+Sources: `docs/handoff/W7-C3-fuzz.md`, `docs/handoff/FUZZ-seams.md`, `docs/handoff/FUZZ-timing.md`.
