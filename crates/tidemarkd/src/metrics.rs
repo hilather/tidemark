@@ -675,12 +675,26 @@ pub fn start(
                         &config.metrics,
                         now,
                     )?;
-                    let error = write_textfile(&config.metrics.textfile, &output)
-                        .err()
-                        .map(|e| e.to_string())
+                    let write_error = write_textfile(&config.metrics.textfile, &output).err();
+                    let writer_busy = write_error
+                        .as_ref()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock);
+                    let error = write_error
+                        .map(|e| {
+                            if writer_busy {
+                                "writer busy; retry on next tick".into()
+                            } else {
+                                e.to_string()
+                            }
+                        })
                         .or_else(|| cache_error.clone());
                     if let Some(error) = error {
-                        if last_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
+                        // A forked reporting child can briefly retain a flock.
+                        // Retry at the normal tick and clear health on success;
+                        // transient contention does not consume the warning budget.
+                        if !writer_busy
+                            && last_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600))
+                        {
                             tracing::warn!(%error,"metrics exporter degraded");
                             last_log = Some(Instant::now());
                         }

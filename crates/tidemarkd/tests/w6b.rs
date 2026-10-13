@@ -25,6 +25,20 @@ fn wait(mut f: impl FnMut() -> bool) {
         std::thread::yield_now();
     }
 }
+// fork/exec in another test can briefly retain a released flock. Retry only
+// contention, with a hard deadline; all other publication errors fail at once.
+fn write_textfile_retry(path: &std::path::Path, text: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match metrics::write_textfile(path, text) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Err(e) => panic!("textfile publication: {e}"),
+        }
+    }
+}
 fn publish(state: &LiveState, value: Publication) {
     state
         .publish(value, component("test", "ok", "measured"))
@@ -256,7 +270,7 @@ fn atomic_publication_and_modes() {
     let path = tmp.path().join("metrics.prom");
     let a = "a".repeat(100000);
     let b = "b".repeat(100000);
-    metrics::write_textfile(&path, &a).unwrap();
+    write_textfile_retry(&path, &a);
     let done = Arc::new(AtomicBool::new(false));
     let stop = done.clone();
     let p = path.clone();
@@ -277,7 +291,7 @@ fn atomic_publication_and_modes() {
     });
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     for i in 0..100 {
-        metrics::write_textfile(&path, if i % 2 == 0 { &b } else { &a }).unwrap();
+        write_textfile_retry(&path, if i % 2 == 0 { &b } else { &a });
     }
     done.store(true, Ordering::Release);
     assert!(reader.join().unwrap() > 0);
@@ -290,7 +304,7 @@ fn atomic_publication_and_modes() {
     assert!(metrics::write_textfile(&tmp.path().join("absent/file"), "x").is_err());
     let staging = path.with_extension("prom.tmp");
     std::fs::write(&staging, "reserved").unwrap();
-    metrics::write_textfile(&path, "new").unwrap();
+    write_textfile_retry(&path, "new");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
     assert!(!staging.exists());
     std::os::unix::fs::symlink(&path, &staging).unwrap();
@@ -365,7 +379,7 @@ fn vm_xfs_textfile_publication_root_owned_and_readable() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let xfs = test_support::xfs::LoopXfs::new(1 << 30, &[], "");
     let output = xfs.mountpoint.join("tidemark.prom");
-    metrics::write_textfile(&output, "tidemark_up 1\n").unwrap();
+    write_textfile_retry(&output, "tidemark_up 1\n");
     let md = std::fs::metadata(&output).unwrap();
     assert_eq!((md.uid(), md.gid()), (0, 0));
     assert_eq!(md.permissions().mode() & 0o777, 0o644);
@@ -421,7 +435,7 @@ fn temporary_live_writer_and_nonregular_are_refused() {
     assert!(metrics::write_textfile(&output, "new").is_err());
     assert_eq!(std::fs::read_to_string(&staging).unwrap(), "live");
     drop(file);
-    metrics::write_textfile(&output, "recovered").unwrap();
+    write_textfile_retry(&output, "recovered");
     std::fs::create_dir(&staging).unwrap();
     assert!(metrics::write_textfile(&output, "refused").is_err());
     assert_eq!(std::fs::read_to_string(&output).unwrap(), "recovered");
@@ -664,4 +678,44 @@ fn unit_allows_only_unix_and_netlink() {
         .filter_map(|l| l.strip_prefix("RestrictAddressFamilies="))
         .collect();
     assert_eq!(families, ["AF_UNIX AF_NETLINK"]);
+}
+
+#[test]
+fn exporter_retries_busy_temporary_and_clears_health_on_next_success() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.roots.clear();
+    config.general.state_dir = tmp.path().into();
+    config.metrics.textfile = tmp.path().join("out.prom");
+    config.metrics.interval = Duration::from_millis(50);
+    tidemark_store::catalog::Catalog::open(tmp.path(), true).unwrap();
+    let staging = tmp.path().join("out.prom.tmp");
+    std::fs::write(&staging, "live writer").unwrap();
+    let file = std::fs::File::open(&staging).unwrap();
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+    let state = LiveState::new(&config, 0);
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = metrics::start(Arc::new(config.clone()), state.clone(), stop.clone()).unwrap();
+    wait(|| {
+        state.view().status(0).unwrap().components.iter().any(|c| {
+            c.name == "metrics" && c.state == "degraded" && c.detail.contains("retry on next tick")
+        })
+    });
+    assert!(!config.metrics.textfile.exists());
+    assert_eq!(std::fs::read_to_string(&staging).unwrap(), "live writer");
+    drop(file);
+    wait(|| {
+        state
+            .view()
+            .status(0)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "metrics" && c.state == "ok")
+    });
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap().unwrap();
+    assert!(std::fs::read_to_string(&config.metrics.textfile)
+        .unwrap()
+        .contains("tidemark_up 1"));
 }
