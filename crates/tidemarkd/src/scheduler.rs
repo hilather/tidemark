@@ -1113,7 +1113,10 @@ fn scheduler(
     let mut schedule_at = i64::MIN;
     let mut generation = u64::MAX;
     let started = (shared.monotonic)();
-    let mut cadence = std::collections::BTreeMap::new();
+    let started_wall = (shared.clock)();
+    // At most one completion anchor per current configured root. Only startup
+    // history is translated from Unix timestamps; runtime completions use elapsed time.
+    let mut completions = std::collections::BTreeMap::new();
     shared
         .state
         .publish_component(component("scheduler", "ok", "scheduler started"))?;
@@ -1177,7 +1180,8 @@ fn scheduler(
         }
         schedule_at = elapsed.saturating_add(1);
         if generation != current_generation {
-            cadence.clear();
+            completions
+                .retain(|root: &RawPath, _| config.roots.iter().any(|r| r.path == root.as_path()));
             // Reload resets delays and attempts, but cannot claim a failed root recovered.
             shared.failures.lock().values_mut().for_each(|r| {
                 r.attempts = 0;
@@ -1200,43 +1204,40 @@ fn scheduler(
             let last = catalog
                 .latest(&raw)
                 .map_err(|e| DaemonError::Store(e.to_string()))?;
-            let mut due = next_run(
-                &parse_schedule(&root.schedule)?,
-                root.window
-                    .as_deref()
-                    .map(parse_window)
-                    .transpose()?
-                    .as_ref(),
-                last.as_ref().and_then(|e| e.finished_at),
-                now,
-            )?;
-            let mut operational_due = None;
-            if let Schedule::Every(interval) = parse_schedule(&root.schedule)? {
-                let last_finished = last.as_ref().and_then(|e| e.finished_at);
-                let initial_due = next_run(&Schedule::Every(interval), None, last_finished, now)?;
-                let entry = cadence.entry(raw.clone()).or_insert_with(|| {
-                    (
-                        last_finished,
-                        elapsed
-                            .saturating_add(initial_due.unwrap_or(now).saturating_sub(now).max(0)),
-                    )
-                });
-                if entry.0 != last_finished {
-                    *entry = (last_finished, elapsed.saturating_add(interval));
-                }
-                operational_due = Some(entry.1);
-                // Calendar windows still use wall time; elapsed cadence supplies readiness.
-                due = next_run(
-                    &Schedule::Every(interval),
-                    root.window
-                        .as_deref()
-                        .map(parse_window)
-                        .transpose()?
-                        .as_ref(),
-                    None,
-                    now.saturating_add(entry.1.saturating_sub(elapsed).max(0)),
-                )?;
+            let last_finished = last.as_ref().and_then(|e| e.finished_at);
+            let last_id = last.as_ref().map(|e| e.scan_id.as_str());
+            let completion = completions.entry(raw.clone()).or_insert_with(|| {
+                (
+                    last_id.map(str::to_owned),
+                    last_finished.map(|finished| {
+                        started.saturating_add(finished.saturating_sub(started_wall))
+                    }),
+                )
+            });
+            if completion.0.as_deref() != last_id {
+                *completion = (last_id.map(str::to_owned), last_finished.map(|_| elapsed));
             }
+            let schedule = parse_schedule(&root.schedule)?;
+            let window = root.window.as_deref().map(parse_window).transpose()?;
+            let operational_due = match schedule {
+                Schedule::Every(interval) => Some(
+                    completion
+                        .1
+                        .map_or(elapsed, |done| done.saturating_add(interval)),
+                ),
+                _ => None,
+            };
+            let due = if let Some(deadline) = operational_due {
+                // Windows remain calendar-based even when cadence uses elapsed time.
+                next_run(
+                    &schedule,
+                    window.as_ref(),
+                    None,
+                    now.saturating_add(deadline.saturating_sub(elapsed).max(0)),
+                )?
+            } else {
+                next_run(&schedule, window.as_ref(), last_finished, now)?
+            };
             let next_due = due.map(|scheduled| {
                 shared.failures.lock().get(&raw).map_or(scheduled, |r| {
                     now.saturating_add(r.due.saturating_sub(elapsed).max(0))

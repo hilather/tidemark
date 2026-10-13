@@ -917,6 +917,10 @@ fn successful_cadence_survives_wall_steps() {
 
     wait(|| status().next_due == Some(base + 7200 + remaining - 1));
     assert_eq!(status().last_complete.unwrap().scan_id, id);
+    h.state.replace_config(h.cfg.clone()).unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(status().next_due, Some(base + 7200 + remaining - 1));
+    assert_eq!(status().last_complete.unwrap().scan_id, id);
     wall.store(base - 7200, Ordering::Release);
     elapsed.store(3, Ordering::Release);
     wait(|| status().next_due == Some(base - 7200 + remaining - 2));
