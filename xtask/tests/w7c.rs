@@ -39,6 +39,21 @@ fn fault_scripts_are_guarded_and_valid_shell() {
         assert!(text.contains("$EUID == 0"), "{}", path.display());
         // The common harness owns the executable trap; require the delegation too.
         assert!(text.contains("trap") && text.contains("source tests/fault/common.bash"));
+        for line in text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+        {
+            if line.contains("timeout ") {
+                assert!(line.contains("--foreground"), "untracked timeout: {line}");
+            }
+        }
+        if path.file_name().unwrap() == "04-compaction-crash.sh" {
+            assert!(text.contains("${TIDEMARK_FAULT_SLOW:-0} != 1"));
+            assert!(text.contains(
+                "SKIP: 04-compaction-crash.sh needs TIDEMARK_FAULT_SLOW=1 (about 70 minutes)"
+            ));
+            assert!(text.find("TIDEMARK_FAULT_SLOW").unwrap() < text.find("setup\n").unwrap());
+        }
         let output = Command::new("bash").arg("-n").arg(&path).output().unwrap();
         assert!(
             output.status.success(),
@@ -64,6 +79,16 @@ fn fault_scripts_are_guarded_and_valid_shell() {
     }
     let common = std::fs::read_to_string(root.join("tests/fault/common.bash")).unwrap();
     assert!(common.contains("trap cleanup EXIT"));
+    assert!(common.contains("mkdir -m 0755 \"$work/metrics\""));
+    assert!(common.contains("$work/metrics/metrics.prom"));
+    for line in common
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+    {
+        if line.contains("timeout ") {
+            assert!(line.contains("--foreground"), "untracked timeout: {line}");
+        }
+    }
     let output = Command::new("bash")
         .arg("-n")
         .arg(root.join("tests/fault/common.bash"))

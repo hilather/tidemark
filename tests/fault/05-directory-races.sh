@@ -9,7 +9,7 @@ source tests/fault/common.bash
 # The shared harness installs the EXIT trap before allocating loop resources.
 setup
 trap cleanup EXIT
-python3 - "$root" <<'PYCODE'
+run_helper 180 python3 - "$root" <<'PYCODE'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1])
 for n in range(2000):
@@ -20,7 +20,7 @@ for n in range(2000):
 PYCODE
 scan_background
 # Repeated deletion creates races while the scanner discovers directory entries.
-python3 - "$root" <<'PYCODE' &
+setsid python3 - "$root" <<'PYCODE' &
 import pathlib, shutil, sys, time
 p = pathlib.Path(sys.argv[1])
 time.sleep(0.05)
@@ -31,7 +31,11 @@ PYCODE
 mutator=$!
 children+=("$mutator")
 await_child "$scan_pid" 900
-[[ $child_rc == 0 || $child_rc == 3 ]] || fail "scan panic/failure exit $child_rc"
+if [[ $child_rc == 0 || $child_rc == 3 ]]; then
+    pass "race scan: exit=$child_rc"
+else
+    fail "race scan: exit=$child_rc"
+fi
 await_child "$mutator" 60
 check 'removed directories counted as races and scan complete' python3 tests/fault/check.py scan "$work/scan.json" races
 check 'race snapshot publication valid' snapshots

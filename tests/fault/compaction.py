@@ -47,7 +47,7 @@ elif mode == 'kill':
                 with connect() as db:
                     assert db.execute('SELECT count(*) FROM fs_samples WHERE mount=? AND res=0', (subject,)).fetchone()[0] == 300000, 'compaction committed before kill delay elapsed'
                 os.kill(pid, signal.SIGKILL)
-                print(f'PASS: observed uncommitted WAL spill; SIGKILL after {delay}s')
+                print(f'PASS: observed uncommitted WAL spill baseline={baseline} bytes={size} raw={raw}; SIGKILL after {delay}s')
                 break
             raise AssertionError('compaction committed before spill observation; no proven hit')
         time.sleep(0.01)

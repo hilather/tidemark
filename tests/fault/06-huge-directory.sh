@@ -13,14 +13,14 @@ count=50000
 if [[ ${TIDEMARK_FAULT_SCALE:-0} == 1 ]]; then count=1000000; fi
 fixture "$count"
 # Direct child PID is the scanner whose RSS is measured.
-"$cli" -c "$config" --json scan "$root" --mode walk --throttle max > "$work/scan.json" 2> "$work/scan.err" &
+setsid "$cli" -c "$config" --json scan "$root" --mode walk --throttle max > "$work/scan.json" 2> "$work/scan.err" &
 pid=$!
 children+=("$pid")
 peak=0
 samples=0
 deadline=$((SECONDS + 900))
 while kill -0 "$pid" 2>/dev/null; do
-    (( SECONDS < deadline )) || fail 'huge scan deadline'
+    (( SECONDS < deadline )) || { fail 'huge scan deadline'; exit 1; }
     if rss=$(python3 - "$pid" <<'PYCODE'
 import pathlib, sys
 try:
@@ -36,9 +36,15 @@ PYCODE
     sleep 0.01
 done
 await_child "$pid" 10
-[[ $child_rc == 0 ]] || fail "huge scan exit $child_rc"
-(( samples > 0 && peak > 0 )) || fail 'no RSS samples obtained'
-(( peak <= 1280 * 1024 )) || fail "peak RSS $peak KiB exceeds configured 1280MiB"
-pass "peak RSS $peak KiB under configured budget ($samples samples)"
+if [[ $child_rc == 0 ]]; then
+    pass "huge scan: exit=$child_rc"
+else
+    fail "huge scan: exit=$child_rc"
+fi
+if (( samples > 0 && peak > 0 && peak <= 1280 * 1024 )); then
+    pass "peak RSS $peak KiB under configured budget 1310720 KiB ($samples samples)"
+else
+    fail "RSS peak=$peak KiB samples=$samples budget=1310720 KiB"
+fi
 check "progress reaches $count files" python3 tests/fault/check.py scan "$work/scan.json" huge "$count"
 check 'huge snapshot publication valid' snapshots

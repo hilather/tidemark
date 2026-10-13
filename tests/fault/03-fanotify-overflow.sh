@@ -19,12 +19,12 @@ modes = dict(json.load(open(sys.argv[1]))['data']['watch_modes'])
 assert modes.get(sys.argv[2]) in ('fd_mount', 'dfid_name_mount', 'dfid_name_filesystem'), modes
 PYCODE
  do
-    (( SECONDS < deadline )) || fail 'watcher did not negotiate a mode'
+    (( SECONDS < deadline )) || { fail 'watcher did not negotiate a mode'; exit 1; }
     sleep 1
 done
 # Stop all daemon threads so the kernel queue deterministically overflows.
 kill -STOP "$daemon_pid"
-timeout 120 python3 - "$root" <<'PYCODE'
+run_helper 120 python3 - "$root" <<'PYCODE'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1])
 for n in range(100000):
@@ -34,16 +34,16 @@ PYCODE
 kill -CONT "$daemon_pid"
 deadline=$((SECONDS + 150))
 until cli_json now > "$work/now.json" 2> "$work/now.err" && python3 tests/fault/check.py lossy "$work/now.json" "$work/fs" > "$work/lossy-check.log" 2>&1; do
-    (( SECONDS < deadline )) || fail 'overflow did not flag a lossy minute'
+    (( SECONDS < deadline )) || { fail 'overflow did not flag a lossy minute'; break; }
     sleep 1
 done
 deadline=$((SECONDS + 30))
-until python3 tests/fault/check.py overflow "$work/metrics.prom" 0 > "$work/counter-check.log" 2>&1; do
-    (( SECONDS < deadline )) || fail 'overflow counter did not grow'
+until python3 tests/fault/check.py overflow "$work/metrics/metrics.prom" 0 > "$work/counter-check.log" 2>&1; do
+    (( SECONDS < deadline )) || { fail 'overflow counter did not grow'; break; }
     sleep 1
 done
-pass 'overflow counter grows' 
-pass 'lossy minute flagged'
+check 'overflow counter grows' python3 tests/fault/check.py overflow "$work/metrics/metrics.prom" 0
+check 'lossy minute flagged' python3 tests/fault/check.py lossy "$work/now.json" "$work/fs"
 # A new close-write after recovery must be visible in hot JSON, not just a live PID.
 mkdir "$root/recovered"
 printf 'recovery' > "$root/recovered/after-overflow"
@@ -54,11 +54,17 @@ mounts = json.load(open(sys.argv[1]))['data']['mounts']
 assert any(e['events'] > 0 and e['path'] == sys.argv[2] for m in mounts for e in m['hot_dirs_5m']), mounts
 PYCODE
  do
-    (( SECONDS < deadline )) || fail 'no close-write activity after recovery'
+    (( SECONDS < deadline )) || { fail 'no close-write activity after recovery'; break; }
     sleep 1
 done
-pass 'watcher records activity after overflow'
-cli_json status > "$work/status.json" 2> "$work/status.err" || fail 'watcher status unavailable after overflow'
-pass 'watcher remains responsive' 
-kill -0 "$daemon_pid" || fail 'watcher daemon exited'
-pass 'daemon remains running after overflow'
+check 'watcher records activity after overflow' python3 tests/fault/check.py activity "$work/recovery.json" "$root/recovered"
+if cli_json status > "$work/status.json" 2> "$work/status.err"; then
+    pass "watcher remains responsive: $(cat "$work/status.json")"
+else
+    fail 'watcher status unavailable after overflow'
+fi
+if kill -0 "$daemon_pid"; then
+    pass "daemon remains running after overflow: pid=$daemon_pid"
+else
+    fail 'watcher daemon exited'
+fi

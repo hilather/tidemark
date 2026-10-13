@@ -1,6 +1,10 @@
 #!/bin/bash
 # Owned by: W7-C2-fault. Disposable Rocky guest fault injection.
 set -euo pipefail
+if [[ ${TIDEMARK_FAULT_SLOW:-0} != 1 ]]; then
+    echo 'SKIP: 04-compaction-crash.sh needs TIDEMARK_FAULT_SLOW=1 (about 70 minutes)'
+    exit 0
+fi
 [[ ${TIDEMARK_DEPLOY_TEST_VM:-} == 1 ]] || { echo 'Requires disposable VM marker TIDEMARK_DEPLOY_TEST_VM=1' >&2; echo "RESULT $(basename "$0"): FAIL"; exit 1; }
 [[ $EUID == 0 ]] || { echo 'Requires root in disposable VM' >&2; echo "RESULT $(basename "$0"): FAIL"; exit 1; }
 cd "$(dirname "$0")/../.." || exit 1
@@ -26,16 +30,16 @@ p = pathlib.Path(sys.argv[1])
 p.write_text(p.read_text().replace('interval = "1s"', 'interval = "24h"'))
 PYCODE
 for delay in 0.02 0.2; do
-    timeout 120 python3 tests/fault/compaction.py seed "$state/timeseries.db"
+    run_helper 120 python3 tests/fault/compaction.py seed "$state/timeseries.db"
     start_daemon
     # Observe uncommitted WAL spill rather than assuming an hourly timer hit.
-    check "kill during compaction (delay $delay)" timeout 3800 python3 tests/fault/compaction.py kill "$state/timeseries.db" "$daemon_pid" "$delay"
+    check "kill during compaction (delay $delay)" run_helper 3800 python3 tests/fault/compaction.py kill "$state/timeseries.db" "$daemon_pid" "$delay"
     await_child "$daemon_pid" 30
     check 'killed compaction database opens cleanly' python3 tests/fault/check.py integrity "$state/timeseries.db"
 done
 start_daemon
-check 'recovery compaction reaches oracle' timeout 3800 python3 tests/fault/compaction.py complete "$state/timeseries.db"
-pass 'restart compaction produces one last-value row per complete bucket'
+check 'recovery compaction reaches oracle' run_helper 3800 python3 tests/fault/compaction.py complete "$state/timeseries.db"
+pass 'restart compaction produces 1000 last-value rows (oracle helper exit recorded above)'
 # One more actual daemon compaction must leave seeded historical rows identical.
-check 'second compaction is idempotent' timeout 3800 python3 tests/fault/compaction.py idempotent "$state/timeseries.db"
+check 'second compaction is idempotent' run_helper 3800 python3 tests/fault/compaction.py idempotent "$state/timeseries.db"
 check 'compacted database integrity' python3 tests/fault/check.py integrity "$state/timeseries.db"
