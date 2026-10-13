@@ -397,7 +397,7 @@ mod tests {
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770)).unwrap();
         assert_eq!(
             StateDir::open(&child, false).err().unwrap().kind(),
-            io::ErrorKind::NotFound
+            io::ErrorKind::Other
         );
     }
 }
