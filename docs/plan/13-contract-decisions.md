@@ -1161,3 +1161,43 @@ Sources: `docs/handoff/W7-C2-fault.md`, `docs/handoff/FAULT-fix.md`, `docs/hando
 Stable property/smoke tests run in each CI pass; fuzz/ is a separate nightly libFuzzer workspace. Initial 13 targets and the three later safe seams total 16 (R5-24). Nightly builds/runs each target for 600 seconds with 1 MiB input, 2 GiB RSS and two-second execution limits. At the original handoff, fanotify buffers, mount-id and framing lacked safe seams; FUZZ-seams closes those coverage gaps. OPEN: first GitHub workflow/fuzz execution was unverified in the notes and the cumulative 24-hour crash-free release gate remains outstanding. Timing assertions are coarse regression guards, not complexity proofs.
 
 Sources: `docs/handoff/W7-C3-fuzz.md`, `docs/handoff/FUZZ-seams.md`, `docs/handoff/FUZZ-timing.md`.
+
+### R5-16 — Operator documentation and man pages
+
+**Decision: accepted; open gates explicitly retained.**
+
+docs/operator-guide.md covers installation, live views, snapshots, troubleshooting and limits. cargo xtask man generates command man pages, shipped by the package; operators can use man tidemark. Documentation does not establish privileged acceptance.
+
+Sources: `docs/handoff/W7-D1.md`, `docs/handoff/W7-D2.md`.
+
+### R5-17 — CI dependencies, deny and shell lint
+
+**Decision: accepted; open gates explicitly retained.**
+
+GitHub fetches dependencies with cargo fetch --locked. cargo-deny is pinned to 0.20.2; BSL-1.0 is allowed for xxhash-rust. The initially nonblocking deny job is now required by owner decision (CI-deny-required supersedes CI-deny). Shell scripts gate on shellcheck severity warning; informational/default-severity notes are printed on standard error, outside test-output capture. This supersedes R4-4’s default-severity gate.
+
+Sources: `docs/handoff/CI-fetch.md`, `docs/handoff/CI-deny.md`, `docs/handoff/CI-deny2.md`, `docs/handoff/CI-deny3.md`, `docs/handoff/CI-deny-required.md`, `docs/handoff/CI-shellcheck-severity.md`, `docs/handoff/RECHECK-edge.md`.
+
+### R5-18 — Open work and review evidence
+
+**Decision: accepted; open gates explicitly retained.**
+
+OPEN: million-child paging index decision; staging scale/soak; cumulative fuzz gate; scan.cancel cannot be conditional on scan id; HotMinute has no top_unit; multi-minute files sum minute counts. First-audit direct state trust F01 is addressed by R5-21/24, and symlink atime F03 is documented by R5-23/25. W6-recheck and W7-C1-audit2 are now available: their supplied fix notes establish implemented behavior, not independent acceptance. Final Rocky 8.8/8.10 passes, wave tags and tidemark-core sign-off remain owner gates. Later open items are R5-27.
+
+Sources: `docs/handoff/RECHECK-life.md`, `docs/handoff/RECHECK-state.md`, `docs/handoff/RECHECK-edge.md`, `docs/handoff/STATE-trust-A2.md`, `docs/handoff/SYMLINK-atime.md`.
+
+### R5-19 — Recheck lifecycle, state and edge contracts
+
+**Decision: accepted; open gates explicitly retained.**
+
+R9: every shared-database rename/recreation holds the scan lock; startup recovery waits up to 30 seconds then exits, while healthy storage need not wait. R10: offline prune/rebuild use scan’s daemon check and refuse uncertain endpoints before mutation. R6: output path collisions are rejected. R5: firstboot follow-up uses monotonic time. R3: only a real due measurement clears sampler collection errors. R4: mount resolution and transition logging perform no I/O under the global state lock, then generation-check publication. R1: every failed collection, including resource pressure, invalidates alert input; immutable process display reports remain but alert age is limited to three current intervals. R8: overflow windows use boundary totals; R7: shellcheck notes reach stderr; R2: the request deadline reaches admission and acknowledgement, polling within 50 ms, cancelling an admitted scan on expiry and reporting uncertain outcome.
+
+Sources: `docs/handoff/RECHECK-life.md`, `docs/handoff/RECHECK-state.md`, `docs/handoff/RECHECK-edge.md`.
+
+### R5-20 — Peer credential refusal and separate API deadlines
+
+**Decision: accepted; open gates explicitly retained.**
+
+Unauthorized or failed SO_PEERCRED lookup closes before parsing, with zero response bytes. The forbidden code remains in the frozen dispatch type but is not a transport response to unauthorized peers. Frame collection, handler execution and response writing each have their own absolute ten-second budget. A timed-out handler retains its worker/slot until joined; transport timeout cannot prove an admitted scan or committed reload did not happen. Supersedes R3-14 and ADR-018’s forbidden-response wording.
+
+Sources: `docs/handoff/EDGE-api.md`, `docs/handoff/RECHECK-edge.md`.
