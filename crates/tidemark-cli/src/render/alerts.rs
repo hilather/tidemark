@@ -65,7 +65,12 @@ pub fn history_width(
             crate::render::size::timestamp(r.ts),
             display(r.rule.as_bytes()),
             display(r.subject.as_bytes()),
-            format!("{:?}", r.state).to_lowercase(),
+            match r.state {
+                tidemark_core::live::AlertState::Firing => "firing",
+                tidemark_core::live::AlertState::Resolved => "resolved",
+                tidemark_core::live::AlertState::Renotify => "renotify",
+            }
+            .into(),
             r.value.map_or_else(|| "?".into(), |v| v.to_string()),
             display(r.message.as_bytes()),
         ]);

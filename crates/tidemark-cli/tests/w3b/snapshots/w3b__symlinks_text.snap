@@ -3,7 +3,7 @@ source: crates/tidemark-cli/tests/w3b.rs
 expression: "String::from_utf8(output).unwrap()"
 ---
 Symlinks under /r: 2 (absolute 0, relative 2)
-Dangling: 1
-Loop: 1
-/r/a -> ../missing (Dangling)
-/r/\xFF -> \xFF (Loop)
+dangling: 1
+loop: 1
+/r/a -> ../missing (dangling)
+/r/\xFF -> \xFF (loop)

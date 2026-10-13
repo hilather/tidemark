@@ -1148,7 +1148,7 @@ fn writer_unit_key_json_uses_the_frozen_core_serializer() {
 
 #[test]
 fn appended_watcher_cap_detail_wraps_without_losing_reason() {
-    const DETAIL: &str = "truncated: distinct-file cap reached in the minute 10:42 UTC (timestamp 1791888120) (events complete, per-file counts capped)";
+    const DETAIL: &str = "truncated: distinct-file cap reached in the minute 10:42 UTC (events complete, per-file counts capped)";
     let context = tidemark_cli::Context {
         config: Default::default(),
         config_path: "/fixture".into(),
@@ -1166,6 +1166,7 @@ fn appended_watcher_cap_detail_wraps_without_losing_reason() {
             .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.lines().all(|line| line.len() <= width), "{text}");
+        assert!(!text.contains("(timestamp "), "{text}");
         let lines: Vec<_> = text.lines().collect();
         let column = lines[1].find("DETAIL").unwrap();
         let end = lines
@@ -1318,4 +1319,55 @@ fn rebuild_refuses_pre_api_writer_without_renaming() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(state.join("timeseries-recovery-0/timeseries.db").exists());
+}
+
+#[test]
+fn daemon_lvm_numbers_are_percentages_and_unknowns_without_sockets() {
+    for present in [true, false] {
+        let value = present.then_some(25.0);
+        let report: tidemark_core::api::LvmResult = serde_json::from_value(serde_json::json!({
+            "mounts":[["/data", {"vg":"vg", "lv":"lv", "lv_size":1024,
+                "vg_free":512,"thin_pool":"pool","data_pct":value,"meta_pct":value,"sampled_at":42}]],
+            "vgs":[],"sampled_at":42
+        })).unwrap();
+        let mut now = example_now();
+        now.mounts[0].lvm = Some(report.mounts[0].1.clone());
+        let text = tidemark_cli::render::now::render_text(&now, 100);
+        assert!(!text.contains("Some(") && !text.contains("None"));
+        assert!(
+            text.contains(if present {
+                "data 25.00% meta 25.00%"
+            } else {
+                "data - meta -"
+            }),
+            "{text}"
+        );
+        let trends = vec![(
+            "/data".into(),
+            present.then_some(1.5),
+            present.then_some(-0.5),
+        )];
+        for width in [80, 100] {
+            let mut out = Vec::new();
+            tidemark_cli::render::now::lvm_width(&report, &trends, false, width, &mut out).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(!text.contains("Some(") && !text.contains("None"), "{text}");
+            if present {
+                assert!(
+                    text.contains("25.00%") && text.contains("+1.50") && text.contains("-0.50"),
+                    "{text}"
+                );
+            } else {
+                assert_eq!(
+                    text.split_whitespace().filter(|v| *v == "-").count(),
+                    4,
+                    "{text}"
+                );
+            }
+            let mut out = Vec::new();
+            tidemark_cli::render::now::lvm_width(&report, &trends, true, width, &mut out).unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(doc["data"], serde_json::to_value(&report).unwrap());
+        }
+    }
 }

@@ -727,10 +727,9 @@ impl Rings {
                 }
                 reported[index] = true;
                 let minute = format!(
-                    "{:02}:{:02} UTC (timestamp {})",
+                    "{:02}:{:02} UTC",
                     b.minute.div_euclid(3600).rem_euclid(24),
-                    b.minute.div_euclid(60).rem_euclid(60),
-                    b.minute
+                    b.minute.div_euclid(60).rem_euclid(60)
                 );
                 let qualifier = if index == 3 && !b.transport_loss {
                     " (events complete, per-file counts capped)"
@@ -1044,12 +1043,13 @@ mod tests {
         bucket.distinct_capped = true;
         let detail = r.detail(62);
         assert!(!detail.contains("events complete"));
+        assert!(!detail.contains("(timestamp "), "{detail}");
         for reason in [
             "truncated: distinct-file cap",
             "lost events: queue overflow",
             "lost events: read error",
             "lost events: descriptor pressure",
-            "00:01 UTC (timestamp 60)",
+            "00:01 UTC",
         ] {
             assert!(detail.contains(reason), "{detail}");
         }
@@ -1062,7 +1062,8 @@ mod tests {
         }
         let detail = r.detail(14 * 60);
         assert_eq!(detail.matches("descriptor pressure").count(), 1);
-        assert!(detail.contains("00:14 UTC (timestamp 840)"));
+        assert!(detail.contains("00:14 UTC"));
+        assert!(!detail.contains("(timestamp "), "{detail}");
     }
     #[test]
     fn completed_empty_minutes_and_overflow_boundaries() {

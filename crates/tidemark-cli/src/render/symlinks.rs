@@ -27,18 +27,30 @@ pub fn report(
             report.relative
         )?;
         for (class, count) in &report.by_class {
-            writeln!(out, "{class:?}: {count}")?;
+            writeln!(out, "{}: {count}", class_label(*class))?;
         }
         for (path, target, class) in &report.examples {
             writeln!(
                 out,
-                "{} -> {} ({class:?})",
+                "{} -> {} ({})",
                 path.display_lossy(),
-                display_lossy_bytes(target)
+                display_lossy_bytes(target),
+                class_label(*class)
             )?;
         }
     }
     Ok(())
+}
+fn class_label(class: tidemark_fs::symlinks::SymlinkClass) -> &'static str {
+    use tidemark_fs::symlinks::SymlinkClass::*;
+    match class {
+        InsideRoot => "inside root",
+        OutsideRoot => "outside root",
+        OtherFs => "leaves the mount",
+        Dangling => "dangling",
+        Loop => "loop",
+        Unreadable => "unreadable",
+    }
 }
 fn target_json(bytes: &[u8]) -> serde_json::Value {
     // Target text may contain slashes and dot-dot; preserve it without normalization.
@@ -76,6 +88,37 @@ fn encode_base64(bytes: &[u8]) -> String {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_class_has_an_operator_label() {
+        use tidemark_fs::symlinks::{SymlinkClass::*, SymlinkReport};
+        let classes = [InsideRoot, OutsideRoot, OtherFs, Dangling, Loop, Unreadable];
+        let labels = [
+            "inside root",
+            "outside root",
+            "leaves the mount",
+            "dangling",
+            "loop",
+            "unreadable",
+        ];
+        let root = tidemark_core::path::RawPath::new(b"/r".to_vec()).unwrap();
+        let report = SymlinkReport {
+            total: 6,
+            absolute: 0,
+            relative: 6,
+            by_class: classes.iter().map(|c| (*c, 1)).collect(),
+            examples: classes
+                .iter()
+                .map(|c| (root.clone(), b"target".to_vec(), *c))
+                .collect(),
+        };
+        let mut out = Vec::new();
+        super::report(&root, &report, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        for label in labels {
+            assert!(text.contains(&format!("{label}: 1")), "{text}");
+            assert!(text.contains(&format!("({label})")), "{text}");
+        }
+    }
     #[test]
     fn target_encoding_preserves_relative_bytes() {
         assert_eq!(
