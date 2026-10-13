@@ -1,0 +1,7 @@
+20 1 8:1 / / rw,relatime shared:1 - xfs /dev/sda1 rw,attr2,inode64
+30 20 253:0 / /data rw,noatime shared:2 - xfs /dev/mapper/rl-data rw,attr2,inode64
+31 30 253:0 /database /data/bind rw,noatime - xfs /dev/mapper/rl-data rw,attr2
+32 30 9:0 / /data/with\040space rw,relatime - xfs /dev/md0 rw
+33 30 8:2 / /data/tab\011line\012slash\134 rw - ext4 /dev/sda2 rw
+34 30 8:3 / /data/\377 rw - ext4 /dev/sda3 rw
+99 20 0:99 / /data rw - tmpfs tmpfs rw

@@ -1,0 +1,32 @@
+# Owned by: W7-C3-fuzz
+name: Parser fuzzing
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [mountinfo, disk_stat, cgroup_unit, fdinfo_flags, stat_starttime, lvs, vgs, config, api_request, api_response, staged, firstboot, catalog_path]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+      - name: Build all targets
+        run: cargo +nightly fuzz build
+      - name: Run target for ten minutes
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600 -max_len=1048576 -rss_limit_mb=2048 -timeout=2
+      - name: Preserve crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

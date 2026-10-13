@@ -1,2 +1,5 @@
 /target/
 *.db.tmp
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
