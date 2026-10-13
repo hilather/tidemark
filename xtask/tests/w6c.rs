@@ -127,7 +127,13 @@ fn metadata_and_scriptlet_contract() {
         ("/usr/share/doc/tidemark/11-rollout-runbook.md", "0644"),
         ("/usr/share/bash-completion/completions/tidemark", "0644"),
     ];
-    assert_eq!(assets.len(), expected.len());
+    assert_eq!(
+        assets
+            .iter()
+            .filter(|a| !a["source"].as_str().unwrap().starts_with("target/man/"))
+            .count(),
+        expected.len()
+    );
     for (path, mode) in expected {
         let a = assets
             .iter()
@@ -199,6 +205,7 @@ fn pure_commands_and_invalid_arguments() {
         script.contains("cargo build --offline --locked --release -p tidemark-cli -p tidemarkd")
     );
     assert!(script.contains("tidemark completions bash > target/release/tidemark.bash"));
+    assert!(script.contains("cargo run --offline --locked -p xtask -- man; cargo"));
     assert!(!script.contains("curl"));
     assert!(rpm::run(root(), ["--bad".to_owned()].into_iter()).is_err());
 }
@@ -288,7 +295,7 @@ fn native_options_and_command_order() {
     }
     for online in [false, true] {
         let commands = rpm::native_commands("0.1.1", online, false).unwrap();
-        assert_eq!(commands.len(), 3);
+        assert_eq!(commands.len(), 4);
         assert_eq!(commands[0].program, "cargo");
         assert_eq!(commands[0].args[0], "build");
         assert!(commands[0].args.contains(&"--locked".into()));
@@ -303,7 +310,9 @@ fn native_options_and_command_order() {
             Some("target/release/tidemark.bash")
         );
         assert_eq!(commands[2].program, "cargo");
-        assert_eq!(commands[2].args, rpm::generate_rpm_args("0.1.1").unwrap());
+        assert_eq!(commands[2].args.last().map(String::as_str), Some("man"));
+        assert_eq!(commands[2].args.contains(&"--offline".into()), !online);
+        assert_eq!(commands[3].args, rpm::generate_rpm_args("0.1.1").unwrap());
     }
     assert!(rpm::native_commands("bad", false, false).is_err());
 }
@@ -378,8 +387,8 @@ fn upgrade_fixture_options_and_drift() {
     for online in [false, true] {
         let ordinary = rpm::native_commands("0.1.1", online, false).unwrap();
         let mut fixture = rpm::native_commands("0.1.1", online, true).unwrap();
-        assert_eq!(fixture[2].args[4], "tests/install/rpm-upgrade.toml");
-        fixture[2].args[4] = "packaging/rpm/rpm.toml".into();
+        assert_eq!(fixture[3].args[4], "tests/install/rpm-upgrade.toml");
+        fixture[3].args[4] = "packaging/rpm/rpm.toml".into();
         assert_eq!(fixture, ordinary);
     }
     let metadata = read("packaging/rpm/rpm.toml");
