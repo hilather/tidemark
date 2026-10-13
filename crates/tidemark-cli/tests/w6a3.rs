@@ -1094,3 +1094,17 @@ fn live_human_state_and_scan_labels_are_lowercase() {
         assert!(!text.contains("Complete") && !text.contains("Fid"));
     }
 }
+
+#[test]
+fn writer_unit_key_json_uses_the_frozen_core_serializer() {
+    let mut report = example_now();
+    report.mounts[0].writers_5m[0].key = b"user-1000".to_vec();
+    let context = tidemark_cli::Context { config: Default::default(), config_path: "/fixture".into(), json: true, color: false };
+    let mut out = Vec::new();
+    tidemark_cli::render::now::write(&report, &context, &mut out).unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let entry = &report.mounts[0].writers_5m[0];
+    assert_eq!(doc["data"]["mounts"][0]["writers_5m"][0], serde_json::to_value(entry).unwrap());
+    assert_eq!(doc["data"]["mounts"][0]["writers_5m"][0]["key"], serde_json::json!(b"user-1000".to_vec()));
+    assert!(doc["data"]["mounts"][0]["writers_5m"][0].get("path").is_none());
+}
