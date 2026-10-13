@@ -255,9 +255,24 @@ impl Catalog {
     /// Corrupt/unsupported files are logged and skipped; temporary files are ignored.
     /// Existing catalog rows are replaced, including records with missing files.
     pub fn rebuild_from_files(&self) -> Result<usize, StoreError> {
+        self.rebuild(false)
+    }
+    /// Refresh published snapshots after scan retention, preserving failed and
+    /// running lifecycle records that have no snapshot file.
+    pub fn rebuild_after_scan(&self) -> Result<usize, StoreError> {
+        self.rebuild(true)
+    }
+    fn rebuild(&self, preserve_lifecycle: bool) -> Result<usize, StoreError> {
         let snapshots = self.state_dir.join("snapshots");
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM scans", [])?;
+        tx.execute(
+            if preserve_lifecycle {
+                "DELETE FROM scans WHERE file IS NOT NULL OR status NOT IN ('failed','running')"
+            } else {
+                "DELETE FROM scans"
+            },
+            [],
+        )?;
         if !snapshots.try_exists()? {
             tx.commit()?;
             return Ok(0);
@@ -303,7 +318,7 @@ impl Catalog {
                         errors: Some(m.errors),
                         duration_ms: duration,
                     },
-                    false,
+                    preserve_lifecycle,
                     &m.tool_version,
                 )?;
                 count = count
@@ -356,4 +371,123 @@ pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError> {
     catalog.recovery_files = preserved;
     catalog.rebuild_from_files()?;
     Ok(catalog)
+}
+
+/// Repair abandoned scans and remove snapshot temporaries, best effort.
+///
+/// The caller MUST hold the exclusive host scan lock and must call this before
+/// recording its own running scan. `now` is the repair timestamp in UTC seconds.
+/// Errors are logged independently so file failures do not prevent row repair.
+pub fn cleanup_abandoned_scans(state_dir: &Path, now: i64) {
+    if let Err(error) = cleanup_temporaries(state_dir) {
+        tracing::warn!(%error, "snapshot temporary cleanup failed");
+    }
+    if let Err(error) = repair_running(state_dir, now) {
+        tracing::warn!(%error, "abandoned scan catalog repair failed");
+    }
+}
+
+fn repair_running(state_dir: &Path, now: i64) -> Result<(), StoreError> {
+    let catalog = Catalog::open(state_dir, true)?;
+    // One row per transaction bounds memory and logs only committed repairs.
+    // A crash during cleanup leaves the remaining rows for the next lock holder.
+    let mut cursor = String::new();
+    loop {
+        let tx = catalog.conn.unchecked_transaction()?;
+        let entry = tx
+            .query_row(
+                "SELECT scan_id,root FROM scans WHERE scan_id>=? AND status='running' ORDER BY scan_id LIMIT 1",
+                [&cursor],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let Some((scan_id, root)) = entry else {
+            break;
+        };
+        let root = RawPath::new(root)?;
+        tx.execute("UPDATE scans SET status='failed',finished_at=?,file=NULL WHERE scan_id=? AND status='running'", params![now, scan_id])?;
+        tx.commit()?;
+        cursor.clone_from(&scan_id);
+        tracing::warn!(root=%root.display_lossy(), %scan_id, "repaired abandoned running scan");
+    }
+    Ok(())
+}
+
+fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
+    use rustix::fs::{self as sys, AtFlags, Dir, FileType, Mode, OFlags};
+    fn directory(
+        fd: impl std::os::fd::AsFd,
+        name: impl rustix::path::Arg + Copy,
+    ) -> std::io::Result<rustix::fd::OwnedFd> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        match sys::openat(&fd, name, flags | OFlags::NOATIME, Mode::empty()) {
+            Err(rustix::io::Errno::PERM) => Ok(sys::openat(fd, name, flags, Mode::empty())?),
+            result => Ok(result?),
+        }
+    }
+    // A proc-fd path ending in /. is intentional: the final component is a
+    // directory, while the already retained ancestor descriptor binds the state.
+    let state = directory(sys::CWD, state_dir)?;
+    let mount = crate::space_guard::mount_id(&state)?;
+    let snapshots = match directory(&state, "snapshots") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        result => result?,
+    };
+    if crate::space_guard::mount_id(&snapshots)? != mount {
+        return Ok(());
+    }
+    let mut roots = Dir::new(snapshots)?;
+    while let Some(entry) = roots.next() {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let result = (|| -> std::io::Result<()> {
+            let bound = sys::openat(
+                roots.fd()?,
+                name,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            if FileType::from_raw_mode(sys::fstat(&bound)?.st_mode) != FileType::Directory
+                || crate::space_guard::mount_id(&bound)? != mount
+            {
+                return Ok(());
+            }
+            let mut files = Dir::new(directory(&bound, ".")?)?;
+            while let Some(file) = files.next() {
+                let file = file?;
+                let filename = file.file_name();
+                if !filename.to_bytes().ends_with(b".db.tmp") {
+                    continue;
+                }
+                let removed = (|| -> std::io::Result<()> {
+                    let file = sys::openat(
+                        files.fd()?,
+                        filename,
+                        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )?;
+                    let stat = sys::fstat(&file)?;
+                    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                        || crate::space_guard::mount_id(&file)? != mount
+                    {
+                        return Ok(());
+                    }
+                    sys::unlinkat(files.fd()?, filename, AtFlags::empty())?;
+                    tracing::warn!(root=%name.to_string_lossy(), scan_id=%String::from_utf8_lossy(&filename.to_bytes()[..filename.to_bytes().len()-7]), "removed abandoned snapshot temporary");
+                    Ok(())
+                })();
+                if let Err(error) = removed {
+                    tracing::warn!(root=%name.to_string_lossy(), file=%filename.to_string_lossy(), %error, "snapshot temporary cleanup failed");
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(root=%name.to_string_lossy(), %error, "snapshot directory cleanup failed");
+        }
+    }
+    Ok(())
 }

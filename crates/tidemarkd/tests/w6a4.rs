@@ -212,13 +212,84 @@ fn non_cancel_failure_records_failed_without_snapshot() {
     h.failed(&scan.scan_id);
 }
 #[test]
-fn shutdown_interrupted_outcome_exposes_startup_repair_requirement() {
+fn shutdown_interrupted_outcome_is_repaired_at_startup() {
     let mut h = Harness::new();
     h.slow_tree();
     let scan: tidemark_core::api::ScanStartResult = h.api("scan.start", h.params());
     h.stop();
-    // Shared daemon shutdown can interrupt final persistence. Startup recovery
-    // currently handles corruption only; coordinator must repair this stale row.
+    // Shared daemon shutdown can interrupt final persistence.
     assert_eq!(h.entry(&scan.scan_id).status, "running");
     assert!(h.entry(&scan.scan_id).file.is_none());
+    let tmp = h._state.path().join("snapshots/fixture/dead.db.tmp");
+    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        h._state.path().join("snapshots"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::write(&tmp, b"abandoned").unwrap();
+    startup(&h);
+    assert_eq!(h.entry(&scan.scan_id).status, "failed");
+    assert_eq!(h.entry(&scan.scan_id).finished_at, Some(123));
+    assert!(!tmp.exists());
+}
+
+fn startup(h: &Harness) {
+    let path = h._root.path().join("config.toml");
+    std::fs::write(&path, format!("[general]\nstate_dir='{}'\nsocket='{}'\n[watch]\nenabled=false\n[lvm]\nenabled=false\n[procscan]\nenabled=false\n[[roots]]\npath='{}'\nschedule='off'\n", h._state.path().display(), h._state.path().join("api.sock").display(), h._root.path().display())).unwrap();
+    let cfg = Config::load(&path).unwrap();
+    // Cleanup precedes socket binding. A denied socket is expected in the worker
+    // sandbox; a pre-set shutdown also bounds startup on unrestricted CI.
+    let _result = tidemarkd::run_controlled(
+        cfg.clone(),
+        tidemarkd::RunOptions {
+            config_path: path,
+            now: 123,
+        },
+        LiveState::new(&cfg, 123),
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+}
+
+#[test]
+fn scan_lock_child() {
+    let Some(state) = std::env::var_os("TIDEMARK_LOCK_CHILD") else {
+        return;
+    };
+    let state = std::path::PathBuf::from(state);
+    let _lock = tidemark_scan::orchestrator::ScanLock::acquire(&state).unwrap();
+    std::fs::write(state.join("lock-ready"), b"ready").unwrap();
+    std::thread::sleep(Duration::from_secs(30));
+}
+#[test]
+fn startup_skips_cleanup_while_another_process_holds_lock() {
+    let mut h = Harness::new();
+    h.slow_tree();
+    let scan: tidemark_core::api::ScanStartResult = h.api("scan.start", h.params());
+    h.stop();
+    let tmp = h._state.path().join("snapshots/fixture/dead.db.tmp");
+    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        h._state.path().join("snapshots"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::write(&tmp, b"abandoned").unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "scan_lock_child"])
+        .env("TIDEMARK_LOCK_CHILD", h._state.path())
+        .spawn()
+        .unwrap();
+    wait(|| h._state.path().join("lock-ready").exists());
+    startup(&h);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(h.entry(&scan.scan_id).status, "running");
+    assert!(tmp.exists());
+    startup(&h);
+    assert_eq!(h.entry(&scan.scan_id).status, "failed");
+    assert!(!tmp.exists());
 }

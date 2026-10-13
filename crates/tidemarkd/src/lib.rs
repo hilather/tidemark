@@ -435,6 +435,13 @@ pub fn run_controlled(
         }
         Err(error) => return Err(DaemonError::Store(error.to_string())),
     };
+    match tidemark_scan::orchestrator::ScanLock::acquire(&storage) {
+        Ok(_lock) => tidemark_store::catalog::cleanup_abandoned_scans(&storage, options.now),
+        Err(tidemark_scan::orchestrator::ScanError::Busy) => {
+            tracing::info!("startup scan cleanup skipped: host scan lock is held");
+        }
+        Err(error) => tracing::warn!(%error, "startup scan cleanup lock failed"),
+    }
     // Read catalog history before treating any configured root as measured never-scanned.
     for root in &config.roots {
         let raw = tidemark_core::path::RawPath::from_path(&root.path)
