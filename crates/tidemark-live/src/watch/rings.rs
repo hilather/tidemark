@@ -89,7 +89,9 @@ impl Bucket {
     fn compact(&mut self, index: usize, limit: usize) {
         // Rank references, then move retained rows: no duplicate pathname payload.
         let mut rows: Vec<_> = self.maps[index].iter().collect();
-        rows.sort_by(|(_, a), (_, b)| b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key)));
+        rows.sort_unstable_by(|(_, a), (_, b)| {
+            b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key))
+        });
         let keep: HashSet<_> = rows
             .into_iter()
             .take(limit)
@@ -192,22 +194,39 @@ impl Drop for Rings {
 }
 
 fn ranked(map: &BTreeMap<Vec<u8>, HotEntry>, limit: usize) -> Vec<HotEntry> {
-    let mut rows: Vec<_> = map.values().collect();
-    rows.sort_by(|a, b| b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key)));
-    rows.into_iter()
-        .take(limit)
-        .filter_map(|r| {
-            Some(HotEntry {
-                key: copy(&r.key)?,
-                events: r.events,
-                files: r.files,
-                bytes_delta: r.bytes_delta,
-                top_unit: r.top_unit.clone(),
-                lossy: r.lossy,
-            })
-        })
-        .collect()
+    let mut rows = Vec::new();
+    if rows.try_reserve_exact(map.len()).is_err() {
+        return Vec::new();
+    }
+    rows.extend(map.values());
+    rows.sort_unstable_by(|a, b| b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key)));
+    let mut result = Vec::new();
+    if result.try_reserve_exact(rows.len().min(limit)).is_err() {
+        return result;
+    }
+    for r in rows.into_iter().take(limit) {
+        let Some(key) = copy(&r.key) else {
+            break;
+        };
+        let top_unit = match r.top_unit.as_deref() {
+            Some(unit) => match super::budget::copy_string(unit) {
+                Some(unit) => Some(unit),
+                None => break,
+            },
+            None => None,
+        };
+        result.push(HotEntry {
+            key,
+            events: r.events,
+            files: r.files,
+            bytes_delta: r.bytes_delta,
+            top_unit,
+            lossy: r.lossy,
+        });
+    }
+    result
 }
+
 impl Rings {
     pub fn new() -> Self {
         Self {
@@ -733,23 +752,24 @@ impl Rings {
             .count() as u32
     }
     fn output_bytes(b: &Bucket, limit: usize, mount: &str, dirs: bool) -> usize {
-        let mut bytes = 0;
-        for (index, map) in b.maps.iter().enumerate() {
-            let mut rows: Vec<_> = map.values().collect();
-            rows.sort_by(|a, b| b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key)));
-            for row in rows.into_iter().take(limit) {
-                if !b.drained {
-                    bytes += row.key.len()
-                        + row.top_unit.as_ref().map_or(0, String::len)
-                        + mount.len()
-                        + [3, 4, 4][index];
-                }
-                if dirs && index == 0 {
-                    bytes += row.key.len() + row.top_unit.as_ref().map_or(0, String::len);
-                }
-            }
-        }
-        bytes
+        // Admission must precede ranking scratch allocation. The largest row
+        // cost times the requested count conservatively covers any ranking.
+        b.maps
+            .iter()
+            .enumerate()
+            .map(|(index, map)| {
+                let largest = map
+                    .values()
+                    .map(|row| {
+                        let payload = row.key.len() + row.top_unit.as_ref().map_or(0, String::len);
+                        usize::from(!b.drained) * (payload + mount.len() + [3, 4, 4][index])
+                            + usize::from(dirs && index == 0) * payload
+                    })
+                    .max()
+                    .unwrap_or(0);
+                largest.saturating_mul(map.len().min(limit))
+            })
+            .sum()
     }
     fn output_reservation(
         b: &mut Bucket,
@@ -762,8 +782,11 @@ impl Rings {
             let payload = Reservation::new(&b.budget, Self::output_bytes(b, limit, mount, dirs));
             let count: usize = b.maps.iter().map(|m| m.len().min(limit)).sum();
             let count_dir = if dirs { b.maps[0].len().min(limit) } else { 0 };
-            let node_bytes = count
-                * (3 * std::mem::size_of::<HotEntry>() + 2 * std::mem::size_of::<HotMinute>())
+            let ranking_bytes = b.maps.iter().map(BTreeMap::len).max().unwrap_or(0)
+                * std::mem::size_of::<&HotEntry>();
+            let node_bytes = ranking_bytes
+                + count
+                    * (3 * std::mem::size_of::<HotEntry>() + 2 * std::mem::size_of::<HotMinute>())
                 + count_dir * 2 * std::mem::size_of::<HotEntry>();
             let nodes = payload
                 .as_ref()
@@ -900,6 +923,45 @@ mod tests {
                         + b.seen.iter().map(|(_, k, _)| k.capacity()).sum::<usize>()
                 })
                 .sum::<usize>()
+    }
+    #[test]
+    fn output_admission_bounds_unequal_rows_before_ranking() {
+        let mut r = Rings::new();
+        r.configure(Budget::new(), b"/mount").unwrap();
+        for n in 0..10 {
+            r.add(
+                0,
+                [vec![b'x'; n * 100 + 1], b"unit".to_vec(), b"comm".to_vec()],
+                n as i64,
+                Some("writer".into()),
+                (1, n as u64),
+            );
+        }
+        let bucket = r.buckets.back().unwrap();
+        for limit in [0, 1, 5, 1000] {
+            let admitted = Rings::output_bytes(bucket, limit, "/mount", true);
+            let persisted = bucket
+                .maps
+                .iter()
+                .enumerate()
+                .map(|(index, map)| {
+                    ranked(map, limit)
+                        .iter()
+                        .map(|row| {
+                            row.key.len()
+                                + row.top_unit.as_ref().map_or(0, String::len)
+                                + "/mount".len()
+                                + [3, 4, 4][index]
+                        })
+                        .sum::<usize>()
+                })
+                .sum::<usize>();
+            let dirs = ranked(&bucket.maps[0], limit)
+                .iter()
+                .map(|row| row.key.len() + row.top_unit.as_ref().map_or(0, String::len))
+                .sum::<usize>();
+            assert!(admitted >= persisted + dirs);
+        }
     }
     #[test]
     fn byte_budget_falls_back_to_root_and_releases_completed_maps() {
