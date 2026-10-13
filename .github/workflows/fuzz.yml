@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [mountinfo, disk_stat, cgroup_unit, fdinfo_flags, stat_starttime, lvs, vgs, config, api_request, api_response, staged, firstboot, catalog_path]
+        target: [mountinfo, disk_stat, cgroup_unit, fdinfo_flags, stat_starttime, lvs, vgs, config, api_request, api_response, staged, firstboot, catalog_path, fanotify_events, mount_id, api_frame]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

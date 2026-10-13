@@ -1,6 +1,7 @@
 //! Owned by: WFUZZ-seams
 //! fdinfo mount identity generated properties and scaling guards.
 #![forbid(unsafe_code)]
+#![allow(clippy::unwrap_used)]
 #[path = "../../../fuzz/support/seams.rs"]
 mod seams;
 use tidemark_live::fuzzing::parse_mount_id;

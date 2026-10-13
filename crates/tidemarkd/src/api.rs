@@ -1042,6 +1042,15 @@ mod tests {
         for byte in [0, 255, b'9'] {
             super::fuzz_seams::timed(&vec![byte; LIMIT + 1], exercise_frame);
         }
+        let mut deep = b"{\"v\":1,\"id\":\"x\",\"method\":\"status\",\"params\":".to_vec();
+        deep.extend(std::iter::repeat_n(b'[', 512));
+        deep.extend(std::iter::repeat_n(b']', 512));
+        deep.extend_from_slice(b"}\n");
+        assert!(matches!(
+            read_frame(&mut deep.as_slice(), &mut FrameDecoder::default()),
+            Err(FrameError::InvalidJson(_))
+        ));
+        super::fuzz_seams::timed(&deep, exercise_frame);
     }
 
     use std::io::{BufRead, BufReader};

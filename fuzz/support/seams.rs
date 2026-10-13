@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 use std::time::{Duration, Instant};
 
+/// Exercise deterministic arbitrary bytes and exhaustive mutations of supplied seeds.
 pub fn generated(mut exercise: impl FnMut(&[u8]), seeds: &[&[u8]]) {
     let mut state = 0x46555a5a_u64;
     for length in (0..256).chain([512, 1024, 4096, 8192]) {
@@ -32,6 +33,7 @@ pub fn generated(mut exercise: impl FnMut(&[u8]), seeds: &[&[u8]]) {
     }
 }
 
+/// Observe one parser call with generous CI slack, returning its elapsed duration.
 pub fn timed(bytes: &[u8], mut exercise: impl FnMut(&[u8])) -> Duration {
     let start = Instant::now();
     exercise(std::hint::black_box(bytes));
@@ -45,6 +47,7 @@ pub fn timed(bytes: &[u8], mut exercise: impl FnMut(&[u8])) -> Duration {
     elapsed
 }
 
+/// Compare minimum elapsed times for 64 KiB and 1 MiB repeated seed inputs.
 pub fn scaling(seed: &[u8], mut exercise: impl FnMut(&[u8])) {
     let mut minimum = |size: usize| {
         let mut bytes = seed.repeat(size.div_ceil(seed.len()));
