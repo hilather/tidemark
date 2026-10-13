@@ -629,9 +629,11 @@ pub fn run_controlled(
                 if Instant::now() >= firstboot_due {
                     firstboot_due = Instant::now() + Duration::from_secs(10);
                     if let Some(inputs) = state.view().firstboot_inputs() {
-                        if let Err(error) =
-                            firstboot_followup.poll(&state.config().0.general.state_dir, &inputs, unix_now())
-                        {
+                        if let Err(error) = firstboot_followup.poll(
+                            &state.config().0.general.state_dir,
+                            &inputs,
+                            unix_now(),
+                        ) {
                             tracing::warn!(%error, "firstboot followup failed");
                         }
                     }
