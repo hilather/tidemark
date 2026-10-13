@@ -22,7 +22,8 @@ pub struct FsTotals {
     pub avail: u64,
 }
 fn totals(path: &Path) -> io::Result<FsTotals> {
-    let stat = rustix::fs::statvfs(path)?;
+    let verified = crate::state_dir::StateDir::open(path, false)?;
+    let stat = rustix::fs::fstatvfs(verified.fd())?;
     let size = stat
         .f_blocks
         .checked_mul(stat.f_frsize)
@@ -67,7 +68,8 @@ fn state_usage(path: &Path) -> io::Result<u64> {
     use rustix::fs::{self, Dir, FileType, Mode, OFlags};
     // Iterative DFS has at most 4096 retained directory fds and one entry fd.
     const MAX_DEPTH: usize = 4096;
-    let root = directory(fs::CWD, path)?;
+    let verified = crate::state_dir::StateDir::open(path, false)?;
+    let root = rustix::io::dup(verified.fd())?;
     let root_mount = mount_id(&root)?;
     let root_stat = fs::fstat(&root)?;
     let mut used = u64::try_from(root_stat.st_blocks)
@@ -109,6 +111,9 @@ fn state_usage(path: &Path) -> io::Result<u64> {
             .checked_add(bytes)
             .ok_or_else(|| io::Error::other("state allocation overflow"))?;
         if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+            if stat.st_uid != rustix::process::geteuid().as_raw() || stat.st_mode & 0o077 != 0 {
+                return Err(io::Error::other(format!("state directory {}: child {} is not private and owned", path.as_os_str().to_string_lossy(), name.to_string_lossy())));
+            }
             if stack.len() >= MAX_DEPTH {
                 return Err(io::Error::other("state directory depth exceeds 4096"));
             }
