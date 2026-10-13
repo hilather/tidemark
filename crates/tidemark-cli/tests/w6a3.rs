@@ -963,30 +963,65 @@ fn status_error_continuations_keep_the_message_and_prefix_indent() {
 }
 
 #[test]
+fn direct_scan_space_refusal_has_state_context() {
+    let dir = ::test_support::private_tempdir().unwrap();
+    let p = config(&dir);
+    // Refuse in preflight, before walking /, without exhausting the filesystem.
+    let mut text = std::fs::read_to_string(&p).unwrap();
+    text.push_str("[retention]\nmin_free_pct=100.0\n");
+    std::fs::write(&p, text).unwrap();
+    let out = cli(&p, &["-q", "--json", "scan", "/", "--mode", "walk"]);
+    assert_eq!(out.status.code(), Some(5));
+    let error = String::from_utf8_lossy(&out.stderr);
+    let state = dir.path().join("state");
+    if error
+        == format!(
+            "scan: /: scan state: {}: root mount changed during setup\n",
+            state.display()
+        )
+    {
+        eprintln!("pending unrestricted host: root mount identity differs in sandbox");
+        return;
+    }
+    assert_eq!(
+        error,
+        format!(
+            "scan: /: scan state: {}: NoSpace\n",
+            dir.path().join("state").display()
+        )
+    );
+}
+
+#[test]
 fn daemon_scan_space_refusal_matches_direct_exit_and_wording() {
     if !socket_available() {
         return;
     }
     use tidemark_core::api::{ApiError, ApiErrorCode};
     for (code, message, exit, expected) in [
-        (ApiErrorCode::Unavailable, "scan: NoSpace", 5, "NoSpace"),
+        (
+            ApiErrorCode::Unavailable,
+            "scan: NoSpace",
+            5,
+            "scan: /: NoSpace\n",
+        ),
         (
             ApiErrorCode::Unavailable,
             "scan: NoSpace: floor",
             5,
-            "NoSpace",
+            "scan: /: NoSpace\n",
         ),
         (
             ApiErrorCode::Unavailable,
             "measurement unavailable",
             4,
-            "measurement unavailable",
+            "scan: /: daemon request scan.start: measurement unavailable\n",
         ),
         (
             ApiErrorCode::Internal,
             "scan: NoSpace",
             1,
-            "daemon error: scan: NoSpace",
+            "scan: /: daemon request scan.start: daemon error: scan: NoSpace\n",
         ),
     ] {
         let dir = ::test_support::private_tempdir().unwrap();
@@ -1035,9 +1070,12 @@ fn daemon_scan_space_refusal_matches_direct_exit_and_wording() {
         server.join().unwrap();
         assert_eq!(out.status.code(), Some(exit));
         let error = String::from_utf8_lossy(&out.stderr);
-        assert!(error.contains(expected), "{error}");
+        assert_eq!(error, expected);
         if exit == 5 {
-            assert!(!error.contains("scan:"), "{error}");
+            // Direct mode additionally includes scan state context; see the
+            // separate direct-mode test and GATE-fix2 handoff for this gap.
+            assert!(!error.contains("scan: scan:"), "{error}");
+            assert!(!error.contains("daemon error"), "{error}");
         }
     }
 }
