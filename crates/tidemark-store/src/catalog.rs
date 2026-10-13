@@ -352,15 +352,29 @@ pub fn recover_catalog_with_lock(
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
     )
     .map_err(std::io::Error::from)?;
-    recover_catalog(state_dir)
+    recover_catalog_owned(state_dir)
 }
 
 /// Preserve the shared database and sidecars, then rebuild from published snapshots.
 ///
 /// The caller must stop writers and close all catalog/sample connections first.
+/// This compatibility entry point acquires the scan lock itself; callers already
+/// holding it must use `recover_catalog_with_lock` instead.
 /// Historical samples remain in `Catalog::recovery_files()` and are unavailable in
 /// the new database. Ordinary `Catalog::open` never performs this recovery.
 pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(state_dir.join("scan.lock"))?;
+    recover_catalog_with_lock(state_dir, &lock)
+}
+fn recover_catalog_owned(state_dir: &Path) -> Result<Catalog, StoreError> {
     // A private, exclusively created directory supplies a collision-free namespace.
     let mut recovery = None;
     for sequence in 0..10_000u32 {

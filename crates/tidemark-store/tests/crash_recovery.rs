@@ -141,6 +141,7 @@ fn checked_recovery_refuses_wrong_or_busy_scan_lock() {
     rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
     let other = std::fs::File::open(dir.path().join("scan.lock")).unwrap();
     assert!(recover_catalog_with_lock(dir.path(), &other).is_err());
+    assert!(tidemark_store::catalog::recover_catalog(dir.path()).is_err());
     let wrong = std::fs::File::create(dir.path().join("wrong.lock")).unwrap();
     assert!(recover_catalog_with_lock(dir.path(), &wrong).is_err());
     assert_eq!(std::fs::read(&database).unwrap(), b"corrupt");

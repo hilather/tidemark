@@ -145,7 +145,16 @@ mod tests {
     fn recovery_wait_preserves_busy_database_and_sidecars() {
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
-        let lock = tidemark_scan::orchestrator::ScanLock::acquire(dir.path()).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::recovery_scan_lock_child"])
+            .env("TIDEMARK_RECOVERY_LOCK_CHILD", dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("ready").exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let mut originals = Vec::new();
         for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
             let path = dir.path().join(name);
@@ -165,9 +174,20 @@ mod tests {
             assert_eq!(std::fs::read(path).unwrap(), b"corrupt fixture");
         }
         assert!(!dir.path().join("timeseries-recovery-0").exists());
-        drop(lock);
+        child.kill().unwrap();
+        child.wait().unwrap();
         let catalog = startup_catalog(dir.path(), 100, Duration::ZERO).unwrap();
         assert_eq!(catalog.recovery_files().len(), 3);
+    }
+    #[test]
+    fn recovery_scan_lock_child() {
+        let Some(path) = std::env::var_os("TIDEMARK_RECOVERY_LOCK_CHILD") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let _lock = tidemark_scan::orchestrator::ScanLock::acquire(&path).unwrap();
+        std::fs::write(path.join("ready"), b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(30));
     }
     #[test]
     fn healthy_catalog_does_not_wait_for_scan_lock() {
@@ -1087,13 +1107,15 @@ fn startup_catalog(
     };
     let catalog = match &lock {
         Some(lock) => {
-            let catalog = lock
-                .open_catalog(storage)
-                .map_err(|e| DaemonError::Store(e.to_string()))?;
+            let catalog = lock.open_catalog(storage).map_err(|e| match e {
+                tidemark_scan::orchestrator::ScanError::Store(error) => startup_store_error(error),
+                error => DaemonError::Store(error.to_string()),
+            })?;
             tidemark_store::catalog::cleanup_abandoned_scans(storage, now);
             catalog
         }
         None => {
+            tracing::info!("startup scan cleanup skipped: host scan lock is held");
             tidemark_store::catalog::Catalog::open(storage, true).map_err(startup_store_error)?
         }
     };

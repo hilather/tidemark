@@ -726,26 +726,16 @@ impl ScanLock {
         }
     }
 }
-/// Open without destructive recovery; preserve corrupt files only after a reported corruption.
-/// Caller must hold the host lock and have no other sample/catalog connections.
+/// Open shared storage, acquiring scan ownership for writable opens and recovery.
+/// Callers already holding a scan lock use `ScanLock::open_catalog` instead.
 pub fn open_catalog(
     state: &std::path::Path,
     rw: bool,
 ) -> Result<tidemark_store::catalog::Catalog, ScanError> {
-    match tidemark_store::catalog::Catalog::open(state, rw) {
-        Ok(c) => Ok(c),
-        Err(tidemark_store::StoreError::Sql(ref e))
-            if e.sqlite_error()
-                .is_some_and(|e| matches!(e.extended_code & 255, 11 | 26))
-                && rw =>
-        {
-            let c = tidemark_store::catalog::recover_catalog(state)?;
-            for p in c.recovery_files() {
-                tracing::warn!(path=%p.display(), "preserved catalog recovery file");
-            }
-            Ok(c)
-        }
-        Err(e) => Err(e.into()),
+    if rw {
+        ScanLock::acquire(state)?.open_catalog(state)
+    } else {
+        Ok(tidemark_store::catalog::Catalog::open(state, false)?)
     }
 }
 fn open_directory(
