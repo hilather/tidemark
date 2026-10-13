@@ -35,16 +35,29 @@ impl Harness {
         Self::with_nested_storage(schedule, throttle, false)
     }
     fn with_nested_storage(schedule: &str, throttle: &str, nested: bool) -> Self {
-        Self::with_clock(schedule, throttle, nested, Arc::new(tidemarkd::unix_now))
+        Self::with_clocks(
+            schedule,
+            throttle,
+            nested,
+            Arc::new(tidemarkd::unix_now),
+            tidemarkd::monotonic_clock(),
+        )
     }
-    fn with_clock(schedule: &str, throttle: &str, nested: bool, clock: tidemarkd::Clock) -> Self {
-        Self::with_root_count(schedule, throttle, nested, clock, 1)
+    fn with_clocks(
+        schedule: &str,
+        throttle: &str,
+        nested: bool,
+        clock: tidemarkd::Clock,
+        monotonic: tidemarkd::Clock,
+    ) -> Self {
+        Self::with_root_count(schedule, throttle, nested, clock, monotonic, 1)
     }
     fn with_root_count(
         schedule: &str,
         throttle: &str,
         nested: bool,
         clock: tidemarkd::Clock,
+        monotonic: tidemarkd::Clock,
         root_count: usize,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -77,12 +90,13 @@ impl Harness {
         let writer_stop = Arc::new(AtomicBool::new(false));
         let (writer, wh) =
             tswriter::start(Arc::new(cfg.clone()), state.clone(), writer_stop.clone()).unwrap();
-        let (control, sh) = scheduler::start_with_clock(
+        let (control, sh) = scheduler::start_with_clocks(
             Arc::new(cfg.clone()),
             state.clone(),
             writer,
             stop.clone(),
             clock,
+            monotonic,
         )
         .unwrap();
         Self {
@@ -641,7 +655,12 @@ fn scheduled_failures_back_off_with_injected_clock_and_reload_resets() {
         let now = now.clone();
         Arc::new(move || now.load(Ordering::Acquire))
     };
-    let h = Harness::with_clock("off", "max", false, clock);
+    let mono = Arc::new(AtomicI64::new(0));
+    let monotonic = {
+        let mono = mono.clone();
+        Arc::new(move || mono.load(Ordering::Acquire))
+    };
+    let h = Harness::with_clocks("off", "max", false, clock, monotonic);
     let mut cfg = h.cfg.clone();
     cfg.roots[0].path = h.cfg.roots[0].path.join("absent");
     cfg.roots[0].schedule = "every 1h".into();
@@ -659,6 +678,7 @@ fn scheduled_failures_back_off_with_injected_clock_and_reload_resets() {
     for delay in [30, 60, 120, 240, 480, 960, 1920, 3600, 3600] {
         let expected = now.load(Ordering::Acquire) + delay;
         wait(|| next_due() == Some(expected));
+        mono.fetch_add(delay, Ordering::AcqRel);
         now.store(expected, Ordering::Release);
     }
     h.state.replace_config(cfg).unwrap();
@@ -675,7 +695,12 @@ fn busy_keeps_fixed_deferral_and_does_not_increment_failure_attempts() {
         let now = now.clone();
         Arc::new(move || now.load(Ordering::Acquire))
     };
-    let h = Harness::with_clock("off", "max", false, clock);
+    let mono = Arc::new(AtomicI64::new(0));
+    let monotonic = {
+        let mono = mono.clone();
+        Arc::new(move || mono.load(Ordering::Acquire))
+    };
+    let h = Harness::with_clocks("off", "max", false, clock, monotonic);
     let lock = tidemark_scan::orchestrator::ScanLock::acquire(&h.cfg.general.state_dir).unwrap();
     let mut cfg = h.cfg.clone();
     cfg.roots[0].schedule = "every 1h".into();
@@ -702,6 +727,7 @@ fn busy_keeps_fixed_deferral_and_does_not_increment_failure_attempts() {
     assert_eq!(component.state, "ok");
     drop(lock);
     std::fs::remove_dir_all(&h.cfg.roots[0].path).unwrap();
+    mono.store(30, Ordering::Release);
     now.store(base + 30, Ordering::Release);
     // First actual failure gets 30 seconds, rather than the second-attempt minute.
     wait(|| next_due() == Some(base + 60));
@@ -773,7 +799,14 @@ fn bound_storage_snapshot_readable_in_separate_process_without_sockets() {
 
 #[test]
 fn exact_capacity_root_replacement_and_cumulative_churn_keep_scheduler_alive() {
-    let h = Harness::with_root_count("off", "max", false, Arc::new(tidemarkd::unix_now), 128);
+    let h = Harness::with_root_count(
+        "off",
+        "max",
+        false,
+        Arc::new(tidemarkd::unix_now),
+        tidemarkd::monotonic_clock(),
+        128,
+    );
     wait(|| {
         h.state
             .view()
@@ -797,4 +830,110 @@ fn exact_capacity_root_replacement_and_cumulative_churn_keep_scheduler_alive() {
     // Allow a real scheduler boundary after the last replacement.
     std::thread::sleep(Duration::from_millis(150));
     assert!(!h.stop.load(Ordering::Acquire));
+}
+
+#[test]
+fn wall_steps_do_not_consume_retry_delay_or_suspend_polling() {
+    use std::sync::atomic::AtomicI64;
+    let base = tidemarkd::unix_now();
+    let wall = Arc::new(AtomicI64::new(base));
+    let elapsed = Arc::new(AtomicI64::new(0));
+    let clock = {
+        let wall = wall.clone();
+        Arc::new(move || wall.load(Ordering::Acquire))
+    };
+    let monotonic = {
+        let elapsed = elapsed.clone();
+        Arc::new(move || elapsed.load(Ordering::Acquire))
+    };
+    let h = Harness::with_clocks("off", "max", false, clock, monotonic);
+    let mut cfg = h.cfg.clone();
+    cfg.roots[0].path = h.cfg.roots[0].path.join("absent");
+    cfg.roots[0].schedule = "every 1h".into();
+    let raw = RawPath::from_path(&cfg.roots[0].path).unwrap();
+    h.state.replace_config(cfg).unwrap();
+    let next = || {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(raw.clone()),
+            })
+            .unwrap()
+            .first()
+            .and_then(|s| s.next_due)
+    };
+    wait(|| next() == Some(base + 30));
+    wall.store(base + 7200, Ordering::Release);
+    elapsed.store(1, Ordering::Release);
+    wait(|| next() == Some(base + 7200 + 29));
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(next(), Some(base + 7200 + 29));
+    wall.store(base - 7200, Ordering::Release);
+    elapsed.store(2, Ordering::Release);
+    wait(|| next() == Some(base - 7200 + 28));
+    elapsed.store(30, Ordering::Release);
+    wait(|| next() == Some(base - 7200 + 60));
+}
+
+#[test]
+fn successful_cadence_survives_wall_steps() {
+    use std::sync::atomic::AtomicI64;
+    // The orchestrator owns its wall timestamps; a different injected startup
+    // wall time must not turn this new manual completion into restart history.
+    let base = tidemarkd::unix_now() + 7200;
+    let wall = Arc::new(AtomicI64::new(base));
+    let elapsed = Arc::new(AtomicI64::new(0));
+    let clock = {
+        let wall = wall.clone();
+        Arc::new(move || wall.load(Ordering::Acquire))
+    };
+    let monotonic = {
+        let elapsed = elapsed.clone();
+        Arc::new(move || elapsed.load(Ordering::Acquire))
+    };
+    let h = Harness::with_clocks("off", "max", false, clock, monotonic);
+    h.control.start(&h.params()).unwrap();
+    wait(|| {
+        !h.control
+            .status(&ScanStatusParams {
+                root: Some(h.root()),
+            })
+            .unwrap()
+            .is_empty()
+    });
+    let status = || {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(h.root()),
+            })
+            .unwrap()
+            .remove(0)
+    };
+    wait(|| status().last_complete.is_some() && status().running.is_none());
+    let id = status().last_complete.unwrap().scan_id;
+    elapsed.store(1, Ordering::Release);
+    let mut cfg = h.cfg.clone();
+    cfg.roots[0].schedule = "every 1h".into();
+    h.state.replace_config(cfg.clone()).unwrap();
+    wait(|| status().next_due.is_some());
+    let remaining = status().next_due.unwrap() - base;
+    assert!(
+        (3599..=3600).contains(&remaining),
+        "remaining cadence: {remaining}"
+    );
+    wall.store(base + 7200, Ordering::Release);
+    elapsed.store(2, Ordering::Release);
+
+    wait(|| status().next_due == Some(base + 7200 + remaining - 1));
+    assert_eq!(status().last_complete.unwrap().scan_id, id);
+    h.state.replace_config(cfg.clone()).unwrap();
+    cfg.roots[0].schedule = "every 2h".into();
+    h.state.replace_config(cfg).unwrap();
+    // A changed interval makes publication observable, without a sleep or
+    // confusing the recorder's preceding completion status with a fresh poll.
+    wait(|| status().next_due == Some(base + 7200 + remaining - 1 + 3600));
+    assert_eq!(status().last_complete.unwrap().scan_id, id);
+    wall.store(base - 7200, Ordering::Release);
+    elapsed.store(3, Ordering::Release);
+    wait(|| status().next_due == Some(base - 7200 + remaining - 2 + 3600));
+    assert_eq!(status().last_complete.unwrap().scan_id, id);
 }

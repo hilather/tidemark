@@ -400,17 +400,40 @@ fn compaction_uses_injected_clock() {
         let n = now.clone();
         Arc::new(move || n.load(Ordering::Acquire)) as tidemarkd::Clock
     };
+    let elapsed = Arc::new(AtomicI64::new(0));
+    let monotonic = {
+        let elapsed = elapsed.clone();
+        Arc::new(move || elapsed.load(Ordering::Acquire))
+    };
     let stop = Shutdown::default();
-    let (tx, h) = tswriter::start_with_clock(
+    let (tx, h) = tswriter::start_with_clocks(
         Arc::new(c.clone()),
         LiveState::new(&c, 0),
         stop.clone(),
         clock,
+        monotonic,
     )
     .unwrap();
     tx.send(Message::Fs(vec![sample(1, 10)])).unwrap();
     flush(&tx);
-    now.store(3599, Ordering::Release);
+    elapsed.store(3599, Ordering::Release);
+    now.store(7200, Ordering::Release);
+    flush(&tx);
+    // The second barrier also waits for the prior iteration's compaction check.
+    flush(&tx);
+    assert_eq!(
+        tidemark_store::timeseries::TimeSeries::open(
+            &c.general.state_dir.join("timeseries.db"),
+            false
+        )
+        .unwrap()
+        .query_fs("/fixture", 1, 1)
+        .unwrap()
+        .len(),
+        1
+    );
+    now.store(0, Ordering::Release);
+    flush(&tx);
     flush(&tx);
     assert_eq!(
         tidemark_store::timeseries::TimeSeries::open(
@@ -424,6 +447,7 @@ fn compaction_uses_injected_clock() {
         1
     );
     now.store(3601, Ordering::Release);
+    elapsed.store(3601, Ordering::Release);
     flush(&tx);
     let db = tidemark_store::timeseries::TimeSeries::open(
         &c.general.state_dir.join("timeseries.db"),
@@ -453,11 +477,11 @@ fn lvm_disabled_and_backoff() {
     h.join().unwrap().unwrap();
     assert_eq!(
         lvm::retry_delay(1, Duration::from_secs(300)),
-        Duration::from_secs(1)
+        Duration::from_secs(300)
     );
     assert_eq!(
         lvm::retry_delay(100, Duration::from_secs(4)),
-        Duration::from_secs(4)
+        Duration::from_secs(3600)
     );
 }
 #[test]
