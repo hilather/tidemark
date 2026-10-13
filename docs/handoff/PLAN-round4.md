@@ -7,7 +7,7 @@
 
 ## What was built
 
-Recorded R4-1–R4-16 in a new “First real runs and Wave 6 review decisions” part of 13 and committed that record first. Amended operator, contract and wave documents, distinguishing implemented library contracts from unresolved daemon publications. All sixteen requested handoff notes and both review files exist. Exact catalog legacy resolution, CompletedMinute/drain cursor and rollback semantics, runtime interval exemptions, transactional reload reservations, install assertions and watcher validation caching follow the notes where more precise than the brief. Platform measurements and owner budget/push decisions are attributed to the task brief; they were not independently remeasured here.
+Recorded R4-1–R4-16 in a new “First real runs and Wave 6 review decisions” part of 13 and committed that record first. Amended operator, contract and wave documents, distinguishing implemented library contracts from unresolved daemon publications. All fifteen requested handoff notes and both review files exist. Exact catalog legacy resolution, CompletedMinute/drain cursor and rollback semantics, runtime interval exemptions, transactional reload reservations, install assertions and watcher validation caching follow the notes where more precise than the brief. Platform measurements and owner budget/push decisions are attributed to the task brief; they were not independently remeasured here.
 
 ## Every changed file and section
 
