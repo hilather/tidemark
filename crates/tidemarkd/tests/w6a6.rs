@@ -1,6 +1,7 @@
 //! Owned by: WRECHECK-life
 //! Output alias validation and exporter destination preservation.
 #![forbid(unsafe_code)]
+#![allow(clippy::unwrap_used)]
 
 use std::{
     os::unix::fs::{symlink, MetadataExt},
