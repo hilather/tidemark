@@ -335,6 +335,8 @@ pub fn recover_catalog_with_lock(
     scan_lock: &fs::File,
 ) -> Result<Catalog, StoreError> {
     use std::os::unix::fs::MetadataExt;
+    let verified = crate::state_dir::StateDir::open(state_dir, false)?;
+    verified.check_leaf(std::ffi::OsStr::new("scan.lock"))?;
     let held = scan_lock.metadata()?;
     let named = fs::symlink_metadata(state_dir.join("scan.lock"))?;
     if !named.is_file() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
@@ -358,24 +360,21 @@ pub fn recover_catalog_with_lock(
 /// Historical samples remain in `Catalog::recovery_files()` and are unavailable in
 /// the new database. Ordinary `Catalog::open` never performs this recovery.
 pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(state_dir.join("scan.lock"))?;
+    let verified = crate::state_dir::StateDir::open(state_dir, false)?;
+    for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm", "timeseries.db-journal", "timeseries.db.bak-v0"] { verified.check_leaf(std::ffi::OsStr::new(name))?; }
+    let lock = verified.open_leaf(std::ffi::OsStr::new("scan.lock"), true, true)?;
     recover_catalog_with_lock(state_dir, &lock)
 }
 fn recover_catalog_owned(state_dir: &Path) -> Result<Catalog, StoreError> {
+    let verified = crate::state_dir::StateDir::open(state_dir, false)?;
+    for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm", "timeseries.db-journal", "timeseries.db.bak-v0"] { verified.check_leaf(std::ffi::OsStr::new(name))?; }
     // A private, exclusively created directory supplies a collision-free namespace.
     let mut recovery = None;
     for sequence in 0..10_000u32 {
         let path = state_dir.join(format!("timeseries-recovery-{sequence}"));
         match fs::DirBuilder::new().mode(0o700).create(&path) {
             Ok(()) => {
+                verified.subdir(path.file_name().ok_or_else(|| StoreError::Invalid("recovery name missing".into()))?, false)?;
                 recovery = Some(path);
                 break;
             }
