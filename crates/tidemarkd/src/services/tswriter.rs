@@ -385,7 +385,7 @@ fn writer_loop(
             compact_at = monotonic().saturating_add(3600);
         }
         if let Some(error) = failure.take() {
-            tracing::error!(%error,"time-series writer failure");
+            tracing::error!(%error,"time-series writer failure: {error}");
             state.publish_component(crate::component(
                 "tswriter",
                 if pressure { "degraded" } else { "error" },

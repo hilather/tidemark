@@ -195,6 +195,11 @@ fn params<T: serde::de::DeserializeOwned>(r: &Request) -> Result<T, DaemonError>
 fn value<T: serde::Serialize>(v: T) -> Result<serde_json::Value, DaemonError> {
     serde_json::to_value(v).map_err(|e| DaemonError::Internal(e.to_string()))
 }
+pub(crate) fn log_request(uid: u32, pid: i32, method: &str, ok: bool, elapsed: Duration) {
+    let outcome = if ok { "ok" } else { "failed" };
+    let millis = elapsed.as_millis();
+    tracing::info!(uid, pid, method = %method, ok, millis = %millis, "API request: {method} from uid {uid} pid {pid}, {outcome} in {millis} ms");
+}
 fn available<T>(v: Option<T>) -> Result<T, DaemonError> {
     v.ok_or_else(|| DaemonError::Unavailable("measurement unavailable".into()))
 }
@@ -454,7 +459,8 @@ fn connection(
                 }
                 Err(_) => return,
             };
-            tracing::info!(uid, pid, method = %request.method, "API request");
+            let request_started = Instant::now();
+            let method = request.method.clone();
             let scan_start = request.method == "scan.start";
             let id = request.id.clone();
             let ctx = context.clone();
@@ -507,6 +513,7 @@ fn connection(
                     Err(_) => break error(&id, ApiErrorCode::Internal, "handler disconnected"),
                 }
             };
+            log_request(uid, pid, &method, response.ok, request_started.elapsed());
             if send(&mut stream, &response, &shutdown, timeout).is_err() {
                 return;
             }
@@ -735,7 +742,7 @@ impl Drop for SocketPath {
         let _keep_locked = &self.lock;
         if let Some(identity) = self.identity {
             if let Err(error) = self.unlink(identity) {
-                tracing::warn!(%error, "API socket cleanup failed");
+                tracing::warn!(%error, "API socket cleanup failed: {error}");
             }
         }
         if let Ok(stat) = rustix::fs::statat(
@@ -749,7 +756,7 @@ impl Drop for SocketPath {
                     &self.lock_name,
                     rustix::fs::AtFlags::empty(),
                 ) {
-                    tracing::warn!(%error, "API lock cleanup failed");
+                    tracing::warn!(%error, "API lock cleanup failed: {error}");
                 }
             }
         }
@@ -823,7 +830,7 @@ pub fn start_with_peer_timeout(
                     || listener.accept(),
                     |error, log| {
                         if log {
-                            tracing::warn!(%error, "API accept degraded; retrying");
+                            tracing::warn!(%error, "API accept degraded; retrying: {error}");
                         }
                         let _ = context.state.publish_component(crate::component(
                             "api",

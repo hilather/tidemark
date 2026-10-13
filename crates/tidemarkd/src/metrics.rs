@@ -707,7 +707,7 @@ pub fn start(
                         if !writer_busy
                             && last_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600))
                         {
-                            tracing::warn!(%error,"metrics exporter degraded");
+                            tracing::warn!(%error,"metrics exporter degraded: {error}");
                             last_log = Some(Instant::now());
                         }
                         state.publish_component(crate::component("metrics", "degraded", error))?;

@@ -139,17 +139,17 @@ pub fn log(changes: &[Transition], service: &str) {
             .map(|p| p.display_lossy())
             .unwrap_or_else(|_| "invalid configured mount path".into());
         match (change.previous, change.current) {
-            (_, None) => tracing::warn!(service, "mount not present: {path}"),
+            (_, None) => tracing::warn!(service = %service, "mount not present: {path}"),
             (None, Some(identity)) => {
                 tracing::info!(
-                    service,
+                    service = %service,
                     "mount present: {path} ({}:{})",
                     identity.major,
                     identity.minor
                 )
             }
             (Some(_), Some(identity)) => {
-                tracing::warn!(service, mount_id = identity.id, "mount changed: {path}")
+                tracing::warn!(service = %service, mount_id = identity.id, "mount changed: {path}")
             }
         }
     }

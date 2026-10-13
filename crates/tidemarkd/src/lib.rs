@@ -139,6 +139,9 @@ pub fn main_entry() -> std::process::ExitCode {
 }
 
 #[cfg(test)]
+mod log_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -523,6 +526,12 @@ pub enum DaemonError {
     #[error("internal: {0}")]
     Internal(String),
 }
+fn limit_text(limit: Option<u64>) -> String {
+    limit.map_or_else(|| "unlimited".into(), |value| value.to_string())
+}
+fn log_descriptor_limit(limit: rustix::process::Rlimit) {
+    tracing::info!(soft = %limit_text(limit.current), hard = %limit_text(limit.maximum), "effective descriptor limit: soft {}, hard {}", limit_text(limit.current), limit_text(limit.maximum));
+}
 fn raise_fd_limit(
     get: impl Fn() -> rustix::process::Rlimit,
     set: impl Fn(rustix::process::Rlimit) -> Result<(), rustix::io::Errno>,
@@ -533,7 +542,7 @@ fn raise_fd_limit(
             current: limit.maximum,
             ..limit
         }) {
-            tracing::warn!(%error, "could not raise descriptor soft limit");
+            tracing::warn!(%error, "could not raise descriptor soft limit: {error}");
         }
     }
     get()
@@ -556,11 +565,11 @@ pub(crate) fn watch_fd_budget(mounts: usize) {
     tidemark_live::watch::set_fd_batch(batch);
     if limit.is_some_and(|limit| limit < needed) {
         tracing::warn!(
-            ?limit,
+            limit = %limit_text(limit),
             needed,
             mounts,
             batch,
-            "descriptor budget reduced; minimum batch may exceed available reserve"
+            "descriptor budget reduced; minimum batch may exceed available reserve: soft {}, needed {needed}, mounts {mounts}, batch {batch}", limit_text(limit)
         );
     }
 }
@@ -598,7 +607,7 @@ fn retry_start<T>(
                 }
                 state.publish_component(component(name, "degraded", error.to_string()))?;
                 if last_log.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
-                    tracing::warn!(component=name, %error, "startup resource pressure; retrying");
+                    tracing::warn!(component=%name, %error, "startup resource pressure; retrying {name}: {error}");
                     last_log = Some(Instant::now());
                 }
                 let end = Instant::now() + Duration::from_millis(50u64 << failures.min(4));
@@ -705,7 +714,7 @@ pub fn run_controlled(
         || rustix::process::getrlimit(rustix::process::Resource::Nofile),
         |limit| rustix::process::setrlimit(rustix::process::Resource::Nofile, limit),
     );
-    tracing::info!(soft=?limit.current, hard=?limit.maximum, "effective descriptor limit");
+    log_descriptor_limit(limit);
     let (loaded, hash) = retry_start("config", &state, &shutdown, || {
         load_config(&options.config_path)
     })?;
@@ -769,9 +778,14 @@ pub fn run_controlled(
                 state.publish_component(component("watcher", "degraded", error.to_string()))?;
             }
             result => {
+                let detail = match result {
+                    Ok(false) => "daemon is outside the host mount namespace".to_owned(),
+                    Err(error) => error.to_string(),
+                    Ok(true) => "host namespace check changed".to_owned(),
+                };
                 let reason =
-                    format!("host mount namespace unavailable: {result:?}; watcher disabled");
-                tracing::error!(%reason);
+                    format!("host mount namespace unavailable: {detail}; watcher disabled");
+                tracing::error!(%reason, "{reason}");
                 config.watch.enabled = false;
                 state.publish(
                     state::Publication::Degraded(reason.clone()),
@@ -944,10 +958,10 @@ pub fn run_controlled(
                         std::time::Duration::from_secs(10),
                     )) {
                         Ok(r) if r.reloaded => {
-                            tracing::info!(reloaded = true, "config reload")
+                            tracing::info!(reloaded = true, "config reload: accepted")
                         }
                         Ok(_) => {}
-                        Err(e) => tracing::error!(error=%e,"config reload rejected"),
+                        Err(e) => tracing::error!(error=%e,"config reload rejected: {e}"),
                     }
                 }
                 if Instant::now() >= firstboot_due {
@@ -959,7 +973,7 @@ pub fn run_controlled(
                             unix_now(),
                             firstboot_elapsed(),
                         ) {
-                            tracing::warn!(%error, "firstboot followup failed");
+                            tracing::warn!(%error, "firstboot followup failed: {error}");
                         }
                     }
                 }
@@ -1047,7 +1061,7 @@ fn add_service(
             Ok(())
         }
         Err(DaemonError::NotYetImplemented) => {
-            tracing::warn!(component = name, "service implementation pending");
+            tracing::warn!(component = %name, "service implementation pending: {name}");
             state.publish_component(component(name, "disabled", "implementation pending"))
         }
         Err(e) => Err(e),
@@ -1077,7 +1091,7 @@ fn join_until(
     }
     if let Err(error) = &result {
         if daemon_pressure(error) {
-            tracing::warn!(component=name, %error, "service degraded at shutdown");
+            tracing::warn!(component=%name, %error, "service degraded at shutdown: {name}: {error}");
             return Ok(());
         }
     }
@@ -1341,7 +1355,7 @@ fn cooperative_reload_callback(path: std::path::PathBuf, state: state::LiveState
                     })
                 }
                 Err(e) => {
-                    tracing::error!(reloaded=false,error=%e,"keeping previous config");
+                    tracing::error!(reloaded=false,error=%e,"keeping previous config: reload rejected: {e}");
                     let _ = sd_notify::notify(
                         false,
                         &[sd_notify::NotifyState::Status(

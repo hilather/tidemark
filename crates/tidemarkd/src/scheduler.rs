@@ -677,7 +677,7 @@ impl ScanRecorder for Recorder {
             ))
             .map_err(scan_error)?;
         self.status(e, true)?;
-        tracing::info!(root = %e.root.display_lossy(), scan_id = %e.scan_id, "scan started");
+        tracing::info!(root = %e.root.display_lossy(), scan_id = %e.scan_id, "scan started: root {}, scan id {}", e.root.display_lossy(), e.scan_id);
         if let Some(reply) = self.reply.lock().take() {
             let _ = reply.try_send(Ok(ScanStartResult {
                 scan_id: e.scan_id.clone(),
@@ -694,7 +694,7 @@ impl ScanRecorder for Recorder {
                 self.state
                     .publish_component(component("post_scan", "degraded", error.to_string()))
                     .map_err(scan_error)?;
-                tracing::warn!(%error, "post-scan publication incomplete; dirty state retained");
+                tracing::warn!(%error, "post-scan publication incomplete; dirty state retained: {error}");
             }
         }
         self.status(e, false)
@@ -846,8 +846,8 @@ fn launch(
                         ModeRequest::Auto => "auto",
                     };
                     tracing::warn!(
-                        root = %req.root.display_lossy(), mode, scheduled = command.scheduled,
-                        error = %e, attempt = attempts, next_due = due, "scan failed"
+                        root = %req.root.display_lossy(), mode = %mode, scheduled = command.scheduled,
+                        error = %e, attempt = attempts, next_due = due, "scan failed: root {}, mode {mode}, source {}, attempt {attempts}, retry timestamp {due}: {e}", req.root.display_lossy(), if command.scheduled { "scheduled" } else { "operator" }
                     );
                 } else {
                     // Preserve the existing 30-second scheduled deferral without
@@ -895,7 +895,7 @@ fn launch(
             } else {
                 shared.failures.lock().remove(&req.root);
                 if let Ok(outcome) = &result {
-                    tracing::info!(root = %req.root.display_lossy(), scan_id = %outcome.scan_id, "scan completed");
+                    tracing::info!(root = %req.root.display_lossy(), scan_id = %outcome.scan_id, "scan completed: root {}, scan id {}", req.root.display_lossy(), outcome.scan_id);
                 }
                 shared.state.publish(
                     Publication::StateSpaceRefused(false),
@@ -1208,7 +1208,15 @@ impl Drop for Job {
             }
             // Also join on scheduler errors and unwinding, before releasing the writer.
             if let Err(error) = handle.join() {
-                tracing::error!(?error, "scan worker panicked during scheduler cleanup");
+                let reason = error
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| error.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-text panic payload");
+                tracing::error!(
+                    reason,
+                    "scan worker panicked during scheduler cleanup: {reason}"
+                );
             }
         }
     }
@@ -1405,7 +1413,7 @@ fn scheduler(
                 shared
                     .state
                     .publish_component(component("config", "error", error.to_string()))?;
-                tracing::error!(%error, "scan inventory publication rejected; scheduler continuing");
+                tracing::error!(%error, "scan inventory publication rejected; scheduler continuing: {error}");
                 continue;
             }
             if due.is_some_and(|d| d <= now)
@@ -1432,7 +1440,7 @@ fn scheduler(
                             "error",
                             error.to_string(),
                         ))?;
-                        tracing::error!(%error, "scheduled scan capacity rejected; scheduler continuing");
+                        tracing::error!(%error, "scheduled scan capacity rejected; scheduler continuing: {error}");
                         continue;
                     }
                 }
