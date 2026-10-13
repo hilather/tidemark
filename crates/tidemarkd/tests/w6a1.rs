@@ -1266,3 +1266,57 @@ fn configured_roots_reserve_capacity_against_inactive_manual_history() {
     assert_eq!(scans.len(), 128);
     assert!(scans.iter().all(|s| s.root.starts_with("/configured/")));
 }
+
+#[test]
+fn late_sampler_pass_cannot_resurrect_removed_mount() {
+    let mut config = Config::default();
+    config.sampler.mounts = vec!["/fixture".into()];
+    let state = LiveState::new(&config, 0);
+    let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    let worker_state = state.clone();
+    let worker = std::thread::spawn(move || {
+        let (_, generation) = worker_state.config();
+        ready_tx.send(()).unwrap();
+        resume_rx.recv().unwrap();
+        worker_state
+            .publish(
+                Publication::FsAttempt {
+                    generation,
+                    mount: "/fixture".into(),
+                    sample: Some(sample(10, 95)),
+                },
+                health(),
+            )
+            .unwrap();
+        worker_state
+            .publish(
+                Publication::FsAttempt {
+                    generation,
+                    mount: "/fixture".into(),
+                    sample: None,
+                },
+                health(),
+            )
+            .unwrap();
+    });
+    ready_rx.recv().unwrap();
+    config.sampler.mounts = vec!["/new".into()];
+    state.replace_config(config).unwrap();
+    resume_tx.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(state.view_at(10).fs_samples().is_none());
+    // Even a current-generation pass may publish only current mounts.
+    let (_, generation) = state.config();
+    state
+        .publish(
+            Publication::FsAttempt {
+                generation,
+                mount: "/fixture".into(),
+                sample: Some(sample(11, 95)),
+            },
+            health(),
+        )
+        .unwrap();
+    assert!(state.view_at(11).fs_samples().is_none());
+}
