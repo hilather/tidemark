@@ -615,8 +615,14 @@ impl ScanRecorder for Recorder {
         self.state
             .publish(
                 Publication::StateSpaceRefused(false),
-                scheduler_health(&self.failures, "space guard admitted scan"),
+                crate::component("state_space", "ok", "space guard admitted scan"),
             )
+            .map_err(scan_error)?;
+        self.state
+            .publish_component(scheduler_health(
+                &self.failures,
+                "space guard admitted scan",
+            ))
             .map_err(scan_error)?;
         self.status(e, true)?;
         tracing::info!(root = %e.root.display_lossy(), scan_id = %e.scan_id, "scan started");
@@ -767,9 +773,6 @@ fn launch(
                 }
             }));
             if let Err(e) = result {
-                if let Some(reply) = recorder.reply.lock().take() {
-                    let _ = reply.try_send(Err(DaemonError::Scan(e.to_string())));
-                }
                 if !matches!(e, ScanError::Cancelled | ScanError::Busy) {
                     let mut failures = shared.failures.lock();
                     let attempts = failures
@@ -825,9 +828,16 @@ fn launch(
                 if matches!(e, ScanError::NoSpace) {
                     shared
                         .state
-                        .publish(Publication::StateSpaceRefused(true), health)?;
+                        .publish(Publication::StateSpaceRefused(true), crate::component(
+                            "state_space", "degraded", "scan: NoSpace",
+                        ))?;
+                    shared.state.publish_component(health)?;
                 } else {
                     shared.state.publish_component(health)?;
+                }
+                // Publish refusal and health before acknowledging it to the API.
+                if let Some(reply) = recorder.reply.lock().take() {
+                    let _ = reply.try_send(Err(DaemonError::Scan(e.to_string())));
                 }
                 return Err(DaemonError::Scan(e.to_string()));
             } else {

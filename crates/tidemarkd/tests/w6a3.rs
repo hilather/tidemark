@@ -541,3 +541,64 @@ fn api_and_metrics_share_a_private_directory() {
     assert!(!lock.exists());
     assert!(!c.general.socket.exists());
 }
+
+#[test]
+fn space_refusal_reply_and_status_are_published_before_acknowledgement() {
+    use tidemark_core::{
+        config::{RootConfig, RootMode},
+        path::RawPath,
+    };
+    use tidemarkd::{scheduler, services::tswriter};
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mut c = Config::default();
+    c.general.state_dir = storage.path().to_owned();
+    c.retention.min_free_pct = 100.0;
+    c.roots = vec![RootConfig {
+        path: root.path().to_owned(),
+        schedule: "off".into(),
+        mode: RootMode::Walk,
+        ..RootConfig::default()
+    }];
+    let state = LiveState::new(&c, 10);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::new(AtomicBool::new(false));
+    let (writer, wh) =
+        tswriter::start(Arc::new(c.clone()), state.clone(), writer_stop.clone()).unwrap();
+    let (control, sh) = scheduler::start(Arc::new(c), state.clone(), writer, stop.clone()).unwrap();
+    let ctx = Context {
+        state: state.clone(),
+        scans: control,
+        reload: Arc::new(|| unreachable!("reload unused")),
+    };
+    let r = Request {
+        v: 1,
+        id: "refused".into(),
+        method: "scan.start".into(),
+        params: serde_json::to_value(ScanStartParams {
+            root: RawPath::from_path(root.path()).unwrap(),
+            mode: Some(RootMode::Walk),
+            throttle: None,
+        })
+        .unwrap(),
+    };
+    let response = api::dispatch(&r, 0, &ctx, 20).unwrap();
+    let view = state.view();
+    let status = api::dispatch(&request("status", "{}"), 0, &ctx, 20).unwrap();
+    stop.store(true, Ordering::Release);
+    sh.join().unwrap().unwrap();
+    writer_stop.store(true, Ordering::Release);
+    wh.join().unwrap().unwrap();
+    let error = response.error.unwrap();
+    assert_eq!(error.code, ApiErrorCode::Unavailable);
+    assert_eq!(error.message, "scan: NoSpace");
+    assert_eq!(view.state_space_refused(), Some(true));
+    let report: StatusResult = serde_json::from_value(status.result.unwrap()).unwrap();
+    let component = report
+        .components
+        .iter()
+        .find(|c| c.name == "state_space")
+        .unwrap();
+    assert_eq!(component.state, "degraded");
+    assert_eq!(component.detail, "scan: NoSpace");
+}

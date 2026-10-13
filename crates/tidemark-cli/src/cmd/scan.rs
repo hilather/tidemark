@@ -60,7 +60,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             .map(|s| serde_json::from_value(serde_json::Value::String(s.into())))
             .transpose()?;
         let interrupt = super::now::Interrupt::new()?;
-        let started: ScanStartResult = super::now::call(
+        let started: ScanStartResult = start_scan(
             &mut client,
             "scan.start",
             &ScanStartParams {
@@ -228,6 +228,24 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         .into());
     }
     Ok(())
+}
+
+fn start_scan(
+    client: &mut crate::client::Client,
+    method: &str,
+    params: &tidemark_core::api::ScanStartParams,
+) -> anyhow::Result<tidemark_core::api::ScanStartResult> {
+    // Only the frozen Unavailable + NoSpace response is a space precondition.
+    // Other Unavailable responses retain the shared daemon mapping.
+    super::now::call(client, method, params).map_err(|error| {
+        if matches!(error.downcast_ref::<crate::CliError>(),
+            Some(crate::CliError::Unavailable(message)) if message.starts_with("scan: NoSpace"))
+        {
+            scan_error(tidemark_scan::orchestrator::ScanError::NoSpace).into()
+        } else {
+            error
+        }
+    })
 }
 
 pub(crate) fn scan_error(e: tidemark_scan::orchestrator::ScanError) -> crate::CliError {

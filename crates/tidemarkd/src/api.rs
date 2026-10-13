@@ -123,6 +123,7 @@ fn code(e: &DaemonError) -> ApiErrorCode {
             ApiErrorCode::Unavailable
         }
         DaemonError::Scan(s) if s == "Busy" => ApiErrorCode::Busy,
+        DaemonError::Scan(s) if s == "NoSpace" => ApiErrorCode::Unavailable,
         DaemonError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
             ApiErrorCode::NotFound
         }

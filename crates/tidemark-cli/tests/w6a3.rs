@@ -9,6 +9,8 @@ use std::{
 };
 use tidemark_core::api::{Request, Response};
 fn config(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let p = dir.path().join("config.toml");
     std::fs::write(
         &p,
@@ -937,5 +939,85 @@ fn status_error_continuations_keep_the_message_and_prefix_indent() {
                 .join(" "),
             WATCHER_DETAIL
         );
+    }
+}
+
+#[test]
+fn daemon_scan_space_refusal_matches_direct_exit_and_wording() {
+    if !socket_available() {
+        return;
+    }
+    use tidemark_core::api::{ApiError, ApiErrorCode};
+    for (code, message, exit, expected) in [
+        (ApiErrorCode::Unavailable, "scan: NoSpace", 5, "NoSpace"),
+        (
+            ApiErrorCode::Unavailable,
+            "scan: NoSpace: floor",
+            5,
+            "NoSpace",
+        ),
+        (
+            ApiErrorCode::Unavailable,
+            "measurement unavailable",
+            4,
+            "measurement unavailable",
+        ),
+        (
+            ApiErrorCode::Internal,
+            "scan: NoSpace",
+            1,
+            "daemon error: scan: NoSpace",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let p = config(&dir);
+        let listener = UnixListener::bind(dir.path().join("api.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((s, _)) => break s,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("fake daemon accept: {e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            let r: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(r.method, "scan.start");
+            serde_json::to_writer(
+                stream.get_mut(),
+                &Response {
+                    v: 1,
+                    id: r.id,
+                    ok: false,
+                    result: None,
+                    error: Some(ApiError {
+                        code,
+                        message: message.into(),
+                    }),
+                },
+            )
+            .unwrap();
+            stream.get_mut().write_all(b"\n").unwrap();
+        });
+        let out = cli(&p, &["--json", "scan", "/", "--mode", "walk"]);
+        server.join().unwrap();
+        assert_eq!(out.status.code(), Some(exit));
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains(expected), "{error}");
+        if exit == 5 {
+            assert!(!error.contains("scan:"), "{error}");
+        }
     }
 }
