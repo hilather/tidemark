@@ -16,6 +16,10 @@ fn error(path: &Path, reason: impl std::fmt::Display) -> io::Error {
         tidemark_core::path::display_lossy_bytes(path.as_os_str().as_bytes())
     ))
 }
+fn context(path: &Path, source: impl Into<io::Error>) -> io::Error {
+    let source = source.into();
+    io::Error::new(source.kind(), error(path, &source).to_string())
+}
 fn directory(fd: impl AsFd, name: &Path) -> io::Result<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     match fs::openat(&fd, name, flags | OFlags::NOATIME, Mode::empty()) {
@@ -78,7 +82,7 @@ pub fn trusted_directory(path: &Path) -> io::Result<OwnedFd> {
         };
         let sticky = ancestor(&traversed, &fd)?;
         traversed.push(name);
-        fd = directory(&fd, Path::new(name)).map_err(|e| error(&traversed, e))?;
+        fd = directory(&fd, Path::new(name)).map_err(|e| context(&traversed, e))?;
         if sticky {
             private(&traversed, &fs::fstat(&fd)?)?;
         }
@@ -116,7 +120,7 @@ impl StateDir {
                 Err(rustix::io::Errno::PERM) => fs::open(path, flags, Mode::empty()),
                 result => result,
             }
-            .map_err(|e| error(path, e))?;
+            .map_err(|e| context(path, e))?;
             private(path, &fs::fstat(&fd)?)?;
             return Ok(Self {
                 fd,
@@ -131,14 +135,14 @@ impl StateDir {
         let name = path
             .file_name()
             .ok_or_else(|| error(path, "missing directory name"))?;
-        let parent_fd = trusted_directory(parent).map_err(|e| error(path, e))?;
+        let parent_fd = trusted_directory(parent).map_err(|e| context(path, e))?;
         let fd = match directory(&parent_fd, Path::new(name)) {
             Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
                 fs::mkdirat(&parent_fd, name, Mode::from_raw_mode(0o700))
-                    .map_err(|e| error(path, e))?;
+                    .map_err(|e| context(path, e))?;
                 directory(&parent_fd, Path::new(name))?
             }
-            result => result.map_err(|e| error(path, e))?,
+            result => result.map_err(|e| context(path, e))?,
         };
         private(path, &fs::fstat(&fd)?)?;
         Ok(Self {
@@ -214,7 +218,7 @@ impl StateDir {
                 Ok(true)
             }
             Err(rustix::io::Errno::NOENT) => Ok(false),
-            Err(e) => Err(error(&self.path.join(name), e)),
+            Err(e) => Err(context(&self.path.join(name), e)),
         }
     }
     /// Open a leaf without following links or blocking on special files.
@@ -227,7 +231,7 @@ impl StateDir {
             flags |= OFlags::CREATE | OFlags::EXCL;
         }
         let fd = fs::openat(&self.fd, name, flags, Mode::from_raw_mode(0o600))
-            .map_err(|e| error(&self.path.join(name), e))?;
+            .map_err(|e| context(&self.path.join(name), e))?;
         self.leaf(name, &fs::fstat(&fd)?)?;
         Ok(File::from(fd))
     }
@@ -240,7 +244,7 @@ impl StateDir {
                 fs::mkdirat(&self.fd, name, Mode::from_raw_mode(0o700))?;
                 directory(&self.fd, Path::new(name))?
             }
-            result => result.map_err(|e| error(&path, e))?,
+            result => result.map_err(|e| context(&path, e))?,
         };
         private(&path, &fs::fstat(&fd)?)?;
         Ok(Self { fd, path })
@@ -275,9 +279,20 @@ mod tests {
             .tempdir()
             .unwrap();
         let child = temp.path().join("state");
-        assert!(StateDir::open(&child, false).is_err());
+        assert_eq!(
+            StateDir::open(&child, false).err().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
         assert!(!child.exists());
         let state = StateDir::open(&child, true).unwrap();
+        assert_eq!(
+            state
+                .subdir(OsStr::new("missing"), false)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
         use std::os::fd::AsRawFd;
         assert!(StateDir::open(
             Path::new(&format!("/proc/self/fd/{}/.", state.fd.as_raw_fd())),
@@ -355,6 +370,9 @@ mod tests {
         std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o750)).unwrap();
         assert!(trusted_directory(&child).is_err());
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(StateDir::open(&child, false).is_err());
+        assert_eq!(
+            StateDir::open(&child, false).err().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 }

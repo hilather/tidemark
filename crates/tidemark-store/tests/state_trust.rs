@@ -90,6 +90,10 @@ fn snapshot_reads_refuse_hostile_leaves_and_hierarchy() {
             &victim,
         );
         assert!(Snapshot::open(&state.path().join("snapshots/root/snapshot.db")).is_err());
+        assert!(Catalog::open(state.path(), true)
+            .unwrap()
+            .rebuild_from_files()
+            .is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"sentinel");
         assert_eq!(
             std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,

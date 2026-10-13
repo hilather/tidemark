@@ -281,6 +281,14 @@ impl Catalog {
         for root in fs::read_dir(snapshots)? {
             let root = root?;
             if !root.file_type()?.is_dir() {
+                if root.file_type()?.is_symlink() {
+                    return Err(StoreError::Invalid(format!(
+                        "state snapshot directory {}: symbolic link refused",
+                        tidemark_core::path::display_lossy_bytes(
+                            root.path().as_os_str().as_bytes()
+                        )
+                    )));
+                }
                 continue;
             }
             let root_dir = snapshot_dir
@@ -289,7 +297,7 @@ impl Catalog {
                 .subdir(&root.file_name(), false)?;
             for file in fs::read_dir(root.path())? {
                 let file = file?;
-                if !file.file_type()?.is_file() || !file.file_name().as_bytes().ends_with(b".db") {
+                if !file.file_name().as_bytes().ends_with(b".db") {
                     continue;
                 }
                 root_dir.check_leaf(&file.file_name())?;
