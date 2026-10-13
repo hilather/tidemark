@@ -1483,14 +1483,15 @@ fn process_publication_is_independent_of_collector_and_clears_on_invalidation() 
     assert!(state
         .view_at(2)
         .phantom(&PhantomParams { mount: None })
-        .is_none());
+        .is_some());
     assert!(state
         .view_at(2)
         .writers(&WritersParams {
             mount: None,
             window: Duration::from_secs(300)
         })
-        .is_none());
+        .is_some());
+    assert!(state.view_at(2).phantom_bytes("/fixture").is_none());
     publish(&state, Publication::Procscan(report.clone()));
     config.procscan.open_writers = !config.procscan.open_writers;
     state.replace_config(config.clone()).unwrap();

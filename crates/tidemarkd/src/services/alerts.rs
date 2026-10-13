@@ -25,7 +25,7 @@ pub fn start(
         .spawn(move || {
             let mut previous = None;
             let mut engine: Option<AlertEngine> = None;
-            let mut previous_failures = (std::collections::BTreeMap::new(), 0);
+            let mut previous_failures = (std::collections::BTreeMap::new(), 0, 0);
             let mut sinks: Vec<Box<dyn Deliver>> = vec![Box::new(JournalDeliver)];
             while !shutdown.load(Ordering::Acquire) {
                 let (config, generation) = state.config();
@@ -64,9 +64,9 @@ pub fn start(
         })
 }
 
-type CollectorFailures = (std::collections::BTreeMap<String, u64>, u64);
+pub(crate) type CollectorFailures = (std::collections::BTreeMap<String, u64>, u64, u64);
 
-fn tick_current(
+pub(crate) fn tick_current(
     engine: &mut AlertEngine,
     now: i64,
     state: &LiveState,
@@ -82,7 +82,8 @@ fn tick_current(
             .iter()
             .any(|c| c.name == "procscan" && matches!(c.state.as_str(), "ok" | "degraded"))
     });
-    let failures = view.collector_failures();
+    let (fs_failures, lvm_failures) = view.collector_failures();
+    let failures = (fs_failures, lvm_failures, view.procscan_failure_epoch());
     let interrupted: Vec<_> = failures
         .0
         .iter()
@@ -90,13 +91,16 @@ fn tick_current(
         .map(|(mount, _)| mount.clone())
         .collect();
     let mut events = Vec::new();
-    if !interrupted.is_empty() || previous_failures.1 != failures.1 {
+    if !interrupted.is_empty()
+        || previous_failures.1 != failures.1
+        || previous_failures.2 != failures.2
+    {
         // Replay a missed unavailability observation before recovery. A
         // failed and recovered pass between alert ticks still breaks continuity.
         let source = EnabledSource {
             source: &view,
             config: &config,
-            procscan_ok,
+            procscan_ok: procscan_ok && previous_failures.2 == failures.2,
             interrupted_fs: &interrupted,
             interrupted_lvm: previous_failures.1 != failures.1,
         };

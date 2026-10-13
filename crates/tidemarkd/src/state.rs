@@ -38,6 +38,9 @@ struct Inner {
     fs_failures: BTreeMap<String, u64>,
     fs_failure_epoch: u64,
     lvm_failures: u64,
+    procscan_failures: u64,
+    procscan_completed_at: Option<i64>,
+    procscan_available: bool,
     alert_revision: u64,
     lvm_available: bool,
     lvm: Option<LvmResult>,
@@ -99,8 +102,17 @@ pub enum Publication {
     ProcscanAttempt {
         /// Configuration observed before collection.
         generation: u64,
-        /// Immutable completed report; None clears the publication.
+        /// Immutable completed report; None retains display history but invalidates alert use.
         report: Option<Arc<tidemark_live::procscan::ProcReport>>,
+    },
+    /// Generation-bound process report with daemon completion time for alert freshness.
+    ProcscanCompleted {
+        /// Configuration observed before collection.
+        generation: u64,
+        /// Immutable successful report.
+        report: Arc<tidemark_live::procscan::ProcReport>,
+        /// Injected Unix completion timestamp.
+        completed_at: i64,
     },
     /// Publish alerts measurements.
     Alerts((Vec<AlertSummary>, Vec<AlertDiagnostic>)),
@@ -153,6 +165,9 @@ impl LiveState {
             fs_failures: BTreeMap::new(),
             fs_failure_epoch: 0,
             lvm_failures: 0,
+            procscan_failures: 0,
+            procscan_completed_at: None,
+            procscan_available: false,
             alert_revision: 0,
             lvm_available: false,
             lvm: None,
@@ -305,6 +320,8 @@ impl LiveState {
         }
         if d.config.procscan != config.procscan || d.config.watch.mounts != config.watch.mounts {
             d.procscan = None;
+            d.procscan_available = false;
+            d.procscan_failures = d.procscan_failures.saturating_add(1);
         }
         d.presence.retain(|m, _| {
             config
@@ -569,12 +586,28 @@ impl LiveState {
                 d.watchers.insert(mount, w);
                 d.alert_revision = d.alert_revision.saturating_add(1);
             }
-            Publication::Procscan(p) => d.procscan = Some(p),
+            Publication::Procscan(p) => complete_procscan(&mut d, p, crate::unix_now()),
+            Publication::ProcscanCompleted {
+                generation,
+                report,
+                completed_at,
+            } => {
+                if generation != d.generation {
+                    return Ok(());
+                }
+                complete_procscan(&mut d, report, completed_at);
+            }
             Publication::ProcscanAttempt { generation, report } => {
                 if generation != d.generation {
                     return Ok(());
                 }
-                d.procscan = report;
+                if let Some(report) = report {
+                    complete_procscan(&mut d, report, crate::unix_now());
+                } else {
+                    d.procscan_available = false;
+                    d.procscan_failures = d.procscan_failures.saturating_add(1);
+                    d.alert_revision = d.alert_revision.saturating_add(1);
+                }
             }
             Publication::Alerts((mut a, mut diagnostics)) => {
                 let internal = a
@@ -1210,10 +1243,24 @@ impl LiveStateView {
     pub(crate) fn collector_failures(&self) -> (BTreeMap<String, u64>, u64) {
         (self.data.fs_failures.clone(), self.data.lvm_failures)
     }
+    pub(crate) fn procscan_failure_epoch(&self) -> u64 {
+        self.data.procscan_failures
+    }
     /// Known degradation reasons, capped at MAX_SUBJECTS.
     pub fn degraded(&self) -> Option<Vec<String>> {
         Some(self.data.degraded.clone())
     }
+}
+fn complete_procscan(d: &mut Inner, report: Arc<tidemark_live::procscan::ProcReport>, now: i64) {
+    if d.procscan_completed_at
+        .is_some_and(|last| !fresh(last, now, d.config.procscan.interval))
+    {
+        d.procscan_failures = d.procscan_failures.saturating_add(1);
+    }
+    d.procscan = Some(report);
+    d.procscan_completed_at = Some(now);
+    d.procscan_available = true;
+    d.alert_revision = d.alert_revision.saturating_add(1);
 }
 trait TransposeOption<T> {
     fn transpose_option(self) -> Option<Option<T>>;
@@ -1271,6 +1318,16 @@ impl AlertSource for LiveStateView {
         f.overflows
     }
     fn phantom_bytes(&self, mount: &str) -> Option<u64> {
+        if !self.data.procscan_available
+            || !self.data.config.procscan.enabled
+            || !fresh(
+                self.data.procscan_completed_at?,
+                self.now,
+                self.data.config.procscan.interval,
+            )
+        {
+            return None;
+        }
         self.phantom(&PhantomParams {
             mount: Some(mount.into()),
         })?

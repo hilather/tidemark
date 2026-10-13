@@ -102,6 +102,30 @@ fn start_with(
     clock: crate::Clock,
     mount_source: MountSource,
 ) -> Result<ServiceHandle, DaemonError> {
+    start_with_sample(
+        config,
+        state,
+        writer,
+        shutdown,
+        clock,
+        mount_source,
+        Arc::new(sample_checked),
+    )
+}
+type SampleSource = Arc<
+    dyn Fn(&std::path::Path, i64, Option<crate::mounts::Identity>) -> Result<FsSample, DaemonError>
+        + Send
+        + Sync,
+>;
+fn start_with_sample(
+    config: Arc<Config>,
+    state: LiveState,
+    writer: super::tswriter::Sender,
+    shutdown: Shutdown,
+    clock: crate::Clock,
+    mount_source: MountSource,
+    collect: SampleSource,
+) -> Result<ServiceHandle, DaemonError> {
     crate::state::validate_bounds(&config)?;
     std::thread::Builder::new()
         .name("sampler".into())
@@ -125,11 +149,6 @@ fn start_with(
                     Ok(mounts) => mounts,
                     Err(error) => {
                         measurement_errors = vec![error.to_string()];
-                        if matches!(&error, DaemonError::Io { source, .. } if crate::resource_pressure(source)) {
-                            state.publish_component(crate::component("sampler", "degraded", error.to_string()))?;
-                            crate::wait_service(&state, generation, &shutdown, config.sampler.interval.min(std::time::Duration::from_secs(10)));
-                            continue;
-                        }
                         for path in &config.sampler.mounts {
                             state.publish(
                                 Publication::FsAttempt {
@@ -170,7 +189,9 @@ fn start_with(
                     next_sample = std::time::Instant::now();
                 }
                 let due = std::time::Instant::now() >= next_sample;
-                if due { measurement_errors.clear(); }
+                if due {
+                    measurement_errors.clear();
+                }
                 // Include watch-only entries so the existing firstboot sampler
                 // health input cannot claim healthy while any entry is absent.
                 for path in config.sampler.mounts.iter().chain(&config.watch.mounts) {
@@ -196,7 +217,7 @@ fn start_with(
                     if !due {
                         continue;
                     }
-                    match sample_checked(path, now, identities.get(path).copied().flatten()) {
+                    match collect(path, now, identities.get(path).copied().flatten()) {
                         Ok(s) => {
                             state.publish(
                                 Publication::FsAttempt {
@@ -218,10 +239,6 @@ fn start_with(
                             }
                         }
                         Err(e) => {
-                            if matches!(&e, DaemonError::Io { source, .. } if crate::resource_pressure(source)) {
-                                measurement_errors.push(e.to_string());
-                                continue;
-                            }
                             state.publish(
                                 Publication::FsAttempt {
                                     generation,
@@ -268,6 +285,101 @@ fn start_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn emfile_collection_invalidates_firing_input_and_retains_history() {
+        use tidemark_core::config::{AlertRule, AlertThreshold};
+        use tidemark_live::alerts::{AlertEngine, AlertSource};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let mut cfg = Config::default();
+        cfg.sampler.mounts = vec![path.clone()];
+        cfg.watch.mounts.clear();
+        cfg.sampler.interval = std::time::Duration::from_millis(20);
+        cfg.alerts.rule = vec![AlertRule {
+            name: "usage".into(),
+            mount: Some(path.clone()),
+            above: Some(AlertThreshold::Number(50.)),
+            for_: std::time::Duration::ZERO,
+            ..Default::default()
+        }];
+        let state = LiveState::new(&cfg, 100);
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (commands, collect_commands) = crossbeam_channel::bounded(1);
+        let stop = Shutdown::default();
+        let collect = Arc::new(move |path: &std::path::Path, _, _| {
+            let success = collect_commands
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            if success {
+                Ok(FsSample {
+                    ts: 100,
+                    mount: path.to_string_lossy().into_owned(),
+                    size: 100,
+                    used: 95,
+                    avail: 5,
+                    inodes: 1,
+                    inodes_used: 0,
+                })
+            } else {
+                Err(DaemonError::Io {
+                    context: "injected collection".into(),
+                    source: std::io::Error::from_raw_os_error(24),
+                })
+            }
+        });
+        let table = format!("1 0 8:0 / {} rw - xfs /dev/fixture rw\n", path.display()).into_bytes();
+        let worker = start_with_sample(
+            Arc::new(cfg.clone()),
+            state.clone(),
+            tx.clone(),
+            stop.clone(),
+            Arc::new(|| 100),
+            Arc::new(move || crate::mounts::parse(&table)),
+            collect,
+        )
+        .unwrap();
+        let wait = |predicate: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !predicate() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        };
+        commands.send(true).unwrap();
+        wait(&|| {
+            state
+                .view_at(100)
+                .fs_sample(&path.to_string_lossy())
+                .is_some()
+        });
+        let mut engine = AlertEngine::new(&cfg.alerts.rule, cfg.alerts.renotify).unwrap();
+        let mut failures = Default::default();
+        super::super::alerts::tick_current(&mut engine, 100, &state, &tx, &mut [], &mut failures)
+            .unwrap();
+        assert_eq!(engine.active().len(), 1);
+        commands.send(false).unwrap();
+        wait(&|| {
+            state
+                .view_at(100)
+                .fs_sample(&path.to_string_lossy())
+                .is_none()
+        });
+        assert!(state.view_at(100).fs_samples().is_some());
+        super::super::alerts::tick_current(&mut engine, 100, &state, &tx, &mut [], &mut failures)
+            .unwrap();
+        assert!(!state.view_at(100).alert_diagnostics().unwrap().is_empty());
+        commands.send(true).unwrap();
+        wait(&|| {
+            state
+                .view_at(100)
+                .fs_sample(&path.to_string_lossy())
+                .is_some()
+        });
+        stop.store(true, Ordering::Release);
+        commands.send(true).unwrap();
+        worker.join().unwrap().unwrap();
+    }
+
     #[test]
     fn failed_measurement_survives_presence_poll_until_success() {
         let dir = tempfile::tempdir().unwrap();
