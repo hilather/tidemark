@@ -112,7 +112,11 @@ fn state_usage(path: &Path) -> io::Result<u64> {
             .ok_or_else(|| io::Error::other("state allocation overflow"))?;
         if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
             if stat.st_uid != rustix::process::geteuid().as_raw() || stat.st_mode & 0o077 != 0 {
-                return Err(io::Error::other(format!("state directory {}: child {} is not private and owned", path.as_os_str().to_string_lossy(), name.to_string_lossy())));
+                return Err(io::Error::other(format!(
+                    "state directory {}: child {} is not private and owned",
+                    tidemark_core::path::display_lossy_bytes(path.as_os_str().as_encoded_bytes()),
+                    tidemark_core::path::display_lossy_bytes(name.to_bytes())
+                )));
             }
             if stack.len() >= MAX_DEPTH {
                 return Err(io::Error::other("state directory depth exceeds 4096"));
@@ -195,11 +199,11 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     #[test]
     fn state_usage_counts_allocation_without_following_symlinks() {
-        let own = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let own = ::test_support::private_tempdir().unwrap();
+        let outside = ::test_support::private_tempdir().unwrap();
         let data = own.path().join("data");
         let child = own.path().join("child");
-        std::fs::create_dir(&child).unwrap();
+        ::test_support::private_dir(&child).unwrap();
         std::fs::write(&data, vec![1; 8192]).unwrap();
         std::fs::write(outside.path().join("unrelated"), vec![1; 1024 * 1024]).unwrap();
         let link = child.join("link");

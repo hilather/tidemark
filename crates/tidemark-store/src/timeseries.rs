@@ -30,9 +30,11 @@ pub struct CompactStats {
     pub deleted: u64,
 }
 pub(crate) fn open_connection(path: &Path, rw: bool) -> Result<Connection, StoreError> {
-    let parent = path.parent().ok_or_else(|| StoreError::Invalid("database parent missing".into()))?;
-    let name = path.file_name().ok_or_else(|| StoreError::Invalid("database name missing".into()))?;
-    let directory = crate::state_dir::StateDir::open(parent, rw)?;
+    let parent = crate::state_dir::file_parent(path)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| StoreError::Invalid("database name missing".into()))?;
+    let directory = crate::state_dir::StateDir::open(&parent, rw)?;
     let check = || -> Result<(), StoreError> {
         directory.check_leaf(name)?;
         for suffix in ["-wal", "-shm", "-journal", ".bak-v0"] {
@@ -103,9 +105,11 @@ pub(crate) fn open_connection(path: &Path, rw: bool) -> Result<Connection, Store
 }
 // Inspect only our own state file before SQLite can mutate its sidecars.
 fn preflight_header(path: &Path) -> Result<(), StoreError> {
-    let parent = path.parent().ok_or_else(|| StoreError::Invalid("database parent missing".into()))?;
-    let name = path.file_name().ok_or_else(|| StoreError::Invalid("database name missing".into()))?;
-    let directory = crate::state_dir::StateDir::open(parent, false)?;
+    let parent = crate::state_dir::file_parent(path)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| StoreError::Invalid("database name missing".into()))?;
+    let directory = crate::state_dir::StateDir::open(&parent, false)?;
     let mut file = directory.open_leaf(name, false, false)?;
     let mut header = [0; 16];
     let mut len = 0;
@@ -487,7 +491,7 @@ mod query_plan_tests {
 
     #[test]
     fn tier_checks_seek_timestamp_primary_keys() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ::test_support::private_tempdir().unwrap();
         let store = TimeSeries::open(&tmp.path().join("timeseries.db"), true).unwrap();
         for sql in [FS_QUERY, LVM_QUERY] {
             let mut statement = store

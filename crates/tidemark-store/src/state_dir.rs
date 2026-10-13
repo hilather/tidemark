@@ -13,7 +13,7 @@ use std::{
 fn error(path: &Path, reason: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!(
         "state directory {}: {reason}",
-        path.as_os_str().to_string_lossy()
+        tidemark_core::path::display_lossy_bytes(path.as_os_str().as_bytes())
     ))
 }
 fn directory(fd: impl AsFd, name: &Path) -> io::Result<OwnedFd> {
@@ -86,6 +86,20 @@ pub fn trusted_directory(path: &Path) -> io::Result<OwnedFd> {
     ancestor(&traversed, &fd)?;
     Ok(fd)
 }
+/// Obtain a file's parent without normalizing the retained-fd `/.` suffix.
+pub fn file_parent(path: &Path) -> io::Result<PathBuf> {
+    let bytes = path.as_os_str().as_bytes();
+    let split = bytes
+        .iter()
+        .rposition(|&b| b == b'/')
+        .ok_or_else(|| error(path, "file parent missing"))?;
+    Ok(PathBuf::from(OsStr::from_bytes(if split == 0 {
+        b"/"
+    } else {
+        &bytes[..split]
+    })))
+}
+
 /// A verified euid-owned directory with no group/world permissions.
 pub struct StateDir {
     fd: OwnedFd,
@@ -117,7 +131,7 @@ impl StateDir {
         let name = path
             .file_name()
             .ok_or_else(|| error(path, "missing directory name"))?;
-        let parent_fd = trusted_directory(parent)?;
+        let parent_fd = trusted_directory(parent).map_err(|e| error(path, e))?;
         let fd = match directory(&parent_fd, Path::new(name)) {
             Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
                 fs::mkdirat(&parent_fd, name, Mode::from_raw_mode(0o700))
@@ -142,7 +156,10 @@ impl StateDir {
         for component in path.components() {
             if found {
                 match component {
-                    Component::Normal(n) => relative.push(n),
+                    Component::Normal(n) => {
+                        if relative.len() >= 4096 { return Err(error(path, "snapshot directory depth exceeds 4096")); }
+                        relative.push(n);
+                    },
                     _ => return Err(error(path, "unsafe snapshot component")),
                 }
             } else if component.as_os_str() == "snapshots" {
@@ -153,7 +170,9 @@ impl StateDir {
             }
         }
         if found {
-            if base.as_os_str().as_bytes().starts_with(b"/proc/self/fd/") { base.push("."); }
+            if base.as_os_str().as_bytes().starts_with(b"/proc/self/fd/") {
+                base.push(".");
+            }
             let mut dir = Self::open(&base, create)?;
             for name in relative {
                 dir = dir.subdir(name, create)?;
@@ -223,6 +242,12 @@ impl StateDir {
         };
         private(&path, &fs::fstat(&fd)?)?;
         Ok(Self { fd, path })
+    }
+    /// Exclusively create a private child directory relative to this descriptor.
+    pub fn create_subdir(&self, name: &OsStr) -> io::Result<Self> {
+        self.name(name)?;
+        fs::mkdirat(&self.fd, name, Mode::from_raw_mode(0o700))?;
+        self.subdir(name, false)
     }
     /// Unlink a checked regular leaf relative to the retained descriptor.
     pub fn unlink_leaf(&self, name: &OsStr) -> io::Result<()> {

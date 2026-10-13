@@ -2,7 +2,6 @@
 //! Scan catalog shared with the long-lived sample database.
 use crate::{error::sql_u64, reader::Snapshot, StoreError};
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use std::os::unix::fs::DirBuilderExt;
 use std::{
     fs,
     os::unix::ffi::{OsStrExt, OsStringExt},
@@ -284,7 +283,10 @@ impl Catalog {
             if !root.file_type()?.is_dir() {
                 continue;
             }
-            let root_dir = snapshot_dir.as_ref().ok_or_else(|| StoreError::Invalid("snapshot directory missing".into()))?.subdir(&root.file_name(), false)?;
+            let root_dir = snapshot_dir
+                .as_ref()
+                .ok_or_else(|| StoreError::Invalid("snapshot directory missing".into()))?
+                .subdir(&root.file_name(), false)?;
             for file in fs::read_dir(root.path())? {
                 let file = file?;
                 if !file.file_type()?.is_file() || !file.file_name().as_bytes().ends_with(b".db") {
@@ -369,20 +371,38 @@ pub fn recover_catalog_with_lock(
 /// the new database. Ordinary `Catalog::open` never performs this recovery.
 pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError> {
     let verified = crate::state_dir::StateDir::open(state_dir, false)?;
-    for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm", "timeseries.db-journal", "timeseries.db.bak-v0"] { verified.check_leaf(std::ffi::OsStr::new(name))?; }
+    for name in [
+        "timeseries.db",
+        "timeseries.db-wal",
+        "timeseries.db-shm",
+        "timeseries.db-journal",
+        "timeseries.db.bak-v0",
+    ] {
+        verified.check_leaf(std::ffi::OsStr::new(name))?;
+    }
     let lock = verified.open_leaf(std::ffi::OsStr::new("scan.lock"), true, true)?;
     recover_catalog_with_lock(state_dir, &lock)
 }
 fn recover_catalog_owned(state_dir: &Path) -> Result<Catalog, StoreError> {
     let verified = crate::state_dir::StateDir::open(state_dir, false)?;
-    for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm", "timeseries.db-journal", "timeseries.db.bak-v0"] { verified.check_leaf(std::ffi::OsStr::new(name))?; }
+    for name in [
+        "timeseries.db",
+        "timeseries.db-wal",
+        "timeseries.db-shm",
+        "timeseries.db-journal",
+        "timeseries.db.bak-v0",
+    ] {
+        verified.check_leaf(std::ffi::OsStr::new(name))?;
+    }
     // A private, exclusively created directory supplies a collision-free namespace.
     let mut recovery = None;
     for sequence in 0..10_000u32 {
         let path = state_dir.join(format!("timeseries-recovery-{sequence}"));
-        match fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => {
-                verified.subdir(path.file_name().ok_or_else(|| StoreError::Invalid("recovery name missing".into()))?, false)?;
+        match verified.create_subdir(
+            path.file_name()
+                .ok_or_else(|| StoreError::Invalid("recovery name missing".into()))?,
+        ) {
+            Ok(_) => {
                 recovery = Some(path);
                 break;
             }
@@ -497,7 +517,8 @@ fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
             {
                 return Ok(());
             }
-            let root_dir = snapshot_dir.subdir(std::ffi::OsStr::from_bytes(name.to_bytes()), false)?;
+            let root_dir =
+                snapshot_dir.subdir(std::ffi::OsStr::from_bytes(name.to_bytes()), false)?;
             let mut files = Dir::new(directory(&bound, ".")?)?;
             while let Some(file) = files.next() {
                 let file = file?;
