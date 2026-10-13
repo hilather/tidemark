@@ -260,6 +260,25 @@ impl ScanControl {
     /// Start one root, acknowledging only after the writer persists
     /// scan_started. Host lock conflicts return `DaemonError::Scan("Busy")`.
     pub fn start(&self, params: &ScanStartParams) -> Result<ScanStartResult, DaemonError> {
+        self.start_inner(params, None)
+    }
+
+    /// API-only admission using the caller's cancellation and absolute deadline.
+    pub(crate) fn start_for_request(
+        &self,
+        params: &ScanStartParams,
+        request: &crate::api::Cancellation,
+    ) -> Result<ScanStartResult, DaemonError> {
+        self.start_inner(params, Some(request))
+    }
+
+    fn start_inner(
+        &self,
+        params: &ScanStartParams,
+        request: Option<&crate::api::Cancellation>,
+    ) -> Result<ScanStartResult, DaemonError> {
+        let check_request = || request.map_or(Ok(()), crate::api::Cancellation::check);
+        check_request()?;
         let shared = self
             .shared
             .as_ref()
@@ -269,6 +288,7 @@ impl ScanControl {
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let mut active = shared.active.lock();
+        check_request()?;
         if active.is_some() {
             return Err(DaemonError::Scan("Busy".into()));
         }
@@ -283,24 +303,41 @@ impl ScanControl {
             .into_iter()
             .map(|s| s.root)
             .collect();
+        check_request()?;
         labels.extend(shared.failures.lock().keys().map(root_label));
+        check_request()?;
         for root in &shared.state.config().0.roots {
             let raw =
                 RawPath::from_path(&root.path).map_err(|e| DaemonError::Invalid(e.to_string()))?;
             labels.insert(root_label(&raw));
         }
+        check_request()?;
         if !labels.contains(&root_label(&params.root)) && labels.len() >= crate::state::MAX_SUBJECTS
         {
             return Err(DaemonError::Unavailable(
                 "scan root inventory cap reached".into(),
             ));
         }
+        check_request()?;
         shared.state.reserve_scan(root_label(&params.root))?;
+        // State access can block. Recheck after reservation and arbitrate
+        // cancellation atomically before publishing work to the scheduler.
+        let admission = check_request()
+            .and_then(|()| request.map_or(Ok(()), crate::api::Cancellation::begin_scan_admission));
+        if let Err(error) = admission {
+            shared.state.release_scan();
+            return Err(error);
+        }
         let (tx, rx) = bounded(1);
         *active = Some(Active {
             root: params.root.clone(),
             cancel: cancel.clone(),
         });
+        if let Err(error) = check_request() {
+            *active = None;
+            shared.state.release_scan();
+            return Err(error);
+        }
         if shared
             .commands
             .try_send(Command {
@@ -320,6 +357,13 @@ impl ScanControl {
         drop(active);
         let end = Instant::now() + ACK_TIMEOUT;
         loop {
+            if check_request().is_err() {
+                cancel.store(true, Ordering::Release);
+                return Err(DaemonError::Unavailable(
+                    "scan start request cancelled or expired after admission; outcome uncertain"
+                        .into(),
+                ));
+            }
             if shared.shutdown.load(Ordering::Acquire)
                 || shared.deadline.lock().is_some_and(|d| Instant::now() >= d)
             {
@@ -334,7 +378,15 @@ impl ScanControl {
                 ));
             }
             match rx.recv_timeout(remaining.min(POLL)) {
-                Ok(result) => return result,
+                Ok(result) => {
+                    if check_request().is_err() {
+                        cancel.store(true, Ordering::Release);
+                        return Err(DaemonError::Unavailable(
+                            "scan start request cancelled or expired after admission; outcome uncertain".into(),
+                        ));
+                    }
+                    return result;
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(_) => {
                     cancel.store(true, Ordering::Release);
@@ -1475,6 +1527,103 @@ mod tests {
             failures: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         }
     }
+    fn request_control() -> (ScanControl, Receiver<Command>) {
+        let (tx, rx) = bounded(1);
+        let state = LiveState::new(&Config::default(), 0);
+        let control = ScanControl {
+            shared: Some(Arc::new(Shared {
+                state,
+                shutdown: Shutdown::default(),
+                active: Mutex::new(None),
+                deadline: Arc::new(Mutex::new(None)),
+                commands: tx,
+                clock: Arc::new(|| 0),
+                monotonic: Arc::new(|| 0),
+                failures: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            })),
+        };
+        (control, rx)
+    }
+
+    fn scan_dispatch(
+        control: ScanControl,
+        budget: &crate::api::Cancellation,
+    ) -> tidemark_core::api::Response {
+        let context = crate::api::Context {
+            state: control.shared.as_ref().unwrap().state.clone(),
+            scans: control,
+            reload: Arc::new(|| unreachable!()),
+        };
+        crate::api::dispatch_controlled(
+            &tidemark_core::api::Request {
+                v: 1,
+                id: "deadline".into(),
+                method: "scan.start".into(),
+                params: serde_json::json!({"root": "/fixture"}),
+            },
+            0,
+            &context,
+            0,
+            budget,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn request_expiring_behind_admission_locks_never_enqueues() {
+        for failures_lock in [false, true] {
+            let (control, commands) = request_control();
+            let shared = control.shared.as_ref().unwrap().clone();
+            let active = (!failures_lock).then(|| shared.active.lock());
+            let failures = failures_lock.then(|| shared.failures.lock());
+            let budget =
+                crate::api::Cancellation::new(Shutdown::default(), Duration::from_millis(100));
+            let (entered_tx, entered_rx) = bounded(1);
+            let (done_tx, done_rx) = bounded(1);
+            let worker = std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                let response = scan_dispatch(control, &budget);
+                done_tx.send(response).unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(150)).is_err());
+            drop(active);
+            drop(failures);
+            let response = done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(!response.ok);
+            worker.join().unwrap();
+            assert!(commands.is_empty());
+            assert!(shared.active.lock().is_none());
+            assert!(shared.state.view().scans().unwrap_or_default().is_empty());
+        }
+    }
+
+    #[test]
+    fn short_request_deadline_cancels_admitted_scan_while_ack_is_held() {
+        let (control, commands) = request_control();
+        let budget = crate::api::Cancellation::new(Shutdown::default(), Duration::from_millis(150));
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || scan_dispatch(control, &budget));
+        let command = commands.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!command.cancel.load(Ordering::Acquire));
+        // Holding the actual reply sender simulates a writer's pending ack.
+        let response = worker.join().unwrap();
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .unwrap()
+            .message
+            .contains("outcome uncertain"));
+        assert!(command.cancel.load(Ordering::Acquire));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(command
+            .reply
+            .try_send(Ok(ScanStartResult {
+                scan_id: "late".into()
+            }))
+            .is_err());
+    }
+
     #[test]
     fn catalog_descriptor_pressure_keeps_scheduler_pass_alive() {
         let state = LiveState::new(&Config::default(), 0);

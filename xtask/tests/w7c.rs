@@ -1,7 +1,7 @@
 //! Owned by: W7-C2-fault
 //! Static validation of disposable-guest fault entrypoints.
 
-use std::{path::Path, process::Command};
+use std::{io::Write, path::Path, process::Command};
 
 #[test]
 fn fault_scripts_are_guarded_and_valid_shell() {
@@ -69,12 +69,20 @@ fn fault_scripts_are_guarded_and_valid_shell() {
                 .arg(&path)
                 .output()
                 .unwrap();
-            eprintln!(
-                "shellcheck notes for {}:\n{}\n{}",
-                path.display(),
-                String::from_utf8_lossy(&notes.stdout),
-                String::from_utf8_lossy(&notes.stderr),
-            );
+            let mut stderr = std::io::stderr().lock();
+            stderr
+                .write_all(
+                    format!(
+                        "shellcheck notes for {}:\n{}\n{}",
+                        path.display(),
+                        String::from_utf8_lossy(&notes.stdout),
+                        String::from_utf8_lossy(&notes.stderr),
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stderr.write_all(b"\n").unwrap();
+            drop(stderr);
             let output = Command::new("shellcheck")
                 .current_dir(root)
                 .arg("--severity=warning")
@@ -175,4 +183,45 @@ fn guest_tool_guard_covers_shell_and_python_commands() {
         forbidden_guest_tool("# rg is unavailable\ngrep -Fq NoSpace file\nchild_fd = 1"),
         None
     );
+}
+
+#[test]
+fn shellcheck_advisories_survive_passing_harness_and_warnings_fail() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let stub = dir.path().join("shellcheck");
+    let path = std::env::join_paths(std::iter::once(dir.path().to_owned()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    for fail_warning in [false, true] {
+        std::fs::write(&stub, format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nfor arg in \"$@\"; do\nif [ \"$arg\" = --severity=warning ]; then echo WARNING_GATE >&2; exit {}; fi\ndone\necho ADVISORY_STDOUT\necho ADVISORY_STDERR >&2\nexit 1\n",
+            u8::from(fail_warning),
+        )).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Exact filtering avoids recursively invoking this regression. No nocapture.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fault_scripts_are_guarded_and_valid_shell",
+                "--test-threads=1",
+            ])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            !fail_warning,
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("ADVISORY_STDOUT"), "{stderr}");
+        assert!(stderr.contains("ADVISORY_STDERR"), "{stderr}");
+        if fail_warning {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("WARNING_GATE"));
+        }
+    }
 }

@@ -43,9 +43,21 @@ impl Cancellation {
         }
     }
     fn cancel(&self) {
+        // Configuration commits (phase 2) remain irrevocable. Scan admission
+        // (phase 3) stays cancellable while its acknowledgement is outstanding.
         let _ = self
             .phase
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |phase| {
+                matches!(phase, 0 | 3).then_some(1)
+            });
+    }
+    /// Claim scan admission against cancellation while keeping the request cancellable.
+    pub(crate) fn begin_scan_admission(&self) -> Result<(), DaemonError> {
+        self.check()?;
+        self.phase
+            .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| DaemonError::Shutdown)
     }
     /// Claim the configuration commit boundary atomically against cancellation.
     /// Once claimed, publication completes even if a transport timeout follows;
@@ -146,7 +158,8 @@ pub fn dispatch(
         &Cancellation::new(Arc::new(std::sync::atomic::AtomicBool::new(false)), TIMEOUT),
     )
 }
-fn dispatch_controlled(
+/// Dispatch an authenticated request with its caller-supplied execution budget.
+pub(crate) fn dispatch_controlled(
     request: &Request,
     peer_uid: u32,
     context: &Context,
@@ -187,7 +200,11 @@ fn dispatch_controlled(
                 value(rows)
             }
             "alerts.history" => value(view.alerts_history(&params(request)?)?),
-            "scan.start" => value(context.scans.start(&params(request)?)?),
+            "scan.start" => value(
+                context
+                    .scans
+                    .start_for_request(&params(request)?, cancellation)?,
+            ),
             "scan.status" => value(context.scans.status(&params(request)?)?),
             "scan.cancel" => value(context.scans.cancel(&params(request)?)?),
             "config.reload" => {
@@ -370,6 +387,7 @@ fn connection(
             };
             line.clear();
             tracing::info!(uid, pid, method = %request.method, "API request");
+            let scan_start = request.method == "scan.start";
             let id = request.id.clone();
             let ctx = context.clone();
             let retained = permit.clone();
@@ -404,7 +422,15 @@ fn connection(
                 if Instant::now() >= deadline {
                     cancellation.cancel();
                     timed_out = true;
-                    break error(&id, ApiErrorCode::Unavailable, "handler timed out");
+                    break error(
+                        &id,
+                        ApiErrorCode::Unavailable,
+                        if scan_start {
+                            "scan start handler timed out; outcome uncertain"
+                        } else {
+                            "handler timed out"
+                        },
+                    );
                 }
                 match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(Ok(r)) => break r,
@@ -1071,6 +1097,13 @@ mod tests {
         committed.begin_commit().unwrap();
         committed.cancel();
         assert_eq!(committed.phase.load(Ordering::Acquire), 2);
+        let admitted = Cancellation::new(stop.clone(), TIMEOUT);
+        admitted.begin_scan_admission().unwrap();
+        admitted.cancel();
+        assert!(admitted.check().is_err());
+        let refused_scan = Cancellation::new(stop.clone(), TIMEOUT);
+        refused_scan.cancel();
+        assert!(refused_scan.begin_scan_admission().is_err());
         let expired = Cancellation::new(stop.clone(), Duration::ZERO);
         assert!(expired.begin_commit().is_err());
         let stopping = Cancellation::new(stop.clone(), TIMEOUT);
