@@ -316,3 +316,106 @@ fn immutable_report_keeps_exact_windows_while_collector_blocks() {
     assert_eq!(collector.report().unwrap().phantom(None)[0].total_bytes, 0);
     assert_eq!(report.phantom(None)[0].total_bytes, 2048);
 }
+
+#[test]
+fn inventory_budget_failure_preserves_report_and_pending_then_short_pass_recovers() {
+    let long = || {
+        (0..34_000)
+            .map(|i| {
+                let mut f = file(1, 1, 512);
+                f.fd = i;
+                f.target = vec![b'/'; 4000];
+                f
+            })
+            .collect()
+    };
+    let short = (0..34_000)
+        .map(|i| {
+            let mut f = file(1, 1, 1024);
+            f.fd = i;
+            f
+        })
+        .collect();
+    let mut s = scanner(vec![Ok(vec![file(1, 1, 512)]), Ok(long()), Ok(short)]);
+    s.scan_once(0).unwrap();
+    let report = s.report().unwrap();
+    let error = s.scan_once(10).err().unwrap();
+    assert!(error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<procfs::InventoryBudgetExceeded>()
+        .is_some());
+    assert_eq!(s.now, Some(0));
+    assert_eq!(s.pending.0.len(), 1);
+    assert_eq!(s.phantom(None)[0].total_bytes, 512);
+    assert_eq!(report.phantom(None)[0].total_bytes, 512);
+    assert_eq!(s.scan_once(20).unwrap().fds_seen, 34_000);
+    assert_eq!(s.phantom(None)[0].holders.len(), 1);
+    assert_eq!(s.phantom(None)[0].total_bytes, 1024);
+}
+
+#[test]
+fn downstream_long_unique_holders_fail_before_history_changes() {
+    let long = (0..1200)
+        .map(|i| {
+            let mut f = file(i, i as u32, 512);
+            f.target = [vec![b'/'; 4000], b" (deleted)".to_vec()].concat();
+            f
+        })
+        .collect();
+    let mut s = scanner(vec![
+        Ok(vec![file(1, 1, 512)]),
+        Ok(long),
+        Ok(vec![file(1, 1, 1024)]),
+    ]);
+    s.scan_once(0).unwrap();
+    let before = s.tracked[&(1, 1)].samples.clone();
+    let error = s.scan_once(10).err().unwrap();
+    assert!(error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<CopyBudgetExceeded>()
+        .is_some());
+    assert_eq!(s.tracked[&(1, 1)].samples, before);
+    assert_eq!(s.now, Some(0));
+    assert_eq!(s.pending.0[0].bytes, 512);
+    s.scan_once(20).unwrap();
+    assert_eq!(s.phantom(None)[0].total_bytes, 1024);
+}
+
+#[test]
+fn long_duplicate_phantom_below_budget_keeps_counts_holders_and_samples() {
+    let descriptors = (0..400)
+        .map(|i| {
+            let mut f = file(9, 7, 8192);
+            f.fd = i;
+            f.target = [vec![b'/'; 4000], b" (deleted)".to_vec()].concat();
+            f
+        })
+        .collect();
+    let mut s = scanner(vec![Ok(descriptors)]);
+    assert_eq!(s.scan_once(0).unwrap().fds_seen, 400);
+    let summaries = s.phantom(None);
+    assert_eq!(summaries[0].files, 1);
+    assert_eq!(summaries[0].total_bytes, 8192);
+    assert_eq!(summaries[0].holders.len(), 1);
+    assert_eq!(summaries[0].holders[0].pid, 7);
+    assert_eq!(summaries[0].holders[0].path.len(), 4000);
+    let (phantom, writers) = s.take_samples();
+    assert_eq!(phantom.len(), 1);
+    assert_eq!(writers.len(), 1);
+}
+
+#[test]
+fn pipeline_envelope_is_below_512_mib() {
+    // 64 daemon queue slots plus twelve overlapping collector/report/reader row sets.
+    // Three writer-history generations include conservative tree node overhead.
+    // Six MiB covers one attribution read/UTF-8 conversion and transient row.
+    let envelope = procfs::MAX_INVENTORY_BYTES
+        + MAX_SCRATCH_BYTES
+        + (64 + 12) * MAX_PASS_BYTES
+        + 3 * MAX_WRITERS * (ROW_OVERHEAD + HISTORY * std::mem::size_of::<(i64, u64, u64)>())
+        + 6 * 1024 * 1024;
+    assert!(envelope < 512 * 1024 * 1024);
+    assert_eq!(envelope, 534_613_504);
+}
