@@ -43,7 +43,15 @@ fn executable_cli_and_config_paths_use_realpath() {
             let config = dir.path().join("config.toml");
             let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"));
             if configured {
-                std::fs::write(&config, format!("[[roots]]\npath = {:?}\n", requested)).unwrap();
+                std::fs::write(
+                    &config,
+                    format!(
+                        "[general]\nsocket = {:?}\n[[roots]]\npath = {:?}\n",
+                        dir.path().join("absent-api.sock"),
+                        requested
+                    ),
+                )
+                .unwrap();
                 command.arg("--config").arg(&config);
             } else {
                 command.args(["--config", "/tidemark-w1a-missing-config"]);

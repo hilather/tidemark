@@ -1,6 +1,8 @@
 //! Owned by: W2-C
 //! Query and renderer coverage from deterministic hand-built snapshot rows.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "../support/config.rs"]
+mod config_support;
 use std::{path::Path, time::Duration};
 use tidemark_cli::render::tree::{self, Directory};
 use tidemark_core::{
@@ -262,7 +264,7 @@ fn command(state: &Path, args: &[&std::ffi::OsStr]) -> std::process::Output {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"));
     command
         .arg("--config")
-        .arg(state.join("absent.toml"))
+        .arg(config_support::direct_config(state, ""))
         .arg("--state-dir")
         .arg(state)
         .arg("--json");
@@ -421,7 +423,7 @@ fn fixture_command(state: &Path, json: bool) -> assert_cmd::Command {
     let mut command = assert_cmd::Command::new(env!("CARGO_BIN_EXE_tidemark"));
     command
         .arg("--config")
-        .arg(state.join("config.toml"))
+        .arg(state.join("direct-config.toml"))
         .arg("--state-dir")
         .arg(state);
     if json {
@@ -434,7 +436,7 @@ fn fixture_command(state: &Path, json: bool) -> assert_cmd::Command {
 fn non_xfs_modes_and_scan_lock_are_explicit() {
     let fixture = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
-    std::fs::write(state.path().join("config.toml"), "[scan]\nthreads=2\n").unwrap();
+    config_support::direct_config(state.path(), "[scan]\nthreads=2\n");
     // No assumption about the host mount: the non-XFS assertion is conditional on its actual type.
     if !tidemark_fs::mount::read_mountinfo()
         .unwrap()
@@ -480,11 +482,10 @@ fn prune_rebuilds_catalog_for_remaining_files() {
     let old = publish(state.path(), &root, now - 86400, [4096; 4]);
     let retained = publish(state.path(), &root, now - 100, [6000; 4]);
     let current = publish(state.path(), &root, now, [8192; 4]);
-    std::fs::write(
-        state.path().join("config.toml"),
+    config_support::direct_config(
+        state.path(),
         "[retention.snapshots]\nrecent=2\ndaily=0\nweekly=0\n",
-    )
-    .unwrap();
+    );
     fixture_command(state.path(), true)
         .args(["snapshots", "prune"])
         .assert()

@@ -3,6 +3,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "w3a/catalog.rs"]
 mod catalog;
+#[path = "support/config.rs"]
+mod config_support;
 #[path = "w3a/end_to_end.rs"]
 mod end_to_end;
 #[path = "w3a/reports.rs"]

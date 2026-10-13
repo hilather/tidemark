@@ -1,10 +1,11 @@
 //! Owned by: W5-B
 //! Executable direct modes with empty device selection and no daemon/state files.
+#[path = "../support/config.rs"]
+mod config_support;
 #[test]
 fn direct_modes_json_without_daemon() {
     let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    std::fs::write(&config, "[watch]\nmounts = []\n").unwrap();
+    let config = config_support::direct_config(dir.path(), "[watch]\nmounts = []\n");
     for (command, schema, extra) in [
         ("phantom", "tidemark.phantom.v1", vec![]),
         ("writers", "tidemark.writers.v1", vec!["--interval", "1ms"]),
@@ -45,8 +46,7 @@ fn direct_writer_reports_observed_interval() {
         tidemark_core::path::RawPath::from_path(&std::fs::canonicalize(&path).unwrap()).unwrap();
     let table = tidemark_fs::mount::read_mountinfo().unwrap();
     let mount = tidemark_fs::mount::mount_for_path(&table, &raw).unwrap();
-    let config = dir.path().join("config.toml");
-    std::fs::write(&config, "[watch]\nmounts = []\n").unwrap();
+    let config = config_support::direct_config(dir.path(), "[watch]\nmounts = []\n");
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
     let writer = std::thread::spawn(move || {
