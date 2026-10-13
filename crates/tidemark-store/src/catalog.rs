@@ -2,7 +2,6 @@
 //! Scan catalog shared with the long-lived sample database.
 use crate::{error::sql_u64, reader::Snapshot, StoreError};
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use std::os::unix::fs::DirBuilderExt;
 use std::{
     fs,
     os::unix::ffi::{OsStrExt, OsStringExt},
@@ -117,12 +116,7 @@ impl rusqlite::types::ToSql for SqlPath<'_> {
 impl Catalog {
     /// Open the source-of-truth catalog, optionally applying sample migrations.
     pub fn open(state_dir: &Path, rw: bool) -> Result<Self, StoreError> {
-        if rw {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(state_dir)?;
-        }
+        crate::state_dir::StateDir::open(state_dir, rw)?;
         Ok(Self {
             conn: crate::timeseries::open_connection(&state_dir.join("timeseries.db"), rw)?,
             state_dir: state_dir.to_owned(),
@@ -263,7 +257,16 @@ impl Catalog {
         self.rebuild(true)
     }
     fn rebuild(&self, preserve_lifecycle: bool) -> Result<usize, StoreError> {
+        let state = crate::state_dir::StateDir::open(&self.state_dir, false)?;
         let snapshots = self.state_dir.join("snapshots");
+        let snapshot_dir = match state.subdir(std::ffi::OsStr::new("snapshots"), false) {
+            Ok(dir) => Some(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(directory) = snapshot_dir.as_ref() {
+            verify_snapshot_tree(directory, &snapshots)?;
+        }
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             if preserve_lifecycle {
@@ -273,7 +276,7 @@ impl Catalog {
             },
             [],
         )?;
-        if !snapshots.try_exists()? {
+        if snapshot_dir.is_none() {
             tx.commit()?;
             return Ok(0);
         }
@@ -281,13 +284,26 @@ impl Catalog {
         for root in fs::read_dir(snapshots)? {
             let root = root?;
             if !root.file_type()?.is_dir() {
+                if root.file_type()?.is_symlink() {
+                    return Err(StoreError::Invalid(format!(
+                        "state snapshot directory {}: symbolic link refused",
+                        tidemark_core::path::display_lossy_bytes(
+                            root.path().as_os_str().as_bytes()
+                        )
+                    )));
+                }
                 continue;
             }
+            let root_dir = snapshot_dir
+                .as_ref()
+                .ok_or_else(|| StoreError::Invalid("snapshot directory missing".into()))?
+                .subdir(&root.file_name(), false)?;
             for file in fs::read_dir(root.path())? {
                 let file = file?;
-                if !file.file_type()?.is_file() || !file.file_name().as_bytes().ends_with(b".db") {
+                if !file.file_name().as_bytes().ends_with(b".db") {
                     continue;
                 }
+                root_dir.check_leaf(&file.file_name())?;
                 let path = file.path();
                 let loaded = Snapshot::open(&path).and_then(|s| Ok((s.root()?, s.meta().clone())));
                 let (d, m) = match loaded {
@@ -331,6 +347,34 @@ impl Catalog {
     }
 }
 
+// Validate the whole used namespace before a transaction or recovery mutates state.
+// Width is streamed; only the two-level snapshot hierarchy is traversed.
+fn verify_snapshot_tree(
+    directory: &crate::state_dir::StateDir,
+    path: &Path,
+) -> Result<(), StoreError> {
+    for root in fs::read_dir(path)? {
+        let root = root?;
+        if root.file_type()?.is_symlink() {
+            return Err(StoreError::Invalid(format!(
+                "state snapshot directory {}: symbolic link refused",
+                tidemark_core::path::display_lossy_bytes(root.path().as_os_str().as_bytes())
+            )));
+        }
+        if !root.file_type()?.is_dir() {
+            continue;
+        }
+        let child = directory.subdir(&root.file_name(), false)?;
+        for leaf in fs::read_dir(root.path())? {
+            let leaf = leaf?;
+            if leaf.file_name().as_bytes().ends_with(b".db") {
+                child.check_leaf(&leaf.file_name())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Recover with a retained scan-lock descriptor, verifying its identity and exclusion.
 /// All local catalog/sample connections must be closed before calling this function.
 /// The legacy recovery entry point remains for existing callers; production callers
@@ -340,6 +384,8 @@ pub fn recover_catalog_with_lock(
     scan_lock: &fs::File,
 ) -> Result<Catalog, StoreError> {
     use std::os::unix::fs::MetadataExt;
+    let verified = crate::state_dir::StateDir::open(state_dir, false)?;
+    verified.check_leaf(std::ffi::OsStr::new("scan.lock"))?;
     let held = scan_lock.metadata()?;
     let named = fs::symlink_metadata(state_dir.join("scan.lock"))?;
     if !named.is_file() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
@@ -363,24 +409,55 @@ pub fn recover_catalog_with_lock(
 /// Historical samples remain in `Catalog::recovery_files()` and are unavailable in
 /// the new database. Ordinary `Catalog::open` never performs this recovery.
 pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(state_dir.join("scan.lock"))?;
+    let verified = crate::state_dir::StateDir::open(state_dir, false)?;
+    for name in [
+        "timeseries.db",
+        "timeseries.db-wal",
+        "timeseries.db-shm",
+        "timeseries.db-journal",
+        "timeseries.db.bak-v0",
+        "timeseries.db.bak-v0-wal",
+        "timeseries.db.bak-v0-shm",
+        "timeseries.db.bak-v0-journal",
+    ] {
+        verified.check_leaf(std::ffi::OsStr::new(name))?;
+    }
+    match verified.subdir(std::ffi::OsStr::new("snapshots"), false) {
+        Ok(directory) => verify_snapshot_tree(&directory, &state_dir.join("snapshots"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let lock = verified.open_leaf(std::ffi::OsStr::new("scan.lock"), true, true)?;
     recover_catalog_with_lock(state_dir, &lock)
 }
 fn recover_catalog_owned(state_dir: &Path) -> Result<Catalog, StoreError> {
+    let verified = crate::state_dir::StateDir::open(state_dir, false)?;
+    for name in [
+        "timeseries.db",
+        "timeseries.db-wal",
+        "timeseries.db-shm",
+        "timeseries.db-journal",
+        "timeseries.db.bak-v0",
+        "timeseries.db.bak-v0-wal",
+        "timeseries.db.bak-v0-shm",
+        "timeseries.db.bak-v0-journal",
+    ] {
+        verified.check_leaf(std::ffi::OsStr::new(name))?;
+    }
+    match verified.subdir(std::ffi::OsStr::new("snapshots"), false) {
+        Ok(directory) => verify_snapshot_tree(&directory, &state_dir.join("snapshots"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     // A private, exclusively created directory supplies a collision-free namespace.
     let mut recovery = None;
     for sequence in 0..10_000u32 {
         let path = state_dir.join(format!("timeseries-recovery-{sequence}"));
-        match fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => {
+        match verified.create_subdir(
+            path.file_name()
+                .ok_or_else(|| StoreError::Invalid("recovery name missing".into()))?,
+        ) {
+            Ok(_) => {
                 recovery = Some(path);
                 break;
             }
@@ -452,7 +529,7 @@ fn repair_running(state_dir: &Path, now: i64) -> Result<(), StoreError> {
 }
 
 fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
-    use rustix::fs::{self as sys, AtFlags, Dir, FileType, Mode, OFlags};
+    use rustix::fs::{self as sys, Dir, FileType, Mode, OFlags};
     fn directory(
         fd: impl std::os::fd::AsFd,
         name: impl rustix::path::Arg + Copy,
@@ -465,12 +542,14 @@ fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
     }
     // A proc-fd path ending in /. is intentional: the final component is a
     // directory, while the already retained ancestor descriptor binds the state.
-    let state = directory(sys::CWD, state_dir)?;
+    let verified = crate::state_dir::StateDir::open(state_dir, false)?;
+    let state = rustix::io::dup(verified.fd())?;
     let mount = crate::space_guard::mount_id(&state)?;
-    let snapshots = match directory(&state, "snapshots") {
+    let snapshot_dir = match verified.subdir(std::ffi::OsStr::new("snapshots"), false) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         result => result?,
     };
+    let snapshots = rustix::io::dup(snapshot_dir.fd())?;
     if crate::space_guard::mount_id(&snapshots)? != mount {
         return Ok(());
     }
@@ -493,6 +572,8 @@ fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
             {
                 return Ok(());
             }
+            let root_dir =
+                snapshot_dir.subdir(std::ffi::OsStr::from_bytes(name.to_bytes()), false)?;
             let mut files = Dir::new(directory(&bound, ".")?)?;
             while let Some(file) = files.next() {
                 let file = file?;
@@ -513,7 +594,7 @@ fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
                     {
                         return Ok(());
                     }
-                    sys::unlinkat(files.fd()?, filename, AtFlags::empty())?;
+                    root_dir.unlink_leaf(std::ffi::OsStr::from_bytes(filename.to_bytes()))?;
                     tracing::warn!(root=%name.to_string_lossy(), scan_id=%String::from_utf8_lossy(&filename.to_bytes()[..filename.to_bytes().len()-7]), "removed abandoned snapshot temporary");
                     Ok(())
                 })();

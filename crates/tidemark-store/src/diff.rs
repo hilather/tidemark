@@ -473,7 +473,7 @@ mod tests {
     #[ignore = "scale"]
     fn wide_explain_uses_streaming_count_and_bounded_top_n() {
         const CHILDREN: u32 = 200_000;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ::test_support::private_tempdir().unwrap();
         let mut rows = vec![test_support::row(0, None, b"/fixture", 0)];
         rows[0].subtree_end = CHILDREN;
         // Long paths amplify the old window query's per-child scratch usage.
@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn query_restores_mapping_limit_and_detaches_on_error_and_unwind() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ::test_support::private_tempdir().unwrap();
         let mut meta = crate::test_meta();
         meta.schema_version = 1;
         let a = crate::writer::SnapshotWriter::create(dir.path(), &meta)

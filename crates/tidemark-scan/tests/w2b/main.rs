@@ -56,7 +56,7 @@ fn estimate_rounds_up_and_saturates() {
 #[test]
 fn names_smallest_bytes_missing_and_cancelled() {
     use std::os::unix::fs::MetadataExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let name = std::ffi::OsString::from_vec(vec![0xff]);
     std::fs::write(dir.path().join(&name), []).unwrap();
     std::fs::hard_link(dir.path().join(&name), dir.path().join("a")).unwrap();
@@ -230,7 +230,7 @@ mod vm;
 #[test]
 fn preflight_refuses_ftype_without_io() {
     use std::os::fd::AsFd;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let fd = std::fs::File::open(dir.path()).unwrap();
     let root = RawPath::from_path(dir.path()).unwrap();
     let params = BulkParams {
@@ -266,7 +266,7 @@ fn preflight_refuses_ftype_without_io() {
 #[test]
 fn namespace_failure_is_redoable_and_cancellation_is_not() {
     use std::os::fd::AsFd;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let fd = std::fs::File::open(dir.path()).unwrap();
     let root = RawPath::from_path(&dir.path().join("missing")).unwrap();
     let params = BulkParams {
@@ -333,7 +333,7 @@ fn bulk_namespace_progress_reports_while_setup_is_blocked() {
             1.0
         }
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let fd = std::fs::File::open(dir.path()).unwrap();
     let root = RawPath::from_path(&dir.path().join("missing")).unwrap();
     let params = BulkParams {
@@ -395,7 +395,7 @@ fn root_identity(path: &RawPath) -> Vec<names::Identity> {
 #[test]
 fn names_exclude_smallest_alias() {
     use std::os::unix::fs::MetadataExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     std::fs::write(dir.path().join("a"), []).unwrap();
     std::fs::hard_link(dir.path().join("a"), dir.path().join("z")).unwrap();
     let path = RawPath::from_path(dir.path()).unwrap();
@@ -420,7 +420,7 @@ fn names_exclude_smallest_alias() {
 #[test]
 fn excluded_alias_namespace_bulk_equals_walk() {
     use std::os::unix::fs::MetadataExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     std::fs::write(dir.path().join("a"), []).unwrap();
     std::fs::hard_link(dir.path().join("a"), dir.path().join("z")).unwrap();
     let root = RawPath::from_path(dir.path()).unwrap();
@@ -521,7 +521,7 @@ fn cancellation_during_namespace_setup_is_normalized() {
             0.0
         }
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let root = RawPath::from_path(dir.path()).unwrap();
     let fd = std::fs::File::open(dir.path()).unwrap();
     let cancel = AtomicBool::new(false);
@@ -558,7 +558,7 @@ fn cancellation_during_namespace_setup_is_normalized() {
 #[test]
 fn replaced_directory_names_remain_unresolved() {
     use std::os::unix::fs::MetadataExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let child = dir.path().join("child");
     std::fs::create_dir(&child).unwrap();
     std::fs::write(child.join("file"), []).unwrap();

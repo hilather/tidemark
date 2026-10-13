@@ -54,7 +54,7 @@ fn digest(path: &Path) -> u64 {
 }
 #[test]
 fn ten_compaction_crashes_recover_and_are_idempotent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let seed = dir.path().join("seed.db");
     drop(TimeSeries::open(&seed, true).unwrap());
     let conn = Connection::open(&seed).unwrap();

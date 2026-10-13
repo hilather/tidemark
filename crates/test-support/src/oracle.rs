@@ -281,7 +281,7 @@ pub fn vgs_free(vg: &str) -> io::Result<u64> {
 /// Some versions omit it; the normative Tidemark reference always includes it.
 /// The probe uses an owned empty temporary directory and never changes metrics.
 pub fn du_apparent_counts_directories() -> io::Result<bool> {
-    let dir = tempfile::tempdir()?;
+    let dir = crate::private_tempdir()?;
     let apparent = std::fs::symlink_metadata(dir.path())?.len();
     let observed = du(dir.path(), true)?;
     if observed == apparent {

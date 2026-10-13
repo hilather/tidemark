@@ -32,7 +32,7 @@ fn record(catalog: &Catalog, file: std::path::PathBuf, status: &str) -> String {
 #[test]
 fn since_age_notice_latest_complete_and_from_default_to() {
     use std::os::unix::ffi::OsStrExt;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let root = temp.path().join("root");
     std::fs::create_dir(&root).unwrap();
     let state = temp.path().join("state");
@@ -96,7 +96,7 @@ fn since_age_notice_latest_complete_and_from_default_to() {
 #[test]
 fn explicit_partial_or_degraded_diff_warns_and_shows_both_inputs() {
     use std::os::unix::ffi::OsStrExt;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let root = temp.path().join("root");
     std::fs::create_dir(&root).unwrap();
     let state = temp.path().join("state");

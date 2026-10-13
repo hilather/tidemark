@@ -470,7 +470,7 @@ fn private_config(out: &Path) -> Result<PathBuf> {
     let config = out.join("bench.toml");
     let state = out.join("state");
     let socket = out.join("private.sock");
-    fs::create_dir_all(&state)?;
+    private_state_dir(&state)?;
     let string = |p: &Path| -> Result<String> {
         Ok(toml::Value::String(
             p.to_str()
@@ -537,7 +537,7 @@ pub fn run(workspace: &Path, args: impl Iterator<Item = OsString>) -> Result<()>
     if o.caches.iter().any(|c| c == "cold") {
         cold_preflight(o.force)?;
     }
-    fs::create_dir_all(&o.out)?;
+    private_state_dir(&o.out)?;
     o.out = fs::canonicalize(&o.out)?;
     if o.out.starts_with(&o.root) {
         bail!("--out must be outside measured root");
@@ -563,7 +563,7 @@ pub fn run(workspace: &Path, args: impl Iterator<Item = OsString>) -> Result<()>
     let run_dir = o
         .out
         .join(format!("{stem}-{seconds}-{}", std::process::id()));
-    fs::create_dir(&run_dir)?;
+    private_state_dir(&run_dir)?;
     let config = private_config(&run_dir)?;
     if o.watcher || o.modes.iter().any(|m| m != "du") {
         o.tidemark = Some(match &o.tidemark {
@@ -592,7 +592,7 @@ pub fn run(workspace: &Path, args: impl Iterator<Item = OsString>) -> Result<()>
         for cache in &o.caches {
             for mode in &o.modes {
                 let state = run_dir.join(format!("state-{cache}-{mode}"));
-                fs::create_dir(&state)?;
+                private_state_dir(&state)?;
                 let invocations = commands(workspace, &o, &config, &state, mode);
                 let mut measurements = Vec::new();
                 for (index, inv) in invocations.iter().enumerate() {
@@ -712,6 +712,14 @@ fn watcher_experiment(
     Ok(vec![
         json!({"throughput_loss_percent":100.0*(1.0-w/b),"experiment":"watcher-overhead","watcher_command":watch.printable(),"baseline":throughput(&baseline)?,"watched":throughput(&watched)?,"baseline_measurement":baseline,"watched_measurement":watched,"note":"foreground watcher startup is checked for liveness; verify event delivery from watcher.stdout; CPU budget requires separate watcher CPU evidence"}),
     ])
+}
+
+fn private_state_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
 }
 
 #[cfg(test)]

@@ -42,7 +42,7 @@ fn wait_ready(
     handle
 }
 fn sockets_available() -> bool {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     match std::os::unix::net::UnixListener::bind(dir.path().join("probe.sock")) {
         Ok(_) => true,
         Err(error)
@@ -89,7 +89,7 @@ fn write_config(path: &Path, interval: &str) {
 }
 fn fixture() -> (tempfile::TempDir, PathBuf, Config) {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     // The API socket lives in this directory. Under a sticky ancestor such as
     // /tmp the daemon requires an owned 0700 directory; tempfile yields 0755.
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -340,7 +340,7 @@ fn reject_incomplete_over_cap_inventory() {
 #[test]
 fn writer_batch_flush_shutdown_and_ack() {
     let (_dir, _, c) = fixture();
-    std::fs::create_dir(&c.general.state_dir).unwrap();
+    ::test_support::private_dir(&c.general.state_dir).unwrap();
     let stop = Shutdown::default();
     let (tx, h) =
         tswriter::start(Arc::new(c.clone()), LiveState::new(&c, 0), stop.clone()).unwrap();
@@ -434,7 +434,7 @@ fn full_channel_sampling_is_nonblocking() {
 #[test]
 fn compaction_uses_injected_clock() {
     let (_dir, _, mut c) = fixture();
-    std::fs::create_dir(&c.general.state_dir).unwrap();
+    ::test_support::private_dir(&c.general.state_dir).unwrap();
     c.retention.samples.raw = Duration::from_secs(1);
     let now = Arc::new(AtomicI64::new(0));
     let clock = {
@@ -618,7 +618,7 @@ fn nonprivate_state_directories_refused_without_creation() {
     use std::os::unix::fs::PermissionsExt;
     for mode in [0o777, 0o750] {
         let (dir, path, cfg) = fixture();
-        std::fs::create_dir(&cfg.general.state_dir).unwrap();
+        ::test_support::private_dir(&cfg.general.state_dir).unwrap();
         std::fs::set_permissions(
             &cfg.general.state_dir,
             std::fs::Permissions::from_mode(mode),
@@ -665,7 +665,7 @@ fn private_and_missing_state_directories_start() {
     for existing in [true, false] {
         let (_dir, path, cfg) = fixture();
         if existing {
-            std::fs::create_dir(&cfg.general.state_dir).unwrap();
+            ::test_support::private_dir(&cfg.general.state_dir).unwrap();
             std::fs::set_permissions(
                 &cfg.general.state_dir,
                 std::fs::Permissions::from_mode(0o700),
@@ -780,7 +780,7 @@ fn phantom_measurement_uses_allocated_byte_oracle() {
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
     use tidemark_live::procscan::{ProcScanner, ProcScannerOptions};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let path = dir.path().join("held");
     let mut file = std::fs::File::create(&path).unwrap();
     file.write_all(&[0u8; 32768]).unwrap();
@@ -833,14 +833,14 @@ fn corrupt_catalog_is_preserved_before_recovery() {
     }
     use std::os::unix::fs::PermissionsExt;
     let (dir, path, cfg) = fixture();
-    std::fs::create_dir(&cfg.general.state_dir).unwrap();
+    ::test_support::private_dir(&cfg.general.state_dir).unwrap();
     std::fs::set_permissions(
         &cfg.general.state_dir,
         std::fs::Permissions::from_mode(0o700),
     )
     .unwrap();
     let bad = b"deliberately invalid sqlite header";
-    std::fs::write(cfg.general.state_dir.join("timeseries.db"), bad).unwrap();
+    test_support::private_write(cfg.general.state_dir.join("timeseries.db"), bad).unwrap();
     let state = LiveState::new(&cfg, 1);
     let stop = Shutdown::default();
     let h = {
@@ -880,7 +880,7 @@ fn corrupt_catalog_is_preserved_before_recovery() {
 fn symlink_state_artifacts_are_refused() {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let (dir, path, cfg) = fixture();
-    std::fs::create_dir(&cfg.general.state_dir).unwrap();
+    ::test_support::private_dir(&cfg.general.state_dir).unwrap();
     std::fs::set_permissions(
         &cfg.general.state_dir,
         std::fs::Permissions::from_mode(0o700),
@@ -975,7 +975,7 @@ fn startup_reads_last_complete_from_catalog() {
 #[test]
 fn repeated_gauge_keys_and_restart_do_not_poison_writer() {
     let (_dir, _, cfg) = fixture();
-    std::fs::create_dir(&cfg.general.state_dir).unwrap();
+    ::test_support::private_dir(&cfg.general.state_dir).unwrap();
     let state = LiveState::new(&cfg, 100);
     let stop = Shutdown::default();
     let (tx, handle) = tswriter::start(Arc::new(cfg.clone()), state, stop.clone()).unwrap();

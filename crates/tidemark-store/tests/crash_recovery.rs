@@ -8,20 +8,20 @@ use tidemark_store::catalog::{cleanup_abandoned_scans, Catalog, ScanEntry};
 
 #[test]
 fn cleanup_is_selective_repairs_rows_and_is_idempotent() {
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let root = state.path().join("snapshots/root");
-    std::fs::create_dir_all(root.join("nested")).unwrap();
+    ::test_support::private_dir(root.join("nested")).unwrap();
     for path in [
         root.join("dead.db.tmp"),
         root.join("keep.db"),
         root.join("other.tmp"),
         root.join("nested/deep.db.tmp"),
     ] {
-        std::fs::write(path, b"preserved unless temporary").unwrap();
+        test_support::private_write(path, b"preserved unless temporary").unwrap();
     }
     std::fs::create_dir(root.join("directory.db.tmp")).unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    std::fs::write(outside.path().join("outside.db.tmp"), b"keep").unwrap();
+    let outside = ::test_support::private_tempdir().unwrap();
+    test_support::private_write(outside.path().join("outside.db.tmp"), b"keep").unwrap();
     symlink(outside.path(), state.path().join("snapshots/outside")).unwrap();
     symlink("keep.db", root.join("x.db.tmp")).unwrap();
     symlink(&root, state.path().join("snapshots/linked")).unwrap();
@@ -73,7 +73,7 @@ fn cleanup_is_selective_repairs_rows_and_is_idempotent() {
 
 #[test]
 fn empty_and_missing_snapshot_directories_are_supported() {
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     cleanup_abandoned_scans(&state.path().join("new"), 1);
     assert!(Catalog::open(&state.path().join("new"), false)
         .unwrap()
@@ -84,10 +84,10 @@ fn empty_and_missing_snapshot_directories_are_supported() {
 
 #[test]
 fn file_cleanup_failure_does_not_prevent_catalog_repair() {
-    let state = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
+    let outside = ::test_support::private_tempdir().unwrap();
     let target = outside.path().join("outside.db.tmp");
-    std::fs::write(&target, b"keep").unwrap();
+    test_support::private_write(&target, b"keep").unwrap();
     symlink(outside.path(), state.path().join("snapshots")).unwrap();
     let catalog = Catalog::open(state.path(), true).unwrap();
     catalog
@@ -117,12 +117,12 @@ fn file_cleanup_failure_does_not_prevent_catalog_repair() {
 
 #[test]
 fn catalog_failure_does_not_prevent_file_cleanup() {
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let root = state.path().join("snapshots/root");
-    std::fs::create_dir_all(&root).unwrap();
+    ::test_support::private_dir(&root).unwrap();
     let tmp = root.join("dead.db.tmp");
-    std::fs::write(&tmp, b"dead").unwrap();
-    std::fs::write(state.path().join("timeseries.db"), b"not sqlite").unwrap();
+    test_support::private_write(&tmp, b"dead").unwrap();
+    test_support::private_write(state.path().join("timeseries.db"), b"not sqlite").unwrap();
     cleanup_abandoned_scans(state.path(), 3);
     assert!(!tmp.exists());
     assert_eq!(
@@ -134,10 +134,14 @@ fn catalog_failure_does_not_prevent_file_cleanup() {
 #[test]
 fn checked_recovery_refuses_wrong_or_busy_scan_lock() {
     use tidemark_store::catalog::recover_catalog_with_lock;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let database = dir.path().join("timeseries.db");
-    std::fs::write(&database, b"corrupt").unwrap();
-    let held = std::fs::File::create(dir.path().join("scan.lock")).unwrap();
+    test_support::private_write(&database, b"corrupt").unwrap();
+    test_support::private_write(dir.path().join("scan.lock"), b"").unwrap();
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("scan.lock"))
+        .unwrap();
     rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
     let other = std::fs::File::open(dir.path().join("scan.lock")).unwrap();
     assert!(recover_catalog_with_lock(dir.path(), &other).is_err());

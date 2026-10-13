@@ -30,18 +30,37 @@ pub struct CompactStats {
     pub deleted: u64,
 }
 pub(crate) fn open_connection(path: &Path, rw: bool) -> Result<Connection, StoreError> {
-    let existing = path.try_exists()?;
+    let parent = crate::state_dir::file_parent(path)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| StoreError::Invalid("database name missing".into()))?;
+    let directory = crate::state_dir::StateDir::open(&parent, rw)?;
+    let check = || -> Result<(), StoreError> {
+        directory.check_leaf(name)?;
+        for suffix in [
+            "-wal",
+            "-shm",
+            "-journal",
+            ".bak-v0",
+            ".bak-v0-wal",
+            ".bak-v0-shm",
+            ".bak-v0-journal",
+        ] {
+            let mut companion = name.to_os_string();
+            companion.push(suffix);
+            directory.check_leaf(&companion)?;
+        }
+        Ok(())
+    };
+    check()?;
+    let existing = directory.check_leaf(name)?;
     if existing {
         preflight_header(path)?;
     }
     if rw && !existing {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        directory.open_leaf(name, true, true)?;
     }
+    check()?;
     let flags = if rw {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
@@ -94,7 +113,12 @@ pub(crate) fn open_connection(path: &Path, rw: bool) -> Result<Connection, Store
 }
 // Inspect only our own state file before SQLite can mutate its sidecars.
 fn preflight_header(path: &Path) -> Result<(), StoreError> {
-    let mut file = fs::File::open(path)?;
+    let parent = crate::state_dir::file_parent(path)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| StoreError::Invalid("database name missing".into()))?;
+    let directory = crate::state_dir::StateDir::open(&parent, false)?;
+    let mut file = directory.open_leaf(name, false, false)?;
     let mut header = [0; 16];
     let mut len = 0;
     while len < header.len() {
@@ -475,7 +499,7 @@ mod query_plan_tests {
 
     #[test]
     fn tier_checks_seek_timestamp_primary_keys() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ::test_support::private_tempdir().unwrap();
         let store = TimeSeries::open(&tmp.path().join("timeseries.db"), true).unwrap();
         for sql in [FS_QUERY, LVM_QUERY] {
             let mut statement = store

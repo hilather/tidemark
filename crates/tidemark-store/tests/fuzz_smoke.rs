@@ -34,7 +34,7 @@ fn mutated(seed: &[u8], cut: usize, byte: u8, mode: u8) -> Vec<u8> {
     }
     out
 }
-#[path = "../../../fuzz/support/catalog.rs"]
+#[path = "support/catalog.rs"]
 mod catalog;
 fn exercise(bytes: &[u8]) {
     catalog::exercise(bytes);

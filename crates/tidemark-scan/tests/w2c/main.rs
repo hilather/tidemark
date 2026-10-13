@@ -79,7 +79,7 @@ fn mandatory_walk_fixtures_match_du_find_for_every_directory() {
             }
             Err(e) => panic!("{name}: {e}"),
         };
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let cfg = config(state.path());
         let result = run_scan(
             &cfg,
@@ -164,7 +164,7 @@ fn auto_xfs_mount_root_and_small_subdir_record_reasons() {
             .set_len(8192)
             .unwrap();
     }
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let cfg = config(state.path());
     let rec = Recorder(state.path().to_owned());
     let root = run_scan(
@@ -236,7 +236,7 @@ fn random_disk_snapshot_matches_independent_reference() {
         inode.mtime = m.mtime();
         assert_eq!(inode.nlink, m.nlink() as u32);
     }
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let result = run_scan(
         &config(state.path()),
         &request(&fixture.root, ModeRequest::Walk),
@@ -301,7 +301,7 @@ fn random_disk_snapshot_matches_independent_reference() {
 
 #[test]
 fn failed_walk_keeps_valid_collected_records_only_when_requested() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = ::test_support::private_tempdir().unwrap();
     let child = fixture.path().join("child");
     std::fs::create_dir(&child).unwrap();
     // The documented threshold-candidate cap deterministically fails the child
@@ -310,7 +310,7 @@ fn failed_walk_keeps_valid_collected_records_only_when_requested() {
         std::fs::File::create(child.join(format!("f{id}"))).unwrap();
     }
     for keep in [false, true] {
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let mut cfg = config(state.path());
         cfg.roots = vec![tidemark_core::config::RootConfig {
             path: fixture.path().to_owned(),
@@ -356,7 +356,7 @@ fn failed_walk_keeps_valid_collected_records_only_when_requested() {
 #[test]
 fn automatic_retention_rebuilds_catalog_after_deleting_old_files() {
     let fixture = test_support::materialize("[[entry]]\npath='file'\nkind='file'\nsize=8\n");
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let mut cfg = config(state.path());
     cfg.retention.snapshots.recent = 1;
     cfg.retention.snapshots.daily = 0;
@@ -418,7 +418,7 @@ fn low_rate_walk_cancellation_cleans_up_and_releases_lock() {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     let fixture = test_support::materialize("[[entry]]\npath='child/file'\nkind='file'\nsize=8\n");
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let mut cfg = config(state.path());
     cfg.throttle.min_ops_per_sec = 1;
     cfg.throttle.max_ops_per_sec = 1;

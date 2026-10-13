@@ -35,7 +35,7 @@ fn cli(path: &std::path::Path, args: &[&str]) -> std::process::Output {
 }
 #[test]
 fn live_commands_without_server_exit_four() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let p = config(&dir);
     for args in [
         vec!["now"],
@@ -193,7 +193,7 @@ fn live_tables_and_shared_byte_path_machine_output() {
         ),
     ];
     for (args, replies, expected) in cases {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ::test_support::private_tempdir().unwrap();
         let p = config(&dir);
         if args.first() == Some(&"scan") && !args.contains(&"--cancel") {
             catalog_entry(&dir, false, "complete");
@@ -208,7 +208,7 @@ fn live_tables_and_shared_byte_path_machine_output() {
         );
         assert!(String::from_utf8_lossy(&out.stdout).contains(expected));
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let p = config(&dir);
     let server = fake(
         &p,
@@ -267,7 +267,7 @@ fn renderers_work_without_socket_permissions() {
 }
 
 fn socket_available() -> bool {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     match std::os::unix::net::UnixListener::bind(dir.path().join("probe.sock")) {
         Ok(_) => true,
         Err(e) if e.raw_os_error() == Some(1) => {
@@ -279,7 +279,7 @@ fn socket_available() -> bool {
 }
 #[test]
 fn lvm_fallback_notice_with_collector_disabled() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let p = config(&dir);
     let mut text = std::fs::read_to_string(&p).unwrap();
     text.push_str("\n[lvm]\nenabled=false\n");
@@ -291,7 +291,7 @@ fn lvm_fallback_notice_with_collector_disabled() {
 
 #[test]
 fn phantom_and_writers_fallback_notice_and_direct_setup_seam() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let p = config(&dir);
     let missing = dir.path().join("missing-mount");
     let missing = missing.to_str().unwrap();
@@ -319,7 +319,7 @@ fn explicit_direct_never_connects_to_listening_daemon() {
     if !socket_available() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let p = config(&dir);
     let listener = UnixListener::bind(dir.path().join("api.sock")).unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -374,7 +374,7 @@ fn scan_resolves_only_its_catalog_outcome() {
         (false, "missing", 3),
     ] {
         for slot in ["completed", "later_running", "later_complete", "absent"] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = ::test_support::private_tempdir().unwrap();
             let p = config(&dir);
             if status != "missing" {
                 catalog_entry(&dir, degraded, status);
@@ -429,7 +429,7 @@ fn scan_resolves_only_its_catalog_outcome() {
 }
 #[test]
 fn scan_invalid_endpoint_never_writes_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let p = config(&dir);
     std::fs::write(dir.path().join("api.sock"), b"not a socket").unwrap();
     let config = std::fs::read_to_string(&p)
@@ -480,7 +480,7 @@ fn scan_full_backlog_expires_without_direct_state_writes() {
     use rustix::net::{
         bind, connect, listen, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType,
     };
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let p = config(&dir);
     let socket = dir.path().join("api.sock");
     let address = SocketAddrUnix::new(&socket).unwrap();
@@ -720,7 +720,7 @@ fn every_live_renderer_fits_long_byte_paths_and_controls() {
 #[test]
 fn scan_permission_error_never_falls_back() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let p = config(&dir);
     let locked = dir.path().join("locked");
     std::fs::create_dir(&locked).unwrap();
@@ -989,7 +989,7 @@ fn daemon_scan_space_refusal_matches_direct_exit_and_wording() {
             "daemon error: scan: NoSpace",
         ),
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ::test_support::private_tempdir().unwrap();
         let p = config(&dir);
         let listener = UnixListener::bind(dir.path().join("api.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1045,7 +1045,7 @@ fn daemon_scan_space_refusal_matches_direct_exit_and_wording() {
 #[test]
 fn catalog_mutations_preserve_existing_corrupt_state_on_uncertain_endpoint() {
     use std::os::unix::fs::MetadataExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let p = config(&dir);
     std::fs::write(dir.path().join("api.sock"), b"not a directory").unwrap();
     let text = std::fs::read_to_string(&p)
@@ -1053,7 +1053,7 @@ fn catalog_mutations_preserve_existing_corrupt_state_on_uncertain_endpoint() {
         .replace("api.sock'", "api.sock/child'");
     std::fs::write(&p, text).unwrap();
     let state = dir.path().join("state");
-    std::fs::create_dir(&state).unwrap();
+    ::test_support::private_dir(&state).unwrap();
     let mut original = Vec::new();
     for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
         let path = state.join(name);

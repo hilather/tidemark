@@ -5,7 +5,7 @@ use crate::{error::sql_u64, space_guard::SpaceVerdict, StoreError};
 use rusqlite::{params, Connection};
 use std::{
     fs::{self, File, OpenOptions},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 use tidemark_core::snapshot::*;
@@ -29,21 +29,33 @@ impl SnapshotWriter {
         if meta.schema_version != 1 {
             return Err(StoreError::Invalid("snapshot schema must be 1".into()));
         }
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
+        let directory = crate::state_dir::StateDir::snapshot_dir(dir, true)?;
         let final_path = dir.join(format!("{}.db", meta.scan_id));
-        if final_path.try_exists()? {
+        if directory.check_leaf(
+            final_path
+                .file_name()
+                .ok_or_else(|| StoreError::Invalid("snapshot name missing".into()))?,
+        )? {
             return Err(
                 std::io::Error::new(std::io::ErrorKind::AlreadyExists, "scan id exists").into(),
             );
         }
         let tmp = dir.join(format!("{}.db.tmp", meta.scan_id));
+        let name = tmp
+            .file_name()
+            .ok_or_else(|| StoreError::Invalid("snapshot name missing".into()))?;
+        directory.check_leaf(name)?;
+        // A preexisting temporary belongs to another/abandoned publication.
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC)
+                    .bits() as i32,
+            )
             .open(&tmp)?;
         let mut writer = Self {
             conn: None,
@@ -58,6 +70,12 @@ impl SnapshotWriter {
         };
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         drop(file);
+        directory.check_leaf(
+            writer
+                .tmp
+                .file_name()
+                .ok_or_else(|| StoreError::Invalid("snapshot name missing".into()))?,
+        )?;
         let conn = Connection::open(&writer.tmp)?;
         conn.execute_batch("PRAGMA page_size=32768; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA locking_mode=EXCLUSIVE; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-262144; PRAGMA user_version=1;")?;
         conn.execute_batch(

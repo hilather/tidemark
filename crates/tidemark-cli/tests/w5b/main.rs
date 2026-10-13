@@ -4,7 +4,7 @@
 mod config_support;
 #[test]
 fn direct_modes_json_without_daemon() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let config = config_support::direct_config(dir.path(), "[watch]\nmounts = []\n");
     for (command, schema, extra) in [
         ("phantom", "tidemark.phantom.v1", vec![]),
@@ -38,7 +38,7 @@ fn direct_writer_reports_observed_interval() {
             Arc,
         },
     };
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let path = dir.path().join("growing");
     let mut file = std::fs::File::create(&path).unwrap();
     let ino = file.metadata().unwrap().ino();

@@ -13,7 +13,7 @@ use std::{
 
 #[test]
 fn low_descriptor_limit_binary_serves_twenty_status_requests() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     match UnixListener::bind(dir.path().join("probe.sock")) {
         Ok(listener) => drop(listener),

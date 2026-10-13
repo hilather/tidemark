@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn mount_realpath_and_state_exclusion() {
         use std::os::unix::fs::symlink;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = ::test_support::private_tempdir().unwrap();
         let target = temp.path().join("target/sub");
         std::fs::create_dir_all(&target).unwrap();
         let alias = temp.path().join("alias");

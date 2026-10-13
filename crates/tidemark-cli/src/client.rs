@@ -445,7 +445,7 @@ mod tests {
     }
     #[test]
     fn unix_listener_connect_and_daemon_absence() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ::test_support::private_tempdir().unwrap();
         let socket = dir.path().join("api.sock");
         let listener = match UnixListener::bind(&socket) {
             Ok(listener) => listener,

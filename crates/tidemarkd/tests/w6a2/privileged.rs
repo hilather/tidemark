@@ -47,7 +47,7 @@ fn daemon_reload_and_shutdown() {
         "disposable VM only"
     );
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::create_dir(dir.path().join("mount")).unwrap();
     for n in 0..1024 {

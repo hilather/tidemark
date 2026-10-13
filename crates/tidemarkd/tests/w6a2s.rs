@@ -24,7 +24,7 @@ fn wait(mut condition: impl FnMut() -> bool) {
     }
 }
 fn config() -> (tempfile::TempDir, Config) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.general.state_dir = dir.path().join("state");
     cfg.general.socket = dir.path().join("socket");

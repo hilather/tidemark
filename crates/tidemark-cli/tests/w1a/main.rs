@@ -28,7 +28,7 @@ fn probe_json_has_remaining_sections() {
 
 #[test]
 fn executable_cli_and_config_paths_use_realpath() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("target/child")).unwrap();
     std::fs::create_dir(dir.path().join("existing")).unwrap();
     std::os::unix::fs::symlink(

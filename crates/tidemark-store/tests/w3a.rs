@@ -11,7 +11,7 @@ fn p(bytes: &[u8]) -> RawPath {
     RawPath::new(bytes.to_vec()).unwrap()
 }
 fn pair() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let mut old = vec![
         row(0, None, b"/fixture", 100),
         row(1, Some(0), b"/fixture/a", 60),
@@ -125,7 +125,7 @@ fn dominant_chain_minimum_and_symmetric_shrink() {
 }
 #[test]
 fn spread_tie_bytes_and_own_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let old = vec![
         row(0, None, b"/fixture", 0),
         row(1, Some(0), b"/fixture/z", 0),
@@ -152,7 +152,7 @@ fn spread_tie_bytes_and_own_files() {
 #[test]
 #[ignore = "scale"]
 fn million_directory_depth_three() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let mut rows = vec![row(0, None, b"/fixture", 0)];
     rows[0].subtree_end = 999_999;
     for group in 0..10 {
@@ -215,7 +215,7 @@ fn million_directory_depth_three() {
 
 #[test]
 fn own_only_zero_change_missing_target_and_read_only_snapshots() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let mut old = row(0, None, b"/fixture", 100);
     old.subtree_end = 0;
     let mut new = old.clone();
@@ -267,11 +267,11 @@ fn own_only_zero_change_missing_target_and_read_only_snapshots() {
 #[test]
 fn attachment_uri_bytes_hash_collision_and_error_cleanup() {
     use std::os::unix::ffi::OsStringExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let state = dir
         .path()
         .join(std::ffi::OsString::from_vec(b"state?#%\xff".to_vec()));
-    std::fs::create_dir(&state).unwrap();
+    ::test_support::private_dir(&state).unwrap();
     let mut old = vec![
         row(0, None, b"/fixture", 10),
         row(1, Some(0), b"/fixture/a", 2),
@@ -312,7 +312,7 @@ fn attachment_uri_bytes_hash_collision_and_error_cleanup() {
 
 #[test]
 fn path_join_ignores_preorder_ids_and_depth_addition_does_not_wrap() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let mut old = vec![
         row(0, None, b"/fixture", 20),
         row(1, Some(0), b"/fixture/b", 10),
@@ -346,7 +346,7 @@ fn path_join_ignores_preorder_ids_and_depth_addition_does_not_wrap() {
 
 #[test]
 fn zero_parent_delta_does_not_count_opposing_children_as_spread() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let mut old = vec![
         row(0, None, b"/fixture", 100),
         row(1, Some(0), b"/fixture/a", 50),

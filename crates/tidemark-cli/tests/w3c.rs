@@ -13,7 +13,7 @@ fn scan(
     tidemark_store::Snapshot,
 ) {
     let fixture = test_support::materialize(fixture);
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.general.state_dir = temp.path().join("state");
     let recorder = tidemark_cli::cmd::scan::DirectRecorder {
@@ -126,7 +126,7 @@ fn export_mode_overwrite_state_protection_and_wide_json() {
         .all(|r| r.get("path").is_some() || r.get("path_b64").is_some()));
     // A malformed immutable snapshot triggers an export error after output has
     // started. Publication must leave neither the target nor a temporary file.
-    let malformed = tempfile::tempdir().unwrap();
+    let malformed = ::test_support::private_tempdir().unwrap();
     let mut row = snap.root().unwrap();
     row.dir_disk = 1;
     row.own_charged = 0;

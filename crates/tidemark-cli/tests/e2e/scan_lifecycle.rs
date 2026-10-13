@@ -15,13 +15,13 @@ impl Drop for ChildGuard {
 fn interrupt_scan(
     keep_partial: bool,
 ) -> (std::process::Output, tempfile::TempDir, tempfile::TempDir) {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = ::test_support::private_tempdir().unwrap();
     for i in 0..100 {
         let dir = fixture.path().join(format!("dir{i}"));
         std::fs::create_dir(&dir).unwrap();
         std::fs::File::create(dir.join("file")).unwrap();
     }
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let config = direct_config(
         state.path(),
         "[throttle]\nmin_ops_per_sec=1\nmax_ops_per_sec=1\n",
@@ -183,7 +183,7 @@ fn interrupted_cancelled_and_failed_scans() {
         no_temporaries(state.path());
     }
     let h = Harness::new();
-    let root = tempfile::tempdir().unwrap();
+    let root = ::test_support::private_tempdir().unwrap();
     super::support::accessible(root.path());
     for opts in [["--threads", "0"], ["--threads", "65"], ["--exclude", "["]] {
         h.run(
@@ -200,14 +200,9 @@ fn interrupted_cancelled_and_failed_scans() {
     }
     // A separate child acquires the lock and explicitly signals readiness.
     // Its bounded stdin lifetime releases it even if an assertion panics.
-    std::fs::create_dir(&h.state).unwrap();
-    std::fs::set_permissions(
-        &h.state,
-        std::os::unix::fs::PermissionsExt::from_mode(0o777),
-    )
-    .unwrap();
-    let mut child = std::process::Command::new("python3")
-        .args(["-c", "import fcntl,sys; f=open(sys.argv[1], 'w'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); sys.stdin.read()"])
+    h.prepare_state();
+    let mut child = h.fixture_command("python3")
+        .args(["-c", "import fcntl,sys; import os; f=os.fdopen(os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT, 0o600), 'w'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); sys.stdin.read()"])
         .arg(h.state.join("scan.lock"))
         .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
     // The lock file is test-owned; make it openable by the CLI child as well.
@@ -226,11 +221,6 @@ fn interrupted_cancelled_and_failed_scans() {
         rx.recv_timeout(Duration::from_secs(30)).unwrap().trim(),
         "locked"
     );
-    std::fs::set_permissions(
-        h.state.join("scan.lock"),
-        std::os::unix::fs::PermissionsExt::from_mode(0o666),
-    )
-    .unwrap();
     h.run(
         false,
         &[

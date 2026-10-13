@@ -77,7 +77,7 @@ fn daemon_end_to_end() {
         },
     );
     let thin = &vg.mounts[0].mountpoint;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("api.sock");
     let config = dir.path().join("config.toml");

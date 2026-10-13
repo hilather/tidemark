@@ -7,7 +7,7 @@ use crate::{
 use clap::Parser;
 #[test]
 fn missing_daemon_takes_direct_setup_without_scanning_proc() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let mut ctx = Context {
         config: tidemark_core::config::Config::default(),
         config_path: dir.path().join("config.toml"),
@@ -98,7 +98,7 @@ fn shared_setup_selects_visible_overmount() {
 
 #[test]
 fn shared_setup_canonicalizes_alias_relative_and_symlink_parent() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let nested = temp.path().join("nested");
     std::fs::create_dir(&nested).unwrap();
     let alias = temp.path().join("alias");

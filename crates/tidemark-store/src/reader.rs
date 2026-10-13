@@ -291,6 +291,12 @@ impl Snapshot {
     /// # Ok(()) }
     /// ```
     pub fn open(path: &Path) -> Result<Self> {
+        let parent = crate::state_dir::file_parent(path)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| StoreError::Invalid("snapshot name missing".into()))?;
+        let directory = crate::state_dir::StateDir::snapshot_dir(&parent, false)?;
+        let _leaf = directory.open_leaf(name, false, false)?;
         let conn = immutable_connection(path)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version != 1 {
@@ -769,7 +775,7 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     fn fixture(name: &str) -> (tempfile::TempDir, super::Snapshot) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ::test_support::private_tempdir().unwrap();
         let file = dir.path().join(name);
         let mut meta = crate::test_meta();
         meta.schema_version = 1;

@@ -23,6 +23,9 @@ pub mod timeseries;
 /// writer module skeleton.
 pub mod writer;
 
+/// Verified state-directory trust boundary.
+pub mod state_dir;
+
 mod error;
 
 pub use error::StoreError;

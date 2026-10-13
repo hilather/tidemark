@@ -273,8 +273,8 @@ fn command(state: &Path, args: &[&std::ffi::OsStr]) -> std::process::Output {
 #[test]
 fn catalog_queries_growth_limits_filters_and_canonicalization() {
     use std::ffi::OsStr;
-    let state = tempfile::tempdir().unwrap();
-    let fixture = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
+    let fixture = ::test_support::private_tempdir().unwrap();
     let root = tidemark_fs::canon::canonicalize(fixture.path()).unwrap();
     let now = tidemark_core::time::unix_now();
     publish(state.path(), &root, now - 86400, [4096, 2048, 2048, 1024]);
@@ -352,8 +352,8 @@ fn catalog_queries_growth_limits_filters_and_canonicalization() {
 #[test]
 fn missing_growth_is_exit_five() {
     use std::ffi::OsStr;
-    let state = tempfile::tempdir().unwrap();
-    let fixture = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
+    let fixture = ::test_support::private_tempdir().unwrap();
     let root = tidemark_fs::canon::canonicalize(fixture.path()).unwrap();
     publish(
         state.path(),
@@ -376,8 +376,8 @@ fn missing_growth_is_exit_five() {
 #[test]
 fn rebuild_preserves_corrupt_database_and_dry_prune_is_read_only() {
     use std::ffi::OsStr;
-    let state = tempfile::tempdir().unwrap();
-    let fixture = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
+    let fixture = ::test_support::private_tempdir().unwrap();
     let root = tidemark_fs::canon::canonicalize(fixture.path()).unwrap();
     publish(state.path(), &root, 100, [4096, 2048, 1024, 1024]);
     let file = state.path().join("timeseries.db");
@@ -434,8 +434,8 @@ fn fixture_command(state: &Path, json: bool) -> assert_cmd::Command {
 
 #[test]
 fn non_xfs_modes_and_scan_lock_are_explicit() {
-    let fixture = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
+    let fixture = ::test_support::private_tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     config_support::direct_config(state.path(), "[scan]\nthreads=2\n");
     // No assumption about the host mount: the non-XFS assertion is conditional on its actual type.
     if !tidemark_fs::mount::read_mountinfo()
@@ -475,8 +475,8 @@ fn non_xfs_modes_and_scan_lock_are_explicit() {
 
 #[test]
 fn prune_rebuilds_catalog_for_remaining_files() {
-    let fixture = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
+    let fixture = ::test_support::private_tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let root = RawPath::from_path(fixture.path()).unwrap();
     let now = tidemark_core::time::unix_now();
     let old = publish(state.path(), &root, now - 86400, [4096; 4]);
@@ -511,9 +511,9 @@ fn prune_rebuilds_catalog_for_remaining_files() {
 
 #[test]
 fn scoped_rebuild_refuses_without_changing_other_root_rows() {
-    let first = tempfile::tempdir().unwrap();
-    let second = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
+    let first = ::test_support::private_tempdir().unwrap();
+    let second = ::test_support::private_tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let root = RawPath::from_path(second.path()).unwrap();
     let now = tidemark_core::time::unix_now();
     publish(state.path(), &root, now, [4096; 4]);
@@ -553,8 +553,8 @@ fn scoped_rebuild_refuses_without_changing_other_root_rows() {
 #[test]
 #[ignore = "scale"]
 fn growth_reader_cap_refuses_instead_of_ranking_disk_prefix() {
-    let fixture = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
+    let fixture = ::test_support::private_tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let root = RawPath::from_path(fixture.path()).unwrap();
     let now = tidemark_core::time::unix_now();
     publish(state.path(), &root, now - 86400, [4096; 4]);

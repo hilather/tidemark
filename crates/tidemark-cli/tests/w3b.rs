@@ -45,7 +45,7 @@ fn bulk_show_paths_marks_live_and_gone() {
         writer::SnapshotWriter,
     };
     let f=test_support::materialize("[[entry]]\npath='a/source'\nkind='file'\nsize=4096\n[[entry]]\npath='b/link'\nkind='hardlink'\ntarget='a/source'\n");
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let cfg = config(tmp.path());
     run(
         &cfg,
@@ -123,7 +123,7 @@ fn bulk_show_paths_marks_live_and_gone() {
     // A symlink replacement must never expose names outside the scan root.
     std::fs::remove_file(f.root.join("b/replacement")).unwrap();
     std::fs::remove_dir(f.root.join("b")).unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let outside = ::test_support::private_tempdir().unwrap();
     std::os::unix::fs::symlink(outside.path(), f.root.join("b")).unwrap();
     let replaced = run(
         &cfg,
@@ -206,7 +206,7 @@ fn million_set_cli_timing() {
         writer::SnapshotWriter,
     };
     let f = test_support::materialize("[[entry]]\npath='a/x/source'\nkind='file'\nsize=1\n[[entry]]\npath='b/y/link'\nkind='hardlink'\ntarget='a/x/source'\n");
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let cfg = config(tmp.path());
     run(
         &cfg,

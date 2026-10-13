@@ -55,7 +55,7 @@ impl LoopXfs {
     /// Fallible constructor; partially constructed resources are rolled back.
     pub fn try_new(size: u64, mkfs_opts: &[&str], mount_opts: &str) -> io::Result<Self> {
         require_root();
-        let mut dir = tempfile::tempdir()?;
+        let mut dir = crate::private_tempdir()?;
         let storage = OwnedStorage::new(&mut dir)?;
         let image = dir.path().join("xfs.img");
         let mountpoint = dir.path().join("mount");

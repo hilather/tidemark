@@ -105,7 +105,7 @@ fn parse(text: &str) -> BTreeMap<String, Vec<(String, f64)>> {
     samples
 }
 fn snapshot(n: u32) -> (tempfile::TempDir, tidemark_store::reader::Snapshot) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let mut meta = fixtures::meta();
     meta.dirs = n as u64;
     meta.errors = 7;
@@ -266,7 +266,7 @@ fn measured_state_and_unavailable_omission() {
 }
 #[test]
 fn atomic_publication_and_modes() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let path = tmp.path().join("metrics.prom");
     let a = "a".repeat(100000);
     let b = "b".repeat(100000);
@@ -314,7 +314,7 @@ fn atomic_publication_and_modes() {
 
 #[test]
 fn exporter_reload_health_and_shutdown() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let mut config = Config::default();
     config.metrics.textfile = tmp.path().join("absent/out.prom");
     config.metrics.interval = Duration::from_millis(10);
@@ -426,7 +426,7 @@ fn huge_interval_reports_error_and_recovers_after_reload() {
 }
 #[test]
 fn temporary_live_writer_and_nonregular_are_refused() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let output = tmp.path().join("out.prom");
     let staging = tmp.path().join("out.prom.tmp");
     std::fs::write(&staging, "live").unwrap();
@@ -583,7 +583,7 @@ fn global_candidates_across_roots_and_replacement_uncover_previous_rows() {
         (b"/b".as_slice(), 0, 9),
         (b"/a".as_slice(), 0, 10),
     ] {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ::test_support::private_tempdir().unwrap();
         let mut meta = fixtures::meta();
         meta.root = RawPath::new(root.to_vec()).unwrap();
         meta.dirs = 601;
@@ -682,7 +682,7 @@ fn unit_allows_only_unix_and_netlink() {
 
 #[test]
 fn exporter_retries_busy_temporary_and_clears_health_on_next_success() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let mut config = Config::default();
     config.roots.clear();
     config.general.state_dir = tmp.path().into();

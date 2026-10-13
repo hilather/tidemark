@@ -13,7 +13,7 @@ fn sum(value: &serde_json::Value) -> u64 {
 }
 #[test]
 fn nested_arrays_subroot_depth_and_charged_totals() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let mut root = support::row(0, None, b"/fixture", 10);
     root.subtree_end = 3;
     root.t_charged = 100;
@@ -74,7 +74,7 @@ fn nested_arrays_subroot_depth_and_charged_totals() {
 #[test]
 #[ignore = "scale"]
 fn million_directory_export_rss_below_64_mib() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let mut meta = support::meta(
         tidemark_core::path::RawPath::new(b"/fixture".to_vec()).unwrap(),
         200,
@@ -164,7 +164,7 @@ fn notable_files_above_old_cap_stream_and_io_errors_propagate() {
         path::{RawName, RawPath},
         snapshot::FileRow,
     };
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let root = RawPath::new(b"/fixture".to_vec()).unwrap();
     let mut meta = support::meta(root.clone(), 300);
     meta.dirs = 1;
@@ -215,7 +215,7 @@ fn notable_files_above_old_cap_stream_and_io_errors_propagate() {
     assert_eq!(std::fs::read(&file).unwrap(), original);
     let absent = RawPath::new(b"/absent".to_vec()).unwrap();
     assert!(export_ncdu(&snap, &absent, &mut out, &opts).is_err());
-    let small = tempfile::tempdir().unwrap();
+    let small = ::test_support::private_tempdir().unwrap();
     let mut row = support::row(0, None, b"/fixture", 0);
     row.subtree_end = 0;
     let file = support::snapshot(small.path(), &[row], 400);
@@ -237,7 +237,7 @@ fn notable_files_above_old_cap_stream_and_io_errors_propagate() {
 
 #[test]
 fn symlinks_are_a_subset_of_other_files() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let mut row = support::row(0, None, b"/fixture", 30);
     row.subtree_end = 0;
     row.own_files = 3;
@@ -260,7 +260,7 @@ fn symlinks_are_a_subset_of_other_files() {
 }
 #[test]
 fn outside_subroot_link_keeps_apparent_charge_at_every_depth() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     // A 500-byte shared inode has names in a/d/e and b and is charged at root.
     let mut root = support::row(0, None, b"/fixture", 500);
     root.subtree_end = 4;
@@ -315,7 +315,7 @@ fn notable_paging_uses_index_seek_without_sort() {
         .split('"')
         .nth(1)
         .unwrap();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let mut row = support::row(0, None, b"/fixture", 0);
     row.subtree_end = 0;
     let path = support::snapshot(temp.path(), &[row], 700);
@@ -341,7 +341,7 @@ fn notable_paging_uses_index_seek_without_sort() {
 
 #[test]
 fn truncated_apparent_sum_reports_overflow() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let mut root = support::row(0, None, b"/fixture", 0);
     root.subtree_end = 3;
     let mut rows = vec![root];
