@@ -22,11 +22,13 @@ struct Pages {
     inode: Option<u64>,
     live: Option<Vec<(DirRow, Option<i128>)>>,
     live_order: Option<state::Sort>,
+    live_growth: std::collections::HashMap<u32, Option<i128>>,
 }
 struct LiveResult {
     root: DirRow,
     children: Vec<(DirRow, Option<i128>)>,
     sort: state::Sort,
+    growth: std::collections::HashMap<u32, Option<i128>>,
 }
 struct Refresh {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -60,7 +62,12 @@ struct Browser {
 impl Browser {
     fn load(&mut self) -> anyhow::Result<()> {
         if self.state.sort == state::Sort::Growth
-            && self.snapshot.children_count(self.dir.id, b"")? > 10_000
+            && (self.snapshot.children_count(self.dir.id, b"")? > 10_000
+                || self
+                    .pages
+                    .live
+                    .as_ref()
+                    .is_some_and(|rows| rows.len() > 10_000))
         {
             return Err(anyhow::anyhow!(
                 "Growth sort requires at most 10,000 children"
@@ -68,7 +75,7 @@ impl Browser {
         }
         if let Some(live) = &mut self.pages.live {
             if self.pages.live_order != Some(self.state.sort) {
-                self.state.order(live);
+                order_live(self.state.sort, live, &self.pages.live_growth);
                 self.pages.live_order = Some(self.state.sort);
             }
             self.rows = live
@@ -202,7 +209,14 @@ impl Browser {
         if next == state::Sort::Growth && self.state.growth_refused {
             next = state::Sort::Name;
         }
-        if next == state::Sort::Growth && self.snapshot.children_count(self.dir.id, b"")? > 10_000 {
+        if next == state::Sort::Growth
+            && (self.snapshot.children_count(self.dir.id, b"")? > 10_000
+                || self
+                    .pages
+                    .live
+                    .as_ref()
+                    .is_some_and(|rows| rows.len() > 10_000))
+        {
             self.state.growth_refused = true;
             self.message =
                 "Growth sort requires at most 10,000 children; s advances to name".into();
@@ -258,6 +272,12 @@ impl Browser {
         let config = config.clone();
         let snapshot_file = self.snapshot_file.clone();
         let sort = self.state.sort;
+        let previous_file = self.old.as_ref().and_then(|old| {
+            self.snapshots
+                .iter()
+                .find(|(id, _, _)| *id == old.meta().scan_id.to_string())
+                .map(|(_, file, _)| file.clone())
+        });
         let (tx, rx) = crossbeam_channel::bounded(1);
         let worker = std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<LiveResult> {
@@ -285,13 +305,38 @@ impl Browser {
                     let delta = i128::from(row.t_disk) - i128::from(baseline);
                     children.push((row, Some(delta)));
                 }
-                let mut ordering = State::new(0);
-                ordering.sort = sort;
-                ordering.order(&mut children);
+                let mut growth = std::collections::HashMap::new();
+                if children.len() <= 10_000 {
+                    let previous = previous_file
+                        .as_ref()
+                        .map(|file| Snapshot::open(file))
+                        .transpose()?;
+                    for (row, _) in &children {
+                        if worker_cancel.load(std::sync::atomic::Ordering::Acquire) {
+                            return Err(tidemark_fs::walk::WalkError::Cancelled.into());
+                        }
+                        let delta = if let Some(previous) = &previous {
+                            Some(
+                                i128::from(row.t_disk)
+                                    - i128::from(
+                                        previous
+                                            .dir_by_path(&row.path)?
+                                            .map(|r| r.t_disk)
+                                            .unwrap_or(0),
+                                    ),
+                            )
+                        } else {
+                            None
+                        };
+                        growth.insert(row.id, delta);
+                    }
+                }
+                order_live(sort, &mut children, &growth);
                 Ok(LiveResult {
                     root,
                     children,
                     sort,
+                    growth,
                 })
             })();
             let _ = tx.send(result);
@@ -336,6 +381,7 @@ impl Browser {
         };
         self.pages.live = Some(rows.children);
         self.pages.live_order = Some(rows.sort);
+        self.pages.live_growth = rows.growth;
         self.pages.offset = 0;
         self.load()?;
         self.message = "live values; delta against snapshot".into();
@@ -480,6 +526,24 @@ impl Browser {
             _ => {}
         }
         Ok(())
+    }
+}
+fn order_live(
+    sort: state::Sort,
+    rows: &mut [(DirRow, Option<i128>)],
+    growth: &std::collections::HashMap<u32, Option<i128>>,
+) {
+    if sort == state::Sort::Growth {
+        rows.sort_by(|a, b| {
+            growth
+                .get(&b.0.id)
+                .cmp(&growth.get(&a.0.id))
+                .then_with(|| a.0.name.cmp(&b.0.name))
+        });
+    } else {
+        let mut state = State::new(0);
+        state.sort = sort;
+        state.order(rows);
     }
 }
 fn byte_contains(name: &[u8], filter: &[u8]) -> bool {

@@ -551,3 +551,16 @@ fn distinct_metrics_and_previous_snapshot_order_across_pages() {
         assert_eq!(b.rows.first().unwrap().0.id, expected.first().unwrap().id);
     }
 }
+
+#[test]
+fn live_growth_order_keeps_snapshot_display_deltas() {
+    let mut rows = vec![
+        (fixture::row(1, Some(0), b"/fixture/a", 50), Some(100)),
+        (fixture::row(2, Some(0), b"/fixture/b", 60), Some(-100)),
+    ];
+    let growth = std::collections::HashMap::from([(1, Some(-50)), (2, Some(60))]);
+    order_live(state::Sort::Growth, &mut rows, &growth);
+    assert_eq!(rows[0].0.id, 2);
+    assert_eq!(rows[0].1, Some(-100));
+    assert_eq!(rows[1].1, Some(100));
+}
