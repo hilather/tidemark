@@ -1,5 +1,7 @@
 # Tidemark operator guide
 
+The packaged service permits only Unix sockets (`RestrictAddressFamilies=AF_UNIX`).
+
 For administrators on Rocky Linux 8 with access through `sudo`. Examples use `/data`; substitute your actual mount and subtree names. Tidemark reads metadata, keeps snapshots, and observes growth. It does not delete data or resize storage. Scans skip symlinks and all nested mounts, including same-device bind mounts. They leave access times alone. The optional `symlinks --check-targets` reads link targets and can update symbolic-link access times under some mount options.
 
 ## Install and inspect the host

@@ -671,13 +671,13 @@ fn resolved_workspace_has_no_http_or_tls_packages() {
 }
 
 #[test]
-fn unit_allows_only_unix_and_netlink() {
+fn unit_allows_only_unix() {
     let unit = include_str!("../../../packaging/systemd/tidemarkd.service");
     let families: Vec<_> = unit
         .lines()
         .filter_map(|l| l.strip_prefix("RestrictAddressFamilies="))
         .collect();
-    assert_eq!(families, ["AF_UNIX AF_NETLINK"]);
+    assert_eq!(families, ["AF_UNIX"]);
 }
 
 #[test]

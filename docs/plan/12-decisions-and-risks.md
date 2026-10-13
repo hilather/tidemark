@@ -104,7 +104,7 @@ Each ADR: context → decision → consequences. Status is "accepted" unless not
 - *Decision:* Tidemark v1 exposes and requires no HTTP. Metrics use only the node_exporter textfile collector; alerts use the journal, with active alerts and history through the Unix API and CLI.
 - *Date:* 2026-10-12.
 - *Reason:* A root daemon on database servers should expose and need no network. Textfile and journal cover the need, and removing HTTP gives a smaller dependency tree.
-- *Removed:* inbound Prometheus endpoint and `metrics.listen`; outbound alert webhook and `alerts.webhook`; HTTP client/server code, tests and TLS dependencies. Old keys are rejected with an ADR-020 removal message. The unit permits `AF_UNIX AF_NETLINK` only, retaining netlink for LVM reporting tools and udev.
+- *Removed:* inbound Prometheus endpoint and `metrics.listen`; outbound alert webhook and `alerts.webhook`; HTTP client/server code, tests and TLS dependencies. Old keys are rejected with an ADR-020 removal message. The unit permits only `AF_UNIX`: Rocky 8.8 and 8.10 guest measurements confirmed readiness, status/now/lvm/hot, daemon scans and LVM reporting with no address-family errors over three minutes, and strace saw no socket() calls from lvs/vgs children.
 - *Consequences:* no replacement or hidden HTTP flag; the daemon opens only its Unix API socket.
 - *Revisit if:* a concrete requirement cannot be met through the textfile collector, journal or Unix API, with a new owner-approved ADR and security review.
 

@@ -32,7 +32,7 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
 SystemCallArchitectures=native
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictAddressFamilies=AF_UNIX
 # DO NOT add ProtectSystem=, ProtectHome=, PrivateTmp=, ReadWritePaths=, ProtectKernel*= or
 # other options that create a private mount namespace: fanotify mount marks would then attach
 # to the namespace's copies and the watcher would silently see nothing (ADR-013).
