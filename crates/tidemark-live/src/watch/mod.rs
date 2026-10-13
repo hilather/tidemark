@@ -230,13 +230,9 @@ impl State {
         }
         let bytes = parent.as_bytes().len();
         let full = self.dirty.len() >= DIRTY_CAP;
-        if full {
-            self.rings.overflow(at);
-            return;
-        }
-        if !self.rings.budget().reserve(bytes) {
+        if full || !self.rings.budget().reserve(bytes) {
             self.mark_loss();
-            self.rings.dirty_loss(at, true);
+            self.rings.dirty_loss(at, !full);
             return;
         }
         // RawPath::clone clones the normalized Vec into an exact-length allocation.
@@ -1096,6 +1092,50 @@ impl std::fmt::Display for WatchMode {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_dirty_set_invalidates_root_once_and_recovers_over_sixteen_minutes() {
+        let watcher = Watcher::from_injected_events(
+            raw("/data"),
+            [(
+                0,
+                [b"/data".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                0,
+                None,
+                (1, 0),
+            )],
+        )
+        .unwrap();
+        {
+            let mut state = watcher.state.lock();
+            for n in 0..DIRTY_CAP {
+                state.dirty_parent(&raw(&format!("/data/{n}")), 0);
+            }
+            assert_eq!(state.dirty.len(), DIRTY_CAP);
+            state.dirty_parent(&raw("/data/0"), 60);
+            assert_eq!(state.rings.lossy(60), 0);
+            assert_eq!(state.dirty.len(), DIRTY_CAP);
+            state.dirty_parent(&raw("/data/omitted"), 60);
+            assert!(state.dirty.is_empty());
+            assert_eq!(state.dirty_bytes, 0);
+            assert_eq!(state.rings.lossy(60), 1);
+            assert!(state.rings.detail(60).contains("dirty set full"));
+            assert!(!state.rings.detail(60).contains("transport recovery"));
+        }
+        let root = raw("/data/omitted/subtree");
+        assert_eq!(watcher.take_dirty(&root), vec![root.clone()]);
+        assert!(watcher.take_dirty(&root).is_empty());
+        for minute in 2..=17 {
+            let mut state = watcher.state.lock();
+            state.dirty_parent(&raw("/data/recovered"), minute * 60);
+            state.rings.advance(minute * 60);
+            assert_eq!(state.dirty.len(), 1);
+            if minute >= 16 {
+                assert_eq!(state.rings.lossy(minute * 60), 0);
+            }
+        }
+        let parent = raw("/data/recovered");
+        assert_eq!(watcher.take_dirty(&parent), vec![parent]);
+    }
     #[test]
     fn dirty_byte_admission_collapses_to_root_and_recovers() {
         let watcher = Watcher::from_injected_events(raw("/data"), []).unwrap();
