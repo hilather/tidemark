@@ -134,6 +134,7 @@ pub fn start(
                             );
                             continue;
                         }
+                        recover_coordinator(&state, &namespace)?;
                         if !matches!(namespace, Ok(true)) {
                             for (mount, watcher) in &watchers {
                                 watcher.shutdown();
@@ -453,6 +454,20 @@ fn requested_windows(config: &Config, mount: &str) -> BTreeSet<usize> {
         .collect()
 }
 
+fn recover_coordinator(
+    state: &LiveState,
+    namespace: &std::io::Result<bool>,
+) -> Result<(), DaemonError> {
+    if matches!(namespace, Ok(true)) {
+        state.publish_component(crate::component(
+            "watcher",
+            "ok",
+            "mount table and host mount namespace checked",
+        ))?;
+    }
+    Ok(())
+}
+
 fn retire_watcher(
     state: &LiveState,
     watchers: &mut BTreeMap<String, Arc<Watcher>>,
@@ -707,6 +722,29 @@ mod tests {
                 .is_some()
         );
         assert!(watchers.contains_key("/fixture"));
+        state
+            .publish_component(crate::component(
+                "watcher:/fixture",
+                "degraded",
+                "retained mount loss",
+            ))
+            .unwrap();
+        recover_coordinator(&state, &Ok(false)).unwrap();
+        assert!(state
+            .view_at(0)
+            .status(0)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "watcher" && c.state == "degraded"));
+        recover_coordinator(&state, &Ok(true)).unwrap();
+        let components = state.view_at(0).status(0).unwrap().components;
+        assert!(components
+            .iter()
+            .any(|c| c.name == "watcher" && c.state == "ok"));
+        assert!(components
+            .iter()
+            .any(|c| c.name == "watcher:/fixture" && c.state == "degraded"));
     }
     #[test]
     fn exact_consecutive_minutes_loss_gaps_overflows_and_cap() {
