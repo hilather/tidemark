@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 use tidemark_core::config::Config;
-use tidemark_live::alerts::{AlertEngine, AlertInputs, Deliver, JournalDeliver, WebhookDeliver};
+use tidemark_live::alerts::{AlertEngine, AlertInputs, Deliver, JournalDeliver};
 
 /// Start the thirty-second alert service; reload replaces compiled rules at a boundary.
 pub fn start(
@@ -34,20 +34,6 @@ pub fn start(
                         AlertEngine::new(&config.alerts.rule, config.alerts.renotify)
                             .map_err(|e| DaemonError::Config(e.to_string()))?,
                     );
-                    sinks.truncate(1);
-                    if !config.alerts.webhook.is_empty() {
-                        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into());
-                        match WebhookDeliver::new(&config.alerts.webhook, &host) {
-                            Ok(sink) => sinks.push(Box::new(sink)),
-                            Err(e) => {
-                                state.publish_component(crate::component(
-                                    "alerts",
-                                    "degraded",
-                                    e.to_string(),
-                                ))?;
-                            }
-                        }
-                    }
                     previous = Some(config.alerts.clone());
                 }
                 if let Some(engine) = engine.as_mut() {
@@ -156,9 +142,6 @@ fn tick_evaluated(
 ) -> Result<(), DaemonError> {
     let mut errors = Vec::new();
     let (config, _) = state.config();
-    if !config.alerts.webhook.is_empty() && sinks.len() < 2 {
-        errors.push("configured webhook deliverer unavailable".into());
-    }
     for event in events {
         for sink in sinks.iter_mut() {
             if let Err(e) = sink.deliver(&event) {

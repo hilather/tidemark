@@ -85,7 +85,7 @@ fn daemon_end_to_end() {
     // Declared before Unit: the unit stops before the binary is removed on unwind.
     let binary = install_binary();
     let unit = Unit(format!("tmtest-w6a3-daemon-{}.service", std::process::id()));
-    let started = Command::new("systemd-run").args(["--unit", &unit.0,"--property=Type=notify","--property=User=root","--property=UMask=0077","--property=NoNewPrivileges=yes","--property=CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SYS_PTRACE","--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6","--property=MemoryMax=2G","--property=CPUQuota=200%","--property=LimitNOFILE=65536","--"]).arg(&binary.0).arg("--config").arg(&config).status().unwrap();
+    let started = Command::new("systemd-run").args(["--unit", &unit.0,"--property=Type=notify","--property=User=root","--property=UMask=0077","--property=NoNewPrivileges=yes","--property=CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SYS_PTRACE","--property=RestrictAddressFamilies=AF_UNIX AF_NETLINK","--property=MemoryMax=2G","--property=CPUQuota=200%","--property=LimitNOFILE=65536","--"]).arg(&binary.0).arg("--config").arg(&config).status().unwrap();
     assert!(
         started.success(),
         "unit failed to start\n{}",
