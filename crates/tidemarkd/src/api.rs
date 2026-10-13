@@ -3,10 +3,7 @@
 use crate::DaemonError;
 use std::{
     io::{Read, Write},
-    os::unix::{
-        fs::{FileTypeExt, PermissionsExt},
-        net::{UnixListener, UnixStream},
-    },
+    os::unix::net::{UnixListener, UnixStream},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -426,6 +423,197 @@ fn connection(
         }
     }
 }
+// Unix bind/connect have no *at variant. Their pathname is derived exclusively
+// from this retained directory fd, never from the mutable configured ancestry.
+struct SocketPath {
+    parent: std::os::fd::OwnedFd,
+    name: std::ffi::OsString,
+    identity: Option<(u64, u64)>,
+}
+impl SocketPath {
+    fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        use rustix::fs::{self, Mode, OFlags};
+        use std::path::Component;
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("socket parent missing"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("socket name missing"))?;
+        if !path.is_absolute() {
+            return Err(std::io::Error::other("socket path must be absolute"));
+        }
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut fd = fs::open("/", flags, Mode::empty())?;
+        let uid = rustix::process::geteuid().as_raw();
+        let mut sticky = false;
+        for component in parent.components() {
+            let stat = fs::fstat(&fd)?;
+            // The sandbox has an immutable root filesystem owned by nobody.
+            // An untrusted owner cannot mutate a read-only mount; writable
+            // filesystems still require root or the daemon uid throughout.
+            if stat.st_uid != 0
+                && stat.st_uid != uid
+                && !fs::fstatvfs(&fd)?
+                    .f_flag
+                    .contains(fs::StatVfsMountFlags::RDONLY)
+            {
+                return Err(std::io::Error::other("socket ancestor has untrusted owner"));
+            }
+            if stat.st_mode & 0o022 != 0 {
+                if stat.st_mode & 0o1000 == 0 {
+                    return Err(std::io::Error::other(
+                        "socket ancestor is writable by another user",
+                    ));
+                }
+                sticky = true;
+            }
+            let name = match component {
+                Component::RootDir => continue,
+                Component::Normal(name) => name,
+                _ => return Err(std::io::Error::other("unsafe socket ancestor component")),
+            };
+            fd = match fs::openat(&fd, name, flags | OFlags::NOATIME, Mode::empty()) {
+                Err(rustix::io::Errno::PERM) => fs::openat(&fd, name, flags, Mode::empty())?,
+                result => result?,
+            };
+            if sticky {
+                let child = fs::fstat(&fd)?;
+                if child.st_uid != uid || child.st_mode & 0o777 != 0o700 {
+                    return Err(std::io::Error::other(
+                        "sticky ancestor requires a private owned descendant",
+                    ));
+                }
+                sticky = false;
+            }
+        }
+        let stat = fs::fstat(&fd)?;
+        if (stat.st_uid != 0 && stat.st_uid != uid) || stat.st_mode & 0o022 != 0 {
+            return Err(std::io::Error::other("socket parent is not trusted"));
+        }
+        // Serialize cooperating startup/stale removal in this API directory.
+        fs::flock(&fd, fs::FlockOperation::NonBlockingLockExclusive)?;
+        Ok(Self {
+            parent: fd,
+            name: name.to_owned(),
+            identity: None,
+        })
+    }
+    fn address(&self) -> std::path::PathBuf {
+        use std::os::fd::AsRawFd;
+        std::path::PathBuf::from(format!("/proc/self/fd/{}/", self.parent.as_raw_fd()))
+            .join(&self.name)
+    }
+    fn stat(&self) -> std::io::Result<rustix::fs::Stat> {
+        rustix::fs::statat(
+            &self.parent,
+            &self.name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(Into::into)
+    }
+    fn same(&self, identity: (u64, u64)) -> std::io::Result<bool> {
+        match self.stat() {
+            Ok(stat) => Ok((stat.st_dev, stat.st_ino) == identity
+                && rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                    == rustix::fs::FileType::Socket),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+    fn unlink(&self, identity: (u64, u64)) -> std::io::Result<()> {
+        if self.same(identity)? {
+            rustix::fs::unlinkat(&self.parent, &self.name, rustix::fs::AtFlags::empty())?;
+        }
+        Ok(())
+    }
+    fn prepare(&self, timeout: Duration) -> std::io::Result<()> {
+        let stat = match self.stat() {
+            Ok(stat) => stat,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Socket {
+            return Err(std::io::Error::other("API path is not a socket"));
+        }
+        let identity = (stat.st_dev, stat.st_ino);
+        use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+        let probe = net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )?;
+        let addr = SocketAddrUnix::new(self.address())?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match net::connect(&probe, &addr) {
+                Ok(()) => return Err(std::io::Error::other("API socket already active")),
+                Err(rustix::io::Errno::CONNREFUSED) => {
+                    if !self.same(identity)? {
+                        return Err(std::io::Error::other("API socket changed during probe"));
+                    }
+                    return self.unlink(identity);
+                }
+                Err(
+                    rustix::io::Errno::AGAIN
+                    | rustix::io::Errno::INPROGRESS
+                    | rustix::io::Errno::ALREADY,
+                ) => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    std::thread::park_timeout(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    fn secure(&mut self) -> std::io::Result<()> {
+        use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
+        use std::os::fd::AsRawFd;
+        // Linux rustix chmodat does not support SYMLINK_NOFOLLOW (including EL8).
+        // Pin the socket inode with O_PATH|NOFOLLOW, reject substituted symlinks,
+        // then chmod the pinned inode via its procfd. A replacement leaf cannot
+        // redirect this chmod to its target. No untrusted pathname is followed.
+        let leaf = fs::openat(
+            &self.parent,
+            &self.name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let stat = fs::fstat(&leaf)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Socket
+            || stat.st_uid != rustix::process::geteuid().as_raw()
+        {
+            return Err(std::io::Error::other("bound API socket replaced"));
+        }
+        let identity = (stat.st_dev, stat.st_ino);
+        self.identity = Some(identity);
+        if !self.same(identity)? {
+            return Err(std::io::Error::other("bound API socket changed"));
+        }
+        fs::chmodat(
+            &self.parent,
+            format!("/proc/self/fd/{}", leaf.as_raw_fd()),
+            Mode::from_raw_mode(0o600),
+            AtFlags::empty(),
+        )?;
+        if !self.same(identity)? {
+            return Err(std::io::Error::other("bound API socket changed"));
+        }
+        Ok(())
+    }
+}
+impl Drop for SocketPath {
+    fn drop(&mut self) {
+        if let Some(identity) = self.identity {
+            if let Err(error) = self.unlink(identity) {
+                tracing::warn!(%error, "API socket cleanup failed");
+            }
+        }
+    }
+}
 /// Start the lifecycle transport with kernel-verified, root-only peer credentials.
 pub fn start(
     config: Arc<tidemark_core::config::Config>,
@@ -463,25 +651,10 @@ pub fn start_with_peer_timeout(
     peer: PeerCredentials,
     timeout: Duration,
 ) -> Result<crate::ServiceHandle, DaemonError> {
-    let path = config.general.socket.clone();
-    match std::fs::symlink_metadata(&path) {
-        Ok(m) => {
-            if !m.file_type().is_socket() {
-                return Err(DaemonError::Invalid("API path is not a socket".into()));
-            }
-            match UnixStream::connect(&path) {
-                Ok(_) => return Err(DaemonError::Unavailable("API socket already active".into())),
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    std::fs::remove_file(&path).map_err(io)?
-                }
-                Err(e) => return Err(io(e)),
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io(e)),
-    }
-    let listener = UnixListener::bind(&path).map_err(io)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(io)?;
+    let mut path = SocketPath::open(&config.general.socket).map_err(io)?;
+    path.prepare(timeout).map_err(io)?;
+    let listener = UnixListener::bind(path.address()).map_err(io)?;
+    path.secure().map_err(io)?;
     listener.set_nonblocking(true).map_err(io)?;
     context
         .state
@@ -538,11 +711,11 @@ pub fn start_with_peer_timeout(
                 }
             }
             drop(listener);
-            let cleanup = std::fs::remove_file(&path).map_err(io);
+            drop(path);
             for h in clients {
                 let _ = h.join();
             }
-            outcome.and(cleanup)
+            outcome
         })
         .map_err(io)
 }
@@ -738,6 +911,29 @@ mod tests {
         let stopping = Cancellation::new(stop.clone(), TIMEOUT);
         stop.store(true, Ordering::Release);
         assert!(stopping.begin_commit().is_err());
+    }
+    #[test]
+    fn socket_parent_trust_and_no_follow_checks_without_listening() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let private = dir.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match SocketPath::open(&private.join("api.sock")) {
+            Ok(_) => {}
+            Err(e) => panic!("trusted parent refused: {e}"),
+        }
+        let link = dir.path().join("link");
+        symlink(&private, &link).unwrap();
+        assert!(SocketPath::open(&link.join("api.sock")).is_err());
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(SocketPath::open(&private.join("api.sock")).is_err());
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(private.join("target"), private.join("api.sock")).unwrap();
+        let mut socket = SocketPath::open(&private.join("api.sock")).unwrap();
+        assert!(socket.prepare(Duration::from_millis(100)).is_err());
+        assert!(socket.secure().is_err());
     }
     #[test]
     fn pair_controllable_timeout_and_shutdown() {

@@ -78,6 +78,7 @@ fn daemon_end_to_end() {
     );
     let thin = &vg.mounts[0].mountpoint;
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("api.sock");
     let config = dir.path().join("config.toml");
     std::fs::write(&config, format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}','{}']\ninterval='1s'\n[watch]\nmounts=['{}','{}']\n[lvm]\ninterval='1s'\n[metrics]\ntextfile='{}'\n[[roots]]\npath='{}'\nmode='walk'\nschedule='off'\n", dir.path().join("state").display(), socket.display(), fs.mountpoint.display(), thin.display(), fs.mountpoint.display(), thin.display(), dir.path().join("metrics.prom").display(), fs.mountpoint.display())).unwrap();

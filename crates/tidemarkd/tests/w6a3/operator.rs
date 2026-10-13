@@ -72,6 +72,7 @@ fn real_operator_status_scan_top_now_reload_cancel_and_sigterm() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = dir.path().join("tree");
     std::fs::create_dir(&root).unwrap();
     let bad = root.join(std::ffi::OsStr::from_bytes(b"nonutf\xff"));
@@ -207,6 +208,7 @@ fn real_binary_scheduled_scan_publishes_then_exits_cleanly() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = dir.path().join("tree");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("file"), b"fixture").unwrap();

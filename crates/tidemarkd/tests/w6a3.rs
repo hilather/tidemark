@@ -102,6 +102,7 @@ fn every_method_authorizes_before_dispatch_and_validates_parameters() {
     );
 }
 fn socket_config(dir: &tempfile::TempDir) -> Config {
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut c = Config::default();
     c.general.socket = dir.path().join("api.sock");
     c
@@ -366,6 +367,136 @@ fn lifecycle_start_uses_kernel_credentials_over_real_socket() {
         let mut line = String::new();
         assert_eq!(stream.read_line(&mut line).unwrap(), 0);
     }
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap().unwrap();
+}
+
+#[test]
+fn socket_cleanup_uses_pinned_parent_and_preserves_replacement_leaf() {
+    if !socket_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("runtime");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut c = socket_config(&dir);
+    c.general.socket = parent.join("api.sock");
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = api::start_with_peer(
+        Arc::new(c.clone()),
+        context(&c),
+        stop.clone(),
+        Arc::new(|_| Ok((0, 1))),
+    )
+    .unwrap();
+    let retained = dir.path().join("retained");
+    std::fs::rename(&parent, &retained).unwrap();
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::write(c.general.socket.clone(), b"replacement parent sentinel").unwrap();
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap().unwrap();
+    assert!(!retained.join("api.sock").exists());
+    assert_eq!(
+        std::fs::read(&c.general.socket).unwrap(),
+        b"replacement parent sentinel"
+    );
+    std::fs::remove_file(&c.general.socket).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = api::start_with_peer(
+        Arc::new(c.clone()),
+        context(&c),
+        stop.clone(),
+        Arc::new(|_| Ok((0, 1))),
+    )
+    .unwrap();
+    std::fs::remove_file(&c.general.socket).unwrap();
+    let target = parent.join("target");
+    std::fs::write(&target, b"untouched").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::os::unix::fs::symlink(&target, &c.general.socket).unwrap();
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap().unwrap();
+    assert!(std::fs::symlink_metadata(&c.general.socket)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+}
+
+#[test]
+fn full_backlog_probe_expires_and_concurrent_start_preserves_socket() {
+    if !socket_available() {
+        return;
+    }
+    use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    let dir = tempfile::tempdir().unwrap();
+    let c = socket_config(&dir);
+    let listener = net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .unwrap();
+    let addr = SocketAddrUnix::new(&c.general.socket).unwrap();
+    net::bind(&listener, &addr).unwrap();
+    net::listen(&listener, 1).unwrap();
+    let mut clients = Vec::new();
+    let mut full = false;
+    for _ in 0..8 {
+        let client = net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+        match net::connect(&client, &addr) {
+            Ok(()) => clients.push(client),
+            Err(rustix::io::Errno::AGAIN) => {
+                full = true;
+                break;
+            }
+            Err(e) => panic!("backlog setup: {e}"),
+        }
+    }
+    assert!(full, "bounded backlog did not fill");
+    let began = std::time::Instant::now();
+    let stop = Arc::new(AtomicBool::new(false));
+    let result = api::start_with_peer_timeout(
+        Arc::new(c.clone()),
+        context(&c),
+        stop.clone(),
+        Arc::new(|_| Ok((0, 1))),
+        Duration::from_millis(100),
+    );
+    assert!(result.is_err());
+    assert!(began.elapsed() < Duration::from_secs(1));
+    assert!(c.general.socket.exists());
+    drop(clients);
+    drop(listener);
+    let handle = api::start_with_peer(
+        Arc::new(c.clone()),
+        context(&c),
+        stop.clone(),
+        Arc::new(|_| Ok((0, 1))),
+    )
+    .unwrap();
+    let before = std::fs::symlink_metadata(&c.general.socket).unwrap();
+    assert!(api::start_with_peer(
+        Arc::new(c.clone()),
+        context(&c),
+        stop.clone(),
+        Arc::new(|_| Ok((0, 1)))
+    )
+    .is_err());
+    use std::os::unix::fs::MetadataExt;
+    let after = std::fs::symlink_metadata(&c.general.socket).unwrap();
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
     stop.store(true, Ordering::Release);
     handle.join().unwrap().unwrap();
 }
