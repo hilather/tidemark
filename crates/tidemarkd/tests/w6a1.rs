@@ -1498,7 +1498,7 @@ fn process_publication_is_independent_of_collector_and_retains_failed_history() 
         ))
         .unwrap();
     });
-    let read = rx.recv_timeout(Duration::from_millis(50));
+    let read = rx.recv_timeout(Duration::from_secs(10));
     drop(guard);
     reader.join().unwrap();
     let (phantom, writers) = read.expect("reader must not lock the mutable collector");
@@ -1662,16 +1662,41 @@ fn mount_presence_recovery_remount_and_rate_history() {
 
 #[test]
 fn blocked_mount_transition_log_does_not_hold_state_lock() {
+    // tracing's callsite interest cache is process-wide even with a thread-local
+    // subscriber. Run alone so parallel mount tests cannot register the shared
+    // warning callsite with a no-op dispatcher while this subscriber is installed.
+    const CHILD: &str = "TIDEMARK_TEST_BLOCKED_MOUNT_LOG_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "blocked_mount_transition_log_does_not_hold_state_lock",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated blocked-log test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
     use std::io::Write;
-    #[derive(Clone)]
     struct BlockedLog {
-        entered: crossbeam_channel::Sender<()>,
+        entered: Option<crossbeam_channel::Sender<()>>,
         release: crossbeam_channel::Receiver<()>,
     }
     impl Write for BlockedLog {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.entered.send(()).unwrap();
-            self.release.recv().unwrap();
+            // A formatter may write an event in several chunks. Block once;
+            // dropping the release sender also unblocks us during test cleanup.
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+                let _ = self.release.recv();
+            }
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -1685,7 +1710,7 @@ fn blocked_mount_transition_log_does_not_hold_state_lock() {
     let (entered, waiting) = crossbeam_channel::bounded(1);
     let (release, released) = crossbeam_channel::bounded(1);
     let sink = BlockedLog {
-        entered,
+        entered: Some(entered),
         release: released,
     };
     let publisher_state = state.clone();
@@ -1693,17 +1718,22 @@ fn blocked_mount_transition_log_does_not_hold_state_lock() {
         let subscriber = tracing_subscriber::fmt()
             .without_time()
             .with_ansi(false)
-            .with_writer(move || sink.clone())
+            .with_writer(std::sync::Mutex::new(sink))
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             publisher_state.publish_mount_presence(0, &[]).unwrap()
         });
     });
-    waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+    let entered = waiting.recv_timeout(Duration::from_secs(10));
+    if entered.is_err() {
+        drop(release);
+        publisher.join().unwrap();
+        panic!("publisher did not enter the transition log writer: {entered:?}");
+    }
     let (done, result) = crossbeam_channel::bounded(1);
     let reader = std::thread::spawn(move || done.send(state.view_at(0).status(0)).unwrap());
-    let read = result.recv_timeout(Duration::from_millis(200));
-    release.send(()).unwrap();
+    let read = result.recv_timeout(Duration::from_secs(10));
+    drop(release);
     publisher.join().unwrap();
     reader.join().unwrap();
     assert!(
