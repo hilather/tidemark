@@ -14,6 +14,31 @@ impl Write for Sink {
 }
 #[test]
 fn every_operator_message_formats_with_values_and_without_debug_fields() {
+    // Callsite interest is process-wide; exclude sibling callers with no subscriber.
+    const CHILD: &str = "TIDEMARK_TEST_OPERATOR_LOG_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "log_tests::every_operator_message_formats_with_values_and_without_debug_fields",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated capture failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "exact child must execute one test"
+        );
+        return;
+    }
+
     let bytes = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let sink = Sink(bytes.clone());
     let subscriber = tracing_subscriber::fmt()

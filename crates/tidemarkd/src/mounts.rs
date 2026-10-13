@@ -197,6 +197,26 @@ mod tests {
     }
     #[test]
     fn logger_emits_one_line_per_transition_and_device_changes_restart() {
+        // Callsite interest is process-wide; exclude sibling callers with no subscriber.
+        const CHILD: &str = "TIDEMARK_TEST_MOUNT_LOG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "mounts::tests::logger_emits_one_line_per_transition_and_device_changes_restart", "--nocapture"])
+            .env(CHILD, "1")
+            .output().unwrap();
+            assert!(
+                output.status.success(),
+                "isolated capture failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "exact child must execute one test"
+            );
+            return;
+        }
+
         use std::{io::Write, sync::Arc};
         #[derive(Clone)]
         struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
