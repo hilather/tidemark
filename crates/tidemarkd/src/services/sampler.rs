@@ -155,10 +155,9 @@ fn start_with(
                     &mut identities,
                     &mounts,
                 )?;
-                crate::mounts::log(&changes, "sampler");
+                state.publish_mount_presence(generation, &mounts)?;
                 for change in &changes {
                     last_sample.remove(&change.path);
-                    state.reset_fs_mount(generation, &change.path.to_string_lossy())?;
                 }
                 if !changes.is_empty() {
                     next_sample = std::time::Instant::now();

@@ -139,12 +139,17 @@ pub fn log(changes: &[Transition], service: &str) {
             .map(|p| p.display_lossy())
             .unwrap_or_else(|_| "invalid configured mount path".into());
         match (change.previous, change.current) {
-            (_, None) => tracing::warn!(%path, service, "not mounted"),
+            (_, None) => tracing::warn!(service, "mount not present: {path}"),
             (None, Some(identity)) => {
-                tracing::info!(%path, service, mount_id=identity.id, "mounted")
+                tracing::info!(
+                    service,
+                    "mount present: {path} ({}:{})",
+                    identity.major,
+                    identity.minor
+                )
             }
             (Some(_), Some(identity)) => {
-                tracing::warn!(%path, service, mount_id=identity.id, "mount identity changed")
+                tracing::warn!(service, mount_id = identity.id, "mount changed: {path}")
             }
         }
     }
@@ -231,9 +236,10 @@ mod tests {
         });
         let log = String::from_utf8(bytes.lock().clone()).unwrap();
         assert_eq!(log.lines().count(), 4, "{log}");
-        assert_eq!(log.matches("not mounted").count(), 2);
-        assert_eq!(log.matches("mount identity changed").count(), 1);
+        assert_eq!(log.matches("mount not present: /data").count(), 2);
+        assert_eq!(log.matches("mount changed: /data").count(), 1);
         assert_eq!(log.matches("INFO").count(), 1);
+        assert!(log.contains("mount present: /data (8:1)"));
     }
 
     #[test]
