@@ -68,7 +68,8 @@ struct State {
     paused: bool,
 }
 /// Maximum simultaneously tracked rule/subject pairs.
-const MAX_ALERT_SUBJECTS: usize = 10_000;
+/// Maximum configured rule/subject states, excluding the reserved internal alert.
+pub const MAX_ALERT_SUBJECTS: usize = 10_000;
 impl AlertEngine {
     /// Validate rules against core configuration and compile their predicates.
     pub fn new(rules: &[AlertRule], renotify: Duration) -> Result<Self, AlertError> {

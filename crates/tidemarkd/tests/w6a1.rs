@@ -1320,3 +1320,62 @@ fn late_sampler_pass_cannot_resurrect_removed_mount() {
         .unwrap();
     assert!(state.view_at(11).fs_samples().is_none());
 }
+
+#[test]
+fn internal_alert_has_reserved_publication_slot() {
+    use tidemark_core::config::{AlertKind, AlertRule, AlertThreshold};
+    use tidemark_live::alerts::{AlertDiagnostic, AlertEngine, AlertInputs, MAX_ALERT_SUBJECTS};
+    let mut config = Config::default();
+    config.alerts.rule = vec![AlertRule {
+        name: "growth".into(),
+        kind: AlertKind::DirGrowth,
+        root: Some("/fixture".into()),
+        depth: Some(2),
+        above: Some(AlertThreshold::Number(1.)),
+        for_: Duration::ZERO,
+        ..Default::default()
+    }];
+    let state = LiveState::new(&config, 0);
+    let rows = (0..MAX_ALERT_SUBJECTS)
+        .map(|i| {
+            (
+                RawPath::new(format!("/fixture/{i}").into_bytes()).unwrap(),
+                10,
+            )
+        })
+        .collect();
+    publish(&state, Publication::DirGrowth(("/fixture".into(), 2, rows)));
+    let mut engine = AlertEngine::new(&config.alerts.rule, config.alerts.renotify).unwrap();
+    let events = engine.evaluate(
+        0,
+        &AlertInputs {
+            source: &state.view_at(0),
+            state_space_refused: true,
+        },
+    );
+    assert_eq!(events.len(), MAX_ALERT_SUBJECTS + 1);
+    publish(
+        &state,
+        Publication::Alerts((engine.active(), engine.diagnostics().to_vec())),
+    );
+    assert_eq!(
+        state.view_at(0).active_alerts().unwrap().len(),
+        MAX_ALERT_SUBJECTS + 1
+    );
+    let diagnostics = vec![
+        AlertDiagnostic {
+            rule: "missing".into(),
+            reason: "unavailable".into()
+        };
+        MAX_ALERT_SUBJECTS + 1
+    ];
+    assert!(state
+        .publish(Publication::Alerts((vec![], diagnostics)), health())
+        .is_err());
+    let mut extra = engine.active();
+    extra.push(extra.iter().find(|a| a.rule == "growth").unwrap().clone());
+    assert!(state
+        .publish(Publication::Alerts((extra, vec![])), health())
+        .is_err());
+}
+

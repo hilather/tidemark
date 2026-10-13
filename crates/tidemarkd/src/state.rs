@@ -393,7 +393,15 @@ impl LiveState {
             }
             Publication::Procscan(p) => d.procscan = Some(p),
             Publication::Alerts((mut a, mut diagnostics)) => {
-                check_len(a.len(), MAX_INVENTORY)?;
+                let internal = a
+                    .iter()
+                    .filter(|a| a.rule == "state_space" && a.subject == "state")
+                    .count()
+                    .min(1);
+                check_len(
+                    a.len().saturating_sub(internal),
+                    tidemark_live::alerts::MAX_ALERT_SUBJECTS,
+                )?;
                 check_len(diagnostics.len(), MAX_INVENTORY)?;
                 a.sort_by(|a, b| (&a.rule, &a.subject).cmp(&(&b.rule, &b.subject)));
                 diagnostics.sort_by(|a, b| a.rule.cmp(&b.rule));
