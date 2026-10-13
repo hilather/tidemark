@@ -48,6 +48,11 @@ struct Bucket {
     drained: bool,
     truncated: bool,
     drain_truncated: bool,
+    distinct_capped: bool,
+    current_capped: bool,
+    completed_capped: bool,
+    read_error: bool,
+    descriptor_pressure: bool,
     overflow_start: u64,
     overflow_end: u64,
     seen: HashSet<(usize, Vec<u8>, (u64, u64))>,
@@ -100,6 +105,7 @@ impl Rings {
                 if rows.len() > COMPLETED_CAP {
                     last.lossy = true;
                     last.truncated = true;
+                    last.completed_capped = true;
                     self.dropped += (rows.len() - COMPLETED_CAP) as u64;
                 }
                 *map = rows
@@ -128,6 +134,11 @@ impl Rings {
                 drained: self.rows_drained_until.is_some_and(|end| at <= end),
                 truncated: false,
                 drain_truncated: false,
+                distinct_capped: false,
+                current_capped: false,
+                completed_capped: false,
+                read_error: false,
+                descriptor_pressure: false,
                 overflow_start: self.overflow_total,
                 overflow_end: self.overflow_total,
                 seen: HashSet::new(),
@@ -155,6 +166,13 @@ impl Rings {
             }
         }
     }
+    pub fn read_failure(&mut self, now: i64, descriptor_pressure: bool) {
+        self.overflow(now);
+        if let Some(b) = self.buckets.back_mut() {
+            b.descriptor_pressure |= descriptor_pressure;
+            b.read_error |= !descriptor_pressure;
+        }
+    }
     pub fn overflow(&mut self, now: i64) {
         self.advance(now);
         if let Some(b) = self.buckets.back_mut() {
@@ -178,6 +196,8 @@ impl Rings {
                 bucket.seen.insert((index, key.clone(), identity))
             } else {
                 bucket.lossy = true;
+                bucket.truncated = true;
+                bucket.distinct_capped = true;
                 false
             };
             if !map.contains_key(&key) && map.len() >= CURRENT_CAP {
@@ -191,6 +211,7 @@ impl Rings {
                 bucket.units[index].retain(|key, _| map.contains_key(key));
                 bucket.lossy = true;
                 bucket.truncated = true;
+                bucket.current_capped = true;
             }
             let row = if map.contains_key(&key) {
                 map.get_mut(&key)
@@ -271,6 +292,69 @@ impl Rings {
             }
         }
         ranked(&sum).into_iter().take(limit).collect()
+    }
+    pub fn detail(&self, now: i64) -> String {
+        let cutoff = now.div_euclid(60) * 60 - 14 * 60;
+        let mut reasons = Vec::new();
+        for b in self
+            .buckets
+            .iter()
+            .filter(|b| b.minute >= cutoff && b.minute <= now)
+        {
+            let minute = format!(
+                "{:02}:{:02} UTC (timestamp {})",
+                b.minute.div_euclid(3600).rem_euclid(24),
+                b.minute.div_euclid(60).rem_euclid(60),
+                b.minute
+            );
+            if b.distinct_capped {
+                reasons.push(format!("truncated: distinct-file cap reached in the minute {minute} (events complete, per-file counts capped)"));
+            }
+            if b.current_capped {
+                reasons.push(format!(
+                    "truncated: current-key cap reached in the minute {minute}"
+                ));
+            }
+            if b.completed_capped {
+                reasons.push(format!(
+                    "truncated: completed-key cap reached in the minute {minute}"
+                ));
+            }
+            if b.drain_truncated {
+                reasons.push(format!(
+                    "truncated: requested-output cap reached in the minute {minute}"
+                ));
+            }
+            if b.read_error {
+                reasons.push(format!("lost events: read error in the minute {minute}"));
+            }
+            if b.descriptor_pressure {
+                reasons.push(format!(
+                    "lost events: descriptor pressure in the minute {minute}"
+                ));
+            }
+            if b.overflow_end > b.overflow_start {
+                reasons.push(format!(
+                    "lost events: queue overflow in the minute {minute}"
+                ));
+            }
+            if b.lossy
+                && !b.truncated
+                && !b.read_error
+                && !b.descriptor_pressure
+                && b.overflow_end == b.overflow_start
+            {
+                reasons.push(format!(
+                    "lost events: {} in the minute {minute}",
+                    if b.overflow_end > b.overflow_start {
+                        "queue overflow"
+                    } else {
+                        "transport recovery or history gap"
+                    }
+                ));
+            }
+        }
+        reasons.join("; ")
     }
     pub fn lossy(&self, now: i64) -> u32 {
         self.buckets
