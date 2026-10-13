@@ -260,6 +260,15 @@ mod tests {
         assert_eq!(calls.get(), 2);
         assert_eq!(fallback.st_ino, old.st_ino);
         assert_eq!(created, old.st_ctime);
+        let other = tempfile::NamedTempFile::new().unwrap();
+        let (path, fallback, _) = resolve_with_fallback(file.as_fd(), other.as_fd(), None, || {
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::NOSYS.raw_os_error(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(fallback.st_ino, old.st_ino);
+        assert_eq!(path.as_path(), other.path());
     }
     #[test]
     fn resolve_only_metadata_and_raw_path() {
