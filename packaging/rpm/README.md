@@ -35,6 +35,7 @@ All visible CLI subcommands (including nested commands) ship in section 1;
 
 Only config/state/runtime are private (0600/0700 root:root); binaries are 0755
 and public unit/docs/completion files 0644 root:root. No account is created.
+The packaged service permits only Unix sockets (`RestrictAddressFamilies=AF_UNIX`).
 An upgrade restarts a running daemon and leaves a stopped daemon stopped, without changing enablement.
 
 For the install gate, `TIDEMARK_INSTALL_UPGRADE_RPM` must be built with
