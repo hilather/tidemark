@@ -35,7 +35,7 @@ All builds used Rust 1.98.0 binaries, `CARGO_HOME=/home/brewerm/.cargo`, `RUSTUP
 - Same command with `-- --nocapture`: exit 0; 3 passed, 53.35 seconds. New listener regression prints the expected sandbox EPERM skip.
 - `cargo fmt --check`: passed.
 - `cargo clippy -p tidemark-cli --all-targets -- -D warnings`: passed with offline environment.
-- `cargo test -p tidemark-cli --offline`: exit 0; all unprivileged CLI targets and doc tests passed (one existing scale test ignored).
+- `cargo test -p tidemark-cli --offline`: exit 0; all unprivileged CLI targets and doc tests passed (two existing scale tests ignored).
 - `cargo test -p tidemark-cli --offline --features privileged --no-run`: passed. Privileged execution: pending VM; no privileged/destructive operation executed.
 - `git diff --check`: passed.
 
