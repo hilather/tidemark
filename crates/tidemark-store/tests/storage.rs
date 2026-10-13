@@ -101,7 +101,7 @@ fn dir(id: u32) -> DirRow {
     }
 }
 fn write_fixture(n: u32) -> (tempfile::TempDir, std::path::PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let m = meta();
     let mut w = SnapshotWriter::create(tmp.path(), &m).unwrap();
     let mut rows: Vec<_> = (0..n).map(dir).collect();
@@ -259,7 +259,7 @@ fn roundtrip_100k_dirs_and_all_query_families() {
 }
 #[test]
 fn drop_abort_collision_and_failed_write_never_publish() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let m = meta();
     {
         let _w = SnapshotWriter::create(tmp.path(), &m).unwrap();
@@ -282,7 +282,7 @@ fn drop_abort_collision_and_failed_write_never_publish() {
     w.abort();
     let w = SnapshotWriter::create(tmp.path(), &m).unwrap();
     let dest = tmp.path().join(format!("{}.db", m.scan_id));
-    std::fs::write(&dest, b"existing").unwrap();
+    test_support::private_write(&dest, b"existing").unwrap();
     assert!(w.finish(&m).is_err());
     assert_eq!(std::fs::read(&dest).unwrap(), b"existing");
     assert!(SnapshotWriter::create(tmp.path(), &m).is_err());
@@ -305,7 +305,7 @@ fn schema_matches_document_sqlite_master() {
         conn.prepare("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap().map(Result::unwrap).collect()
     };
     assert_eq!(schema(&actual), schema(&expected));
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     TimeSeries::open(&tmp.path().join("timeseries.db"), true).unwrap();
     let actual = Connection::open(tmp.path().join("timeseries.db")).unwrap();
     let expected = Connection::open_in_memory().unwrap();
@@ -382,7 +382,7 @@ fn entry(id: &str, root: &[u8], ts: i64, status: &str) -> ScanEntry {
 #[test]
 fn catalog_selection_rebuild_and_nonutf8_file_paths() {
     use std::os::unix::ffi::OsStringExt;
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let c = Catalog::open(state.path(), true).unwrap();
     c.record_start(&entry("early", b"/data", 10, "running"))
         .unwrap();
@@ -415,10 +415,10 @@ fn catalog_selection_rebuild_and_nonutf8_file_paths() {
     );
     let (_tmp, file) = write_fixture(3);
     let snapshots = state.path().join("snapshots").join(root_slug(&meta().root));
-    std::fs::create_dir_all(&snapshots).unwrap();
+    ::test_support::private_dir(&snapshots).unwrap();
     std::fs::copy(file, snapshots.join("valid.db")).unwrap();
-    std::fs::write(snapshots.join("bad.db"), b"invalid").unwrap();
-    std::fs::write(snapshots.join("partial.db.tmp"), b"invalid").unwrap();
+    test_support::private_write(snapshots.join("bad.db"), b"invalid").unwrap();
+    test_support::private_write(snapshots.join("partial.db.tmp"), b"invalid").unwrap();
     assert_eq!(c.rebuild_from_files().unwrap(), 1);
     let catalog_sql = Connection::open(state.path().join("timeseries.db")).unwrap();
     let stored_version: String = catalog_sql
@@ -549,12 +549,12 @@ fn space_guard_decision_table_and_live_state_measurement() {
         space_check_with(|| Ok(FsTotals { size: 0, avail: 0 }), 0, 0, &policy),
         SpaceVerdict::Refuse { .. }
     ));
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let policy = RetentionConfig {
         max_state_size: tidemark_core::units::ByteSize(1),
         ..Default::default()
     };
-    std::fs::write(temp.path().join("allocated"), vec![1; 8192]).unwrap();
+    test_support::private_write(temp.path().join("allocated"), vec![1; 8192]).unwrap();
     std::os::unix::fs::symlink("/does/not/exist", temp.path().join("symlink")).unwrap();
     assert!(matches!(
         space_check(temp.path(), 0, &policy).unwrap(),
@@ -576,7 +576,7 @@ fn fs_sample(ts: i64, value: u64) -> tidemark_core::live::FsSample {
 #[test]
 fn samples_roundtrip_checked_inserts_and_readonly_opens() {
     use tidemark_core::live::*;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let db = tmp.path().join("timeseries.db");
     assert!(TimeSeries::open(&db, false).is_err());
     let t = TimeSeries::open(&db, true).unwrap();
@@ -676,8 +676,9 @@ fn samples_roundtrip_checked_inserts_and_readonly_opens() {
 }
 #[test]
 fn migrations_backup_existing_v0_and_refuse_future_schema() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let db = tmp.path().join("timeseries.db");
+    test_support::private_write(&db, b"").unwrap();
     Connection::open(&db)
         .unwrap()
         .execute_batch(
@@ -714,7 +715,7 @@ fn migrations_backup_existing_v0_and_refuse_future_schema() {
 #[test]
 fn compaction_last_values_idempotence_and_incomplete_buckets() {
     use tidemark_core::live::LvmSample;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let db = tmp.path().join("timeseries.db");
     let t = TimeSeries::open(&db, true).unwrap();
     let policy = SampleRetention::default();
@@ -839,7 +840,7 @@ fn depth_boundary_selects_crossing_sets_and_no_instances_is_honest() {
 #[test]
 #[ignore = "scale"]
 fn insert_2m_directory_rows_under_60_seconds() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let m = meta();
     let mut w = SnapshotWriter::create(tmp.path(), &m).unwrap();
     let start = std::time::Instant::now();
@@ -878,7 +879,7 @@ fn snapshot_xfs_publication_owner_permissions_and_sync() {
 
 #[test]
 fn series_keeps_largest_20000_rows_with_byte_path_ties() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let t = TimeSeries::open(&tmp.path().join("timeseries.db"), true).unwrap();
     let rows: Vec<_> = (0..30000).map(dir).collect();
     t.insert_dir_series(&meta().root, "scale-series", 1, &rows)
@@ -902,7 +903,7 @@ fn series_keeps_largest_20000_rows_with_byte_path_ties() {
 }
 #[test]
 fn mixed_sample_resolutions_keep_old_and_recent_history_for_short_ranges() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let db = tmp.path().join("timeseries.db");
     let t = TimeSeries::open(&db, true).unwrap();
     let sql = Connection::open(db).unwrap();
@@ -964,11 +965,11 @@ fn state_usage_skips_same_device_bind_mount() {
     let xfs = test_support::xfs::LoopXfs::new(1 << 30, &[], "");
     let state = xfs.mountpoint.join("state");
     let outside = xfs.mountpoint.join("outside");
-    std::fs::create_dir(&state).unwrap();
-    std::fs::create_dir(&outside).unwrap();
+    ::test_support::private_dir(&state).unwrap();
+    ::test_support::private_dir(&outside).unwrap();
     let bind = state.join("bind");
-    std::fs::create_dir(&bind).unwrap();
-    std::fs::write(outside.join("large"), vec![1; 1024 * 1024]).unwrap();
+    ::test_support::private_dir(&bind).unwrap();
+    test_support::private_write(outside.join("large"), vec![1; 1024 * 1024]).unwrap();
     assert!(Command::new("mount")
         .arg("--bind")
         .arg(&outside)
@@ -1080,7 +1081,7 @@ fn glob_boundaries_match_raw_bytes_and_nested_regions() {
 
 #[test]
 fn recover_corrupt_catalog_preserves_database_and_sidecars() {
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let snapshots = state.path().join("snapshots").join(root_slug(&meta().root));
     let mut writer = SnapshotWriter::create(&snapshots, &meta()).unwrap();
     let mut root = dir(0);
@@ -1088,7 +1089,7 @@ fn recover_corrupt_catalog_preserves_database_and_sidecars() {
     writer.put_dirs(&[root]).unwrap();
     writer.finish(&meta()).unwrap();
     for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
-        std::fs::write(state.path().join(name), name.as_bytes()).unwrap();
+        test_support::private_write(state.path().join(name), name.as_bytes()).unwrap();
     }
     for rw in [false, true] {
         for error in [
@@ -1163,7 +1164,7 @@ fn space_floor_does_not_round_down_large_sizes() {
 
 #[test]
 fn retained_400_day_history_returns_all_tiers() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let db = tmp.path().join("timeseries.db");
     let store = TimeSeries::open(&db, true).unwrap();
     let mut sql = Connection::open(&db).unwrap();
@@ -1213,7 +1214,7 @@ fn retained_400_day_history_returns_all_tiers() {
 
 #[test]
 fn overlapping_sample_tiers_preserve_selection_for_all_query_families() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let db = tmp.path().join("timeseries.db");
     let store = TimeSeries::open(&db, true).unwrap();
     let sql = Connection::open(db).unwrap();
@@ -1265,9 +1266,9 @@ fn overlapping_sample_tiers_preserve_selection_for_all_query_families() {
 
 #[test]
 fn timeseries_header_preflight_handles_empty_short_and_valid_headers() {
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let db = state.path().join("timeseries.db");
-    std::fs::write(&db, []).unwrap();
+    test_support::private_write(&db, []).unwrap();
     drop(TimeSeries::open(&db, true).unwrap());
     drop(TimeSeries::open(&db, false).unwrap());
 
@@ -1276,7 +1277,7 @@ fn timeseries_header_preflight_handles_empty_short_and_valid_headers() {
         b"SQLite format 3".as_slice(),
         b"garbage database bytes".as_slice(),
     ] {
-        std::fs::write(&db, bytes).unwrap();
+        test_support::private_write(&db, bytes).unwrap();
         assert!(matches!(
             TimeSeries::open(&db, true).err().unwrap(),
             tidemark_store::StoreError::Sql(rusqlite::Error::SqliteFailure(e, _))
@@ -1294,7 +1295,7 @@ fn timeseries_header_preflight_handles_empty_short_and_valid_headers() {
     damaged[19] = 1;
     damaged[21..24].copy_from_slice(&[64, 32, 32]);
     damaged[28..32].copy_from_slice(&1_u32.to_be_bytes());
-    std::fs::write(&db, &damaged).unwrap();
+    test_support::private_write(&db, &damaged).unwrap();
     let direct = Connection::open(&db)
         .unwrap()
         .execute_batch("SELECT name FROM sqlite_master;")
@@ -1319,7 +1320,7 @@ fn finish_cancels_at_every_publication_checkpoint() {
     // and one immediately before rename. Successful finish must not check afterwards.
     const CHECKPOINTS: usize = 10;
     for cancel_at in 1..=CHECKPOINTS + 1 {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = ::test_support::private_tempdir().unwrap();
         let old_meta = meta();
         let existing = SnapshotWriter::create(tmp.path(), &old_meta)
             .unwrap()
@@ -1359,7 +1360,7 @@ fn catalog_paths_are_relative_and_resolve_for_each_reader() {
         fd::AsRawFd,
         unix::ffi::{OsStrExt, OsStringExt},
     };
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let handle = std::fs::File::open(state.path()).unwrap();
     let anchored = std::path::PathBuf::from(format!("/proc/self/fd/{}/.", handle.as_raw_fd()));
     let plain = Catalog::open(state.path(), true).unwrap();
@@ -1367,7 +1368,7 @@ fn catalog_paths_are_relative_and_resolve_for_each_reader() {
     let tail = std::path::PathBuf::from("snapshots")
         .join(std::ffi::OsString::from_vec(b"root-\xff".to_vec()))
         .join(std::ffi::OsString::from_vec(b"scan-\xfe.db".to_vec()));
-    std::fs::create_dir_all(state.path().join(&tail).parent().unwrap()).unwrap();
+    ::test_support::private_dir(state.path().join(&tail).parent().unwrap()).unwrap();
     let (_fixture, snapshot) = write_fixture(3);
     std::fs::copy(snapshot, state.path().join(&tail)).unwrap();
     let sql = Connection::open(state.path().join("timeseries.db")).unwrap();
@@ -1409,7 +1410,7 @@ fn catalog_paths_are_relative_and_resolve_for_each_reader() {
 
 #[test]
 fn catalog_rejects_outside_and_parent_paths() {
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let c = Catalog::open(state.path(), true).unwrap();
     for file in [
         state.path().with_extension("outside").join("scan.db"),
@@ -1433,12 +1434,12 @@ fn catalog_rejects_outside_and_parent_paths() {
 #[test]
 fn catalog_legacy_paths_and_rebuild_repair() {
     use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let c = Catalog::open(state.path(), true).unwrap();
     let (_fixture, snapshot) = write_fixture(3);
     let tail = std::path::PathBuf::from("snapshots/root/valid.db");
     let published = state.path().join(&tail);
-    std::fs::create_dir_all(published.parent().unwrap()).unwrap();
+    ::test_support::private_dir(published.parent().unwrap()).unwrap();
     std::fs::copy(snapshot, &published).unwrap();
     let sql = Connection::open(state.path().join("timeseries.db")).unwrap();
     let existing = state.path().join("legacy.db");
@@ -1505,7 +1506,7 @@ fn catalog_legacy_paths_and_rebuild_repair() {
 
 #[test]
 fn metrics_ranked_query_counts_large_inventory_and_independent_families() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let mut meta = meta();
     meta.dirs = 100_001;
     let mut writer = SnapshotWriter::create(tmp.path(), &meta).unwrap();
@@ -1541,7 +1542,7 @@ fn metrics_ranked_query_counts_large_inventory_and_independent_families() {
 
 #[test]
 fn w7a2_children_keysets_match_all_orders_and_filters() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let metadata = meta();
     let mut writer = SnapshotWriter::create(temp.path(), &metadata).unwrap();
     let mut rows = vec![dir(0)];
@@ -1692,7 +1693,7 @@ fn w7a2_large_children_pages_have_no_duplicates_or_omissions() {
 
 #[test]
 fn w7a2_link_pages_preserve_null_duplicates_and_byte_names() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let metadata = meta();
     let mut writer = SnapshotWriter::create(temp.path(), &metadata).unwrap();
     writer.put_dirs(&[dir(0), dir(1)]).unwrap();

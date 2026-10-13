@@ -34,10 +34,10 @@ struct Harness {
 }
 impl Harness {
     fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let root = ::test_support::private_tempdir().unwrap();
         std::fs::create_dir(root.path().join("child")).unwrap();
         std::fs::write(root.path().join("child/file"), b"fixture").unwrap();
-        let storage = tempfile::tempdir().unwrap();
+        let storage = ::test_support::private_tempdir().unwrap();
         // An API socket may be bound below these directories. Under a sticky
         // ancestor such as /tmp the daemon requires an owned 0700 descendant;
         // tempfile yields 0755.
@@ -221,14 +221,14 @@ fn shutdown_interrupted_outcome_is_repaired_at_startup() {
     assert_eq!(h.entry(&scan.scan_id).status, "running");
     assert!(h.entry(&scan.scan_id).file.is_none());
     let tmp = h._state.path().join("snapshots/fixture/dead.db.tmp");
-    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    ::test_support::private_dir(tmp.parent().unwrap()).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
         h._state.path().join("snapshots"),
         std::fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    std::fs::write(&tmp, b"abandoned").unwrap();
+    test_support::private_write(&tmp, b"abandoned").unwrap();
     startup(&h);
     assert_eq!(h.entry(&scan.scan_id).status, "failed");
     assert_eq!(h.entry(&scan.scan_id).finished_at, Some(123));
@@ -270,14 +270,14 @@ fn startup_skips_cleanup_while_another_process_holds_lock() {
     let scan: tidemark_core::api::ScanStartResult = h.api("scan.start", h.params());
     h.stop();
     let tmp = h._state.path().join("snapshots/fixture/dead.db.tmp");
-    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    ::test_support::private_dir(tmp.parent().unwrap()).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
         h._state.path().join("snapshots"),
         std::fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    std::fs::write(&tmp, b"abandoned").unwrap();
+    test_support::private_write(&tmp, b"abandoned").unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "scan_lock_child"])
         .env("TIDEMARK_LOCK_CHILD", h._state.path())

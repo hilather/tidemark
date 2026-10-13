@@ -60,13 +60,13 @@ impl Harness {
         monotonic: tidemarkd::Clock,
         root_count: usize,
     ) -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let root = ::test_support::private_tempdir().unwrap();
         std::fs::create_dir(root.path().join("child")).unwrap();
         std::fs::write(root.path().join("child/file"), b"fixture").unwrap();
         let storage = if nested {
             tempfile::tempdir_in(root.path()).unwrap()
         } else {
-            tempfile::tempdir().unwrap()
+            ::test_support::private_tempdir().unwrap()
         };
         // An API socket may be bound below these directories. Under a sticky
         // ancestor such as /tmp the daemon requires an owned 0700 descendant;

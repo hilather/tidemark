@@ -71,7 +71,7 @@ fn real_operator_status_scan_top_now_reload_cancel_and_sigterm() {
     if !socket_available() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = dir.path().join("tree");
     std::fs::create_dir(&root).unwrap();
@@ -207,7 +207,7 @@ fn real_binary_scheduled_scan_publishes_then_exits_cleanly() {
     if !socket_available() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = dir.path().join("tree");
     std::fs::create_dir(&root).unwrap();

@@ -470,7 +470,7 @@ fn private_config(out: &Path) -> Result<PathBuf> {
     let config = out.join("bench.toml");
     let state = out.join("state");
     let socket = out.join("private.sock");
-    fs::create_dir_all(&state)?;
+    private_state_dir(&state)?;
     let string = |p: &Path| -> Result<String> {
         Ok(toml::Value::String(
             p.to_str()
@@ -592,7 +592,7 @@ pub fn run(workspace: &Path, args: impl Iterator<Item = OsString>) -> Result<()>
         for cache in &o.caches {
             for mode in &o.modes {
                 let state = run_dir.join(format!("state-{cache}-{mode}"));
-                fs::create_dir(&state)?;
+                private_state_dir(&state)?;
                 let invocations = commands(workspace, &o, &config, &state, mode);
                 let mut measurements = Vec::new();
                 for (index, inv) in invocations.iter().enumerate() {
@@ -777,4 +777,12 @@ mod tests {
                 .contains(&"close_write".into())
         );
     }
+}
+
+fn private_state_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
 }

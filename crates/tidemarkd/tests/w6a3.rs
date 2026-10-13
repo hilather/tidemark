@@ -121,7 +121,7 @@ fn framing_multiple_requests_private_socket_and_idle_shutdown() {
     if !socket_available() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let c = socket_config(&dir);
     let stop = Arc::new(AtomicBool::new(false));
     let handle = api::start_with_peer(
@@ -177,7 +177,7 @@ fn controllable_handler_timeout_keeps_admission_bounded() {
     if !socket_available() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let c = socket_config(&dir);
     let stop = Arc::new(AtomicBool::new(false));
     let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
@@ -224,7 +224,7 @@ fn refuses_non_socket_and_active_socket_removes_stale_socket() {
     if !socket_available() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let c = socket_config(&dir);
     let stop = Arc::new(AtomicBool::new(false));
     std::fs::write(&c.general.socket, b"do not remove").unwrap();
@@ -261,7 +261,7 @@ fn thirty_two_connections_then_rejects_without_queueing() {
     if !socket_available() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let c = socket_config(&dir);
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = crossbeam_channel::bounded(32);
@@ -305,7 +305,7 @@ fn thirty_two_connections_then_rejects_without_queueing() {
 mod privileged;
 
 fn socket_available() -> bool {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     match std::os::unix::net::UnixListener::bind(dir.path().join("probe.sock")) {
         Ok(_) => true,
         Err(e) if e.raw_os_error() == Some(1) => {
@@ -323,7 +323,7 @@ fn injected_nonroot_peer_is_forbidden_over_real_socket() {
     if !socket_available() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let c = socket_config(&dir);
     let stop = Arc::new(AtomicBool::new(false));
     let handle = api::start_with_peer(
@@ -350,7 +350,7 @@ fn lifecycle_start_uses_kernel_credentials_over_real_socket() {
     if !socket_available() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let c = socket_config(&dir);
     let stop = Arc::new(AtomicBool::new(false));
     let handle = api::start(Arc::new(c.clone()), context(&c), stop.clone()).unwrap();
@@ -376,7 +376,7 @@ fn socket_cleanup_uses_pinned_parent_and_preserves_replacement_leaf() {
     if !socket_available() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let parent = dir.path().join("runtime");
     std::fs::create_dir(&parent).unwrap();
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -433,7 +433,7 @@ fn full_backlog_probe_expires_and_concurrent_start_preserves_socket() {
         return;
     }
     use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let c = socket_config(&dir);
     let listener = net::socket_with(
         AddressFamily::UNIX,
@@ -506,10 +506,10 @@ fn api_and_metrics_share_a_private_directory() {
     if !socket_available() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let mut c = socket_config(&dir);
     c.general.state_dir = dir.path().join("state");
-    std::fs::create_dir(&c.general.state_dir).unwrap();
+    ::test_support::private_dir(&c.general.state_dir).unwrap();
     tidemark_store::catalog::Catalog::open(&c.general.state_dir, true).unwrap();
     c.roots.clear();
     c.metrics.textfile = dir.path().join("metrics.prom");
@@ -572,8 +572,8 @@ fn space_refusal_reply_and_status_are_published_before_acknowledgement() {
         path::RawPath,
     };
     use tidemarkd::{scheduler, services::tswriter};
-    let root = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let root = ::test_support::private_tempdir().unwrap();
+    let storage = ::test_support::private_tempdir().unwrap();
     let mut c = Config::default();
     c.general.state_dir = storage.path().to_owned();
     c.retention.min_free_pct = 100.0;

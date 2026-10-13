@@ -23,8 +23,8 @@ pub(super) struct Harness {
 impl Harness {
     /// Prepare private storage and detect whether root needs to drop DAC privileges.
     pub(super) fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let temp = ::test_support::private_tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
         let state = temp.path().join("state");
         let config = direct_config(
             temp.path(),
@@ -45,6 +45,26 @@ impl Harness {
             binary,
             drop_uid,
         }
+    }
+    /// Prepare state owned by the user of CLI children, including root test runners.
+    pub(super) fn prepare_state(&self) {
+        ::test_support::private_dir(&self.state).unwrap();
+        if self.drop_uid {
+            rustix::fs::chown(
+                &self.state,
+                Some(rustix::process::Uid::from_raw(65534)),
+                Some(rustix::process::Gid::from_raw(65534)),
+            )
+            .unwrap();
+        }
+    }
+    /// Run a fixture helper with the same uid as the CLI.
+    pub(super) fn fixture_command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        if self.drop_uid {
+            command.gid(65534).uid(65534);
+        }
+        command
     }
     /// Construct a real CLI child with explicit config and state paths.
     pub(super) fn command(&self, json: bool) -> Command {

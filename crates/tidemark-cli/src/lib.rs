@@ -184,7 +184,7 @@ mod tests {
     use super::*;
     #[test]
     fn configuration_loading_and_overrides() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ::test_support::private_tempdir().unwrap();
         let path = dir.path().join("missing.toml");
         let defaults = load_config(&path).unwrap();
         assert_eq!(

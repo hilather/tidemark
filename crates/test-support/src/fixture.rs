@@ -369,7 +369,7 @@ pub fn try_materialize(spec: &str) -> io::Result<Fixture> {
     if spec.entry.len() + spec.outside.len() > MAX_FIXTURE_ENTRIES {
         return Err(invalid("fixture entry cap exceeded"));
     }
-    let mut dir = tempfile::tempdir()?;
+    let mut dir = crate::private_tempdir()?;
     let storage = OwnedStorage::new(&mut dir)?;
     let root = dir.path().join("r");
     let outside = dir.path().join("outside");
@@ -572,7 +572,7 @@ mod tests {
         } else {
             &fixture.root
         };
-        let victim = tempfile::tempdir().unwrap();
+        let victim = crate::private_tempdir().unwrap();
         let victim_child = victim.path().join("child");
         fs::create_dir(&victim_child).unwrap();
         fs::set_permissions(victim.path(), Permissions::from_mode(0o500)).unwrap();
@@ -594,14 +594,14 @@ mod tests {
 
     #[test]
     fn proc_mount_identity_matches_statx() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir().unwrap();
         let file = File::open(dir.path()).unwrap();
         assert_eq!(proc_mount_id(&file).unwrap(), mount_id(&file).unwrap());
     }
 
     #[test]
     fn cleanup_preserves_replaced_owner() {
-        let sandbox = tempfile::tempdir().unwrap();
+        let sandbox = crate::private_tempdir().unwrap();
         let mut dir = tempfile::tempdir_in(sandbox.path()).unwrap();
         let storage = OwnedStorage::new(&mut dir).unwrap();
         fs::rename(dir.path(), sandbox.path().join("moved")).unwrap();
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn cleanup_survives_parent_symlink_substitution() {
-        let sandbox = tempfile::tempdir().unwrap();
+        let sandbox = crate::private_tempdir().unwrap();
         let parent = sandbox.path().join("parent");
         fs::create_dir(&parent).unwrap();
         // Construct under a private parent without changing process-wide TMPDIR.
@@ -634,7 +634,7 @@ mod tests {
         };
         let moved = sandbox.path().join("moved");
         fs::rename(&parent, &moved).unwrap();
-        let victim = tempfile::tempdir().unwrap();
+        let victim = crate::private_tempdir().unwrap();
         let target = victim.path().join(&name);
         fs::create_dir(&target).unwrap();
         fs::write(target.join("sentinel"), b"safe").unwrap();
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn cleanup_does_not_restore_directory_moved_outside() {
         let fixture = materialize("[[entry]]\npath = 'tracked'\nkind = 'dir'\nmode = 0\n");
-        let victim = tempfile::tempdir().unwrap();
+        let victim = crate::private_tempdir().unwrap();
         let destination = victim.path().join("moved");
         fixture.modes[0]
             .set_permissions(Permissions::from_mode(0o700))
@@ -721,7 +721,7 @@ mod tests {
     fn random_tree_removal_does_not_follow_symlinks() {
         let fixture = crate::random::random_tree(42, crate::random::RandomTreeParams::default());
         let path = fixture.dir.path().to_owned();
-        let victim = tempfile::tempdir().unwrap();
+        let victim = crate::private_tempdir().unwrap();
         fs::write(victim.path().join("sentinel"), b"safe").unwrap();
         std::os::unix::fs::symlink(victim.path(), fixture.root.join("victim")).unwrap();
         drop(fixture);

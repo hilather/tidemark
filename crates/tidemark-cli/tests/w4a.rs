@@ -21,7 +21,7 @@ fn command(owner: &std::path::Path) -> std::process::Command {
 #[test]
 fn missing_tools_render_na_text_and_json() {
     for json in [false, true] {
-        let command_owner = tempfile::tempdir().unwrap();
+        let command_owner = ::test_support::private_tempdir().unwrap();
         let mut cmd = command(command_owner.path());
         if json {
             cmd.arg("--json");
@@ -47,7 +47,7 @@ fn missing_tools_render_na_text_and_json() {
 }
 #[test]
 fn fake_executables_are_collected_without_host_lvm() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let lvs = script(
         dir.path(),
         "lvs",
@@ -75,7 +75,7 @@ fn fake_executables_are_collected_without_host_lvm() {
 }
 #[test]
 fn probe_tolerates_absent_or_failed_lvm() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let failing = script(dir.path(), "fail", "exit 9");
     for path in [std::path::PathBuf::from("/missing/tidemark-lvs"), failing] {
         let output = command(dir.path())
@@ -96,7 +96,7 @@ fn probe_tolerates_absent_or_failed_lvm() {
 }
 #[test]
 fn synthetic_report_maps_measured_fixture_device_in_cli_and_probe() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let raw = tidemark_core::path::RawPath::from_path(dir.path()).unwrap();
     let mounts = tidemark_fs::mount::read_mountinfo().unwrap();
     let mount = tidemark_fs::mount::mount_for_path(&mounts, &raw).unwrap();
@@ -286,7 +286,7 @@ mod privileged {
         let raw = RawPath::from_path(&fs.mountpoint).unwrap();
         let selected = mount::mount_for_path(&mounts, &raw).unwrap();
         assert!(lvm::map_mounts(&report, std::slice::from_ref(selected)).is_empty());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ::test_support::private_tempdir().unwrap();
         let config = super::config_support::direct_config(dir.path(), "[lvm]\nenabled = true\n");
         for json in [false, true] {
             let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"));

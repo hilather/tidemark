@@ -5,7 +5,7 @@ use tidemark_core::{config::Config, path::RawPath};
 use tidemark_scan::{mode::ModeRequest, ScanRequest};
 #[test]
 fn scan_mutate_scan_diff_names_changed_directory() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let fixture = test_support::materialize(
         "[[entry]]\npath = 'changed'\nkind = 'dir'\n[[entry]]\npath = 'unchanged'\nkind = 'dir'\n",
     );
@@ -15,7 +15,7 @@ fn scan_mutate_scan_diff_names_changed_directory() {
 #[cfg(feature = "privileged")]
 #[test]
 fn xfs_scan_mutate_scan_diff_names_changed_directory() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
     let root = fs.mountpoint.join("fixture");
     std::fs::create_dir_all(root.join("changed")).unwrap();
@@ -23,7 +23,7 @@ fn xfs_scan_mutate_scan_diff_names_changed_directory() {
     story(&root, &temp.path().join("state"));
 }
 fn story(root: &std::path::Path, state: &std::path::Path) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let changed = root.join("changed");
     let state = state.to_path_buf();
     let mut cfg = Config::default();

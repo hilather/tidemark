@@ -24,7 +24,7 @@ fn config(path: &Path, socket: &Path, textfile: &Path, state: &Path) {
 
 #[test]
 fn collisions_rejected_by_check_config_and_reload() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let real = dir.path().join("real");
     std::fs::create_dir(&real).unwrap();
     let alias = dir.path().join("alias");
@@ -78,7 +78,7 @@ fn collisions_rejected_by_check_config_and_reload() {
 
 #[test]
 fn exporter_preserves_nonregular_destination() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let destination = dir.path().join("metrics.prom");
     let outside = dir.path().join("outside");
     std::fs::write(&outside, b"unchanged").unwrap();
@@ -98,7 +98,7 @@ fn exporter_preserves_nonregular_destination() {
 
 #[test]
 fn exporter_preserves_live_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let path = dir.path().join("api.sock");
     let _listener = match std::os::unix::net::UnixListener::bind(&path) {
         Ok(listener) => listener,

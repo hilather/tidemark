@@ -20,7 +20,7 @@ fn vm_only() {
 fn deploy_stage_preflight_blocks() {
     vm_only();
     let _lock = SERVICE_TEST.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let source = dir.path().join("source.toml");
     let installed = dir.path().join("installed.toml");
     let state = dir.path().join("state");
@@ -59,7 +59,7 @@ fn deploy_unstage() {
         "this scenario needs a stopped daemon in a disposable VM"
     );
     let before = sys.is_enabled("tidemarkd").unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let state = dir.path().join("state");
     let source = dir.path().join("source.toml");
     let installed = dir.path().join("installed.toml");

@@ -214,7 +214,7 @@ mod tests {
     use super::*;
     #[test]
     fn removed_target_resolves_existing_symlink_ancestor_before_normalization() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ::test_support::private_tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("real/deep")).unwrap();
         std::os::unix::fs::symlink("real/deep", dir.path().join("link")).unwrap();
         let target = query_path(&dir.path().join("link/../gone")).unwrap();
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn missing_target_keeps_bytes_and_rejects_unresolved_parents() {
         use std::os::unix::ffi::OsStringExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = ::test_support::private_tempdir().unwrap();
         let missing = std::ffi::OsString::from_vec(b"missing\xff".to_vec());
         let target = query_path(&dir.path().join(&missing).join("child")).unwrap();
         let expected = tidemark_fs::canon::canonicalize(dir.path())

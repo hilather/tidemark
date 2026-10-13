@@ -95,7 +95,7 @@ fn dir(id: u32) -> DirRow {
 }
 
 fn fixture() -> (tempfile::TempDir, Snapshot) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let mut m = meta();
     m.root = path(b"/r");
     let mut w = SnapshotWriter::create(tmp.path(), &m).unwrap();
@@ -237,7 +237,7 @@ fn top_does_not_limit_totals() {
 }
 #[test]
 fn globs_match_non_utf8_path_bytes_and_literal_separators() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let mut m = meta();
     m.root = path(b"/r");
     let mut w = SnapshotWriter::create(tmp.path(), &m).unwrap();
@@ -264,7 +264,7 @@ fn globs_match_non_utf8_path_bytes_and_literal_separators() {
 #[test]
 #[ignore = "scale"]
 fn million_set_report_timing() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let mut m = meta();
     m.root = path(b"/r");
     let mut w = SnapshotWriter::create(tmp.path(), &m).unwrap();
@@ -379,7 +379,7 @@ fn streamed_selection_matches_reader_order_and_subtree_scope() {
 }
 
 fn increasing_sets(regions: u32, sets: u64) -> (tempfile::TempDir, Snapshot) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = ::test_support::private_tempdir().unwrap();
     let m = meta();
     let mut writer = SnapshotWriter::create(tmp.path(), &m).unwrap();
     let mut root = dir(0);

@@ -40,7 +40,7 @@ fn renders_text_json_and_absent_history() {
 }
 #[test]
 fn reads_history_and_computes_24h_trend() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let path = dir.path().join("timeseries.db");
     let db = tidemark_store::timeseries::TimeSeries::open(&path, true).unwrap();
     let (r, m) = fixture();

@@ -144,7 +144,7 @@ kind = "file"
 size = 0
 "#,
         );
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let path = RawPath::from_path(&fixture.root).unwrap();
         let rows = live_rows(&path, &config(state.path()), &AtomicBool::new(false)).unwrap();
         assert_eq!(rows.len(), 3);
@@ -170,7 +170,7 @@ kind = "file"
 size = 1048576
 "#,
         );
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let path = RawPath::from_path(&fixture.root).unwrap();
         let rows = live_rows(&path, &config(state.path()), &AtomicBool::new(false)).unwrap();
         assert_eq!(rows.len(), 1);
@@ -203,7 +203,7 @@ kind = "file"
 size = 8192
 "#,
         );
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let mut config = config(state.path());
         config.throttle.min_ops_per_sec = 1;
         config.throttle.max_ops_per_sec = 1;
@@ -221,6 +221,17 @@ size = 8192
             ));
             assert!(start.elapsed() < std::time::Duration::from_secs(2));
         });
-        let _lock = tidemark_scan::orchestrator::ScanLock::acquire(state.path()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let _lock = loop {
+            match tidemark_scan::orchestrator::ScanLock::acquire(state.path()) {
+                Ok(lock) => break lock,
+                Err(tidemark_scan::orchestrator::ScanError::Busy)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(error) => panic!("lock reacquisition failed: {error}"),
+            }
+        };
     }
 }

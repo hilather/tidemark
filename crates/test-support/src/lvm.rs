@@ -59,7 +59,7 @@ impl LoopVg {
                 "VG suffix must contain only letters, digits or underscores",
             ));
         }
-        let mut dir = tempfile::tempdir()?;
+        let mut dir = crate::private_tempdir()?;
         let storage = OwnedStorage::new(&mut dir)?;
         let unique = dir
             .path()

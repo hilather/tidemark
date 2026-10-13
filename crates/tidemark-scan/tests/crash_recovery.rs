@@ -63,8 +63,8 @@ fn scan_child() {
 #[test]
 fn killed_scan_is_cleaned_and_following_scan_completes() {
     use std::os::unix::process::ExitStatusExt;
-    let root = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
+    let root = ::test_support::private_tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     for i in 0..15000 {
         std::fs::create_dir(root.path().join(format!("dir-{i}"))).unwrap();
     }

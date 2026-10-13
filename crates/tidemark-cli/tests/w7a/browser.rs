@@ -11,7 +11,7 @@ use tidemark_core::{
 };
 
 fn browser(count: u32) -> (tempfile::TempDir, Browser) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let mut rows = vec![fixture::row(0, None, b"/fixture", u64::from(count) * 4096)];
     rows[0].subtree_end = count;
     rows[0].own_charged = 0;
@@ -109,7 +109,7 @@ fn too_small() {
 }
 #[test]
 fn hostile_names_in_data_panes() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let name = RawName::new([b"\x1b\n\xff".as_slice(), &[b'x'; 300]].concat()).unwrap();
     let root = RawPath::new(b"/fixture".to_vec()).unwrap().join(&name);
     let path = root.join(&name);
@@ -200,7 +200,7 @@ fn million_directory_navigation() {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(1_000_000);
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let root = RawPath::new(b"/fixture".to_vec()).unwrap();
     let mut meta = fixture::meta(root, 1_000_000);
     meta.dirs = u64::from(count) + 1;
@@ -250,7 +250,7 @@ fn million_directory_navigation() {
 
 #[test]
 fn query_pages_skip_nested_subtrees_and_support_back() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let mut rows = vec![
         fixture::row(0, None, b"/fixture", 10),
         fixture::row(1, Some(0), b"/fixture/a", 5),
@@ -294,7 +294,7 @@ fn query_pages_skip_nested_subtrees_and_support_back() {
 #[test]
 fn delta_lookups_and_growth_sort_are_snapshot_relative() {
     let (_temp, mut b) = browser(3);
-    let old_temp = tempfile::tempdir().unwrap();
+    let old_temp = ::test_support::private_tempdir().unwrap();
     let mut rows = vec![
         fixture::row(0, None, b"/fixture", 100),
         fixture::row(1, Some(0), b"/fixture/00000001", 8000),
@@ -387,7 +387,7 @@ fn own_files_columns_and_info() {
 #[test]
 fn instances_page_all_rows_forward_backward_and_end() {
     let (_temp, mut b) = browser(1);
-    let temp = tempfile::tempdir().unwrap();
+    let temp = ::test_support::private_tempdir().unwrap();
     let meta = fixture::meta(b.dir.path.clone(), 1_000_000);
     let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
     writer.put_dirs(&[b.dir.clone()]).unwrap();
@@ -425,7 +425,7 @@ kind = "file"
 size = 8192
 "#,
     );
-    let state = tempfile::tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
     let mut config = tidemark_core::config::Config::default();
     config.general.state_dir = state.path().to_owned();
     config.general.socket = state.path().join("test.sock");
@@ -434,7 +434,7 @@ size = 8192
     let rows =
         crate::live_rows::live_rows(&path, &config, &std::sync::atomic::AtomicBool::new(false))
             .unwrap();
-    let store = tempfile::tempdir().unwrap();
+    let store = ::test_support::private_tempdir().unwrap();
     let file = fixture::snapshot(store.path(), &rows, 1_000_000);
     let (_temp, mut b) = browser(0);
     b.snapshot = Snapshot::open(&file).unwrap();
@@ -481,8 +481,8 @@ size = 8192
 #[test]
 fn distinct_metrics_and_previous_snapshot_order_across_pages() {
     let (_temp, mut b) = browser(2500);
-    let store = tempfile::tempdir().unwrap();
-    let previous = tempfile::tempdir().unwrap();
+    let store = ::test_support::private_tempdir().unwrap();
+    let previous = ::test_support::private_tempdir().unwrap();
     let mut rows = vec![fixture::row(0, None, b"/fixture", 1)];
     rows[0].subtree_end = 2500;
     for id in 1..=2500 {

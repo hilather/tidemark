@@ -226,7 +226,7 @@ fn daemon_check_config_binary() {
         .success();
     let mut binary = std::path::PathBuf::from(assert_cmd::cargo::cargo_bin!("tidemark"));
     binary.set_file_name("tidemarkd");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let doc = include_str!("../../../docs/plan/08-interfaces.md");
     let example = doc

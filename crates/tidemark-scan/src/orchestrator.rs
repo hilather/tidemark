@@ -707,7 +707,13 @@ impl ScanLock {
     /// Create only inside state_dir and refuse a concurrent scan.
     pub fn acquire(state: &std::path::Path) -> Result<Self, ScanError> {
         let directory = tidemark_store::state_dir::StateDir::open(state, true)?;
-        for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm", "timeseries.db-journal", "timeseries.db.bak-v0"] {
+        for name in [
+            "timeseries.db",
+            "timeseries.db-wal",
+            "timeseries.db-shm",
+            "timeseries.db-journal",
+            "timeseries.db.bak-v0",
+        ] {
             directory.check_leaf(std::ffi::OsStr::new(name))?;
         }
         let file = directory.open_leaf(std::ffi::OsStr::new("scan.lock"), true, true)?;
@@ -1023,15 +1029,24 @@ impl crate::agg::RowSink for WriterSink<'_> {
 }
 
 fn delete_snapshot(state: &std::path::Path, file: &std::path::Path) -> Result<(), ScanError> {
-    let relative = file.strip_prefix(state.join("snapshots")).map_err(|_| ScanError::Precondition("snapshot deletion outside state directory refused".into()))?;
+    let relative = file.strip_prefix(state.join("snapshots")).map_err(|_| {
+        ScanError::Precondition("snapshot deletion outside state directory refused".into())
+    })?;
     let mut components = relative.components();
-    let root = match components.next() { Some(std::path::Component::Normal(n)) => n, _ => return Err(ScanError::Precondition("unsafe snapshot path".into())) };
-    let name = match components.next() { Some(std::path::Component::Normal(n)) => n, _ => return Err(ScanError::Precondition("unsafe snapshot path".into())) };
+    let root = match components.next() {
+        Some(std::path::Component::Normal(n)) => n,
+        _ => return Err(ScanError::Precondition("unsafe snapshot path".into())),
+    };
+    let name = match components.next() {
+        Some(std::path::Component::Normal(n)) => n,
+        _ => return Err(ScanError::Precondition("unsafe snapshot path".into())),
+    };
     if components.next().is_some() || file.extension() != Some(std::ffi::OsStr::new("db")) {
         return Err(ScanError::Precondition("unsafe snapshot path".into()));
     }
     let directory = tidemark_store::state_dir::StateDir::open(state, false)?
-        .subdir(std::ffi::OsStr::new("snapshots"), false)?.subdir(root, false)?;
+        .subdir(std::ffi::OsStr::new("snapshots"), false)?
+        .subdir(root, false)?;
     directory.unlink_leaf(name)?;
     tracing::info!(path=%file.display(), "pruned snapshot");
     Ok(())
@@ -1363,7 +1378,7 @@ mod tests {
     #[test]
     fn scan_provenance_uses_injected_environment() {
         let fixture = test_support::materialize("[[entry]]\npath='file'\nkind='file'\nsize=8\n");
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let mut cfg = Config::default();
         cfg.general.state_dir = state.path().to_owned();
         let req = ScanRequest {
@@ -1457,8 +1472,8 @@ mod tests {
 
     #[test]
     fn root_open_refuses_symlink_ancestor() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(temp.path().join("real/child")).unwrap();
+        let temp = ::test_support::private_tempdir().unwrap();
+        ::test_support::private_dir(temp.path().join("real/child")).unwrap();
         let root = RawPath::from_path(&temp.path().join("real/child")).unwrap();
         std::fs::rename(temp.path().join("real"), temp.path().join("old")).unwrap();
         std::os::unix::fs::symlink("old", temp.path().join("real")).unwrap();
@@ -1472,14 +1487,23 @@ mod tests {
 
     #[test]
     fn host_lock_is_exclusive_and_released() {
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let lock = ScanLock::acquire(state.path()).unwrap();
         assert!(matches!(
             ScanLock::acquire(state.path()),
             Err(ScanError::Busy)
         ));
         drop(lock);
-        assert!(ScanLock::acquire(state.path()).is_ok());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match ScanLock::acquire(state.path()) {
+                Ok(_) => break,
+                Err(ScanError::Busy) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(e) => panic!("lock reacquisition failed: {e}"),
+            }
+        }
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             std::fs::metadata(state.path().join("scan.lock"))
@@ -1492,7 +1516,7 @@ mod tests {
     }
     #[test]
     fn lock_rejects_symlink() {
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
         std::os::unix::fs::symlink(outside.path(), state.path().join("scan.lock")).unwrap();
         assert!(ScanLock::acquire(state.path()).is_err());
@@ -1588,9 +1612,9 @@ mod tests {
                 events: Mutex::new(vec![]),
                 fail_cleanup,
             };
-            let state = tempfile::tempdir().unwrap();
+            let state = ::test_support::private_tempdir().unwrap();
             let published = state.path().join("published.db");
-            std::fs::write(&published, b"published data").unwrap();
+            ::test_support::private_write(&published, b"published data").unwrap();
             let mut e = entry();
             let result: Result<(), ScanError> = recorded(
                 &mut e,
@@ -1616,12 +1640,12 @@ mod tests {
     #[test]
     fn emergency_prune_includes_expired_partial_and_failed_artifacts() {
         for status in ["partial", "failed"] {
-            let state = tempfile::tempdir().unwrap();
+            let state = ::test_support::private_tempdir().unwrap();
             let catalog = Catalog::open(state.path(), true).unwrap();
             let dir = state.path().join("snapshots/root");
-            std::fs::create_dir_all(&dir).unwrap();
+            ::test_support::private_dir(&dir).unwrap();
             let file = dir.join("expired.db");
-            std::fs::write(&file, b"expired artifact").unwrap();
+            ::test_support::private_write(&file, b"expired artifact").unwrap();
             let mut e = entry();
             e.status = status.into();
             e.file = Some(file.clone());
@@ -1667,12 +1691,15 @@ mod tests {
     }
     #[test]
     fn scan_ids_retry_without_replacing_and_reject_invalid_years() {
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let mut attempts = 0;
         let id = fresh_id(100, state.path(), |candidate| {
             attempts += 1;
             if attempts == 1 {
-                std::fs::write(state.path().join(format!("{candidate}.db")), b"preserved")?;
+                ::test_support::private_write(
+                    state.path().join(format!("{candidate}.db")),
+                    b"preserved",
+                )?;
                 Ok(true)
             } else {
                 Ok(false)
@@ -1727,7 +1754,7 @@ mod tests {
     }
     #[test]
     fn injected_space_refusal_creates_no_snapshot() {
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let catalog = Catalog::open(state.path(), true).unwrap();
         let result = guard_and_prune(state.path(), &catalog, 4, 100000, || {
             Ok(SpaceVerdict::Refuse {
@@ -1739,17 +1766,17 @@ mod tests {
     }
     #[test]
     fn emergency_prune_protects_recent_and_latest() {
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let catalog = Catalog::open(state.path(), true).unwrap();
         let dir = state.path().join("snapshots/root");
-        std::fs::create_dir_all(&dir).unwrap();
+        ::test_support::private_dir(&dir).unwrap();
         for i in 0..3 {
             let mut e = entry();
             e.scan_id = format!("id{i}");
             e.started_at = i;
             e.status = "complete".into();
             let file = dir.join(format!("id{i}.db"));
-            std::fs::write(&file, b"test").unwrap();
+            ::test_support::private_write(&file, b"test").unwrap();
             e.file = Some(file);
             catalog.record_start(&e).unwrap();
         }
@@ -1769,9 +1796,9 @@ mod tests {
     }
     #[test]
     fn ordinary_catalog_open_preserves_corrupt_bytes_and_explicit_recovery_logs_paths() {
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let file = state.path().join("timeseries.db");
-        std::fs::write(&file, b"corrupt database").unwrap();
+        ::test_support::private_write(&file, b"corrupt database").unwrap();
         assert!(Catalog::open(state.path(), true).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"corrupt database");
         let catalog = open_catalog(state.path(), true).unwrap();
@@ -1886,11 +1913,11 @@ mod tests {
     }
     #[test]
     fn deletion_refuses_paths_outside_state() {
-        let state = tempfile::tempdir().unwrap();
-        std::fs::create_dir(state.path().join("snapshots")).unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
+        ::test_support::private_dir(state.path().join("snapshots")).unwrap();
+        let outside = ::test_support::private_tempdir().unwrap();
         let file = outside.path().join("preserved.db");
-        std::fs::write(&file, b"kept").unwrap();
+        ::test_support::private_write(&file, b"kept").unwrap();
         assert!(delete_snapshot(state.path(), &file).is_err());
         assert_eq!(std::fs::read(file).unwrap(), b"kept");
     }
@@ -1918,7 +1945,7 @@ mod tests {
             }
         }
         let fixture = test_support::materialize("[[entry]]\npath='file'\nkind='file'\nsize=8\n");
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let mut cfg = Config::default();
         cfg.general.state_dir = state.path().to_owned();
         let req = ScanRequest {
@@ -1961,7 +1988,7 @@ mod tests {
             assert!(!cancel.load(Ordering::Acquire));
             let checks = Cell::new(0);
             let recorder = Recorder::default();
-            let catalog_dir = tempfile::tempdir().unwrap();
+            let catalog_dir = ::test_support::private_tempdir().unwrap();
             let catalog = Catalog::open(catalog_dir.path(), true).unwrap();
             let catalog_recorder = CatalogRecorder(catalog_dir.path(), &recorder);
             let mut e = entry();
@@ -2001,7 +2028,7 @@ mod tests {
     #[test]
     fn finish_collision_preserves_existing_snapshot_and_removes_temporary_file() {
         let fixture = test_support::materialize("[[entry]]\npath='file'\nkind='file'\nsize=8\n");
-        let state = tempfile::tempdir().unwrap();
+        let state = ::test_support::private_tempdir().unwrap();
         let mut cfg = Config::default();
         cfg.general.state_dir = state.path().to_owned();
         let req = ScanRequest {
@@ -2029,7 +2056,7 @@ mod tests {
         let writer = tidemark_store::writer::SnapshotWriter::create(dir, &meta).unwrap();
         let existing = dir.join(format!("{}.db", meta.scan_id));
         let temporary = dir.join(format!("{}.db.tmp", meta.scan_id));
-        std::fs::write(&existing, b"existing snapshot must survive").unwrap();
+        ::test_support::private_write(&existing, b"existing snapshot must survive").unwrap();
         assert!(matches!(
             finish_snapshot(writer, &meta, &|| false),
             Err(ScanError::PublicationCollision)

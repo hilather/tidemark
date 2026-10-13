@@ -3,7 +3,7 @@
 
 #[test]
 fn malformed_stage_config_prints_check_table_and_exits_five() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let source = dir.path().join("invalid.toml");
     let invalid = format!(
         "[general]\nsocket = {:?}\nunknown = true\n",
@@ -25,7 +25,7 @@ fn malformed_stage_config_prints_check_table_and_exits_five() {
 }
 #[test]
 fn json_preflight_failure_and_purge_confirmation_exit_five() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let source = dir.path().join("invalid.toml");
     std::fs::write(&source, "bad TOML\n").unwrap();
     let output = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("tidemark"))
@@ -53,10 +53,10 @@ mod privileged;
 
 #[test]
 fn missing_purge_marker_is_precondition_exit_five_without_service_calls() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let config = dir.path().join("config.toml");
     let state = dir.path().join("state");
-    std::fs::create_dir(&state).unwrap();
+    ::test_support::private_dir(&state).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -84,7 +84,7 @@ fn missing_purge_marker_is_precondition_exit_five_without_service_calls() {
 
 #[test]
 fn valid_source_bypasses_invalid_installed_config_and_exits_five_for_unsafe_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = ::test_support::private_tempdir().unwrap();
     let installed = dir.path().join("installed.toml");
     let source = dir.path().join("source.toml");
     std::fs::write(&installed, "invalid TOML").unwrap();
@@ -113,9 +113,9 @@ fn unsafe_directory_permissions_exit_five_before_service_access() {
     use std::os::unix::fs::PermissionsExt;
     for mode in [0o777, 0o750] {
         for child in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = ::test_support::private_tempdir().unwrap();
             let state = dir.path().join("state");
-            std::fs::create_dir_all(state.join("deploy")).unwrap();
+            ::test_support::private_dir(state.join("deploy")).unwrap();
             for path in [&state, &state.join("deploy")] {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
             }

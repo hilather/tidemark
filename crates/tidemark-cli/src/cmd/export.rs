@@ -118,9 +118,9 @@ mod tests {
         use super::{create_output, publish_output};
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = ::test_support::private_tempdir().unwrap();
         let state = temp.path().join("state");
-        std::fs::create_dir(&state).unwrap();
+        ::test_support::private_dir(&state).unwrap();
         let target = temp.path().join("export.json");
         let (mut file, target) = create_output(&target, &state).unwrap();
         let staging = file.path().to_owned();

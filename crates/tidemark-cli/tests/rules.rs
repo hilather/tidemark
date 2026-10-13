@@ -42,7 +42,7 @@ fn metadata_command(temp: &Path) -> Command {
     fs::remove_file(&probe).unwrap();
     let c = command(temp);
     if rustix::process::geteuid().is_root() && bypass {
-        fs::set_permissions(temp, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(temp, fs::Permissions::from_mode(0o1777)).unwrap();
         let binary = copied_binary(temp);
         let mut dropped = Command::new(binary);
         dropped.args(c.get_args()).gid(65534).uid(65534);
@@ -76,7 +76,7 @@ fn atimes(paths: &[std::path::PathBuf]) -> Vec<(i64, i64)> {
 }
 #[test]
 fn regular_contents_are_never_read() {
-    let t = tempfile::tempdir().unwrap();
+    let t = ::test_support::private_tempdir().unwrap();
     let root = t.path().join("root");
     fs::create_dir(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
@@ -151,7 +151,7 @@ fn regular_contents_are_never_read() {
 
 #[test]
 fn namespace_mounts_are_skipped() {
-    let t = tempfile::tempdir().unwrap();
+    let t = ::test_support::private_tempdir().unwrap();
     let root = t.path().join("root");
     fs::create_dir(&root).unwrap();
     for name in ["tmpfs", "bind"] {
