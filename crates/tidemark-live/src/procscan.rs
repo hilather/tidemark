@@ -2,7 +2,7 @@
 //! Metadata-only phantom aggregation and bounded open-writer history.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BinaryHeap, VecDeque},
     io,
     sync::Arc,
     time::{Duration, Instant},
@@ -20,6 +20,43 @@ use tidemark_fs::{
 const MAX_WRITERS: usize = 10_000;
 const HISTORY: usize = 60;
 const MAX_FDS: usize = 1_048_576;
+// Each persistence/report row set is at most 3.75 MiB, including vector slack.
+// Temporary trees are separately bounded; history tuples are capped by MAX_WRITERS/HISTORY.
+const MAX_PASS_BYTES: usize = 15 * 1024 * 1024 / 4;
+const MAX_SCRATCH_BYTES: usize = 16 * 1024 * 1024;
+const ROW_OVERHEAD: usize = 512;
+
+#[derive(Debug, thiserror::Error)]
+#[error("procscan copy byte budget exceeded: {count} descriptors, {bytes} bytes charged")]
+struct CopyBudgetExceeded {
+    count: usize,
+    bytes: usize,
+}
+fn charge(total: &mut usize, bytes: usize, count: usize, limit: usize) -> io::Result<()> {
+    let next = total.saturating_add(bytes);
+    if next > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            CopyBudgetExceeded {
+                count,
+                bytes: *total,
+            },
+        ));
+    }
+    *total = next;
+    Ok(())
+}
+fn row_charge(path: usize, comm: usize, unit: usize, mount: usize) -> usize {
+    // Output vectors reserve their full admitted length, with no geometric slack.
+    std::mem::size_of::<OpenWriter>()
+        .max(std::mem::size_of::<WriterSample>())
+        .max(std::mem::size_of::<PhantomSample>())
+        .max(std::mem::size_of::<PhantomHolder>())
+        + path
+        + comm
+        + unit
+        + mount
+}
 
 /// Devices and exclusions for a single shared procfs pass.
 pub struct ProcScannerOptions {
@@ -143,8 +180,125 @@ impl ProcScanner {
                 "proc descriptor cap exceeded",
             ));
         }
+        // Validate injected sources too, before any collector state changes.
+        let inventory_bytes = files.iter().fold(
+            files
+                .capacity()
+                .saturating_mul(std::mem::size_of::<OpenFile>()),
+            |n, f| n.saturating_add(f.target.capacity()),
+        );
+        if inventory_bytes > procfs::MAX_INVENTORY_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                procfs::InventoryBudgetExceeded {
+                    count: files.len(),
+                    bytes: inventory_bytes,
+                },
+            ));
+        }
         let fds_seen = files.len() as u64;
         files.sort_unstable_by_key(|a| (a.dev, a.ino, a.pid, a.fd));
+        let mut scratch = MAX_WRITERS * std::mem::size_of::<usize>();
+        let mut phantom_bytes = 0;
+        let mut writer_bytes = 0;
+        let mut history_rows = BinaryHeap::with_capacity(MAX_WRITERS);
+        for t in self.tracked.values() {
+            history_rows.push(std::cmp::Reverse(row_charge(
+                t.row.path.capacity(),
+                t.row.comm.capacity(),
+                t.row.unit.as_ref().map_or(0, String::capacity),
+                t.row.mount.capacity(),
+            )));
+        }
+        let mount_bytes = self
+            .cfg
+            .mounts
+            .iter()
+            .map(|m| m.0.as_bytes().len().saturating_mul(4))
+            .sum::<usize>();
+        charge(
+            &mut scratch,
+            mount_bytes + self.cfg.mounts.len() * ROW_OVERHEAD,
+            0,
+            MAX_SCRATCH_BYTES,
+        )?;
+        charge(
+            &mut phantom_bytes,
+            mount_bytes + self.cfg.mounts.len() * ROW_OVERHEAD,
+            0,
+            MAX_PASS_BYTES,
+        )?;
+        let mut attrs = BTreeMap::new();
+        let mut holder_counts = vec![0usize; self.cfg.mounts.len()];
+        let mut last_holder = None;
+        let mut last_writer = None;
+        // Admit all copies before changing histories, reports, or pending samples.
+        for (count, file) in files.iter().enumerate() {
+            let Some(index) = self.cfg.mounts.iter().position(|m| m.1 == file.dev) else {
+                continue;
+            };
+            if !file.target.starts_with(b"/") {
+                continue;
+            }
+            let path = if file.nlink == 0 {
+                file.target
+                    .strip_suffix(b" (deleted)")
+                    .unwrap_or(&file.target)
+            } else {
+                &file.target
+            };
+            let writable = self.cfg.open_writers
+                && file.flags.is_some_and(|f| matches!(f & 3, 1 | 2))
+                && !self
+                    .cfg
+                    .exclude_prefixes
+                    .iter()
+                    .any(|p| under(path, p.as_bytes()));
+            if file.nlink != 0 && !writable {
+                continue;
+            }
+            if !attrs.contains_key(&file.pid) {
+                charge(&mut scratch, ROW_OVERHEAD, count, MAX_SCRATCH_BYTES)?;
+                let attr = self.source.attribution(file.pid);
+                charge(
+                    &mut scratch,
+                    attr.comm.capacity() + attr.unit.as_ref().map_or(0, String::capacity),
+                    count,
+                    MAX_SCRATCH_BYTES,
+                )?;
+                attrs.insert(file.pid, attr);
+            }
+            let attr = &attrs[&file.pid];
+            let bytes = row_charge(
+                path.len(),
+                attr.comm.capacity().max(1),
+                attr.unit.as_ref().map_or(0, String::capacity),
+                self.cfg.mounts[index].0.as_bytes().len() * 4,
+            );
+            let key = (file.dev, file.ino);
+            if file.nlink == 0 && last_holder != Some((key, file.pid)) {
+                charge(&mut phantom_bytes, bytes, count, MAX_PASS_BYTES)?;
+                holder_counts[index] += 1;
+                last_holder = Some((key, file.pid));
+            }
+            if writable && last_writer != Some(key) {
+                charge(&mut writer_bytes, bytes, count, MAX_PASS_BYTES)?;
+                charge(&mut scratch, ROW_OVERHEAD + bytes, count, MAX_SCRATCH_BYTES)?;
+                // The largest MAX_WRITERS rows bound every rotation/admission choice.
+                if history_rows.len() < MAX_WRITERS {
+                    history_rows.push(std::cmp::Reverse(bytes));
+                } else if let Some(mut smallest) = history_rows.peek_mut() {
+                    if bytes > smallest.0 {
+                        *smallest = std::cmp::Reverse(bytes);
+                    }
+                }
+                last_writer = Some(key);
+            }
+        }
+        let mut history_bytes = 0;
+        for bytes in history_rows {
+            charge(&mut history_bytes, bytes.0, files.len(), MAX_PASS_BYTES)?;
+        }
         let mut summaries: Vec<_> = self
             .cfg
             .mounts
@@ -156,11 +310,33 @@ impl ProcScanner {
                 holders: Vec::new(),
             })
             .collect();
+        for (summary, count) in summaries.iter_mut().zip(&holder_counts) {
+            summary.holders.try_reserve_exact(*count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    CopyBudgetExceeded {
+                        count: files.len(),
+                        bytes: phantom_bytes,
+                    },
+                )
+            })?;
+        }
+        let mut phantom_samples = Vec::new();
+        phantom_samples
+            .try_reserve_exact(holder_counts.iter().sum())
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    CopyBudgetExceeded {
+                        count: files.len(),
+                        bytes: phantom_bytes,
+                    },
+                )
+            })?;
         let mut previous_phantom = None;
         let mut previous_holder = None;
         let mut seen_writers = BTreeMap::new();
-        // Attribution is fetched only for relevant descriptors, once per PID per pass.
-        let mut attrs = BTreeMap::new();
+        // Attribution was admitted before aggregation; errors preserve the old report.
         for file in files {
             let Some(index) = self.cfg.mounts.iter().position(|m| m.1 == file.dev) else {
                 continue;
@@ -309,10 +485,9 @@ impl ProcScanner {
                     .then((a.dev, a.ino, a.pid).cmp(&(b.dev, b.ino, b.pid)))
             });
         }
-        self.pending.0 = summaries
-            .iter()
-            .flat_map(|s| {
-                s.holders.iter().map(|h| PhantomSample {
+        for s in &summaries {
+            for h in &s.holders {
+                phantom_samples.push(PhantomSample {
                     ts: now,
                     mount: s.mount.clone(),
                     pid: h.pid,
@@ -322,15 +497,17 @@ impl ProcScanner {
                     dev: h.dev,
                     ino: h.ino,
                     bytes: h.bytes,
-                })
-            })
-            .collect();
-        self.pending.1 = self
-            .tracked
-            .values()
-            .filter(|t| t.missed == 0)
-            .map(|t| t.row.clone())
-            .collect();
+                });
+            }
+        }
+        self.pending.0 = phantom_samples;
+        self.pending.1 = Vec::with_capacity(self.tracked.len());
+        self.pending.1.extend(
+            self.tracked
+                .values()
+                .filter(|t| t.missed == 0)
+                .map(|t| t.row.clone()),
+        );
         self.phantom = summaries;
         self.now = Some(now);
         Ok(ProcScanResult {
@@ -409,7 +586,7 @@ fn writer_rows(
         )
         .unwrap_or(i64::MAX),
     );
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(tracked.len());
     for t in tracked.values().filter(|t| t.missed == 0) {
         let r = &t.row;
         if mount.is_some_and(|p| !mounts.iter().any(|(m, d)| m == p && *d == r.dev)) {

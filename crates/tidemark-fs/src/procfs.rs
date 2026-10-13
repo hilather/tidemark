@@ -4,7 +4,7 @@
 use std::{
     fs,
     io::{self, Read},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::fs::MetadataExt,
 };
 use tidemark_core::scan::{DevId, Ino};
 
@@ -12,6 +12,73 @@ use tidemark_core::scan::{DevId, Ino};
 const MAX_PROC_TEXT: u64 = 1024 * 1024;
 const MAX_IDS: usize = 1_048_576;
 const MAX_OPEN_FILES: usize = 1_048_576;
+const ID_SCRATCH_BYTES: usize = 2 * MAX_IDS * std::mem::size_of::<u32>();
+/// Maximum retained inventory allocation, including record capacity and target capacity.
+/// Includes a conservative reservation for both MAX_IDS enumeration vectors.
+pub const MAX_INVENTORY_BYTES: usize = 128 * 1024 * 1024;
+
+/// A complete process inventory could not fit its memory budget.
+#[derive(Debug, thiserror::Error)]
+#[error("proc inventory byte budget exceeded: {count} descriptors, {bytes} bytes retained")]
+pub struct InventoryBudgetExceeded {
+    /// Descriptors retained before the rejected allocation.
+    pub count: usize,
+    /// Accounted allocation bytes before the rejected allocation.
+    pub bytes: usize,
+}
+fn budget_error(count: usize, bytes: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        InventoryBudgetExceeded { count, bytes },
+    )
+}
+
+struct Inventory {
+    files: Vec<OpenFile>,
+    paths: usize,
+    limit: usize,
+    scratch: usize,
+}
+impl Inventory {
+    fn bytes(&self) -> usize {
+        self.scratch + self.paths + self.files.capacity() * std::mem::size_of::<OpenFile>()
+    }
+    fn push(&mut self, file: OpenFile) -> io::Result<()> {
+        let before = self.bytes();
+        let extra = if self.files.len() == self.files.capacity() {
+            // Exact, fixed chunks avoid hidden geometric spare capacity.
+            256 * std::mem::size_of::<OpenFile>()
+        } else {
+            0
+        };
+        if before
+            .saturating_add(extra)
+            .saturating_add(file.target.capacity())
+            > self.limit
+        {
+            return Err(budget_error(self.files.len(), before));
+        }
+        if extra != 0 {
+            self.files
+                .try_reserve_exact(256)
+                .map_err(|_| budget_error(self.files.len(), before))?;
+        }
+        // Account the actual capacity returned by the allocator as well.
+        if self.bytes().saturating_add(file.target.capacity()) > self.limit {
+            return Err(budget_error(self.files.len(), self.bytes()));
+        }
+        self.paths += file.target.capacity();
+        self.files.push(file);
+        Ok(())
+    }
+    fn truncate(&mut self, len: usize) {
+        self.paths -= self.files[len..]
+            .iter()
+            .map(|f| f.target.capacity())
+            .sum::<usize>();
+        self.files.truncate(len);
+    }
+}
 
 fn invalid() -> io::Error {
     io::Error::new(
@@ -43,6 +110,11 @@ fn ids(path: &str) -> io::Result<Vec<u32>> {
         if let Some(id) = entry.file_name().to_str().and_then(|s| s.parse().ok()) {
             if result.len() == MAX_IDS {
                 return Err(invalid());
+            }
+            if result.len() == result.capacity() {
+                result
+                    .try_reserve_exact(256)
+                    .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
             }
             result.push(id);
         }
@@ -130,10 +202,10 @@ pub fn list_fds(pid: u32) -> io::Result<Vec<u32>> {
 }
 /// Return readlink text as raw bytes, without interpreting it as a filesystem path.
 pub fn read_fd_target(pid: u32, fd: u32) -> io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStringExt;
     Ok(fs::read_link(format!("/proc/{pid}/fd/{fd}"))?
-        .as_os_str()
-        .as_bytes()
-        .to_vec())
+        .into_os_string()
+        .into_vec())
 }
 /// Parse the octal flags field in fdinfo.
 pub fn parse_fdinfo_flags(fdinfo: &str) -> Option<u32> {
@@ -191,8 +263,14 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
     if devs.is_empty() {
         return Ok(Vec::new());
     }
-    let mut files = Vec::new();
-    for pid in list_pids()? {
+    let mut inventory = Inventory {
+        files: Vec::new(),
+        paths: 0,
+        limit: MAX_INVENTORY_BYTES,
+        scratch: ID_SCRATCH_BYTES,
+    };
+    let pids = list_pids()?;
+    for pid in pids {
         let start = match read_starttime(pid) {
             Ok(s) => s,
             Err(e) if transient(&e) => continue,
@@ -203,7 +281,7 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
             Err(e) if transient(&e) => continue,
             Err(e) => return Err(e),
         };
-        let base = files.len();
+        let base = inventory.files.len();
         for fd in fds {
             let path = format!("/proc/{pid}/fd/{fd}");
             let metadata = match fs::metadata(&path) {
@@ -237,10 +315,10 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
             if metadata.dev() != check.dev() || metadata.ino() != check.ino() {
                 continue;
             }
-            if files.len() == MAX_OPEN_FILES {
+            if inventory.files.len() == MAX_OPEN_FILES {
                 return Err(invalid());
             }
-            files.push(OpenFile {
+            inventory.push(OpenFile {
                 pid,
                 starttime: start,
                 fd,
@@ -251,13 +329,13 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
                 size: metadata.len(),
                 disk: metadata.blocks().saturating_mul(512),
                 flags,
-            });
+            })?;
         }
         if read_starttime(pid).ok() != Some(start) {
-            files.truncate(base);
+            inventory.truncate(base);
         }
     }
-    Ok(files)
+    Ok(inventory.files)
 }
 
 #[cfg(test)]
@@ -310,3 +388,7 @@ mod tests {
         assert!(!transient(&io::Error::from_raw_os_error(libc::EIO)));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/w1d/budget.rs"]
+mod budget_tests;
