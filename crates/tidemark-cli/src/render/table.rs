@@ -124,8 +124,15 @@ pub fn shorten(cell: &str, width: usize) -> String {
     }
     format!("{left}...{right}")
 }
-/// Fit each table's cells to a shared width before aligning them.
+/// Fit path/unit cells to a shared width before aligning them.
+/// For tables containing prose, use `aligned_wrapped` with explicit short columns.
 pub fn aligned_width(rows: &[Vec<String>], width: usize) -> String {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    aligned_wrapped(rows, width, &(0..columns).collect::<Vec<_>>())
+}
+/// Align a table, wrapping free text and shortening only the named path/unit columns.
+/// Continuations begin at each cell's column. Oversized words remain whole.
+pub fn aligned_wrapped(rows: &[Vec<String>], width: usize, short_columns: &[usize]) -> String {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     if columns == 0 {
         return String::new();
@@ -137,65 +144,168 @@ pub fn aligned_width(rows: &[Vec<String>], width: usize) -> String {
         }
     }
     let available = width.saturating_sub(2 * columns.saturating_sub(1));
+    let minimum: Vec<usize> = (0..columns)
+        .map(|i| {
+            if short_columns.contains(&i) {
+                rows.first()
+                    .and_then(|r| r.get(i))
+                    .map_or(1, |s| display_width(s))
+            } else {
+                rows.iter()
+                    .filter_map(|r| r.get(i))
+                    .flat_map(|s| s.split_whitespace())
+                    .map(display_width)
+                    .filter(|n| *n < width)
+                    .max()
+                    .unwrap_or(1)
+                    .min(available)
+            }
+        })
+        .collect();
     while widths.iter().sum::<usize>() > available {
-        let Some((index, largest)) = widths.iter().enumerate().max_by_key(|(_, n)| **n) else {
+        let eligible = |i: usize| widths[i] > minimum[i];
+        // Give prose its longest-word budget, then borrow space from paths/units
+        // before wrapping fixed metadata columns such as timestamps.
+        let candidate = if eligible(columns - 1) {
+            Some((columns - 1, &widths[columns - 1]))
+        } else {
+            widths
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| short_columns.contains(i) && eligible(*i))
+                .max_by_key(|(_, n)| **n)
+                .or_else(|| {
+                    widths
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| eligible(*i))
+                        .max_by_key(|(_, n)| **n)
+                })
+        };
+        let candidate = candidate.or_else(|| {
+            widths
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| **n > 0)
+                .max_by_key(|(_, n)| **n)
+        });
+        let Some((index, _)) = candidate else {
             break;
         };
-        if *largest == 0 {
-            break;
-        }
         widths[index] -= 1;
     }
-    let mut out = String::new();
-    for row in rows {
-        for (i, cell) in row.iter().enumerate() {
-            let cell = shorten(cell, widths[i]);
-            out.push_str(&cell);
-            if i + 1 < row.len() {
-                out.extend(std::iter::repeat_n(
-                    ' ',
-                    widths[i] - display_width(&cell) + 2,
-                ));
+    // Multiple unbreakable cells may not fit side by side. Keep their column
+    // starts within the page; the row writer puts overlapping cells on separate lines.
+    for i in 1..columns {
+        let longest = rows
+            .iter()
+            .filter_map(|r| r.get(i))
+            .flat_map(|s| s.split_whitespace())
+            .map(display_width)
+            .filter(|n| *n < width)
+            .max()
+            .unwrap_or(0);
+        while widths[..i].iter().sum::<usize>() + 2 * i + longest > width {
+            let Some((index, largest)) = widths[..i].iter().enumerate().max_by_key(|(_, n)| **n)
+            else {
+                break;
+            };
+            if *largest == 0 {
+                break;
             }
+            widths[index] -= 1;
         }
-        out.push('\n');
     }
-    if width < 2 * columns.saturating_sub(1) {
-        wrap(&out, width)
-    } else {
-        out
+    let mut out = String::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let cells: Vec<Vec<String>> = row
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                if row_index > 0 && short_columns.contains(&i) {
+                    vec![shorten(cell, widths[i])]
+                } else {
+                    word_lines(cell, widths[i].max(1))
+                }
+            })
+            .collect();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(0);
+        for line in 0..height {
+            let mut position = 0;
+            for (i, cell) in cells.iter().enumerate() {
+                let start: usize = widths[..i].iter().sum::<usize>() + 2 * i;
+                let text = cell.get(line).map_or("", String::as_str);
+                if text.is_empty() {
+                    continue;
+                }
+                // An oversized word gets its own line rather than overlapping a later cell.
+                if position > 0 && (position + 2 > start || start + display_width(text) > width) {
+                    out.push('\n');
+                    position = 0;
+                }
+                out.extend(std::iter::repeat_n(' ', start.saturating_sub(position)));
+                out.push_str(text);
+                position = start + display_width(text);
+            }
+            out.push('\n');
+        }
     }
+    out
 }
-/// Wrap text at whitespace and shorten oversized tokens without splitting escapes.
+fn word_lines(text: &str, width: usize) -> Vec<String> {
+    if display_width(text) <= width {
+        return vec![text.to_owned()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && display_width(&current) + 1 + display_width(word) > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+/// Wrap prose at word boundaries without dropping oversized words.
 pub fn wrap(text: &str, width: usize) -> String {
-    let width = width.max(1);
     let mut out = String::new();
     for line in text.lines() {
-        if display_width(line) <= width {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-        let indent = line
-            .chars()
-            .take_while(|c| *c == ' ')
-            .count()
-            .min(width.saturating_sub(1));
-        let mut current = " ".repeat(indent);
-        for word in line.split_whitespace() {
-            let word = shorten(word, width - indent);
-            let space = usize::from(current.len() > indent);
-            if display_width(&current) + space + display_width(&word) > width {
-                out.push_str(&current);
+        let indent = line.chars().take_while(|c| *c == ' ').count();
+        out.push_str(&wrap_prefixed(
+            &" ".repeat(indent),
+            line.trim_start(),
+            width,
+        ));
+    }
+    out
+}
+/// Wrap a prefixed item, indenting every continuation by the prefix's display width.
+pub fn wrap_prefixed(prefix: &str, text: &str, width: usize) -> String {
+    let indent = display_width(prefix);
+    let lines = word_lines(text, width.saturating_sub(indent).max(1));
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i == 0 {
+            if display_width(line) > width.saturating_sub(indent) && !prefix.trim().is_empty() {
+                out.push_str(prefix.trim_end());
                 out.push('\n');
-                current = " ".repeat(indent);
+                out.extend(std::iter::repeat_n(' ', indent));
+            } else {
+                out.push_str(prefix);
             }
-            if current.len() > indent {
-                current.push(' ');
-            }
-            current.push_str(&word);
+        } else {
+            out.extend(std::iter::repeat_n(' ', indent));
         }
-        out.push_str(&current);
+        out.push_str(line);
         out.push('\n');
     }
     out

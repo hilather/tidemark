@@ -34,7 +34,7 @@ pub fn active_width(
             display(r.message.as_bytes()),
         ]);
     }
-    out.write_all(crate::render::table::aligned_width(&table, width).as_bytes())?;
+    out.write_all(crate::render::table::aligned_wrapped(&table, width, &[1]).as_bytes())?;
     Ok(())
 }
 /// Render history, explicitly limited to the current daemon run.
@@ -70,7 +70,7 @@ pub fn history_width(
             display(r.message.as_bytes()),
         ]);
     }
-    out.write_all(crate::render::table::aligned_width(&table, width).as_bytes())?;
+    out.write_all(crate::render::table::aligned_wrapped(&table, width, &[2]).as_bytes())?;
     writeln!(out, "History covers the current daemon run only.")?;
     Ok(())
 }

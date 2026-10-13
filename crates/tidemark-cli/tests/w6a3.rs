@@ -456,7 +456,9 @@ fn cells_and_prose_fit_injected_widths_without_splitting_escapes() {
             &format!("{path} {escaped} full in ~2h (1h trend)"),
             width,
         );
-        assert!(text.lines().all(|line| line.chars().count() <= width));
+        assert!(text
+            .lines()
+            .all(|line| line.chars().count() <= width || line.split_whitespace().count() == 1));
         assert!(text.contains(&escaped));
         assert!(!text.contains("tre\nnd"));
     }
@@ -572,9 +574,11 @@ fn status_schedules_are_human_readable_and_fit_widths() {
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.lines().all(|line| line.chars().count() <= width));
+        assert!(text
+            .lines()
+            .all(|line| line.chars().count() <= width || line.split_whitespace().count() == 1));
         assert!(
-            text.contains("/data  no  2026-10-12 22:52:56Z  -"),
+            text.contains("/data  no       2026-10-12 22:52:56Z  -"),
             "{text}"
         );
         assert!(text.contains("bad\\x0Amessage"), "{text}");
@@ -673,11 +677,19 @@ fn every_live_renderer_fits_long_byte_paths_and_controls() {
         for out in outputs {
             let text = String::from_utf8(out).unwrap();
             assert!(
-                text.lines()
-                    .all(|line| tidemark_cli::render::table::display_width(line) <= width),
+                text.lines().all(
+                    |line| tidemark_cli::render::table::display_width(line) <= width
+                        || line.split_whitespace().count() == 1
+                ),
                 "{text}"
             );
-            assert!(text.contains("..."));
+            assert!(
+                text.contains("...")
+                    || text
+                        .split_whitespace()
+                        .any(|word| tidemark_cli::render::table::display_width(word) > width),
+                "{text}"
+            );
         }
         let mut out = Vec::new();
         tidemark_cli::render::hot::write_width(std::slice::from_ref(&row), true, width, &mut out)
@@ -713,4 +725,217 @@ fn scan_permission_error_never_falls_back() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(out.status.code(), Some(4));
     assert!(!dir.path().join("state").exists());
+}
+
+// CLI-display2: packaged-daemon regressions, independent of sockets or terminal state.
+const WATCHER_DETAIL: &str = "mode=fd/mount recovering=false overflows_total=0 read_errors=0 persistence_dropped=false; exact minute windows unavailable: collector omits empty-minute/loss records and boundary counters";
+const DEGRADED_REASON: &str = "alert watch_lossy:/mnt/tidemark-install: not evaluable: exact completed-minute observation unavailable: collector lacks empty-minute/loss records and boundary overflow counters";
+
+#[test]
+fn packaged_status_wraps_details_and_aligns_roots() {
+    let context = tidemark_cli::Context {
+        config: tidemark_core::config::Config::default(),
+        config_path: "/fixture".into(),
+        json: false,
+        color: false,
+    };
+    let report = serde_json::from_value(serde_json::json!({
+        "version":"fixture", "uptime_s":1,
+        "components":[{"name":"watcher:/mnt/tidemark-install","state":"ok","detail":WATCHER_DETAIL}],
+        "watch_modes":[], "last_errors":[]
+    })).unwrap();
+    let scans = vec![tidemark_core::live::ScanStatus {
+        root: "/mnt/tidemark-install".into(),
+        running: None,
+        next_due: None,
+        last_complete: Some(tidemark_core::live::LastScan {
+            scan_id: "a".into(),
+            finished_at: 1791858543,
+            mode: "walk".into(),
+            duration_ms: 1,
+        }),
+    }];
+    for width in [80, 100, 160] {
+        let mut out = Vec::new();
+        tidemark_cli::render::status::write_width(
+            &report, &scans, &context, false, width, &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.lines().all(|line| line.len() <= width), "{text}");
+        let lines: Vec<_> = text.lines().collect();
+        let detail_column = lines[1].find("DETAIL").unwrap();
+        let root_index = lines
+            .iter()
+            .position(|line| line.starts_with("ROOT"))
+            .unwrap();
+        let mut detail = Vec::new();
+        for (i, line) in lines[2..root_index].iter().enumerate() {
+            if i > 0 {
+                assert!(line.starts_with(&" ".repeat(detail_column)), "{line}");
+            }
+            detail.extend(line[detail_column..].split_whitespace());
+        }
+        assert_eq!(detail.join(" "), WATCHER_DETAIL);
+        for counter in [
+            "recovering=false",
+            "overflows_total=0",
+            "read_errors=0",
+            "persistence_dropped=false;",
+        ] {
+            assert!(text.contains(counter), "{text}");
+        }
+        let header = lines[root_index];
+        let row = lines[root_index + 1];
+        assert_eq!(header.find("RUNNING"), row.find("no"));
+        let next_column = header.find("NEXT RUN").unwrap();
+        assert!(row[next_column..].starts_with("-"));
+        assert_eq!(
+            header.find("LAST COMPLETE"),
+            row.find("2026-10-13 02:29:03Z")
+        );
+    }
+}
+
+#[test]
+fn packaged_now_continuations_belong_to_their_degraded_item() {
+    let mut report = example_now();
+    report.mounts.clear();
+    report.scans.clear();
+    report.degraded = vec![
+        DEGRADED_REASON.into(),
+        "watcher /mnt/tidemark-install: fd mode only".into(),
+    ];
+    for width in [80, 100, 160] {
+        let text = tidemark_cli::render::now::render_text(&report, width);
+        assert!(text.lines().all(|line| line.len() <= width));
+        let lines: Vec<_> = text.lines().skip(1).collect();
+        let next = lines
+            .iter()
+            .position(|line| line.starts_with("degraded: watcher"))
+            .unwrap();
+        assert!(next > 1);
+        assert!(lines[1..next]
+            .iter()
+            .all(|line| line.starts_with("          ")));
+        let reason = std::iter::once(lines[0].strip_prefix("degraded: ").unwrap())
+            .chain(lines[1..next].iter().map(|line| line.trim_start()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(reason, DEGRADED_REASON);
+    }
+}
+
+#[test]
+fn free_text_preserves_oversized_words_and_alert_columns() {
+    let long_word = "x".repeat(180);
+    for width in [80, 100, 160] {
+        let text = tidemark_cli::render::table::wrap_prefixed(
+            "degraded: ",
+            &format!("before {long_word} after"),
+            width,
+        );
+        assert_eq!(
+            text,
+            format!("degraded: before\n          {long_word}\n          after\n")
+        );
+        let rows = vec![tidemark_core::live::AlertSummary {
+            rule: "watch_lossy".into(),
+            subject: "/mnt/tidemark-install".into(),
+            since: 0,
+            value: None,
+            message: WATCHER_DETAIL.into(),
+        }];
+        let mut out = Vec::new();
+        tidemark_cli::render::alerts::active_width(&rows, false, width, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.lines().all(|line| line.len() <= width));
+        let column = text.lines().next().unwrap().find("MESSAGE").unwrap();
+        let lines: Vec<_> = text.lines().skip(1).collect();
+        assert!(lines[1..]
+            .iter()
+            .all(|line| line.starts_with(&" ".repeat(column))));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line[column..].trim())
+                .collect::<Vec<_>>()
+                .join(" "),
+            WATCHER_DETAIL
+        );
+        let events = vec![tidemark_core::live::AlertEvent {
+            ts: 0,
+            rule: "watch_lossy".into(),
+            subject: "/mnt/tidemark-install".into(),
+            state: tidemark_core::live::AlertState::Firing,
+            value: None,
+            message: WATCHER_DETAIL.into(),
+        }];
+        let mut out = Vec::new();
+        tidemark_cli::render::alerts::history_width(&events, false, width, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.lines().all(|line| line.len() <= width), "{text}");
+        let column = text.lines().next().unwrap().find("MESSAGE").unwrap();
+        let message = text
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with("History"))
+            .filter_map(|line| line.get(column..))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(message, WATCHER_DETAIL);
+    }
+}
+
+#[test]
+fn daemon_lvm_json_has_its_own_schema_and_unchanged_fields() {
+    let report: tidemark_core::api::LvmResult =
+        serde_json::from_value(serde_json::json!({"mounts":[],"vgs":[],"sampled_at":42})).unwrap();
+    let mut out = Vec::new();
+    tidemark_cli::render::now::lvm_width(&report, &[], true, 100, &mut out).unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(doc["schema"], "tidemark.lvm.daemon.v1");
+    assert_eq!(doc["data"], serde_json::to_value(report).unwrap());
+}
+
+#[test]
+fn status_error_continuations_keep_the_message_and_prefix_indent() {
+    let context = tidemark_cli::Context {
+        config: tidemark_core::config::Config::default(),
+        config_path: "/fixture".into(),
+        json: false,
+        color: false,
+    };
+    let report = serde_json::from_value(serde_json::json!({
+        "version":"fixture","uptime_s":1,"components":[],"watch_modes":[],
+        "last_errors":[["api",0,WATCHER_DETAIL]]
+    }))
+    .unwrap();
+    let prefix = "last error api at 1970-01-01 00:00:00Z: ";
+    for width in [80, 100, 160] {
+        let mut out = Vec::new();
+        tidemark_cli::render::status::write_width(&report, &[], &context, false, width, &mut out)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.lines().all(|line| line.len() <= width));
+        let lines: Vec<_> = text
+            .lines()
+            .skip_while(|line| !line.starts_with(prefix))
+            .take_while(|line| !line.starts_with("ROOT"))
+            .collect();
+        assert!(lines.len() > 1);
+        assert!(lines[1..]
+            .iter()
+            .all(|line| line.starts_with(&" ".repeat(prefix.len()))));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line[prefix.len()..].trim())
+                .collect::<Vec<_>>()
+                .join(" "),
+            WATCHER_DETAIL
+        );
+    }
 }
