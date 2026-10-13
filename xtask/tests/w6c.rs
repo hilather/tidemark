@@ -209,6 +209,8 @@ fn shell_syntax_and_vm_guard() {
         "packaging/rpm/post.sh",
         "packaging/rpm/preun.sh",
         "packaging/rpm/postun.sh",
+        "tools/check-rpm.sh",
+        "tools/el8-build-env.sh",
     ] {
         assert!(Command::new("bash")
             .arg("-n")
@@ -221,11 +223,17 @@ fn shell_syntax_and_vm_guard() {
             .output()
             .is_ok_and(|o| o.status.success())
         {
-            assert!(Command::new("shellcheck")
+            let output = Command::new("shellcheck")
                 .arg(root().join(file))
-                .status()
-                .unwrap()
-                .success());
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "shellcheck failed for {file} ({}):\n{}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
         }
     }
     let output = Command::new("bash")

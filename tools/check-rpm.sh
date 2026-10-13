@@ -41,6 +41,7 @@ ok 'systemd requirement'
 grep -Fx '/bin/sh' "$tmp/requires" >/dev/null || fail '/bin/sh requirement'
 ok '/bin/sh requirement'
 for pair in 'POSTIN post.sh' 'PREUN preun.sh' 'POSTUN postun.sh'; do
+    # shellcheck disable=SC2086 # Split each fixed pair into the RPM tag and script name.
     set -- $pair
     rpm -qp --qf "%{$1}" "$package" > "$tmp/script"
     cp "packaging/rpm/$2" "$tmp/source"
