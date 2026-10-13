@@ -1081,3 +1081,43 @@ Sources: `docs/handoff/EDGE-api.md`, `docs/handoff/DAEMON-misc.md`, `docs/handof
 The exporter flocks <textfile>.tmp and the API flocks <socket>.lock. No component flocks a directory. The host scan lock serializes scans and shared database replacement/recreation; holding an exporter/API lock does not confer scan recovery ownership.
 
 Sources: `docs/handoff/DAEMON-misc.md`.
+
+### R5-6 — Crash recovery ownership
+
+**Decision: accepted; open gates explicitly retained.**
+
+At daemon start and before scans, the holder of the host scan lock removes checked leftover snapshot *.db.tmp files and marks stale running catalog rows failed, including roots no longer configured. A process unable to acquire that lock must not delete another scan’s temporary files or repair its running rows. Database corruption recovery preserves originals and uses the same scan lock before rename/recreation. Recovery is bounded and must report failures rather than fabricate completion.
+
+Sources: `docs/handoff/CRASH-recovery.md`, `docs/handoff/RECHECK-life.md`.
+
+### R5-7 — State-directory space exhaustion
+
+**Decision: accepted; open gates explicitly retained.**
+
+A state-directory space failure is daemon Unavailable with scan: NoSpace and CLI exit 5. No partial snapshot is published. Final catalog persistence may itself fail under exhausted storage and must be reported as uncertain rather than a completed scan.
+
+Sources: `docs/handoff/DAEMON-misc.md`, `docs/handoff/W7-C2-fault.md`.
+
+### R5-8 — Mount identity and first boot
+
+**Decision: accepted; open gates explicitly retained.**
+
+Mount identity changes clear current filesystem samples and rate rings; persisted history is retained. Missing configured mounts contribute current not mounted entries to now.degraded, removed when healthy. First-boot reports are republished while unhealthy until a healthy report finalizes them; changed configuration starts a new report. Follow-up timing uses monotonic elapsed time.
+
+Sources: `docs/handoff/W6-mount-state.md`, `docs/handoff/RECHECK-life.md`.
+
+### R5-9 — Completed watcher windows and alert evidence
+
+**Decision: accepted; open gates explicitly retained.**
+
+Retain at most 60 completed minute facts per watcher identity; startup’s partial minute is excluded. Integral 1–60-minute hot windows require every consecutive healthy, untruncated, overflow-free minute, with a 10,000-key union cap. Freshness is age 0–90 seconds inclusive. Overflow uses two exact cumulative boundary totals, even when interior minutes are missing (RECHECK-edge supersedes W6-watch-windows). Files sum per-minute distinct counts, not window-wide distinct files; cross-minute top_unit is None. Hot-growth and watch-lossy rules become evaluable with their respective exact inputs; filesystem, thin-pool and process rules require available fresh measurements. Rate-based rules require five minutes of current-identity history. Initial healthy filling is warmup, not a fault; loss/gaps/staleness are faults. Reload preserves unchanged rule definitions and their continuity; changed/removed rules lose their state.
+
+Sources: `docs/handoff/W6-watch-windows.md`, `docs/handoff/RECHECK-edge.md`, `docs/handoff/DAEMON-polish.md`, `docs/handoff/GATE-fix.md`.
+
+### R5-10 — Watcher descriptor budget and resource pressure
+
+**Decision: accepted; open gates explicitly retained.**
+
+Fd reads admit at most 256 event descriptors per mount: 6,144 bytes at 24 bytes/record; FID buffers remain 64 KiB. Raise soft NOFILE to hard at startup if permitted. The batch is clamp((soft−512)/configured mounts,16,256), recomputed after old workers retire. EMFILE, ENFILE, ENOMEM and ENOBUFS are transient throughout services: retry/back off and report degraded, never terminate merely for resource pressure. Accept also retries ECONNABORTED, using 50–800 ms backoff. Pressure loss is counted and the affected minute is lossy. Other accept errors are fatal; scheduler channel disconnection, worker panic, noncontained non-resource errors, invalid paths/invariants/caps and nontransient catalog failures retain terminal behavior. Invalid config, unsafe ownership/paths, lock conflicts, nonrecoverable malformed storage and non-resource startup failures remain fatal. On Rocky 8.8, a 64 KiB read with limit 1,024 filled the descriptor table and API accept ended the daemon in 3 of 13 runs; this motivated the cap, not a post-fix acceptance measurement.
+
+Sources: `docs/handoff/WATCH-fd-budget.md`.
