@@ -596,3 +596,31 @@ fn growth_reader_cap_refuses_instead_of_ranking_disk_prefix() {
         String::from_utf8_lossy(&rejected.get_output().stderr).contains("1,000,000-row result cap")
     );
 }
+
+#[test]
+fn missing_snapshot_file_names_the_file_and_operation() {
+    let state = test_support::private_tempdir().unwrap();
+    let root = RawPath::from_path(state.path()).unwrap();
+    let id = publish(state.path(), &root, 100, [4096, 2048, 1024, 512]);
+    let catalog = tidemark_store::catalog::Catalog::open(state.path(), false).unwrap();
+    let file = catalog.get(&id).unwrap().unwrap().file.unwrap();
+    std::fs::remove_file(&file).unwrap();
+    let out = command(
+        state.path(),
+        &[
+            std::ffi::OsStr::new("top"),
+            state.path().as_os_str(),
+            std::ffi::OsStr::new("--snapshot"),
+            std::ffi::OsStr::new(&id),
+        ],
+    );
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("top:")
+            && text.contains("open snapshot:")
+            && text.contains(&file.display().to_string())
+            && text.to_ascii_lowercase().contains("no such file"),
+        "{text}"
+    );
+}

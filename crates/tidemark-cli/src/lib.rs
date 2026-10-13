@@ -32,7 +32,7 @@ pub struct Context {
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     /// Runtime failure.
-    #[error("{0}")]
+    #[error("{0:#}")]
     Runtime(#[source] anyhow::Error),
     /// Usage or configuration failure.
     #[error("{0}")]
@@ -64,9 +64,16 @@ impl CliError {
     }
 }
 fn command_error(error: anyhow::Error) -> CliError {
-    error
-        .downcast::<CliError>()
-        .unwrap_or_else(CliError::Runtime)
+    let message = format!("{error:#}");
+    let code = error.downcast_ref::<CliError>().map(CliError::exit_code);
+    match code {
+        Some(2) => CliError::Configuration(message),
+        Some(3) => CliError::Partial(message),
+        Some(4) => CliError::Unavailable(message),
+        Some(5) => CliError::Precondition(message),
+        Some(6) => CliError::Unhealthy(message),
+        _ => CliError::Runtime(error),
+    }
 }
 
 /// Root-only access hint for permission errors, without an effective-uid gate.
@@ -82,9 +89,15 @@ pub fn load_config(path: &std::path::Path) -> Result<Config, CliError> {
             Ok(config)
         }
         Err(CoreError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            Err(CliError::Configuration(format!("{e}\n{ACCESS_HINT}")))
+            Err(CliError::Configuration(format!(
+                "load configuration: {}: {e}\n{ACCESS_HINT}",
+                cmd::display_path(path)
+            )))
         }
-        Err(e) => Err(CliError::Configuration(e.to_string())),
+        Err(e) => Err(CliError::Configuration(format!(
+            "load configuration: {}: {e}",
+            cmd::display_path(path)
+        ))),
     }
 }
 /// Execute a parsed invocation.
@@ -100,7 +113,7 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
                 color: false,
             },
         )
-        .map_err(command_error);
+        .map_err(|error| command_error(error.context("completions: stdout")));
     }
     let staging = matches!(&cli.command, cli::Command::Deploy(args) if matches!(&args.command, cmd::deploy::Command::Stage(_)));
     let mut config = if staging {
@@ -142,6 +155,7 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
             cli::Color::Always => true,
             cli::Color::Never => false,
         };
+    let operation = cmd::error_context(&cli.command, &config, &cli.config);
     cli.command
         .run(&Context {
             config,
@@ -149,7 +163,7 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
             json: cli.json,
             color,
         })
-        .map_err(command_error)
+        .map_err(|error| command_error(error.context(operation)))
 }
 /// Process entry point with clap's help and usage statuses intact.
 pub fn main_entry() -> std::process::ExitCode {

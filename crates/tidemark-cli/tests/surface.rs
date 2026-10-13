@@ -402,3 +402,65 @@ fn top_sort_includes_snapshot_metrics_and_cli_growth() {
     }
     assert!(Cli::try_parse_from(["tidemark", "top", "--sort", "bad"]).is_err());
 }
+
+#[test]
+fn failures_name_operation_subject_and_preserve_status() {
+    let work = test_support::private_tempdir().unwrap();
+    let state = work.path().join("state");
+    let socket = work.path().join("absent.sock");
+    let config = work.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[general]\nstate_dir = '{}'\nsocket = '{}'\n",
+            state.display(),
+            socket.display()
+        ),
+    )
+    .unwrap();
+    let missing = work.path().join("missing-root");
+    for verb in ["top", "scan"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
+            .arg("-c")
+            .arg(&config)
+            .arg(verb)
+            .arg(&missing)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{text}");
+        assert!(
+            text.contains(&format!("{verb}: {}", missing.display())),
+            "{text}"
+        );
+        assert!(text.to_ascii_lowercase().contains("no such file"), "{text}");
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
+        .arg("-c")
+        .arg(&config)
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(
+        text.contains(&socket.display().to_string()) && text.contains("daemon unavailable"),
+        "{text}"
+    );
+    // A directory is deterministically unreadable as a configuration file,
+    // including when the harness runs as root.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
+        .arg("-c")
+        .arg(work.path())
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text.contains("load configuration:")
+            && text.contains(&work.path().display().to_string())
+            && text.to_ascii_lowercase().contains("directory"),
+        "{text}"
+    );
+}

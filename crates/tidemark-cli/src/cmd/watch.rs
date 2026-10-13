@@ -1,6 +1,8 @@
 //! Owned by: W5-A
 //! Command surface and shared CLI support.
 
+use anyhow::Context as _;
+
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -34,7 +36,8 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     ));
     let mut watchers = Vec::new();
     for mount in mounts {
-        let mount = tidemark_fs::canon::canonicalize(&mount)?;
+        let mount = tidemark_fs::canon::canonicalize(&mount)
+            .with_context(|| format!("resolve watch mount: {}", super::display_path(&mount)))?;
         let options = WatcherOptions {
             mount,
             events: if args.events.is_empty() {

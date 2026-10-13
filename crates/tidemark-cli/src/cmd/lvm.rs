@@ -1,6 +1,8 @@
 //! Owned by: W4-A
 //! Direct-mode LVM report composition with optional read-only history.
+
 use crate::render::lvm::{Report, TrackedLv, Trend};
+use anyhow::Context as _;
 use tidemark_fs::{lvm, mount};
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
@@ -87,7 +89,8 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         context.config.roots.iter().map(|root| &root.path).collect()
     };
     for path in paths {
-        let canonical = std::fs::canonicalize(path)?;
+        let canonical = std::fs::canonicalize(path)
+            .with_context(|| format!("resolve path: {}", super::display_path(path)))?;
         let raw = tidemark_core::path::RawPath::from_path(&canonical)?;
         if let Some(m) = mount::mount_for_path(&mounts, &raw) {
             if !selected

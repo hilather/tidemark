@@ -1,6 +1,8 @@
 //! Owned by: W2-C
 //! Command surface and shared CLI support.
 
+use anyhow::Context as _;
+
 /// Command arguments.
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -53,7 +55,10 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     };
     let root = root_arg
         .as_deref()
-        .map(tidemark_fs::canon::canonicalize)
+        .map(|path| {
+            tidemark_fs::canon::canonicalize(path)
+                .with_context(|| format!("resolve snapshot root: {}", super::display_path(path)))
+        })
         .transpose()?;
     if matches!(args.command, Command::RebuildCatalog { .. }) && root_arg.is_some() {
         return Err(crate::CliError::Configuration(
@@ -79,9 +84,11 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             .ok_or_else(|| {
                 crate::CliError::Precondition("catalog mutation requires scan ownership".into())
             })?
-            .open_catalog(state)?
+            .open_catalog(state)
+            .with_context(|| format!("recover catalog: {}", super::display_path(state)))?
     } else {
-        Catalog::open(state, mutation)?
+        Catalog::open(state, mutation)
+            .with_context(|| format!("open catalog: {}", super::display_path(state)))?
     };
     let mut out = std::io::stdout().lock();
     match &args.command {
@@ -133,7 +140,11 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 .into());
             }
             let data = if let Some(file) = &e.file {
-                serde_json::to_value(tidemark_store::reader::Snapshot::open(file)?.meta())?
+                serde_json::to_value(
+                    tidemark_store::reader::Snapshot::open(file)
+                        .with_context(|| format!("open snapshot: {}", super::display_path(file)))?
+                        .meta(),
+                )?
             } else {
                 entry_json(&e)?
             };
@@ -229,8 +240,14 @@ pub(crate) fn remove_snapshot(
     let parent = file
         .parent()
         .ok_or_else(|| crate::CliError::Precondition("snapshot has no parent".into()))?;
-    let allowed = std::fs::canonicalize(state.join("snapshots"))?;
-    let parent = std::fs::canonicalize(parent)?;
+    let allowed = std::fs::canonicalize(state.join("snapshots")).with_context(|| {
+        format!(
+            "resolve snapshot directory: {}",
+            super::display_path(&state.join("snapshots"))
+        )
+    })?;
+    let parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolve parent: {}", super::display_path(parent)))?;
     if !parent.starts_with(&allowed) || file.extension() != Some(std::ffi::OsStr::new("db")) {
         return Err(crate::CliError::Precondition(
             "catalog snapshot path is outside the state snapshot directory".into(),
@@ -240,7 +257,8 @@ pub(crate) fn remove_snapshot(
     match std::fs::remove_file(file) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(anyhow::Error::new(e)
+            .context(format!("remove snapshot: {}", super::display_path(file)))),
     }
 }
 /// Resolve a canonical live query path and select a containing complete snapshot.
@@ -252,9 +270,16 @@ pub(crate) fn select(
     tidemark_core::path::RawPath,
     tidemark_store::reader::Snapshot,
 )> {
-    let path =
-        tidemark_fs::canon::canonicalize(path.unwrap_or_else(|| std::path::Path::new("/data")))?;
-    let catalog = tidemark_store::catalog::Catalog::open(&context.config.general.state_dir, false)?;
+    let subject = path.unwrap_or_else(|| std::path::Path::new("/data"));
+    let path = tidemark_fs::canon::canonicalize(subject)
+        .with_context(|| format!("resolve query path: {}", super::display_path(subject)))?;
+    let catalog = tidemark_store::catalog::Catalog::open(&context.config.general.state_dir, false)
+        .with_context(|| {
+            format!(
+                "open catalog: {}",
+                super::display_path(&context.config.general.state_dir)
+            )
+        })?;
     let entry = if let Some(id) = id {
         catalog.get(id)?
     } else {
@@ -283,5 +308,9 @@ pub(crate) fn select(
     let file = entry
         .file
         .ok_or_else(|| crate::CliError::Precondition("snapshot has no file".into()))?;
-    Ok((path, tidemark_store::reader::Snapshot::open(&file)?))
+    Ok((
+        path,
+        tidemark_store::reader::Snapshot::open(&file)
+            .with_context(|| format!("open snapshot: {}", super::display_path(&file)))?,
+    ))
 }
