@@ -274,6 +274,12 @@ fn watcher_component(
         detail.push_str("; ");
         detail.push_str(&reasons);
     }
+    if watcher.unmapped_events() != 0 {
+        detail.push_str(&format!("; unmapped_events={}", watcher.unmapped_events()));
+    }
+    if stats.mode == WatchMode::FdMount {
+        detail.push_str("; writes from other mount namespaces and bind mounts are not seen");
+    }
     crate::component(&format!("watcher:{mount}"), health, detail)
 }
 
@@ -503,6 +509,34 @@ fn persistence_rows(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filesystem_mode_detail_is_healthy() {
+        let watcher = super::Watcher::from_injected_events_in_mode(
+            tidemark_core::path::RawPath::new(b"/fixture".to_vec()).unwrap(),
+            [],
+            tidemark_live::watch::WatchMode::FdFilesystem,
+        )
+        .unwrap();
+        let component = super::watcher_component("/fixture", &watcher, false, 0);
+        assert_eq!(component.state, "ok");
+        assert!(component.detail.starts_with("mode=fd/filesystem "));
+        assert!(!component.detail.contains("not seen"));
+    }
+    #[test]
+    fn mount_mode_detail_reports_blind_spots() {
+        let watcher = super::Watcher::from_injected_events(
+            tidemark_core::path::RawPath::new(b"/fixture".to_vec()).unwrap(),
+            [],
+        )
+        .unwrap();
+        let component = super::watcher_component("/fixture", &watcher, false, 0);
+        assert_eq!(component.state, "ok");
+        assert!(component
+            .detail
+            .ends_with("writes from other mount namespaces and bind mounts are not seen"));
+        assert!(!component.detail.contains("unmapped_events"));
+    }
+
     #[test]
     fn distinct_cap_detail_and_alert_window_remain_unavailable() {
         let at = crate::unix_now().div_euclid(60) * 60;

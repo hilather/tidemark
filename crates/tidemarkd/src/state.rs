@@ -1403,6 +1403,7 @@ fn watch_mode(mode: tidemark_live::watch::WatchMode) -> &'static str {
     use tidemark_live::watch::WatchMode;
     match mode {
         WatchMode::FdMount => "fd_mount",
+        WatchMode::FdFilesystem => "fd_filesystem",
         WatchMode::DfidNameMount => "dfid_name_mount",
         WatchMode::DfidNameFilesystem => "dfid_name_filesystem",
         WatchMode::Failed => "failed",
@@ -1426,6 +1427,17 @@ fn interrupt_fs(d: &mut Inner, mount: &str) -> Result<(), crate::DaemonError> {
 #[cfg(test)]
 mod presence_lock_tests {
     use super::*;
+    #[test]
+    fn filesystem_watch_mode_state_string() {
+        assert_eq!(
+            watch_mode(tidemark_live::watch::WatchMode::FdFilesystem),
+            "fd_filesystem"
+        );
+        assert_eq!(
+            watch_mode(tidemark_live::watch::WatchMode::FdMount),
+            "fd_mount"
+        );
+    }
     #[test]
     fn now_rates_are_missing_until_five_minutes_for_every_window() {
         let mut config = Config::default();

@@ -107,8 +107,12 @@ fn event_stat(s: rustix::fs::Statx) -> io::Result<(EventStat, i64)> {
     };
     Ok((stat, created))
 }
-pub(super) fn resolve_event(fd: BorrowedFd<'_>) -> io::Result<(RawPath, EventStat, i64)> {
-    resolve_with(fd, || {
+pub(super) fn resolve_event_with_fallback(
+    fd: BorrowedFd<'_>,
+    path_fd: BorrowedFd<'_>,
+    fallback: Option<&RawPath>,
+) -> io::Result<(RawPath, EventStat, i64)> {
+    resolve_with_fallback(fd, path_fd, fallback, || {
         rustix::fs::statx(
             fd,
             "",
@@ -118,8 +122,17 @@ pub(super) fn resolve_event(fd: BorrowedFd<'_>) -> io::Result<(RawPath, EventSta
         .map_err(Into::into)
     })
 }
+#[cfg(test)]
 fn resolve_with(
     fd: BorrowedFd<'_>,
+    stat: impl FnOnce() -> io::Result<rustix::fs::Statx>,
+) -> io::Result<(RawPath, EventStat, i64)> {
+    resolve_with_fallback(fd, fd, None, stat)
+}
+fn resolve_with_fallback(
+    fd: BorrowedFd<'_>,
+    path_fd: BorrowedFd<'_>,
+    fallback: Option<&RawPath>,
     stat: impl FnOnce() -> io::Result<rustix::fs::Statx>,
 ) -> io::Result<(RawPath, EventStat, i64)> {
     let (stat, created) = match stat().and_then(event_stat) {
@@ -131,11 +144,18 @@ fn resolve_with(
             (stat, stat.st_ctime)
         }
     };
-    let path = descriptor_path(fd)?;
-    let raw = RawPath::from_path(&path).map_err(io::Error::other)?;
+    let raw = match descriptor_path(path_fd)
+        .and_then(|path| RawPath::from_path(&path).map_err(io::Error::other))
+    {
+        Ok(path) => path,
+        Err(error) => match fallback {
+            Some(root) => root.clone(),
+            None => return Err(error),
+        },
+    };
     Ok((raw, stat, created))
 }
-fn descriptor_path(fd: BorrowedFd<'_>) -> io::Result<std::path::PathBuf> {
+pub(super) fn descriptor_path(fd: BorrowedFd<'_>) -> io::Result<std::path::PathBuf> {
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
     let mut buffer = [0u8; 32];
@@ -240,6 +260,15 @@ mod tests {
         assert_eq!(calls.get(), 2);
         assert_eq!(fallback.st_ino, old.st_ino);
         assert_eq!(created, old.st_ctime);
+        let other = tempfile::NamedTempFile::new().unwrap();
+        let (path, fallback, _) = resolve_with_fallback(file.as_fd(), other.as_fd(), None, || {
+            Err(io::Error::from_raw_os_error(
+                rustix::io::Errno::NOSYS.raw_os_error(),
+            ))
+        })
+        .unwrap();
+        assert_eq!(fallback.st_ino, old.st_ino);
+        assert_eq!(path.as_path(), other.path());
     }
     #[test]
     fn resolve_only_metadata_and_raw_path() {
@@ -250,5 +279,42 @@ mod tests {
         assert_eq!(path.as_path(), dir.path());
         use std::os::unix::fs::MetadataExt;
         assert_eq!(st.st_ino, fd.metadata().unwrap().ino());
+    }
+}
+
+/// Select a host path only when its mount provenance is known. None means root fallback.
+pub(super) fn mapped_path<'a>(
+    event_mount: Option<u64>,
+    watched_mount: u64,
+    original: &'a RawPath,
+    reopened: Option<&'a RawPath>,
+    mount: &RawPath,
+) -> Option<&'a RawPath> {
+    let path = match event_mount {
+        Some(id) if id == watched_mount => Some(original),
+        Some(_) => reopened,
+        None => None,
+    }?;
+    (path.as_bytes() != b"/" && path != mount && path.starts_with(mount)).then_some(path)
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    #[test]
+    fn provenance_and_bounds() {
+        let mount = RawPath::new(b"/data".to_vec()).unwrap();
+        let host = RawPath::new(b"/data/a (deleted)".to_vec()).unwrap();
+        let foreign = RawPath::new(b"/bind/a".to_vec()).unwrap();
+        let root = RawPath::new(b"/".to_vec()).unwrap();
+        assert_eq!(mapped_path(Some(1), 1, &host, None, &mount), Some(&host));
+        assert_eq!(
+            mapped_path(Some(2), 1, &foreign, Some(&host), &mount),
+            Some(&host)
+        );
+        for reopened in [None, Some(&foreign), Some(&root)] {
+            assert_eq!(mapped_path(Some(2), 1, &foreign, reopened, &mount), None);
+        }
+        assert_eq!(mapped_path(None, 1, &host, Some(&host), &mount), None);
     }
 }
