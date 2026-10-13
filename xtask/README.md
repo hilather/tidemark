@@ -62,8 +62,12 @@ SSH user, then runs them serially via `sudo env "PATH=$PATH" cargo test`.
 Passing PATH explicitly handles EL8 sudo's `secure_path`. Scale tests remain
 ignored. `--filter` selects a cargo test substring and is rejected for script
 suites. Script suites run `tests/install/*.sh` or `tests/fault/*.sh` under sudo,
-and fail clearly if the suite is absent. Output streams directly; subprocess
-exit codes propagate to the caller. No VM provisioning or host-side privileged
+and fail clearly if the suite is absent. Script suites always run every script,
+then print a PASS/FAIL summary with each exit status and elapsed seconds; any
+failure makes the suite exit 1. Output streams directly; cargo-suite subprocess
+exit codes propagate to the caller. The fault suite skips slow compaction by
+default; opt in with `--env TIDEMARK_FAULT_SLOW=1`. Retain successful fault
+evidence with `--env TIDEMARK_FAULT_KEEP=1`. No VM provisioning or host-side privileged
 operations are performed by this runner.
 
 ## Test parameters and Wave 1 evidence

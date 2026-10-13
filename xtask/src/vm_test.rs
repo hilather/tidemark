@@ -138,7 +138,10 @@ fn remote_command(o: &Options) -> String {
             script.push_str(" --nocapture");
         }
     } else {
-        script.push_str(&format!("for script in tests/{}/*.sh; do [ -f \"$script\" ] || {{ echo 'missing script suite' >&2; exit 1; }}; {sudo_env} bash \"$script\"; done",o.suite));
+        script.push_str(&format!(
+            "failed=0; summary=$(mktemp); for script in tests/{}/*.sh; do [ -f \"$script\" ] || {{ echo 'missing script suite' >&2; rm -f \"$summary\"; exit 1; }}; started=$(date +%s); if {sudo_env} bash \"$script\"; then rc=0; result=PASS; else rc=$?; result=FAIL; failed=1; fi; elapsed=$(($(date +%s) - started)); printf '%s %s exit=%s seconds=%s\\n' \"$result\" \"$script\" \"$rc\" \"$elapsed\" >> \"$summary\"; done; cat \"$summary\"; rm -f \"$summary\"; exit \"$failed\"",
+            o.suite
+        ));
     }
     script
 }
@@ -319,6 +322,70 @@ mod tests {
             assert!(parse(args(&["--host", "vm", "--suite", suite, "--no-fail-fast"])).is_err());
         }
         assert!(parse(args(&["--host", "vm", "--no-fail-fast", "--no-fail-fast"])).is_err());
+    }
+    #[test]
+    fn script_suite_collects_failures_and_prints_all_summaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let scratch = temp.path();
+        std::fs::create_dir_all(scratch.join("tests/fault")).unwrap();
+        std::fs::create_dir_all(scratch.join("bin")).unwrap();
+        std::fs::write(scratch.join("tests/fault/01.sh"), "exit 7\n").unwrap();
+        std::fs::write(scratch.join("tests/fault/02.sh"), "echo second-ran\n").unwrap();
+        // A fake sudo strips env/PATH arguments; no privileged operation runs.
+        let sudo = scratch.join("bin/sudo");
+        std::fs::write(&sudo, "#!/bin/sh\nshift\nshift\nexec \"$@\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let o = parse(args(&[
+            "--host",
+            "vm",
+            "--suite",
+            "fault",
+            "--remote-dir",
+            scratch.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let output = Command::new("sh")
+            .args(["-c", &remote_command(&o)])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    scratch.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stdout.contains("second-ran"), "{stdout}");
+        assert!(
+            stdout.contains("FAIL tests/fault/01.sh exit=7 seconds="),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("PASS tests/fault/02.sh exit=0 seconds="),
+            "{stdout}"
+        );
+        std::fs::write(scratch.join("tests/fault/01.sh"), "exit 0\n").unwrap();
+        let output = Command::new("sh")
+            .args(["-c", &remote_command(&o)])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    scratch.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            stdout.find("second-ran").unwrap() < stdout.find("FAIL tests/fault/01.sh").unwrap(),
+            "summaries must follow all script output: {stdout}"
+        );
     }
     #[test]
     fn constructs_both_script_suites() {

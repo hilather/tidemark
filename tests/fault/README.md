@@ -10,7 +10,7 @@ They never use systemd, the packaged daemon, its socket, or its state directory.
 | `01-state-full.sh` | Free-space guard refusal, `state_space` alert, admitted writer interrupted by ENOSPC, no temporary or incomplete publication | 1–5 min; scan deadlines 300 s |
 | `02-snapshot-crash.sh` | Twelve fixed kill delays after observing a writer, complete metadata on every published snapshot, startup removes temporaries, subsequent scan succeeds | 2–10 min; 300 s to observe each writer, 900 s recovery |
 | `03-fanotify-overflow.sh` | 100,000 distinct close-writes while daemon consumption is stopped, lossy minute, cumulative overflow counter, fresh activity after resume | 1–5 min; burst 120 s, lossy 150 s, recovery 90 s |
-| `04-compaction-crash.sh` | SIGKILL during uncommitted compaction WAL spill, database integrity, restart produces independent last-value oracle, second hourly compaction leaves it identical | About 4 h; each hourly phase bounded by 3800 s |
+| `04-compaction-crash.sh` | SIGKILL during uncommitted compaction WAL spill, database integrity, restart produces independent last-value oracle, second hourly compaction leaves it identical | SKIP by default; slow mode about 4 h, each hourly phase bounded by 3800 s |
 | `05-directory-races.sh` | Background subtree deletion produces recorded races, complete valid snapshot, no panic | 1–5 min; scan 900 s |
 | `06-huge-directory.sh` | 50,000 entries by default or 1,000,000 with scale marker; direct scan PID peak RSS <= configured 1280 MiB; exact completed file count | 1–5 min normal, 5–20 min scale; fixture 600 s, scan 900 s |
 
@@ -26,7 +26,7 @@ script is added. The detailed existing-coverage table is in
 `docs/handoff/W7-C2-fault.md`.
 
 The guest needs Bash, python3 (with SQLite), util-linux (`mount`, `umount`,
-`losetup`, `findmnt`), xfsprogs (`mkfs.xfs`), and coreutils (`timeout`, `truncate`).
+`losetup`, `findmnt`), xfsprogs (`mkfs.xfs`), and coreutils (`timeout`, `truncate`) and util-linux `setsid`.
 It needs loop devices, root capabilities for mounts/fanotify, the host mount
 namespace (the same as PID 1), and at least 10 GiB free backing storage under
 `/tmp`. Each script uses an 8 GiB sparse image; the full-state script really
@@ -52,9 +52,13 @@ cargo xtask vm-test --host tester@rocky810 --remote-dir tidemark-vm-test --suite
 ```
 
 Repeat on the other Rocky guest. For the million-entry case append
-`--env TIDEMARK_FAULT_SCALE=1`. The whole suite is roughly 4–5 hours, dominated
-by real hourly daemon compaction. The runner stops on the first failed script;
-run a later script by hand to collect its independent evidence.
+`--env TIDEMARK_FAULT_SCALE=1`. The whole suite is fast by default: `04` prints SKIP unless `--env TIDEMARK_FAULT_SLOW=1` is
+provided. Slow mode waits on real hourly compaction (the guard prints an
+approximate 70-minute budget; the current multi-phase scenario can take about
+four hours). The runner runs every script and prints PASS/FAIL, exit status and
+seconds per script at the end, exiting nonzero if any script failed. Fast
+coverage of the compaction row will be a Rust store test that kills compaction
+in a child process, supplied by another task.
 
 Run one script **inside the guest**, from its checkout:
 
@@ -63,7 +67,8 @@ sudo env "PATH=$PATH" TIDEMARK_DEPLOY_TEST_VM=1 bash tests/fault/01-state-full.s
 sudo env "PATH=$PATH" TIDEMARK_DEPLOY_TEST_VM=1 TIDEMARK_FAULT_SCALE=1 bash tests/fault/06-huge-directory.sh
 ```
 
-Every entrypoint prints check-level PASS/FAIL lines and a final `RESULT` line.
+Every running entrypoint prints check-level PASS/FAIL lines and a final `RESULT`
+line; the disabled slow row prints SKIP and exits before allocating resources.
 Any failed check or failed cleanup exits nonzero. Failure retains its private
 `/tmp/tidemark-fault.*` directory with stderr, JSON responses and daemon log;
 the trap prints those plus state listings and current status/now. Inspect the
@@ -82,3 +87,22 @@ ownership, and runs `shellcheck -x` at its default severity when installed.
 executed as a seventh script by the runner. `check.py` validates public JSON,
 SQLite integrity and publication metadata; the public cumulative overflow
 counter exists in Prometheus textfile output, so only that check parses metrics.
+
+Checks record failures and continue where the fixture is safe; setup errors and
+deadlines stop that script. Snapshot crash iterations compare against the
+pre-scan temporary set, report completed-before-kill delays as SKIP, and require
+at least three writer hits. Startup cleanup remains an assertion of product
+behavior and may fail until the separate product repair lands.
+
+Set `--env TIDEMARK_FAULT_KEEP=1` to retain evidence on PASS as well as FAIL.
+PASS lines include judged counts, JSON, metric lines, exit statuses or timing.
+The API socket parent remains mode 0700; metrics use a separate mode-0755
+`metrics/` parent to avoid competing exporter/API directory locks. Long helpers
+run in tracked process groups behind an interruptible `wait`; signal cleanup
+kills groups before unmounting and detaching the owned loop.
+
+For slow evidence, inside the disposable guest checkout only:
+
+```sh
+sudo env "PATH=$PATH" TIDEMARK_DEPLOY_TEST_VM=1 TIDEMARK_FAULT_KEEP=1 TIDEMARK_FAULT_SLOW=1 bash tests/fault/04-compaction-crash.sh
+```
