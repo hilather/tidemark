@@ -38,6 +38,9 @@ struct Inner {
     fs_failures: BTreeMap<String, u64>,
     fs_failure_epoch: u64,
     lvm_failures: u64,
+    procscan_failures: u64,
+    procscan_completed_at: Option<i64>,
+    procscan_available: bool,
     alert_revision: u64,
     lvm_available: bool,
     lvm: Option<LvmResult>,
@@ -99,8 +102,17 @@ pub enum Publication {
     ProcscanAttempt {
         /// Configuration observed before collection.
         generation: u64,
-        /// Immutable completed report; None clears the publication.
+        /// Immutable completed report; None retains display history but invalidates alert use.
         report: Option<Arc<tidemark_live::procscan::ProcReport>>,
+    },
+    /// Generation-bound process report with daemon completion time for alert freshness.
+    ProcscanCompleted {
+        /// Configuration observed before collection.
+        generation: u64,
+        /// Immutable successful report.
+        report: Arc<tidemark_live::procscan::ProcReport>,
+        /// Injected Unix completion timestamp.
+        completed_at: i64,
     },
     /// Publish alerts measurements.
     Alerts((Vec<AlertSummary>, Vec<AlertDiagnostic>)),
@@ -153,6 +165,9 @@ impl LiveState {
             fs_failures: BTreeMap::new(),
             fs_failure_epoch: 0,
             lvm_failures: 0,
+            procscan_failures: 0,
+            procscan_completed_at: None,
+            procscan_available: false,
             alert_revision: 0,
             lvm_available: false,
             lvm: None,
@@ -305,6 +320,8 @@ impl LiveState {
         }
         if d.config.procscan != config.procscan || d.config.watch.mounts != config.watch.mounts {
             d.procscan = None;
+            d.procscan_available = false;
+            d.procscan_failures = d.procscan_failures.saturating_add(1);
         }
         d.presence.retain(|m, _| {
             config
@@ -359,45 +376,64 @@ impl LiveState {
         generation: u64,
         mounts: &[tidemark_fs::mount::MountInfo],
     ) -> Result<(), crate::DaemonError> {
-        let mut d = self.0.write();
-        if generation != d.generation {
+        self.publish_mount_presence_with(
+            generation,
+            mounts,
+            crate::mounts::live_identity,
+            |changes| crate::mounts::log(changes, "presence"),
+        )
+    }
+    fn publish_mount_presence_with(
+        &self,
+        generation: u64,
+        mounts: &[tidemark_fs::mount::MountInfo],
+        resolve: impl Fn(
+            &[tidemark_fs::mount::MountInfo],
+            &std::path::Path,
+        ) -> Result<Option<crate::mounts::Identity>, crate::DaemonError>,
+        log: impl FnOnce(&[crate::mounts::Transition]),
+    ) -> Result<(), crate::DaemonError> {
+        let (config, captured_generation) = self.config();
+        if generation != captured_generation {
             return Ok(());
         }
-        let mut paths = d.config.sampler.mounts.clone();
-        paths.extend(d.config.watch.mounts.clone());
+        let mut paths = config.sampler.mounts.clone();
+        paths.extend(config.watch.mounts.clone());
         paths.sort();
         paths.dedup();
         let mut resolved = BTreeMap::new();
         for path in &paths {
-            resolved.insert(
-                path.to_string_lossy().into_owned(),
-                crate::mounts::live_identity(mounts, path)?,
-            );
+            resolved.insert(path.to_string_lossy().into_owned(), resolve(mounts, path)?);
         }
-        for (mount, current) in &resolved {
-            if d.presence.get(mount) != Some(current) {
-                let previous = d.presence.get(mount).copied().flatten();
-                if d.config
-                    .sampler
-                    .mounts
-                    .iter()
-                    .any(|p| p.to_string_lossy() == mount.as_str())
-                {
-                    interrupt_fs(&mut d, mount)?;
-                }
-                d.fs.remove(mount);
-                d.fs_available.remove(mount);
-                crate::mounts::log(
-                    &[crate::mounts::Transition {
+        let mut changes = Vec::new();
+        {
+            let mut d = self.0.write();
+            if generation != d.generation {
+                return Ok(());
+            }
+            for (mount, current) in &resolved {
+                if d.presence.get(mount) != Some(current) {
+                    let previous = d.presence.get(mount).copied().flatten();
+                    if config
+                        .sampler
+                        .mounts
+                        .iter()
+                        .any(|p| p.to_string_lossy() == mount.as_str())
+                    {
+                        interrupt_fs(&mut d, mount)?;
+                    }
+                    d.fs.remove(mount);
+                    d.fs_available.remove(mount);
+                    changes.push(crate::mounts::Transition {
                         path: mount.into(),
                         previous,
                         current: *current,
-                    }],
-                    "presence",
-                );
+                    });
+                }
             }
+            d.presence = resolved;
         }
-        d.presence = resolved;
+        log(&changes);
         Ok(())
     }
     /// Clear a mount's current samples on a presence/identity transition.
@@ -550,12 +586,28 @@ impl LiveState {
                 d.watchers.insert(mount, w);
                 d.alert_revision = d.alert_revision.saturating_add(1);
             }
-            Publication::Procscan(p) => d.procscan = Some(p),
+            Publication::Procscan(p) => complete_procscan(&mut d, p, crate::unix_now()),
+            Publication::ProcscanCompleted {
+                generation,
+                report,
+                completed_at,
+            } => {
+                if generation != d.generation {
+                    return Ok(());
+                }
+                complete_procscan(&mut d, report, completed_at);
+            }
             Publication::ProcscanAttempt { generation, report } => {
                 if generation != d.generation {
                     return Ok(());
                 }
-                d.procscan = report;
+                if let Some(report) = report {
+                    complete_procscan(&mut d, report, crate::unix_now());
+                } else {
+                    d.procscan_available = false;
+                    d.procscan_failures = d.procscan_failures.saturating_add(1);
+                    d.alert_revision = d.alert_revision.saturating_add(1);
+                }
             }
             Publication::Alerts((mut a, mut diagnostics)) => {
                 let internal = a
@@ -1191,10 +1243,24 @@ impl LiveStateView {
     pub(crate) fn collector_failures(&self) -> (BTreeMap<String, u64>, u64) {
         (self.data.fs_failures.clone(), self.data.lvm_failures)
     }
+    pub(crate) fn procscan_failure_epoch(&self) -> u64 {
+        self.data.procscan_failures
+    }
     /// Known degradation reasons, capped at MAX_SUBJECTS.
     pub fn degraded(&self) -> Option<Vec<String>> {
         Some(self.data.degraded.clone())
     }
+}
+fn complete_procscan(d: &mut Inner, report: Arc<tidemark_live::procscan::ProcReport>, now: i64) {
+    if d.procscan_completed_at
+        .is_some_and(|last| !fresh(last, now, d.config.procscan.interval))
+    {
+        d.procscan_failures = d.procscan_failures.saturating_add(1);
+    }
+    d.procscan = Some(report);
+    d.procscan_completed_at = Some(now);
+    d.procscan_available = true;
+    d.alert_revision = d.alert_revision.saturating_add(1);
 }
 trait TransposeOption<T> {
     fn transpose_option(self) -> Option<Option<T>>;
@@ -1252,6 +1318,16 @@ impl AlertSource for LiveStateView {
         f.overflows
     }
     fn phantom_bytes(&self, mount: &str) -> Option<u64> {
+        if !self.data.procscan_available
+            || !self.data.config.procscan.enabled
+            || !fresh(
+                self.data.procscan_completed_at?,
+                self.now,
+                self.data.config.procscan.interval,
+            )
+        {
+            return None;
+        }
         self.phantom(&PhantomParams {
             mount: Some(mount.into()),
         })?
@@ -1332,4 +1408,61 @@ fn interrupt_fs(d: &mut Inner, mount: &str) -> Result<(), crate::DaemonError> {
     d.fs_failure_epoch = d.fs_failure_epoch.saturating_add(1);
     d.fs_failures.insert(mount.into(), d.fs_failure_epoch);
     Ok(())
+}
+
+#[cfg(test)]
+mod presence_lock_tests {
+    use super::*;
+    #[test]
+    fn blocked_resolution_and_logging_leave_readers_free_and_reject_stale_generation() {
+        for phase in [0, 1, 2] {
+            let mut config = Config::default();
+            config.sampler.mounts = vec!["/".into()];
+            config.watch.mounts.clear();
+            let state = LiveState::new(&config, 0);
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+            let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+            let worker_state = state.clone();
+            let worker = std::thread::spawn(move || {
+                worker_state
+                    .publish_mount_presence_with(
+                        0,
+                        &[],
+                        |_, _| {
+                            if phase != 1 {
+                                entered_tx.send(()).unwrap();
+                                release_rx.recv().unwrap();
+                            }
+                            Ok(Some(crate::mounts::Identity {
+                                id: 1,
+                                major: 8,
+                                minor: 0,
+                            }))
+                        },
+                        |_| {
+                            if phase == 1 {
+                                entered_tx.send(()).unwrap();
+                                release_rx.recv().unwrap();
+                            }
+                        },
+                    )
+                    .unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let (read_tx, read_rx) = crossbeam_channel::bounded(1);
+            let reader_state = state.clone();
+            let reader = std::thread::spawn(move || {
+                read_tx.send(reader_state.view_at(0).status(0)).unwrap();
+            });
+            let read = read_rx.recv_timeout(Duration::from_millis(200));
+            if phase == 2 {
+                state.replace_config(config).unwrap();
+            }
+            release_tx.send(()).unwrap();
+            worker.join().unwrap();
+            reader.join().unwrap();
+            assert!(read.is_ok(), "reader blocked during phase {phase}");
+            assert_eq!(state.0.read().presence.is_empty(), phase == 2);
+        }
+    }
 }

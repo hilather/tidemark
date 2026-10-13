@@ -289,7 +289,9 @@ fn alert_source_unavailable_empty_and_measured() {
 #[test]
 fn scanner_measured_empty() {
     use tidemark_live::procscan::{ProcScanner, ProcScannerOptions};
-    let s = LiveState::default();
+    let mut config = Config::default();
+    config.procscan.enabled = true;
+    let s = LiveState::new(&config, 0);
     let mut scanner = ProcScanner::new(
         ProcScannerOptions {
             mounts: vec![(RawPath::new(b"/fixture".to_vec()).unwrap(), u64::MAX)],
@@ -304,11 +306,15 @@ fn scanner_measured_empty() {
     scanner.scan_once(1).unwrap();
     publish(
         &s,
-        Publication::Procscan(Arc::new(scanner.report().unwrap())),
+        Publication::ProcscanCompleted {
+            generation: 0,
+            report: Arc::new(scanner.report().unwrap()),
+            completed_at: 1,
+        },
     );
-    assert_eq!(s.view().phantom_bytes("/fixture"), Some(0));
+    assert_eq!(s.view_at(1).phantom_bytes("/fixture"), Some(0));
     assert_eq!(
-        s.view().writers(&WritersParams {
+        s.view_at(1).writers(&WritersParams {
             mount: None,
             window: Duration::from_secs(1)
         }),
@@ -794,20 +800,26 @@ fn phantom_measurement_uses_allocated_byte_oracle() {
         )),
     );
     scanner.scan_once(1).unwrap();
-    let state = LiveState::default();
+    let mut config = Config::default();
+    config.procscan.enabled = true;
+    let state = LiveState::new(&config, 0);
     publish(
         &state,
-        Publication::Procscan(Arc::new(scanner.report().unwrap())),
+        Publication::ProcscanCompleted {
+            generation: 0,
+            report: Arc::new(scanner.report().unwrap()),
+            completed_at: 1,
+        },
     );
     assert!(
         state
-            .view()
+            .view_at(1)
             .phantom_bytes(mount.as_path().to_str().unwrap())
             .unwrap()
             >= allocated
     );
     assert!(state
-        .view()
+        .view_at(1)
         .phantom(&PhantomParams { mount: None })
         .unwrap()
         .iter()
@@ -1430,9 +1442,10 @@ fn internal_alert_has_reserved_publication_slot() {
 }
 
 #[test]
-fn process_publication_is_independent_of_collector_and_clears_on_invalidation() {
+fn process_publication_is_independent_of_collector_and_retains_failed_history() {
     use tidemark_live::procscan::{ProcScanner, ProcScannerOptions};
     let mut config = Config::default();
+    config.procscan.enabled = true;
     config.watch.mounts = vec!["/fixture".into()];
     let state = LiveState::new(&config, 0);
     let mut scanner = ProcScanner::new(
@@ -1448,7 +1461,15 @@ fn process_publication_is_independent_of_collector_and_clears_on_invalidation() 
     );
     scanner.scan_once(1).unwrap();
     let report = Arc::new(scanner.report().unwrap());
-    publish(&state, Publication::Procscan(report.clone()));
+    publish(
+        &state,
+        Publication::ProcscanCompleted {
+            generation: 0,
+            report: report.clone(),
+            completed_at: 1,
+        },
+    );
+    assert_eq!(state.view_at(1).phantom_bytes("/fixture"), Some(0));
     let scanner = Arc::new(parking_lot::Mutex::new(scanner));
     let guard = scanner.lock();
     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1483,14 +1504,15 @@ fn process_publication_is_independent_of_collector_and_clears_on_invalidation() 
     assert!(state
         .view_at(2)
         .phantom(&PhantomParams { mount: None })
-        .is_none());
+        .is_some());
     assert!(state
         .view_at(2)
         .writers(&WritersParams {
             mount: None,
             window: Duration::from_secs(300)
         })
-        .is_none());
+        .is_some());
+    assert!(state.view_at(1).phantom_bytes("/fixture").is_none());
     publish(&state, Publication::Procscan(report.clone()));
     config.procscan.open_writers = !config.procscan.open_writers;
     state.replace_config(config.clone()).unwrap();
@@ -1618,4 +1640,56 @@ fn mount_presence_recovery_remount_and_rate_history() {
         .degraded
         .iter()
         .any(|d| d.starts_with("mount not present:")));
+}
+
+#[test]
+fn blocked_mount_transition_log_does_not_hold_state_lock() {
+    use std::io::Write;
+    #[derive(Clone)]
+    struct BlockedLog {
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    }
+    impl Write for BlockedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut config = Config::default();
+    config.sampler.mounts = vec!["/".into()];
+    config.watch.mounts.clear();
+    let state = LiveState::new(&config, 0);
+    let (entered, waiting) = crossbeam_channel::bounded(1);
+    let (release, released) = crossbeam_channel::bounded(1);
+    let sink = BlockedLog {
+        entered,
+        release: released,
+    };
+    let publisher_state = state.clone();
+    let publisher = std::thread::spawn(move || {
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            publisher_state.publish_mount_presence(0, &[]).unwrap()
+        });
+    });
+    waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (done, result) = crossbeam_channel::bounded(1);
+    let reader = std::thread::spawn(move || done.send(state.view_at(0).status(0)).unwrap());
+    let read = result.recv_timeout(Duration::from_millis(200));
+    release.send(()).unwrap();
+    publisher.join().unwrap();
+    reader.join().unwrap();
+    assert!(
+        read.is_ok(),
+        "state reader blocked on transition log writer"
+    );
 }
