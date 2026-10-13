@@ -66,7 +66,7 @@ pub(crate) fn write_width(
     let output = &mut buffer;
     if report.status == "n/a" {
         writeln!(output, "LVM: n/a")?;
-        destination.write_all(&buffer)?;
+        destination.write_all(super::table::wrap(&String::from_utf8(buffer)?, width).as_bytes())?;
         return Ok(());
     }
     for row in &report.tracked {

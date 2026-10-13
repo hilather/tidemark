@@ -67,6 +67,13 @@ fn select_width(is_terminal: bool, query: impl FnOnce() -> Option<u16>) -> usize
         100
     }
 }
+/// Conservative terminal-column budget: ASCII occupies one, other scalars at most two.
+/// Counting combining/ambiguous scalars as two avoids overflowing differing terminal locales.
+pub fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+        .sum()
+}
 /// Shorten the middle of a display cell, retaining complete escaped-byte tokens.
 pub fn shorten(cell: &str, width: usize) -> String {
     let mut tokens = Vec::new();
@@ -80,7 +87,7 @@ pub fn shorten(cell: &str, width: usize) -> String {
         let end = chars.peek().map_or(cell.len(), |(i, _)| *i);
         tokens.push(&cell[start..end]);
     }
-    if cell.chars().count() <= width {
+    if display_width(cell) <= width {
         return cell.to_owned();
     }
     if width < 3 {
@@ -89,7 +96,7 @@ pub fn shorten(cell: &str, width: usize) -> String {
     let budget = width - 3;
     let last_component = cell
         .rsplit_once('/')
-        .map_or(0, |(_, last)| last.chars().count() + 1);
+        .map_or(0, |(_, last)| display_width(last) + 1);
     let right_budget = if last_component < budget {
         (budget - budget / 2).max(last_component)
     } else {
@@ -100,7 +107,7 @@ pub fn shorten(cell: &str, width: usize) -> String {
     let mut right = String::new();
     let mut used = 0;
     for token in &tokens {
-        let n = token.chars().count();
+        let n = display_width(token);
         if used + n > left_budget {
             break;
         }
@@ -108,7 +115,7 @@ pub fn shorten(cell: &str, width: usize) -> String {
         used += n;
     }
     for token in tokens.iter().rev() {
-        let n = token.chars().count();
+        let n = display_width(token);
         if used + n > budget {
             break;
         }
@@ -126,7 +133,7 @@ pub fn aligned_width(rows: &[Vec<String>], width: usize) -> String {
     let mut widths = vec![0; columns];
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.chars().count());
+            widths[i] = widths[i].max(display_width(cell));
         }
     }
     let available = width.saturating_sub(2 * columns.saturating_sub(1));
@@ -139,24 +146,32 @@ pub fn aligned_width(rows: &[Vec<String>], width: usize) -> String {
         }
         widths[index] -= 1;
     }
-    aligned(
-        &rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .map(|(i, cell)| shorten(cell, widths[i]))
-                    .collect()
-            })
-            .collect::<Vec<_>>(),
-    )
+    let mut out = String::new();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            let cell = shorten(cell, widths[i]);
+            out.push_str(&cell);
+            if i + 1 < row.len() {
+                out.extend(std::iter::repeat_n(
+                    ' ',
+                    widths[i] - display_width(&cell) + 2,
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    if width < 2 * columns.saturating_sub(1) {
+        wrap(&out, width)
+    } else {
+        out
+    }
 }
 /// Wrap text at whitespace and shorten oversized tokens without splitting escapes.
 pub fn wrap(text: &str, width: usize) -> String {
     let width = width.max(1);
     let mut out = String::new();
     for line in text.lines() {
-        if line.chars().count() <= width {
+        if display_width(line) <= width {
             out.push_str(line);
             out.push('\n');
             continue;
@@ -170,7 +185,7 @@ pub fn wrap(text: &str, width: usize) -> String {
         for word in line.split_whitespace() {
             let word = shorten(word, width - indent);
             let space = usize::from(current.len() > indent);
-            if current.chars().count() + space + word.chars().count() > width {
+            if display_width(&current) + space + display_width(&word) > width {
                 out.push_str(&current);
                 out.push('\n');
                 current = " ".repeat(indent);

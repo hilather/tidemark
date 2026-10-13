@@ -72,9 +72,12 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         return crate::render::json("tidemark.writers.v1", rows, &mut out);
     }
     crate::render::now::writers(&rows, false, &mut out)?;
-    writeln!(
-        out,
-        "Root provides full /proc coverage; other users see the readable subset."
+    out.write_all(
+        crate::render::table::wrap(
+            "Root provides full /proc coverage; other users see the readable subset.\n",
+            crate::render::table::terminal_width(),
+        )
+        .as_bytes(),
     )?;
     Ok(())
 }

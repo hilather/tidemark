@@ -56,14 +56,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         return crate::render::json("tidemark.phantom.v1", rows, &mut out);
     }
     crate::render::now::phantom(&rows, false, &mut out)?;
-    writeln!(
-        out,
-        "Root provides full /proc coverage; other users see the readable subset."
-    )?;
-    writeln!(
-        out,
-        "Consider restarting or HUP-ing the holder to release deleted files."
-    )?;
+    out.write_all(crate::render::table::wrap("Root provides full /proc coverage; other users see the readable subset.\nConsider restarting or HUP-ing the holder to release deleted files.\n", crate::render::table::terminal_width()).as_bytes())?;
     Ok(())
 }
 

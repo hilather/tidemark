@@ -583,7 +583,7 @@ fn hot_units_are_visible_without_repeating_unit_group_keys() {
 #[test]
 fn every_live_renderer_fits_long_byte_paths_and_controls() {
     let mut key = format!("/begin/{}/last", "a".repeat(200)).into_bytes();
-    key.extend_from_slice("é".as_bytes());
+    key.extend_from_slice("世界é".as_bytes());
     key.extend_from_slice(b"\xff\n");
     let row = tidemark_core::live::HotEntry {
         key: key.clone(),
@@ -642,7 +642,8 @@ fn every_live_renderer_fits_long_byte_paths_and_controls() {
         for out in outputs {
             let text = String::from_utf8(out).unwrap();
             assert!(
-                text.lines().all(|line| line.chars().count() <= width),
+                text.lines()
+                    .all(|line| tidemark_cli::render::table::display_width(line) <= width),
                 "{text}"
             );
             assert!(text.contains("..."));
