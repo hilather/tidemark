@@ -141,6 +141,37 @@ pub fn main_entry() -> std::process::ExitCode {
 mod tests {
     use super::*;
     #[test]
+    fn operational_intervals_have_inclusive_366_day_cap() {
+        let max = std::time::Duration::from_secs(366 * 86400);
+        let setters: [fn(&mut tidemark_core::config::Config, std::time::Duration); 7] = [
+            |c, d| c.throttle.sample_interval = d,
+            |c, d| c.sampler.interval = d,
+            |c, d| c.lvm.interval = d,
+            |c, d| c.lvm.timeout = d,
+            |c, d| c.procscan.interval = d,
+            |c, d| c.metrics.interval = d,
+            |c, d| c.alerts.renotify = d,
+        ];
+        for set in setters {
+            let mut config = tidemark_core::config::Config::default();
+            set(&mut config, max);
+            validate_config(&config).unwrap();
+            set(&mut config, max + std::time::Duration::from_nanos(1));
+            assert!(validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("366 days"));
+        }
+        let mut config = tidemark_core::config::Config::default();
+        config.roots[0].schedule = "every 31622400s".into();
+        validate_config(&config).unwrap();
+        config.roots[0].schedule = "every 31622401s".into();
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("366 days"));
+    }
+    #[test]
     fn example_and_unknown_key() {
         let doc = include_str!("../../../docs/plan/08-interfaces.md");
         let example = doc
@@ -638,8 +669,42 @@ fn validate_config(c: &tidemark_core::config::Config) -> Result<(), DaemonError>
                 .map_err(|e| DaemonError::Config(format!("roots[{index}].window: {e}")))?;
         }
     }
+    // Retention horizons are wall-clock history, not runtime wait intervals.
+    for (field, duration) in [
+        ("throttle.sample_interval", c.throttle.sample_interval),
+        ("sampler.interval", c.sampler.interval),
+        ("lvm.interval", c.lvm.interval),
+        ("lvm.timeout", c.lvm.timeout),
+        ("procscan.interval", c.procscan.interval),
+        ("metrics.interval", c.metrics.interval),
+        ("alerts.renotify", c.alerts.renotify),
+    ] {
+        validate_interval(field, duration)?;
+    }
+    for (index, root) in c.roots.iter().enumerate() {
+        if let Some(duration) = root.schedule.strip_prefix("every ") {
+            let duration = humantime::parse_duration(duration)
+                .map_err(|e| DaemonError::Config(e.to_string()))?;
+            validate_interval(&format!("roots[{index}].schedule"), duration)?;
+        }
+    }
+    for (index, rule) in c.alerts.rule.iter().enumerate() {
+        validate_interval(&format!("alerts.rule[{index}].for"), rule.for_)?;
+        validate_interval(
+            &format!("alerts.rule[{index}].resolve_for"),
+            rule.resolve_for,
+        )?;
+    }
     tidemark_live::alerts::AlertEngine::new(&c.alerts.rule, c.alerts.renotify)
         .map_err(|e| DaemonError::Config(format!("alerts: {e}")))?;
+    Ok(())
+}
+fn validate_interval(field: &str, duration: std::time::Duration) -> Result<(), DaemonError> {
+    if duration > std::time::Duration::from_secs(366 * 24 * 60 * 60) {
+        return Err(DaemonError::Config(format!(
+            "{field}: interval must not exceed 366 days"
+        )));
+    }
     Ok(())
 }
 /// Add state_dir to all collector and scan exclusions before publishing config.

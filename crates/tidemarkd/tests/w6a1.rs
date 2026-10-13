@@ -1168,3 +1168,46 @@ fn reload_inventory_failure_is_contained_and_active_removed_root_is_retired() {
         .unwrap();
     assert!(state.view().scans().unwrap().is_empty());
 }
+
+#[test]
+fn oversized_metrics_interval_is_rejected_before_startup_and_reload() {
+    let (_dir, path, cfg) = fixture();
+    let state = LiveState::new(&cfg, 0);
+    let before = state.config();
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("[metrics]", "[metrics]\ninterval='18446744073709551615s'");
+    std::fs::write(&path, text).unwrap();
+    let invalid = Config::load(&path).unwrap();
+    assert!(invalid.validate().is_empty());
+    let mut output = Vec::new();
+    assert_eq!(
+        tidemarkd::run_args(
+            &tidemarkd::Args {
+                config: path.clone(),
+                check_config: true
+            },
+            &mut output
+        ),
+        2
+    );
+    assert!(String::from_utf8_lossy(&output)
+        .contains("metrics.interval: interval must not exceed 366 days"));
+    assert!(tidemarkd::run_controlled(
+        invalid,
+        tidemarkd::RunOptions {
+            config_path: path.clone(),
+            now: 0
+        },
+        state.clone(),
+        Shutdown::default(),
+        Shutdown::default()
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("366 days"));
+    let result = tidemarkd::reload_callback(path, state.clone())().unwrap();
+    assert!(!result.reloaded);
+    assert!(result.warnings[0].contains("366 days"));
+    assert_eq!(state.config(), before);
+}
