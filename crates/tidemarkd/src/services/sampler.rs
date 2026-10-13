@@ -214,8 +214,15 @@ fn start_with_pass(
                     next_sample = std::time::Instant::now();
                 }
                 let due = std::time::Instant::now() >= next_sample;
-                if due {
-                    // No incomplete pass may certify firstboot, even after a healthy pass.
+                if due
+                    && state
+                        .view_at(now)
+                        .status(now)
+                        .is_some_and(|status| status.components.iter().any(|c| c.name == "sampler"))
+                {
+                    // Invalidate previous health before collecting a new pass. On the
+                    // initial pass there is no sampler health to certify firstboot;
+                    // publish its first measurement and health together instead.
                     state.publish_component(crate::component(
                         "sampler",
                         "degraded",
