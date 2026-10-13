@@ -500,3 +500,128 @@ fn full_backlog_probe_expires_and_concurrent_start_preserves_socket() {
     stop.store(true, Ordering::Release);
     handle.join().unwrap().unwrap();
 }
+
+#[test]
+fn api_and_metrics_share_a_private_directory() {
+    if !socket_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = socket_config(&dir);
+    c.general.state_dir = dir.path().join("state");
+    std::fs::create_dir(&c.general.state_dir).unwrap();
+    tidemark_store::catalog::Catalog::open(&c.general.state_dir, true).unwrap();
+    c.roots.clear();
+    c.metrics.textfile = dir.path().join("metrics.prom");
+    c.metrics.interval = Duration::from_millis(50);
+    let stop = Arc::new(AtomicBool::new(false));
+    let ctx = context(&c);
+    let state = ctx.state.clone();
+    let handle = api::start_with_peer(
+        Arc::new(c.clone()),
+        ctx,
+        stop.clone(),
+        Arc::new(|_| Ok((0, 1))),
+    )
+    .unwrap();
+    let exporter =
+        tidemarkd::metrics::start(Arc::new(c.clone()), state.clone(), stop.clone()).unwrap();
+    let lock = dir.path().join("api.sock.lock");
+    assert_eq!(
+        std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !state
+        .view()
+        .status(0)
+        .unwrap()
+        .components
+        .iter()
+        .any(|c| c.name == "metrics" && c.state == "ok")
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let exported = std::fs::read_to_string(&c.metrics.textfile);
+    let mut stream = BufReader::new(UnixStream::connect(&c.general.socket).unwrap());
+    stream
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write(&mut stream, &request("status", "{}"));
+    let response = read(&mut stream);
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap().unwrap();
+    exporter.join().unwrap().unwrap();
+    assert!(response.ok);
+    let status: StatusResult = serde_json::from_value(response.result.unwrap()).unwrap();
+    assert!(status
+        .components
+        .iter()
+        .any(|c| c.name == "metrics" && c.state == "ok"));
+    assert!(exported.unwrap().contains("tidemark_up 1"));
+    assert!(!lock.exists());
+    assert!(!c.general.socket.exists());
+}
+
+#[test]
+fn space_refusal_reply_and_status_are_published_before_acknowledgement() {
+    use tidemark_core::{
+        config::{RootConfig, RootMode},
+        path::RawPath,
+    };
+    use tidemarkd::{scheduler, services::tswriter};
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mut c = Config::default();
+    c.general.state_dir = storage.path().to_owned();
+    c.retention.min_free_pct = 100.0;
+    c.roots = vec![RootConfig {
+        path: root.path().to_owned(),
+        schedule: "off".into(),
+        mode: RootMode::Walk,
+        ..RootConfig::default()
+    }];
+    let state = LiveState::new(&c, 10);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::new(AtomicBool::new(false));
+    let (writer, wh) =
+        tswriter::start(Arc::new(c.clone()), state.clone(), writer_stop.clone()).unwrap();
+    let (control, sh) = scheduler::start(Arc::new(c), state.clone(), writer, stop.clone()).unwrap();
+    let ctx = Context {
+        state: state.clone(),
+        scans: control,
+        reload: Arc::new(|| unreachable!("reload unused")),
+    };
+    let r = Request {
+        v: 1,
+        id: "refused".into(),
+        method: "scan.start".into(),
+        params: serde_json::to_value(ScanStartParams {
+            root: RawPath::from_path(root.path()).unwrap(),
+            mode: Some(RootMode::Walk),
+            throttle: None,
+        })
+        .unwrap(),
+    };
+    let response = api::dispatch(&r, 0, &ctx, 20).unwrap();
+    let view = state.view();
+    let status = api::dispatch(&request("status", "{}"), 0, &ctx, 20).unwrap();
+    stop.store(true, Ordering::Release);
+    sh.join().unwrap().unwrap();
+    writer_stop.store(true, Ordering::Release);
+    wh.join().unwrap().unwrap();
+    let error = response.error.unwrap();
+    assert_eq!(error.code, ApiErrorCode::Unavailable);
+    assert_eq!(error.message, "scan: NoSpace");
+    assert_eq!(view.state_space_refused(), Some(true));
+    let report: StatusResult = serde_json::from_value(status.result.unwrap()).unwrap();
+    let component = report
+        .components
+        .iter()
+        .find(|c| c.name == "state_space")
+        .unwrap();
+    assert_eq!(component.state, "degraded");
+    assert_eq!(component.detail, "scan: NoSpace");
+}

@@ -591,8 +591,6 @@ pub fn write_textfile(path: &Path, text: &str) -> std::io::Result<()> {
         .file_name()
         .ok_or_else(|| std::io::Error::other("missing textfile name"))?;
     let dir = std::fs::File::open(parent)?;
-    // Serialize our create/open/rename cycle as well as locking the temporary inode.
-    flock(&dir, FlockOperation::NonBlockingLockExclusive)?;
     let mut tmp = name.to_os_string();
     tmp.push(".tmp");
     let fd = openat(
@@ -610,6 +608,19 @@ pub fn write_textfile(path: &Path, text: &str) -> std::io::Result<()> {
         ));
     }
     flock(&f, FlockOperation::NonBlockingLockExclusive)?;
+    // Another writer may have renamed the inode between open and flock. Never
+    // truncate a published textfile through such a stale temporary handle.
+    let named =
+        rustix::fs::statat(&dir, &tmp, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).map_err(|e| {
+            if e == rustix::io::Errno::NOENT {
+                std::io::Error::from(std::io::ErrorKind::WouldBlock)
+            } else {
+                e.into()
+            }
+        })?;
+    if (named.st_dev, named.st_ino) != (md.dev(), md.ino()) {
+        return Err(std::io::ErrorKind::WouldBlock.into());
+    }
     f.set_len(0)?;
     f.write_all(text.as_bytes())?;
     f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
@@ -664,12 +675,26 @@ pub fn start(
                         &config.metrics,
                         now,
                     )?;
-                    let error = write_textfile(&config.metrics.textfile, &output)
-                        .err()
-                        .map(|e| e.to_string())
+                    let write_error = write_textfile(&config.metrics.textfile, &output).err();
+                    let writer_busy = write_error
+                        .as_ref()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock);
+                    let error = write_error
+                        .map(|e| {
+                            if writer_busy {
+                                "writer busy; retry on next tick".into()
+                            } else {
+                                e.to_string()
+                            }
+                        })
                         .or_else(|| cache_error.clone());
                     if let Some(error) = error {
-                        if last_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
+                        // A forked reporting child can briefly retain a flock.
+                        // Retry at the normal tick and clear health on success;
+                        // transient contention does not consume the warning budget.
+                        if !writer_busy
+                            && last_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600))
+                        {
                             tracing::warn!(%error,"metrics exporter degraded");
                             last_log = Some(Instant::now());
                         }
