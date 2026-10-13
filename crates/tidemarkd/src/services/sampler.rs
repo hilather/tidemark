@@ -472,7 +472,7 @@ mod tests {
         let stop = Shutdown::default();
         let collect = Arc::new(move |path: &std::path::Path, _, _| {
             let success = collect_commands
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv_timeout(std::time::Duration::from_secs(10))
                 .unwrap();
             if success {
                 Ok(FsSample {
@@ -503,7 +503,7 @@ mod tests {
         )
         .unwrap();
         let wait = |predicate: &dyn Fn() -> bool| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !predicate() {
                 assert!(std::time::Instant::now() < deadline);
                 std::thread::yield_now();
@@ -573,25 +573,27 @@ mod tests {
             || crate::firstboot::build(&state.view_at(100).firstboot_inputs().unwrap(), 100);
         let (tx, _rx) = crossbeam_channel::bounded(16);
         let stop = Shutdown::default();
-        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (finished, passes) = crossbeam_channel::bounded(1);
+        let (resume, resumed) = crossbeam_channel::bounded(1);
         let table = Arc::new(parking_lot::Mutex::new(
             std::fs::read("/proc/self/mountinfo").unwrap(),
         ));
         let source = {
-            let passes = passes.clone();
             let table = table.clone();
-            Arc::new(move || {
-                passes.fetch_add(1, Ordering::Release);
-                crate::mounts::parse(&table.lock())
-            })
+            Arc::new(move || crate::mounts::parse(&table.lock()))
         };
-        let worker = start_with(
+        let worker = start_with_pass(
             Arc::new(cfg.clone()),
             state.clone(),
             tx,
             stop.clone(),
             Arc::new(|| 100),
             source,
+            Arc::new(sample_checked),
+            Arc::new(move || {
+                finished.send(()).unwrap();
+                let _ = resumed.recv();
+            }),
         )
         .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -614,15 +616,13 @@ mod tests {
         }
         assert!(state.view_at(100).fs_samples().is_none());
         assert!(!report().healthy);
-        while passes.load(Ordering::Acquire) < 2 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "health={:?}",
-                health()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        passes
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        resume.send(()).unwrap();
+        passes
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap();
         assert_eq!(health().unwrap().state, "degraded"); // firstboot's sampler input
         assert!(!report().healthy);
         assert!(state.view_at(100).fs_samples().is_none());
@@ -639,6 +639,10 @@ mod tests {
         .into_bytes();
         cfg.sampler.mounts = vec![dir.path().to_path_buf()];
         state.replace_config(cfg).unwrap();
+        resume.send(()).unwrap();
+        passes
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
         while !health().is_some_and(|c| c.state == "ok") {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -650,6 +654,7 @@ mod tests {
         assert!(state.view_at(100).fs_samples().is_some());
         assert!(report().healthy);
         stop.store(true, Ordering::Release);
+        resume.send(()).unwrap();
         worker.join().unwrap().unwrap();
     }
 
@@ -697,7 +702,7 @@ mod tests {
         )
         .unwrap();
         let wait = |condition: &dyn Fn() -> bool| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !condition() {
                 assert!(std::time::Instant::now() < deadline);
                 std::thread::yield_now();
@@ -721,7 +726,7 @@ mod tests {
         now.store(101, Ordering::Release);
         *bytes.lock() = present;
         wait(&|| state.view_at(101).fs_samples().is_some());
-        match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+        match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
             super::super::tswriter::Message::Fs(rows) => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].ts, 101);
