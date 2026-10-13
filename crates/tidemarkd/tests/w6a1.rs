@@ -1597,8 +1597,8 @@ fn mount_presence_recovery_remount_and_rate_history() {
         .view_at(299)
         .now(&NowParams { mount: None }, 299)
         .unwrap();
-    assert_eq!(report.mounts[0].rate_15m, Some(0.0));
-    assert_eq!(report.mounts[0].rate_1h, Some(0.0));
+    assert_eq!(report.mounts[0].rate_15m, None);
+    assert_eq!(report.mounts[0].rate_1h, None);
     assert!(report.mounts[0].ttf_secs.is_none());
     assert!(report
         .degraded
@@ -1607,6 +1607,12 @@ fn mount_presence_recovery_remount_and_rate_history() {
         .degraded
         .contains(&"mount not present: /fixture".into()));
     publish(&state, Publication::Fs(sample(300, 300)));
+    let report = state
+        .view_at(300)
+        .now(&NowParams { mount: None }, 300)
+        .unwrap();
+    assert_eq!(report.mounts[0].rate_15m, Some(1.0));
+    assert_eq!(report.mounts[0].rate_1h, Some(1.0));
     assert_eq!(
         state
             .view_at(300)
