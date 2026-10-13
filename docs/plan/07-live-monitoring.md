@@ -10,7 +10,7 @@ All live components run inside `tidemarkd` and write to `LiveState` (in memory) 
 
 A normalized sampler.mounts/watch.mounts path must exactly equal a mount point in the daemon namespace; identity is topmost mount id plus device major/minor. Absent entries produce no samples/persistence or watcher and report `not mounted`. Presence checks pick up arrivals (sampler at most ten seconds, watcher every second); identity changes release the old watcher before replacement. Open sampling descriptor identity is checked before statvfs. Covered scheduled and requested scan roots are refused before run_scan, following existing error/backoff handling; unrelated roots remain eligible. Firstboot is unhealthy for absent entries, but startup readiness is prompt.
 
-Open: clearing in-memory filesystem rate series/removing stale samples across appearance/disappearance/remount; current removable missing-mount reasons in `now.degraded`; daemon consumption of retained watcher mark identity and the residual check-to-mark race. Service persistence deduplication reset is not a rate-ring reset. The proposed future state behavior in W6-mount-presence is not claimed implemented. (13 R4-9.)
+Superseded by R5-8/19: current samples/rate rings reset on identity changes, current missing-mount degradation clears on recovery, and retained watcher mark identity is reconciled. The residual check-to-mark race remains a limitation under trusted mount administration.
 
 | Source | Call | Interval | Stored as |
 |--------|------|----------|-----------|
@@ -29,7 +29,7 @@ The daemon-served `lvm` report keeps `LvmResult { mounts: Vec<(String, LvmNow)>,
 
 ## 2. Rates and time-to-full (`tidemark-live::rates`, W5-D)
 
-- **Rate** = least-squares slope of `(ts, used)` over a window. Windows are 5 min, 15 min and 1 h, and need at least 3 samples. A slope is robust to the sawtooth of temp files being created and deleted, unlike first-minus-last.
+- **Rate** = least-squares slope of `(ts, used)` over a window. Windows are 5 min, 15 min and 1 h, and need at least 3 samples plus five minutes of current-mount-identity history (rates and time-to-full are unavailable before that). A slope is robust to the sawtooth of temp files being created and deleted, unlike first-minus-last.
 - **Time-to-full** = `avail / rate` when `rate > 0`, otherwise "not filling". Shown from the 1 h window, with the 15 min value alongside.
 - The same functions apply to thin-pool usage and `dir_series` (scan-to-scan growth).
 
@@ -42,7 +42,7 @@ pub fn time_to_full(avail: u64, rate: f64) -> Option<Duration>;
 
 ### 3.1 Modes and probing
 
-Measured on Rocky 8.8 (4.18.0-477) and 8.10 (-553): fd mode, no FID mode on either. Filesystem marks work on 8.10; 8.8 uses mount marks, so writes through another mount of the same filesystem are invisible (13 R4-15). Continue probing on other kernels.
+Measured Rocky 8.8 (-477) and 8.10 (-553) use fd reporting, with no FID mode measured. Fd mode now independently probes filesystem marks: prefer fd/filesystem on 8.10 when marking succeeds, otherwise fd/mount (8.8). Filesystem marks observe all mounts/private namespaces; mount marks cannot see writes through other bind mounts/namespaces (R5-26). Continue probing other kernels.
 
 | Mode | Kernel need (upstream) | What we get | Default |
 |------|------------------------|-------------|---------|
@@ -60,14 +60,15 @@ RHEL 8 is 4.18-based with selective backports, and whether these FID features we
 
 ```
 fd = fanotify_init(FAN_CLASS_NOTIF | FAN_CLOEXEC, O_RDONLY | O_LARGEFILE | O_CLOEXEC)
-fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_CLOSE_WRITE [| FAN_MODIFY], AT_FDCWD, mount)
+mark = FAN_MARK_FILESYSTEM if supported and successful else FAN_MARK_MOUNT
+fanotify_mark(fd, FAN_MARK_ADD | mark, FAN_CLOSE_WRITE [| FAN_MODIFY], AT_FDCWD, mount)
 loop:
-  n = read(fd, buf[64 KiB])                       # blocking; wakes on events or the shutdown pipe (poll)
+  n = read(fd, buf[batch * 24 bytes] # batch clamped to 16–256 records)                       # blocking; wakes on events or the shutdown pipe (poll)
   for each fanotify_event_metadata m in buf:
      check m.vers == FANOTIFY_METADATA_VERSION
      if m.mask & FAN_Q_OVERFLOW: lossy_minute = true; overflow_total += 1; continue
      if m.pid == self_pid: close(m.fd); continue
-     path  = readlink("/proc/self/fd/{m.fd}")     # canonical path, as seen from our mount namespace
+     path  = map_event_path(m.fd, watched_mount) # foreign filesystem-mark events reopen by handle; failures use watched root
      st    = fstat(m.fd)                          # dev, ino, size, blocks
      close(m.fd)                                  # ALWAYS, even on errors
      if excluded(path): continue
@@ -83,7 +84,7 @@ Rules:
 - **Bounded queue.** Don't use `FAN_UNLIMITED_QUEUE`. On overflow, mark the minute `lossy` and increment `tidemark_watch_overflows_total`. Rates from L0 remain correct.
 - `dir_key(path)` is the parent directory, truncated to `watch.hot_depth` components below the mount (default 6) to bound cardinality. Keys are raw bytes.
 - The LRU of last-seen sizes holds 200,000 entries (about 10 MB). For a file **not** in the LRU, count its full size only if it is new: birth time (`statx` btime, which XFS v5 provides) or, failing that, ctime is after the watcher started and within the last 2 minutes. Otherwise count 0 and seed the LRU. `CLOSE_WRITE` fires even when nothing was written, and this rule avoids false spikes after restarts and evictions.
-- Mount-mark limitation: in fd mode, writes made through a *different* mount of the same filesystem (bind mounts, other mount namespaces) are not seen. The probe lists bind mounts of watched filesystems so operators know.
+- Mount-mark limitation: in fd/mount mode, writes made through a *different* mount of the same filesystem (bind mounts, other mount namespaces) are not seen. The probe lists bind mounts of watched filesystems so operators know.
 - **Mount namespace:** the daemon must share the host mount namespace (`02` §8, ADR-013). Before marking, the watcher compares `/proc/self/ns/mnt` with `/proc/1/ns/mnt` and refuses to start, with a loud error, if they differ.
 
 ```rust
@@ -104,7 +105,7 @@ Retry EMFILE/ENFILE/ENOMEM/ENOBUFS with shutdown-aware exponential 50–800 ms w
 
 `tidemark_live::watch::CompletedMinute` (Clone, Debug) has `started_at: i64`, `overflow_total_at_start: u64`, `overflow_total_at_end: u64`, `lossy: bool`, `truncated: bool`, `dirs: Vec<HotEntry>`, `persisted: Vec<HotMinute>`. `Watcher::drain_minutes(&self, top_k: usize) -> Vec<CompletedMinute>` shares the persistence-row cursor with legacy drains, while minute facts have an independent monotonic watermark. New drains exclude the startup partial minute, materialize idle minutes and remain bounded by 60 buckets; top_k is clamped to 1000 per scope, cuts mark truncation/loss. Retention gaps mark the first surviving minute lossy; rollback never replays emitted timestamps/rows and marks the replay interval lossy. Only actual queue overflow increments totals; contiguous boundaries chain. `Watcher::mount_identity(&self) -> std::io::Result<(u64, u32, u32)>` returns retained descriptor mount id, device major/minor from bounded fdinfo/fstat; injected watchers return Unsupported. Marks target the retained `/proc/self/fd/<fd>/.` directory.
 
-The daemon consumer must retain at most 60 completed facts per watcher identity, discard on replacement and persist only `persisted`. Exact n-minute windows require 1 <= n <= 60, end E of latest completed minute, start S = E - n*60, and measured_at E (never refreshed artificially). Overflow differences need consistent nondecreasing exact S/E boundary totals; otherwise None. Known endpoints suffice even with interior loss. Hot requires n consecutive healthy, untruncated, overflow-free minutes; otherwise None. Sum raw-key rows with saturating counts/deltas, rank signed bytes descending then raw key ascending; healthy empty is Some(empty). A daemon union cap cut makes hot unavailable. Minute leaders cannot reconstruct exact cross-minute unit leadership. These consumer publications remain open.
+The daemon consumer must retain at most 60 completed facts per watcher identity, discard on replacement and persist only `persisted`. Exact n-minute windows require 1 <= n <= 60, end E of latest completed minute, start S = E - n*60, and measured_at E (never refreshed artificially). Overflow differences need consistent nondecreasing exact S/E boundary totals; otherwise None. Known endpoints suffice even with interior loss. Hot requires n consecutive healthy, untruncated, overflow-free minutes; otherwise None. Sum raw-key rows with saturating counts/deltas, rank signed bytes descending then raw key ascending; healthy empty is Some(empty). A daemon union cap cut makes hot unavailable. Minute leaders cannot reconstruct exact cross-minute unit leadership. These consumer publications are implemented by R5-9/19.
 
 `AttributionCache::lookup_watcher` may reuse PID/starttime validation for less than one second, separately from its 60-second attribution TTL. Older hits revalidate; failed/recycled identities invalidate and fresh loads recheck. Failed lookups are not cached. Exact process-scanner callers validate every lookup. (13 R4-7; LIVE-minutes is the precise source for drain and consumer semantics.)
 
@@ -119,7 +120,7 @@ The daemon consumer must retain at most 60 completed facts per watcher identity,
 
 Watcher-backed rules (`hot_dir_growth` and `watch_lossy`) accept only exact whole-minute windows from 1 through 60 minutes. Other durations are not evaluable, with a diagnostic; never round or clamp. Keep 60 whole-minute buckets and a cumulative overflow total. Sample that total at each completed-minute boundary; a window overflow count is the difference between its two boundary samples, unavailable if either sample is missing. Hot data consists of per-minute top lists, not a complete inventory. If any included minute overflowed or was truncated at its cap, hot data for the window is unavailable. The ordinary hot API retains its four ranked-list windows.
 
-Updated by 13 R4-7: LIVE-minutes implements CompletedMinute, drain_minutes and mount_identity with empty-minute and boundary-loss facts. The daemon exact-window/freshness consumer remains open; watcher-backed rules are still not evaluable.
+Superseded by R5-9/19: the daemon drains up to 1,000 rows/scope, retains 60 completed facts, publishes exact configured integral-minute windows, and requires newest age 0–90 s. Hot requires consecutive healthy/untruncated/overflow-free facts; overflow needs exact two boundary totals even with missing interior facts. Hot union cap is 10,000 keys; healthy empty is available. Cross-minute top_unit is None; files sum minute counts. Persistence retains only the first 50 rows/minute/scope. Initial filling is warmup; loss, gaps and stale data are faults.
 
 `Watcher::take_dirty(&self, under: &RawPath) -> Vec<RawPath>` returns `under` itself after a loss, independently for every root, until that root has been taken. A parent, child or sibling take does not acknowledge another root. Loss acknowledgements use a FIFO capped at 1,024 roots; eviction conservatively makes a forgotten root dirty again, repeated loss resets acknowledgements, and clock rollback invalidates them. Ordinary ancestor dirty entries are retained for other callers; descendants are drained, sorted and deduplicated. The scheduler takes dirtiness only after that root's successful scan has published; failed/cancelled scans clear nothing.
 
@@ -335,3 +336,13 @@ Owner decision: fd-mode watcher budget is 5% of one core per 1,000 close-write e
 | Watcher | ≤ 5% of one core per 1,000 close-write events/s (50 µs/event; R4-8) | Close-write only; bounded queue; capped maps |
 | Procscan | < 1 s per pass | 60 s interval; skips non-matching devices early |
 | Memory | ≤ 300 MiB steady (NFR-4) | Fixed rings; capped LRUs and maps |
+
+## Hardening measurement contracts (13 R5-2/8/9/10/19/24/26)
+
+Filesystem rates require five minutes of current-identity history and at least three samples in the fit window; rates/ttf are unavailable before then. Identity changes reset samples/rings; failures invalidate alert input while display history remains. Fresh filesystem/LVM/process evidence is at most three current collection intervals old. Missed failure epochs break pending/clearing continuity. Presence-only polls cannot clear measurement errors. Process reports are immutable and private collection never blocks readers; inventory exceeds 128 MiB by failing the pass, not truncating it.
+
+The shared distinct-file table holds 200,000 scope/key/file tuples across three scopes: 66,667 distinct files per minute reaches the bound. Facts become truncated/lossy while event totals continue; status names cap and UTC minute separately from overflow/read/descriptor-pressure reasons. Whether cap alone should make the component degraded remains OPEN.
+
+Fd mode holds at most 256 event descriptors per read/mount, batch clamp((soft−512)/mounts,16,256); raise soft NOFILE to hard at start when permitted. EMFILE/ENFILE/ENOMEM/ENOBUFS cause bounded retry/degraded and lossy facts rather than daemon termination. Filesystem mode maps foreign events by handle against watched mount; failed mapping retains total/unit/command activity at root for directory scope and reports unmapped_events. Hard-link directory names remain best effort; watched subdirectory binds can receive outside activity attributed at root. fd/mount warns about other namespaces/binds. Host namespace and mark-identity guards remain required.
+
+Unchanged alert rule definitions preserve continuity on reload; changed/removed definitions reset. Active publication reserves 10,000 configured summaries plus one internal state-space summary. Initial healthy window filling is warmup; known loss/gaps/staleness are faults. Component details report published window count and alert unavailable-rule count/first three sorted names; now.degraded keeps all fault diagnostics.

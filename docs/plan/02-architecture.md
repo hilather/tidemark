@@ -12,7 +12,7 @@ Fast Mac and Windows disk tools are fast because they **don't walk the tree file
 
 On top of that sit things the Mac tools don't need: hard-link-correct accounting, LVM awareness, and throttling that keeps a RAID 5 array usable while scanning.
 
-**Tidemark is strictly read-only.** It changes no mounts, fstab entries, LVM, kernel parameters or file metadata. Installing it is just a package plus a service.
+**Tidemark is strictly read-only.** It changes no mounts, fstab entries, LVM or kernel parameters and performs no intentional scanned-data mutation. Link inspection and directory NOATIME fallback can update atime (R5-23/25). Installing it is just a package plus a service.
 
 ## 2. Layers
 
@@ -34,9 +34,9 @@ Each layer works without the others. Without the daemon, snapshot queries still 
   ────────────────            │   L0  FsSampler (statvfs, 30s) ─────┐                                              │
   statvfs  / and /data ───────┼──▶                                  │                                              │
   LVM (lvs/vgs JSON, 5m) ─────┼──▶ L0  LvmSampler ──────────────────┤                                              │
-                              │                                     ├──▶ LiveState (per-minute rings) ──▶ RateEngine ──▶ AlertEngine ──▶ journald / webhook
+                              │                                     ├──▶ LiveState (per-minute rings) ──▶ RateEngine ──▶ AlertEngine ──▶ journald
   fanotify (mount marks ×2) ──┼──▶ L2  Watcher (/ and /data) ───────┤             │                                │
-  /proc/*/fd, fdinfo ─────────┼──▶ L2  ProcScanner (60s) ───────────┘             ├──▶ MetricsExporter ──▶ node_exporter textfile (+ optional HTTP)
+  /proc/*/fd, fdinfo ─────────┼──▶ L2  ProcScanner (60s) ───────────┘             ├──▶ MetricsExporter ──▶ node_exporter textfile only
                               │                                                   └──▶ ApiServer (unix socket, JSON lines) ◀── tidemark now/hot/lvm/...
                               │                                                                                    │
   dirs + inodes ──────────────┼──▶ L1  Scheduler ─▶ Scanner (walk | bulk) ─▶ Aggregator ─▶ SnapshotWriter          │
@@ -92,7 +92,7 @@ test-support   ◀── dev-dependencies only
 
 ## 5. Process model
 
-- **`tidemarkd`** runs as root under systemd. It owns all samplers, the watcher, the scan scheduler, the time-series DB writer, metrics output, the API socket and the first-boot report. It is **read-only** with respect to everything outside its own state directory.
+- **`tidemarkd`** runs as root under systemd. It owns all samplers, the watcher, the scan scheduler, the time-series DB writer, metrics output, the API socket and the first-boot report. Observation makes no intentional scanned-data mutation; metrics textfile publication and documented link/directory atime effects are explicit limits (R5-1/23/25).
 - **`tidemark`** (CLI) is used as root in an installed system because its files are root-only; administrators use `sudo`. Neither binary has a startup uid check; non-root direct runs against user-owned temporary config and state work in the degraded mode below. The API accepts only peer uid 0 via SO_PEERCRED, including with a nonroot daemon (13 R3-14).
   - Snapshot queries open snapshot files directly, read-only and immutable.
   - Live queries (`now`, `hot`, `lvm`, …) go to the daemon socket. Where possible they fall back to doing the work directly (for example `phantom` scans `/proc` itself, `lvm` runs `lvs` itself).
@@ -111,7 +111,7 @@ test-support   ◀── dev-dependencies only
 | `scan-*` | Walker/bulkstat workers + aggregator (spawned per scan) |
 | `ts-writer` | Single writer for timeseries.db; receives batched rows over a channel |
 | `api` | Accepts Unix-socket connections; short-lived handler threads |
-| `metrics` | Every 60 s: render textfile atomically; optional tiny HTTP server |
+| `metrics` | Every 60 s: render textfile atomically (ADR-020) |
 | `alerts` | Every 30 s: evaluate rules; deliver notifications |
 
 Shared state is `Arc<RwLock<LiveState>>` with small critical sections. Cross-thread data goes through `crossbeam-channel`. See ADR-005.
@@ -155,13 +155,13 @@ Shared state is `Arc<RwLock<LiveState>>` with small critical sections. Cross-thr
   - `CAP_DAC_READ_SEARCH` to traverse every directory.
   - `CAP_FOWNER` for `O_NOATIME` on directories it doesn't own.
   - `CAP_SYS_PTRACE` to read other processes' `/proc/<pid>/fd`.
-- **The daemon must run in the host mount namespace.** fanotify mount marks attach to a specific mount object. systemd options that create a private mount namespace (`ProtectSystem=`, `ProtectHome=`, `PrivateTmp=`, `ReadWritePaths=`, …) give the service *copies* of the mounts, and the watcher would silently see nothing.
+- **The daemon must run in the host mount namespace.** fanotify mount marks attach to a specific mount object. systemd options that create a private mount namespace (`ProtectSystem=`, `ProtectHome=`, `PrivateTmp=`, `ReadWritePaths=`, …) give the service *copies* of the mounts, and mount-mode marks would miss host writes. Filesystem mode now covers all mounts on supported 8.10, but the host namespace guard remains for sampling/scanning/path interpretation (R5-26).
   - Hardening instead uses capability bounding, `NoNewPrivileges`, `RestrictNamespaces`, `SystemCallArchitectures`, `LockPersonality` and `RestrictAddressFamilies`.
   - `tidemarkd` checks that `/proc/self/ns/mnt` equals `/proc/1/ns/mnt` and refuses to start the watcher otherwise. (ADR-013.)
 - **LVM access.** It is read-only: the `lvs`/`vgs` reporting commands, which take a brief shared lock and never write metadata.
-- **Network.** No TCP listener by default. The optional metrics listener binds to `127.0.0.1` only.
+- **Network.** No network listener; only the local Unix API socket (ADR-020).
 - **Path names are sensitive.** Snapshot files and the API expose them (customer names in report paths), so access is limited to root; administrators use `sudo` (ADR-018).
-- **No content reads.** Tidemark never opens regular files to read data. fanotify hands the daemon an fd per event, and that fd is only `fstat`-ed and closed.
+- **No content reads.** Tidemark never reads scanned regular-file payloads. Its own configuration/state and designated kernel/OS metadata are legitimate reads. Event descriptors are inspected for metadata/path identity and closed unread; filesystem mode may reopen a bounded handle for metadata mapping (R5-26).
 
 ## 9. Degradation matrix
 
@@ -201,10 +201,14 @@ There are no fstab, LVM or kernel changes, so a failed deploy can't affect boot.
 - **Observability:** `tracing`, `tracing-subscriber`, `tracing-journald`.
 - **Config and serialisation:** `serde`, `toml`, `humantime-serde`, `bytesize`, `serde_json`. JSON is also used to parse LVM's `--reportformat json` output.
 - **Other crates:**
-  - `ureq` for webhooks
-  - `tiny_http` for the optional metrics listener
   - `sd-notify`
   - `xxhash-rust` (xxh3) for path hashes
   - `rustc-hash` for hot maps
 - **Tests:** `tempfile`, `assert_cmd`, `insta`, `proptest`, `cargo-fuzz`.
 - **Packaging:** `cargo-generate-rpm`.
+
+## Hardening lifecycle and trust (13 R5)
+
+One writer supervisor owns the bounded 64-message queue across worker exits, joins each worker and retries 5 seconds doubling to 300; lost in-flight persistence is reported. Collectors publish immutable completed process reports and availability separately from retained display history. Every failed measurement invalidates alert inputs, including resource pressure; generation checks prevent late resurrection. State-lock sections contain only bounded in-memory work: mount resolution and logging run outside them. Operational cadence/backoff is monotonic; calendar facts use wall time.
+
+No HTTP/TLS/webhook exists in v1; textfile and journal are the transports. The installed unit permits AF_UNIX only. Storage, daemon/deploy and metrics use verified directory/leaf trust; see [security model](../security.md). API peers are authorized before parsing, handlers retain/join ownership and scan admission observes request deadlines (R5-4/19/20).

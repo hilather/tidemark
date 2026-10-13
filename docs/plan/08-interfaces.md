@@ -48,7 +48,7 @@ Machine output uses `JsonDoc<T> { schema: Cow<'static, str>, data: T }`, with ow
 | `wide [PATH]` | Widest directories (FR-7) | `--min-entries N` (10000), `--limit` | root |
 | `diff [PATH]` | Snapshot diff (FR-8) | `--since DUR` or `--from ID [--to ID]`, `--depth N` (3), `--metric disk\|reclaimable\|files`, `--explain`, `--explain-ratio F` (0.5), `--explain-min SIZE` (1GiB), `--limit` | root |
 | `links [PATH]` | Hard-link topology (FR-9) | `--boundary GLOB…` or `--boundary-depth N`, `--incomplete`, `--top N`, `--show-paths` (live name resolution) | root |
-| `symlinks [PATH]` | Live symlink analysis (FR-5) | `--check-targets` (stat targets: needed for dangling/loop/other-fs), `--dangling` (list only dangling), `--escaping` (list only links resolving outside PATH), `--limit` | root |
+| `symlinks [PATH]` | Live symlink analysis (FR-5) | `--check-targets` (gated component resolution within selected mount; outside targets are unchecked OtherFs), `--dangling` (list only dangling), `--escaping` (list only links resolving outside PATH), `--limit` | root |
 | `export ncdu [PATH]` | ncdu JSON export (FR-22) | `-o FILE`, `--snapshot`, `--utf8-lossy`, `--max-depth N` | root |
 | `now` | Live situation (FR-18) | `--mount M` | root |
 | `hot` | Hot directories/writers (FR-14) | `--window 1m\|5m\|15m\|60m`, `--by dir\|unit\|comm`, `--mount`, `--limit` | root |
@@ -111,7 +111,7 @@ Invalid config.reload returns ok with `reloaded: false` and the error in warning
 
 - **Transport:** Unix stream socket `/run/tidemark/api.sock`, mode `0600 root:root`.
 - **Framing:** newline-delimited JSON. One request per line, one response per line; the connection may carry several requests.
-- **Authentication:** socket permissions. Every request is logged with the peer's `SO_PEERCRED` uid/pid. Every method accepts only peer uid 0, identified by kernel SO_PEERCRED; other peers receive `forbidden`, even when the daemon runs as another uid.
+- **Authentication:** socket permissions. Every request is logged with the peer's `SO_PEERCRED` uid/pid. Every method accepts only peer uid 0, identified by kernel SO_PEERCRED; other peers are closed before parsing, with zero response bytes (R5-20), even when the daemon runs as another uid.
 
 ```json
 {"v":1,"id":"c1","method":"now","params":{"mount":"/data"}}
@@ -133,7 +133,7 @@ Invalid config.reload returns ok with `reloaded: false` and the error in warning
 | `scan.cancel` | exactly one of `root`/`root_b64` | `{cancelled: bool}` |
 | `config.reload` | — | `{reloaded: bool, warnings: Vec<String>}` |
 
-Every API method serves only peer uid 0, identified by kernel `SO_PEERCRED`, even if the daemon runs with another uid; all other peers receive `forbidden`. The workspace `rustix` dependency enables `net` and `termios`. `status --show-config` prints the CLI's effective configuration, explicitly labelled; the running daemon may retain an older config until reload. There is no `config.get` method in v1. With no daemon, `lvm`, `writers` and `phantom` fall back to direct mode with one stderr notice (including quiet mode); `now`, `hot`, `alerts` and `status` exit 4. Explicit direct mode bypasses the daemon. A connected daemon scan refuses threads, extra excludes and keep-partial options; its request carries only the frozen root/mode/throttle overrides.
+Every API method serves only peer uid 0, identified by kernel `SO_PEERCRED`, even if the daemon runs with another uid; all other peers are closed before parsing, with zero response bytes (R5-20). The workspace `rustix` dependency enables `net` and `termios`. `status --show-config` prints the CLI's effective configuration, explicitly labelled; the running daemon may retain an older config until reload. There is no `config.get` method in v1. With no daemon, `lvm`, `writers` and `phantom` fall back to direct mode with one stderr notice (including quiet mode); `now`, `hot`, `alerts` and `status` exit 4. Explicit direct mode bypasses the daemon. A connected daemon scan refuses threads, extra excludes and keep-partial options; its request carries only the frozen root/mode/throttle overrides.
 
 The daemon-served `lvm` report keeps `LvmResult { mounts: Vec<(String, LvmNow)>, vgs: Vec<VgInfo>, sampled_at: i64 }`. Compared with the direct command it omits segment type and the other/unmounted LV inventory and columns. No wire extension or new flag is added. `W6-A3.md` specifies that the CLI still reads 24-hour trends read-only from the store with the direct command's query/slope/window; missing segment/other-volume columns are omitted and a notice explains the reduced view.
 
@@ -147,7 +147,7 @@ Scan params carry `"root":"<utf-8 path>"` or `"root_b64":"<base64>"` (padded sta
 
 `tidemark_core::api` defines `ComponentState { name: String, state: String /* ok|degraded|disabled|error */, detail: String }` and `VgInfo { vg: String, size: u64, free: u64 }`; downstream re-exports are `tidemarkd::firstboot::ComponentState` and `tidemark_fs::lvm::VgInfo`.
 
-Error codes: `bad_request`, `forbidden`, `not_found`, `unavailable`, `busy`, `internal`. Requests time out server-side after 10 s.
+Error codes: `bad_request`, `forbidden`, `not_found`, `unavailable`, `busy`, `internal`. Frame collection, handler execution and response writes each have separate absolute 10 s budgets (R5-4/20); partial reads do not reset deadlines.
 
 ## 3. Configuration (`/etc/tidemark/tidemark.toml`)
 
@@ -431,3 +431,13 @@ Also shipped:
 
 - `tmpfiles.d/tidemark.conf` creates `/run/tidemark` as `0700 root:root` (it does not create the node_exporter textfile directory).
 - Default config goes to `/etc/tidemark/tidemark.toml` as `%config(noreplace)`, mode `0600 root:root`.
+
+## Hardening interface clarifications (13 R5)
+
+Socket validation retains no-follow ancestors, requires the API’s private owned 0700 child below sticky ancestry and refuses unsafe paths without repair. API locks <socket>.lock; exporter locks <textfile>.tmp, never directories. The request is at most 1 MiB including newline; 32 workers/handlers retain ownership until joined. Frame, handler and write budgets are separate absolute ten-second intervals; poll shutdown/deadline within 50 ms. Unauthorized peers get EOF before parsing, not a forbidden wire response; the frozen dispatch error code remains. Request deadline reaches scan admission; expiry after enqueue cancels that scan and reports uncertain outcome.
+
+Startup/reload/check-config reject socket/socket.lock collisions with textfile/textfile.tmp, including normalized names and parent aliases. NoSpace is Unavailable with scan: NoSpace, CLI 5. Free text wraps with aligned continuations, only paths/unit names shorten in the middle; escaped-byte tokens stay whole. Direct LVM JSON uses tidemark.lvm.v1; daemon LVM uses tidemark.lvm.daemon.v1. Human sizes align right and enums are lowercase; machine quantities/shapes stay unchanged. Errors name operation/subject/full cause chain while preserving exit codes; embedded controls are escaped. HotEntryWire non-path numeric-array keys remain frozen and OPEN for core sign-off.
+
+TUI pages use exclusive metric/name keysets and whole-directory literal-byte filters (1,000 rows/page); growth caps at 10,000 children, live retained rows at 1,000,000. R runs a gated cancellable worker, Esc/navigation cancel; teardown restores terminal before join. Own-files uses charged bytes/counts; link instances page without dropping unresolved duplicates. Million-child SQL/index performance remains OPEN.
+
+Custom state directory rules and the symlink atime limit are in [security](../security.md). These clarifications do not change the normative configuration or unit blocks above.

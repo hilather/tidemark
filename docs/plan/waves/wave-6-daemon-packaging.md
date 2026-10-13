@@ -55,7 +55,7 @@ Log one WARN per actual failed scan (root, mode, source, attempt and retry time)
 
 A normalized sampler.mounts/watch.mounts path must exactly equal a mount point in the daemon namespace; identity is topmost mount id plus device major/minor. Absent entries produce no samples/persistence or watcher and report `not mounted`. Presence checks pick up arrivals (sampler at most ten seconds, watcher every second); identity changes release the old watcher before replacement. Open sampling descriptor identity is checked before statvfs. Covered scheduled and requested scan roots are refused before run_scan, following existing error/backoff handling; unrelated roots remain eligible. Firstboot is unhealthy for absent entries, but startup readiness is prompt.
 
-Open: clearing in-memory filesystem rate series/removing stale samples across appearance/disappearance/remount; current removable missing-mount reasons in `now.degraded`; daemon consumption of retained watcher mark identity and the residual check-to-mark race. Service persistence deduplication reset is not a rate-ring reset. The proposed future state behavior in W6-mount-presence is not claimed implemented.
+Superseded by R5-8/19: current samples/rate rings reset on identity changes, current missing-mount degradation clears on recovery, and retained watcher mark identity is reconciled. The residual check-to-mark race remains a limitation under trusted mount administration.
 
 Invalid config.reload returns ok with `reloaded: false` and the error in warnings, keeping previous config/generation. Inventory/capacity/catalog/history/schedule preflight failures are contained the same way, without stopping scheduler. Reserve current configured roots transactionally within the 128-entry inventory, evict inactive manual history deterministically if needed, retire removed inactive roots and retain admitted/running roots until completion. Stale schedule generations cannot resurrect removed roots.
 
@@ -92,7 +92,7 @@ One shared monotonic shutdown deadline governs recorder queue/acknowledgement wa
 - **API:**
   - One thread per connection; max 32 concurrent connections.
   - 1 MiB request line limit; 10 s handler timeout.
-  - `SO_PEERCRED` logged; every method accepts only peer uid 0, even for a nonroot daemon; other peers receive `forbidden`.
+  - `SO_PEERCRED` logged; every method accepts only peer uid 0, even for a nonroot daemon; other peers are closed before parsing, with zero response bytes (R5-20).
   - Methods and errors exactly as `08` §2.
 - **Self-protection:** `state_dir` is always added to watch and procscan excludes and to scan excludes. The space guard emits the `state_space` alert.
 - **Reload (SIGHUP / `config.reload`):** re-read config and validate. Apply changes to schedules, alert rules, thresholds, exclude lists and metrics settings live. Changes to mounts or the watch set restart only the affected service. Invalid config keeps the old one and reports the issues.
@@ -114,7 +114,7 @@ Contract details: daemon LVM omits segment type and other LVs; CLI trends remain
 
 ### Tests
 
-- Unit: schedule/window parser and next-run computation (DST transitions, windows wrapping midnight); API framing (partial lines, oversize line, malformed JSON → `bad_request`); peer-uid check (only uid 0 accepted via kernel SO_PEERCRED; others `forbidden`) for every method.
+- Unit: schedule/window parser and next-run computation (DST transitions, windows wrapping midnight); API framing (partial lines, oversize line, malformed JSON → `bad_request`); peer-uid check (only uid 0 accepted via kernel SO_PEERCRED; others closed before parsing with zero response bytes) for every method.
 - Integration (unprivileged): start the daemon with a temp config (watcher/LVM disabled, walk-mode root on a fixture, socket in a temp dir) → `tidemark status`, `scan.start` via the CLI, `scan.status` until complete, then `now` renders.
 - Privileged `daemon_end_to_end` (`09` §5): start via `systemd-run` with the real unit's properties → write 50 MiB under a transient unit → within 60 s, `tidemark now` shows the hot directory and the unit; `tidemark now` shows both tracked mounts and, on a loop-LVM thin volume, the pool's data %.
 - Privileged `daemon_reload_and_shutdown`: SIGHUP with a changed alert rule is applied; an invalid config is rejected; SIGTERM mid-scan exits within 10 s with no `.db.tmp` left.
@@ -130,9 +130,9 @@ Contract details: daemon LVM omits segment type and other LVs; CLI trends remain
 
 Independent global directory rankings retain at most the configured series cap per family and count omitted eligible rows exactly, with deterministic raw root/path ties, rather than refusing large inventories before selection. Startup and root/depth/capacity reload reconcile a read-only latest-complete snapshot cache. Crash-left owned single-link regular staging files are flocked, truncated and reused through a collector-directory handle; hostile or live staging files are refused. Nonrepresentable metrics interval reports component error until a new generation.
 
-HTTP removal is separately assigned ADR-020 work: do not adopt EDGE-metrics’ HTTP proposal here. Existing metrics.listen and alerts.webhook text is intentionally retained; see the PLAN-round4 handoff inventory.
+Superseded by R5-1: ADR-020 removed HTTP metrics and webhook delivery; only textfile metrics and journal delivery remain.
 
-The existing HTTP deliverable paragraph is retained solely for the separately assigned ADR-020 removal; it is not a new endpoint decision here.
+The former endpoint deliverable was removed by ADR-020 (R5-1).
 
 **Read first:** `08-interfaces.md` §4, Prometheus text exposition format documentation.
 
@@ -143,7 +143,7 @@ The existing HTTP deliverable paragraph is retained solely for the separately as
   - `# HELP` / `# TYPE` lines; label escaping (`\\`, `\"`, `\n`); stable ordering.
   - Cardinality guard per metric, plus `tidemark_metrics_dropped_series`.
 - **Textfile writer:** write to `<textfile>.tmp` in the same directory, `fsync`, `chmod 0644` (node_exporter typically runs as its own user), then `rename`. If the directory doesn't exist or isn't writable, skip with one log line per hour, and report `metrics` as `degraded` in status. The daemon's capability set has no `CAP_DAC_OVERRIDE`, so the directory must be writable by root through normal permissions; the usual root-owned `textfile_collector` directory is. Tidemark does **not** create it.
-- **Optional HTTP:** `tiny_http` on `metrics.listen`. Config validation **rejects non-loopback addresses**. It serves only `GET /metrics`, with 404 for everything else.
+- **Textfile only:** no HTTP endpoint or network listener (ADR-020, R5-1).
 - `packaging/grafana/tidemark.json`: one dashboard with:
   - Filesystem used/avail with time-to-full;
   - LVM: thin-pool data/metadata % and VG free;
@@ -170,7 +170,7 @@ The existing HTTP deliverable paragraph is retained solely for the separately as
 
 ## W6-C — Packaging, systemd, RPM, install tests
 
-The CLI manifest contains an empty `[package.metadata.generate-rpm]` table for external metadata. `cargo xtask rpm --native` builds on EL8; the changed-default test package requires `--native --version 0.1.1 --upgrade-fixture`. Native mode installs nothing, defaults offline and rejects foreign hosts/missing generator. `tools/check-rpm.sh` checks package identity, exact assets/modes/owners/config flags, scriptlets and extracted ELF binaries. `tools/el8-build-env.sh` prepares disposable EL8 build environments, pinning 8.8 repositories to the vault. GitHub Actions has a `ci` job and separate Rocky 8.8/8.10 `rpm` matrix, locked fetching, package/install verification, checksums and artifacts. ShellCheck runs on GitHub at default severity. Owner decision: push main to GitHub after each green local gate; this task does not push.
+The CLI manifest contains an empty `[package.metadata.generate-rpm]` table for external metadata. `cargo xtask rpm --native` builds on EL8; the changed-default test package requires `--native --version 0.1.1 --upgrade-fixture`. Native mode installs nothing, defaults offline and rejects foreign hosts/missing generator. `tools/check-rpm.sh` checks package identity, exact assets/modes/owners/config flags, scriptlets and extracted ELF binaries. `tools/el8-build-env.sh` prepares disposable EL8 build environments, pinning 8.8 repositories to the vault. GitHub Actions has a `ci` job and separate Rocky 8.8/8.10 `rpm` matrix, locked fetching, package/install verification, checksums and artifacts. ShellCheck gates at warning severity; informational notes are printed on stderr (superseded by R5-17). Owner decision: push main to GitHub after each green local gate; this task does not push.
 
 Unit values have no trailing comments; the existing normative unit remains unchanged. Install neither starts nor enables. Upgrade/reinstall uses guarded `try-restart`: restart a running daemon and leave a stopped daemon stopped, preserving enablement. Erase stops/disables and retains state. The install gate requires effective memory limit 2147483648, notify/root, NoNewPrivileges and exact capability names, and rejects installed-unit parser warnings. Active upgrade must change a nonzero PID and regain API readiness; stopped reinstall stays inactive. Edited config survives, and the changed-default fixture must produce root:root 0600 `.rpmnew` with its marker. Enable and prove active/enabled before erase, then assert inactive/disabled and no wants entry even as a dangling symlink; retained `.rpmsave` matches edited bytes and mode 0600. Require SELinux Enforcing unless an explicit permissive override labels SELinux acceptance untested. Post-reboot verification requires an external writer’s hot directory on restored disposable XFS; any post-mount restart is explicit. (13 R4-4/5.)
 
@@ -180,7 +180,7 @@ Unit values have no trailing comments; the existing normative unit remains uncha
 
 - `packaging/systemd/tidemarkd.service`: **exactly** `08` §6. Do not add mount-namespace options.
 - `packaging/tmpfiles.d/tidemark.conf`: `d /run/tidemark 0700 root root -`.
-- `packaging/config/tidemark.toml`: the `08` §3 example with explanatory comments. Webhook and HTTP metrics are disabled by default. Roots, sampler and watch mounts default to `/` and `/data` (matching the fleet layout); hosts without `/data` are caught by `deploy stage` pre-flight.
+- `packaging/config/tidemark.toml`: the `08` §3 example with explanatory comments. HTTP metrics and webhooks are absent in v1 (ADR-020). Roots, sampler and watch mounts default to `/` and `/data` (matching the fleet layout); hosts without `/data` are caught by `deploy stage` pre-flight.
 - `xtask rpm [--container | --native]` (`--native --version 0.1.1 --upgrade-fixture` for the changed-default install fixture):
   - Build release binaries in a `rockylinux:8` container (podman, or docker if present). The toolchain is installed via rustup in the container image; cache it.
   - Then `cargo generate-rpm` with metadata in `packaging/rpm/rpm.toml`.
@@ -221,3 +221,9 @@ Unit values have no trailing comments; the existing normative unit remains uncha
 - [ ] A 24 h mini-soak on a VM, with the generator mutating a fixture and hourly scans: RSS flat, no fd growth, metrics continuous, no unexpected log errors.
 - [ ] Gate review: every API method and metric in `08` is implemented with the documented names, and nothing extra is undocumented.
 - [ ] Tag `wave-6-done`. This is the first deployable build.
+
+## Post-review implemented contracts (13 R5)
+
+R5-2/3/6/8/9/19 supersede historical open lifecycle/window/mount findings: supervised writer, immutable process reports, failed-collector availability, monotonic operational timing, durable cancellation outcomes, crash cleanup under scan lock, firstboot follow-up and exact completed windows. Request deadlines reach scan admission; unauthorized peers close before parse; per-frame/handler/write budgets are separate. API/exporter use socket.lock/textfile.tmp locks and output collisions are rejected. NoSpace is Unavailable scan: NoSpace and CLI 5.
+
+R5-10/21/24 bound descriptor reads/resource retry and process bytes, verify state/metrics ancestry and leaves, retain stricter private daemon/deploy modes with checked marker read/execute normalization only, and refuse ownership repair. Unit families are AF_UNIX. R5-11/24 specify wrapping/error context and distinct daemon LVM schema. Final guest acceptance is separate from implementation closure.

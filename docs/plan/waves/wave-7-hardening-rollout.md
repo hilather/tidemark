@@ -19,9 +19,9 @@
 
 Read 13 R4-1–R4-16 and the first-real-run risks in 12. Owner decision: fd-mode watcher budget is 5% of one core per 1,000 close-write events/s, or 50 microseconds/event, replacing 1%. EL8 kernels 4.18.0-477 and -553 offer no measured FID mode. Optimised 8.10 guest measured 45.6 microseconds/event at 2,000/s (9.1% of one core) with host under load. Owner will measure real servers; this is no universal performance guarantee. The 2,000/s scale test threshold is 10% of one core, replacing 2%. Idle CPU and write-throughput impact remain separate gates.
 
-Open, not new accepted behavior: watcher-backed alert rules remain unevaluable until daemon publishes exact CompletedMinute windows (R4-7); W6-A2b alert reconfiguration continuity, component removal and cancellable process scan; mount rate-ring reset/current now.degraded (R4-9); one intermittent cancellation deadline miss on 8.8 in scan_lifecycle::interrupted_cancelled_and_failed_scans; firstboot report rewritten on every start with changed config; LVM schema/cancel-id gaps (R4-12).
+Superseded by R5-2/8/9/11/19/21: writer supervision, collector availability, immutable process reports, monotonic scheduling, exact watcher windows, reload continuity, mount-rate reset/current degradation, API ownership/deadlines, crash cleanup and state trust have landed fix notes. Cancellation’s work bound excludes durable outcome sync (R5-3). Open: scan.cancel id conditioning, million-child paging/index decision, staging scale/soak, nightly fuzz execution/cumulative gate and R5-27 core/guest decisions. Implementation notes do not establish independent guest acceptance.
 
-Review findings without landed fix notes: core S1 writer rollover failure/supervision, S2 stale collector alert availability, S3 procscan published-lock contention, S4 LVM retry units/backpressure, S5 wall-clock operational deadlines, S7 late sampler generation resurrection, S8 internal alert capacity; edge F02 incomplete-request API deadline, F03 abandoned handler cancellation, F04 mutable API parent path operations. B1/B2/S6/S9 have CORE-fix-1; F05–F08 EDGE-cli; F09–F12 EDGE-metrics plus CORE-fix-1 validation; F13 INSTALL-assert. F01 has an EDGE-metrics fix note but HTTP removal/ADR-020 is separately assigned and not resolved by this plan task. Landed notes establish implementation evidence, not independent verification; unrestricted socket tests and guest gates remain required.
+Historical findings are superseded by R5-2/4/19/21/24. Unrestricted listener, final Rocky guest and owner sign-off gates remain required; see R5-18/27.
 
 W7-D preserves byte-relative catalog portability, explicit invalid reload warnings and CLI scan-id ownership/exit 3. W7-C verifies shared recorder deadlines, exact hashed-byte parsing and 366-day validation, actual retained watcher mount identity and mount transition state. W7-B measures the revised watcher budget on real servers independently of idle CPU and writer impact.
 
@@ -136,8 +136,8 @@ On staging: daemon at defaults, generator in mutate mode, hourly scans. Pass cri
   - The root daemon and its capability set.
   - Root-only CLI/API access, sudo guidance, and root-owned file and directory modes (ADR-018).
   - Sensitivity of path names in snapshots and metrics.
-  - Data sent in webhooks (escaped paths/subjects and documented fields; no separate v1 redaction key or rule, 13 R2-10).
-  - The read-only guarantee (no metadata, mount or LVM writes) and the `xtask ci` forbidden-call check.
+  - Sensitive names in journal, state and textfile metrics; no webhook transport (R5-1).
+  - The read-only observation contract, documented symlink/directory atime limits (R5-23/25), no mount/LVM writes and the `xtask ci` forbidden-call check.
   - `deploy stage`/`unstage` safety (pre-flight failures change nothing; later failures attempt compensation; unsafe-state refusal and no-follow handles; purge guard, 13 R2-7).
   - The SELinux posture (no shipped policy or required SELinux mode; 8.10 enforcing first-run evidence with no denials, R4-15).
   - Supply chain (`cargo-deny`, pinned toolchain, reproducible container build).
@@ -188,3 +188,11 @@ Review the implemented contracts in `13` R2-1–10: record/resource refusals, ch
 - [ ] W7-D docs reviewed; runbook rehearsed on staging.
 - [ ] All `W7-FIX-*` branches merged and reviewed.
 - [ ] Tag `v1.0.0`; build the RPM; hand off to the rollout runbook (`11`).
+
+## Landed Wave 7 work and open gates (13 R5)
+
+TUI now uses store keyset pages and whole-directory literal-byte filtering, cancellable gated live refresh, paged duplicate-preserving link instances and own-files charged semantics; growth caps at 10,000. Million-child queries exceed 100 ms with current indexes: the checkbox above remains an OPEN measured index decision.
+
+Fixture/benchmark tooling is implemented, with finished observed metadata/flush accounting; owner staging 5M/20M and 72-hour soak remain outstanding. Six guarded Rocky fault scripts cover space, killed scans, repeated/low-limit forced overflow, compaction, directory races and huge directories. Stable parser tests and 16 nightly targets exist, including the three pure seams; first workflow/fuzz run and cumulative gate remain unverified in notes. Operator guide/security and 31 generated packaged man pages exist; cargo xtask man defaults to target/man.
+
+Required cargo-deny 0.20.2 allows BSL-1.0; GitHub fetch is locked, tests use --no-fail-fast, shellcheck warning gates with uncaptured stderr notes. The security audit fixes are implemented but real second-user trust, restricted-unit filesystem marks and symlink boundary/atime guest gates remain. Core non-path key serialization and cap-degraded policy are open owner decisions (R5-27); wave tags remain owner’s.

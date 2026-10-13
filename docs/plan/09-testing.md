@@ -213,9 +213,9 @@ Packaging assertions follow 13 R4-5: Unit values have no trailing comments; the 
 
 **`cargo xtask bench --root … --modes du,walk,bulk --cache cold,warm`** records:
 
-- Wall time, CPU time, peak RSS, and syscall counts per mode.
+- Wall time, CPU time and RSS per mode; syscall counts need external strace profiling (not fabricated by the harness).
 - Leaf block devices' utilisation and average-wait series with and without a scan, from `/sys/block/*/stat` using the adaptive gate's samples.
-- Gate statistics: mean rate, minimum rate, time throttled, number of decreases.
+- Gate statistics are currently unavailable in frozen scan JSON; report that limitation explicitly.
 - Watcher overhead: fixture-generator throughput in mutate mode with and without the watcher.
 
 Gates (NFR-2), set as defaults and confirmed or adjusted in the pilot:
@@ -242,13 +242,13 @@ Pass criteria:
 
 ## 9. CI
 
-The CLI manifest contains an empty `[package.metadata.generate-rpm]` table for external metadata. `cargo xtask rpm --native` builds on EL8; the changed-default test package requires `--native --version 0.1.1 --upgrade-fixture`. Native mode installs nothing, defaults offline and rejects foreign hosts/missing generator. `tools/check-rpm.sh` checks package identity, exact assets/modes/owners/config flags, scriptlets and extracted ELF binaries. `tools/el8-build-env.sh` prepares disposable EL8 build environments, pinning 8.8 repositories to the vault. GitHub Actions has a `ci` job and separate Rocky 8.8/8.10 `rpm` matrix, locked fetching, package/install verification, checksums and artifacts. ShellCheck runs on GitHub at default severity. Owner decision: push main to GitHub after each green local gate; this task does not push. (13 R4-4.)
+The CLI manifest contains an empty `[package.metadata.generate-rpm]` table for external metadata. `cargo xtask rpm --native` builds on EL8; the changed-default test package requires `--native --version 0.1.1 --upgrade-fixture`. Native mode installs nothing, defaults offline and rejects foreign hosts/missing generator. `tools/check-rpm.sh` checks package identity, exact assets/modes/owners/config flags, scriptlets and extracted ELF binaries. `tools/el8-build-env.sh` prepares disposable EL8 build environments, pinning 8.8 repositories to the vault. GitHub Actions has a `ci` job and separate Rocky 8.8/8.10 `rpm` matrix, locked fetching, package/install verification, checksums and artifacts. ShellCheck gates at warning severity; informational notes are printed on stderr (superseded by R5-17). Owner decision: push main to GitHub after each green local gate; this task does not push. (13 R4-4.)
 
 The implemented GitHub jobs below are ci and rpm; VM/fuzz/bench rows describe required external gates, not evidence of additional hosted jobs.
 
 | Job | Trigger | Content |
 |-----|---------|---------|
-| `ci` | Every push | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, `cargo deny check` |
+| `ci` | Every push | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`, required `cargo deny check` |
 | `rpm` | Workflow push/PR/tag/dispatch triggers | Rocky 8.8 (vault-pinned) and 8.10 native build, package inspection, install/version/rpm verification, checksums and separate artifacts |
 | `vm-test` | Nightly + before each wave gate | Privileged suite on Rocky 8.8 and 8.10 VMs |
 | `fuzz` | Nightly | 10 minutes per fuzz target |
@@ -261,3 +261,29 @@ The implemented GitHub jobs below are ci and rpm; VM/fuzz/bench rows describe re
 3. Watch Postgres latency and device await during the scan (`iostat -x 5`, existing database monitoring). Record the result.
 4. Repeat with bulk mode on the full mount.
 5. Only then enable the daemon (see `11-rollout-runbook.md`).
+
+## Landed hardening tooling and remaining gates (13 R5-13–17/24/27)
+
+cargo xtask gen-fixture creates marked deterministic wide/sparse/hard-link/symlink fixtures. Finished metadata accounting follows close/flush and labels the summary before_mutation; du compares observed apparent/allocated totals. cargo xtask bench [--tidemark PATH] measures du/scan wall/CPU/RSS, device utilisation/await, cancellation and watcher throughput impact. GNU time and procfs sampling have distinct limits; absent gate JSON is unavailable. Owner staging hardware is still needed for 5M/20M inode runs and the 72-hour soak.
+
+Fault scripts: 01-state-full.sh, 02-snapshot-crash.sh, 03-fanotify-overflow.sh, 04-compaction-crash.sh, 05-directory-races.sh, 06-huge-directory.sh. cargo xtask vm-test --suite fault requires TIDEMARK_DEPLOY_TEST_VM=1; optional TIDEMARK_FAULT_SLOW=1 enables compaction, TIDEMARK_FAULT_SCALE=1 scale, TIDEMARK_FAULT_KEEP=1 retains passing evidence. Failure evidence is retained. Rocky-only tools, fixed locale and 180-second unmount retry cleanup are required. Three normal bursts and a low-limit pass assert complete accounting without loss; a separate stopped-daemon burst forces queue overflow, checking response/loss within 60 seconds and healthy recovery after 120 quiet seconds. Real compaction can take four hours; store subprocess crash tests provide faster deterministic integrity/oracle coverage.
+
+Stable properties/smokes run each CI pass; nightly fuzz/ has 16 targets (table below), 600 s each, 1 MiB input, 2 GiB RSS, two-second execution guard. Pure fanotify parsing owns no arbitrary fd; mount-id and JSON-line frame seams close the original three gaps. Workflow/fuzz execution was not verified in the source notes; cumulative 24-hour crash-free gate is outstanding. Stable timing guards are 30 seconds; 64 KiB versus 1 MiB repeated seeds use three samples/minimum and <200x only if the small input takes at least 1 ms, not a hard complexity proof.
+
+GitHub cargo fetch --locked precedes builds. cargo-deny 0.20.2 is required by owner decision; BSL-1.0 allowed for xxhash-rust. Local absent-tool skip is not a deny pass. cargo xtask ci uses cargo test --workspace --no-fail-fast. ShellCheck warning severity gates; informational notes are printed uncaptured on stderr. Guest acceptance remains pending for trust with a real second user, filesystem marks under the packaged restrictions and symbolic-link mount-boundary/atime behavior.
+
+| Fuzz target | Seam |
+|---|---|
+| mountinfo | mount table parser |
+| disk_stat | device counters |
+| cgroup_unit | process unit attribution |
+| fdinfo_flags | open flags |
+| stat_starttime | process identity |
+| lvs / vgs | LVM JSON reports |
+| config | bounded TOML configuration |
+| api_request / api_response | frozen JSON types/client response |
+| staged / firstboot | deployment records |
+| catalog_path | persisted snapshot metadata |
+| fanotify_events | pure non-owning event buffer |
+| mount_id | fdinfo mount id |
+| api_frame | incremental bounded JSON-line framing |

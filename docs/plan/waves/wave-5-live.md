@@ -106,7 +106,7 @@ Follow `13` R2-8: retry transient descriptor shortages, report failed workers, a
 
 ---
 
-CompletedMinute, drain_minutes and mount_identity are adopted by 13 R4-7 / LIVE-minutes; legacy drains share the persistence cursor. Exact daemon window consumption remains open.
+CompletedMinute, drain_minutes and mount_identity are adopted by 13 R4-7 / LIVE-minutes; legacy drains share the persistence cursor. Exact daemon window consumption/freshness is implemented; superseded by R5-9/19.
 
 Watcher window and dirty-root contracts follow 07 §3.3 and 13 R3-1/R3-2: supported whole minutes only, unavailable lossy/truncated hot windows, and independent post-publication dirty takes. No permission-error count is reported in v1 (R3-5).
 
@@ -194,8 +194,7 @@ impl AlertEngine {
 }
 pub trait Deliver: Send { fn deliver(&mut self, ev: &AlertEvent) -> Result<(), DeliverError>; }
 pub struct JournalDeliver;                  // tracing-journald with structured fields
-pub struct WebhookDeliver; // ureq; queue 1,000; 5s timeout; 3 retries; no separate v1 redaction
-impl WebhookDeliver { pub fn new(url: &str, host: &str) -> Result<Self, DeliverError>; }
+// Webhook delivery removed by ADR-020; journal delivery only (R5-1).
 
 // now
 pub struct NowInputs<'a> {
@@ -227,7 +226,7 @@ pub fn render_now_text(r: &NowReport, width: usize, color: bool) -> String;
 
 - `slope_bytes_per_sec` on linear, noisy, sawtooth and constant series; fewer than 3 samples gives `None`; `time_to_full` edge cases (zero, negative rate).
 - Alert state machine: table-driven timelines (condition flaps shorter than `for` never fire; resolve after `resolve_for`; re-notify cadence; multiple subjects independent).
-- Webhook: a local `tiny_http` test server receives the JSON body; timeouts and retries; queue overflow drops the oldest and counts it.
+- Journal delivery: structured message fields; no network transport (ADR-020).
 - `render_now_text` `insta` snapshots for: healthy, filling, degraded (watcher fd mode), and multi-mount.
 
 ### Acceptance

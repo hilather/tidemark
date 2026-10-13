@@ -107,9 +107,9 @@ pub fn analyze(root: &RawPath, gate: &dyn Gate, cancel: &AtomicBool, opts: &Syml
 - `--show-paths`: for listed sets, print instance paths, from `link_instances.name` in walk-mode snapshots. In bulk-mode snapshots, resolve each live via `read_dir_entries` on the instance directory, marked `(live)` or `(gone)`.
 - **`symlinks`** (maps `--check-targets` → `SymlinkOpts.check_targets`; `--dangling`/`--escaping` filter the example list): a parallel traversal (reuse the W1-B walker's directory iteration utilities, or a simple gated single-thread traversal; a single thread is acceptable). For each `DT_LNK`, `readlinkat`, then classify:
   - Relative targets resolve against the link's directory.
-  - With `check_targets`, `stat` the target (follows links): `ENOENT` is `Dangling`, `ELOOP` is `Loop`, a different `st_dev` is `OtherFs`.
+  - With `check_targets`, resolve components with gated no-follow metadata/readlink operations, at most 40 expansions. Stop before checking a target beyond the selected mount, including same-device binds: `OtherFs` means unchecked beyond that boundary. Inside-boundary `ENOENT` is `Dangling`, and cycles/expansion limit are `Loop` (R5-25).
   - Without `check_targets`, classify lexically only (inside/outside root).
-  - Never traverses through the links.
+  - Enumeration never descends through found links. Reading link text can update that link’s atime under mount policy; command-line path resolution may follow links (R5-23/25).
 
 ### Tests
 
