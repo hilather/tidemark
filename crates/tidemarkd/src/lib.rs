@@ -494,8 +494,11 @@ pub fn run_controlled(
     }
     let config = Arc::new(config);
     let writer_shutdown = Shutdown::default();
-    let (writer, writer_handle) =
-        services::tswriter::start(config.clone(), state.clone(), writer_shutdown.clone())?;
+    let (writer, writer_handle) = services::tswriter::start_supervised(
+        config.clone(),
+        state.clone(),
+        writer_shutdown.clone(),
+    )?;
     // Any startup error stops already-started services before returning.
     let mut handles = Vec::new();
     let recorder_deadline = Arc::new(parking_lot::Mutex::new(None));
@@ -1047,8 +1050,13 @@ fn parse_config_bytes(
     Ok((config, format!("{:x}", Sha256::digest(bytes))))
 }
 
-/// Injectable Unix clock for service scheduling and compaction tests.
+/// Injectable seconds clock; wall and monotonic instances are wired separately.
 pub type Clock = std::sync::Arc<dyn Fn() -> i64 + Send + Sync>;
+/// Injectable elapsed-seconds clock, independent of wall-clock corrections.
+pub fn monotonic_clock() -> Clock {
+    let origin = std::time::Instant::now();
+    std::sync::Arc::new(move || i64::try_from(origin.elapsed().as_secs()).unwrap_or(i64::MAX))
+}
 /// Wall clock adapter used only at process/service boundaries.
 pub fn unix_now() -> i64 {
     std::time::SystemTime::now()

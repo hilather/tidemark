@@ -400,17 +400,24 @@ fn compaction_uses_injected_clock() {
         let n = now.clone();
         Arc::new(move || n.load(Ordering::Acquire)) as tidemarkd::Clock
     };
+    let elapsed = Arc::new(AtomicI64::new(0));
+    let monotonic = {
+        let elapsed = elapsed.clone();
+        Arc::new(move || elapsed.load(Ordering::Acquire))
+    };
     let stop = Shutdown::default();
-    let (tx, h) = tswriter::start_with_clock(
+    let (tx, h) = tswriter::start_with_clocks(
         Arc::new(c.clone()),
         LiveState::new(&c, 0),
         stop.clone(),
         clock,
+        monotonic,
     )
     .unwrap();
     tx.send(Message::Fs(vec![sample(1, 10)])).unwrap();
     flush(&tx);
-    now.store(3599, Ordering::Release);
+    elapsed.store(3599, Ordering::Release);
+    now.store(7200, Ordering::Release);
     flush(&tx);
     assert_eq!(
         tidemark_store::timeseries::TimeSeries::open(
@@ -423,7 +430,22 @@ fn compaction_uses_injected_clock() {
         .len(),
         1
     );
+    now.store(0, Ordering::Release);
+    flush(&tx);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        tidemark_store::timeseries::TimeSeries::open(
+            &c.general.state_dir.join("timeseries.db"),
+            false
+        )
+        .unwrap()
+        .query_fs("/fixture", 1, 1)
+        .unwrap()
+        .len(),
+        1
+    );
     now.store(3601, Ordering::Release);
+    elapsed.store(3601, Ordering::Release);
     flush(&tx);
     let db = tidemark_store::timeseries::TimeSeries::open(
         &c.general.state_dir.join("timeseries.db"),
