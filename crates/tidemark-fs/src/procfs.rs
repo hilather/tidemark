@@ -45,22 +45,28 @@ impl Inventory {
     }
     fn push(&mut self, file: OpenFile) -> io::Result<()> {
         let before = self.bytes();
-        let extra = if self.files.len() == self.files.capacity() {
-            // Exact, fixed chunks avoid hidden geometric spare capacity.
-            256 * std::mem::size_of::<OpenFile>()
+        let grow = if self.files.len() == self.files.capacity() {
+            self.files.capacity().max(256)
         } else {
             0
         };
+        // Charge both allocations during a moving reallocation. Geometric growth
+        // avoids quadratic record copying without an uncharged transient old buffer.
+        let allocation = if grow == 0 {
+            0
+        } else {
+            (self.files.capacity() + grow) * std::mem::size_of::<OpenFile>()
+        };
         if before
-            .saturating_add(extra)
+            .saturating_add(allocation)
             .saturating_add(file.target.capacity())
             > self.limit
         {
             return Err(budget_error(self.files.len(), before));
         }
-        if extra != 0 {
+        if grow != 0 {
             self.files
-                .try_reserve_exact(256)
+                .try_reserve_exact(grow)
                 .map_err(|_| budget_error(self.files.len(), before))?;
         }
         // Account the actual capacity returned by the allocator as well.

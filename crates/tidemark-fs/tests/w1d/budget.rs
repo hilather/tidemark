@@ -1,5 +1,6 @@
 //! Owned by: WAUDIT-procfs-budget
 //! Synthetic inventory admission and allocation-accounting checks.
+#![allow(clippy::unwrap_used)]
 use super::*;
 fn record(len: usize) -> OpenFile {
     OpenFile {
@@ -67,4 +68,20 @@ fn scratch_and_spare_capacity_are_charged_before_reservation() {
     assert_eq!(inventory.files.capacity(), 0);
     inventory.push(record(0)).unwrap();
     assert_eq!(inventory.bytes(), inventory.limit);
+}
+
+#[test]
+fn moving_reallocation_is_admitted_with_both_record_buffers() {
+    let mut inventory = Inventory {
+        files: Vec::new(),
+        paths: 0,
+        scratch: 0,
+        limit: (256 + 512) * std::mem::size_of::<OpenFile>() - 1,
+    };
+    for _ in 0..256 {
+        inventory.push(record(0)).unwrap();
+    }
+    assert!(inventory.push(record(0)).is_err());
+    assert_eq!(inventory.files.len(), 256);
+    assert_eq!(inventory.files.capacity(), 256);
 }

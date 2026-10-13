@@ -405,3 +405,17 @@ fn long_duplicate_phantom_below_budget_keeps_counts_holders_and_samples() {
     assert_eq!(phantom.len(), 1);
     assert_eq!(writers.len(), 1);
 }
+
+#[test]
+fn pipeline_envelope_is_below_512_mib() {
+    // 64 daemon queue slots plus twelve overlapping collector/report/reader row sets.
+    // Three writer-history generations include conservative tree node overhead.
+    // Six MiB covers one attribution read/UTF-8 conversion and transient row.
+    let envelope = procfs::MAX_INVENTORY_BYTES
+        + MAX_SCRATCH_BYTES
+        + (64 + 12) * MAX_PASS_BYTES
+        + 3 * MAX_WRITERS * (ROW_OVERHEAD + HISTORY * std::mem::size_of::<(i64, u64, u64)>())
+        + 6 * 1024 * 1024;
+    assert!(envelope < 512 * 1024 * 1024);
+    assert_eq!(envelope, 534_613_504);
+}

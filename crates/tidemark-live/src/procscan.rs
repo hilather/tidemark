@@ -20,9 +20,9 @@ use tidemark_fs::{
 const MAX_WRITERS: usize = 10_000;
 const HISTORY: usize = 60;
 const MAX_FDS: usize = 1_048_576;
-// Each persistence/report row set is at most 3.75 MiB, including vector slack.
+// Each persistence/report row set is at most 4 MiB, including vector slack.
 // Temporary trees are separately bounded; history tuples are capped by MAX_WRITERS/HISTORY.
-const MAX_PASS_BYTES: usize = 15 * 1024 * 1024 / 4;
+const MAX_PASS_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SCRATCH_BYTES: usize = 16 * 1024 * 1024;
 const ROW_OVERHEAD: usize = 512;
 
@@ -149,11 +149,16 @@ impl ProcReport {
     }
 }
 impl ProcScanner {
-    /// Construct a real procfs scanner using the shared attribution cache.
-    pub fn new(cfg: ProcScannerOptions, attribution: Arc<AttributionCache>) -> Self {
+    /// Construct a real procfs scanner with pass-local attribution.
+    /// The supplied cache remains accepted for caller compatibility; process passes
+    /// use uncached reads so admitted attribution cannot also accumulate in a cache.
+    pub fn new(cfg: ProcScannerOptions, _attribution: Arc<AttributionCache>) -> Self {
         Self {
             cfg,
-            source: Box::new(ProcSource(attribution)),
+            source: Box::new(ProcSource(Arc::new(AttributionCache::new(
+                Duration::ZERO,
+                0,
+            )))),
             phantom: Vec::new(),
             tracked: BTreeMap::new(),
             pending: (Vec::new(), Vec::new()),
@@ -214,7 +219,7 @@ impl ProcScanner {
             .cfg
             .mounts
             .iter()
-            .map(|m| m.0.as_bytes().len().saturating_mul(4))
+            .map(|m| m.0.as_bytes().len().saturating_mul(8))
             .sum::<usize>();
         charge(
             &mut scratch,
@@ -257,7 +262,7 @@ impl ProcScanner {
             if file.nlink != 0 && !writable {
                 continue;
             }
-            if !attrs.contains_key(&file.pid) {
+            if let std::collections::btree_map::Entry::Vacant(entry) = attrs.entry(file.pid) {
                 charge(&mut scratch, ROW_OVERHEAD, count, MAX_SCRATCH_BYTES)?;
                 let attr = self.source.attribution(file.pid);
                 charge(
@@ -266,7 +271,7 @@ impl ProcScanner {
                     count,
                     MAX_SCRATCH_BYTES,
                 )?;
-                attrs.insert(file.pid, attr);
+                entry.insert(attr);
             }
             let attr = &attrs[&file.pid];
             let bytes = row_charge(
@@ -362,9 +367,8 @@ impl ProcScanner {
             if file.nlink != 0 && !writable {
                 continue;
             }
-            let attr = attrs
-                .entry(file.pid)
-                .or_insert_with(|| self.source.attribution(file.pid));
+            // Every relevant PID was admitted by the identical preflight predicates.
+            let attr = &attrs[&file.pid];
             let unknown = (attr.starttime != file.starttime).then(|| Attribution {
                 pid: file.pid,
                 starttime: file.starttime,
