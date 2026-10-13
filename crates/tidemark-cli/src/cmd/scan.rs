@@ -65,6 +65,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         let started: ScanStartResult = start_scan(
             &mut client,
             "scan.start",
+            &context.config.general.state_dir,
             &ScanStartParams {
                 root: root.clone(),
                 mode,
@@ -156,6 +157,9 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         .into());
     }
     require_absent_daemon(context)?;
+    drop(offline_catalog(context)?);
+    let _writer_lease =
+        tidemark_store::lease::WriterLease::acquire(&context.config.general.state_dir)?;
     {
         // Recover only in direct mode, under the scan lock, before any recorder
         // or catalog connections are retained.
@@ -234,12 +238,8 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     if let Ok(mut display) = display.lock() {
         display.finish()?;
     }
-    let outcome = result.map_err(scan_error).with_context(|| {
-        format!(
-            "scan state: {}",
-            super::display_path(&context.config.general.state_dir)
-        )
-    })?;
+    let outcome =
+        result.map_err(|error| direct_scan_error(error, &context.config.general.state_dir))?;
     crate::render::scan_progress::outcome(&outcome, context.json, &mut std::io::stdout().lock())?;
     if outcome.degraded || outcome.status == tidemark_core::scan::SnapshotStatus::Partial {
         return Err(crate::CliError::Partial(
@@ -253,19 +253,39 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
 fn start_scan(
     client: &mut crate::client::Client,
     method: &str,
+    state: &std::path::Path,
     params: &tidemark_core::api::ScanStartParams,
 ) -> anyhow::Result<tidemark_core::api::ScanStartResult> {
-    // Only the frozen Unavailable + NoSpace response is a space precondition.
-    // Other Unavailable responses retain the shared daemon mapping.
-    super::now::call(client, method, params).map_err(|error| {
-        if matches!(error.downcast_ref::<crate::CliError>(),
-            Some(crate::CliError::Unavailable(message)) if message.starts_with("scan: NoSpace"))
-        {
-            scan_error(tidemark_scan::orchestrator::ScanError::NoSpace).into()
-        } else {
-            error
-        }
-    })
+    super::now::call(client, method, params).map_err(|error| daemon_scan_error(error, state))
+}
+
+fn no_space(state: &std::path::Path) -> anyhow::Error {
+    crate::CliError::Precondition(format!(
+        "scan state: {}: NoSpace",
+        super::display_path(state)
+    ))
+    .into()
+}
+fn direct_scan_error(
+    error: tidemark_scan::orchestrator::ScanError,
+    state: &std::path::Path,
+) -> anyhow::Error {
+    if matches!(error, tidemark_scan::orchestrator::ScanError::NoSpace) {
+        no_space(state)
+    } else {
+        anyhow::Error::from(scan_error(error))
+            .context(format!("scan state: {}", super::display_path(state)))
+    }
+}
+fn daemon_scan_error(error: anyhow::Error, state: &std::path::Path) -> anyhow::Error {
+    // Keep the frozen API refusal and exit code; format its human subject locally.
+    if matches!(error.downcast_ref::<crate::CliError>(),
+        Some(crate::CliError::Unavailable(message)) if message.starts_with("scan: NoSpace"))
+    {
+        no_space(state)
+    } else {
+        error
+    }
 }
 
 pub(crate) fn scan_error(e: tidemark_scan::orchestrator::ScanError) -> crate::CliError {
@@ -337,6 +357,52 @@ pub(crate) fn daemon_connection(
         }
     }
 }
+/// Prepare offline storage with definitive daemon absence checked under recovery locks.
+pub(crate) fn offline_catalog(
+    context: &crate::Context,
+) -> anyhow::Result<tidemark_store::catalog::Catalog> {
+    let state = &context.config.general.state_dir;
+    require_absent_daemon(context)?;
+    let needs_recovery = match tidemark_store::catalog::Catalog::open(state, false) {
+        Ok(_) => false,
+        Err(tidemark_store::StoreError::Sql(ref e))
+            if e.sqlite_error()
+                .is_some_and(|e| matches!(e.extended_code & 255, 11 | 26)) =>
+        {
+            true
+        }
+        Err(_) => !state.join("timeseries.db").exists(),
+    };
+    if needs_recovery {
+        let lease = tidemark_store::lease::RecoveryLease::acquire(
+            state,
+            std::time::Duration::from_secs(30),
+        )?;
+        let lock = tidemark_scan::orchestrator::ScanLock::acquire(state).map_err(scan_error)?;
+        require_absent_daemon(context)?;
+        let files = match tidemark_store::catalog::Catalog::open(state, false) {
+            Ok(_) => Vec::new(),
+            Err(tidemark_store::StoreError::Sql(ref e))
+                if e.sqlite_error()
+                    .is_some_and(|e| matches!(e.extended_code & 255, 11 | 26)) =>
+            {
+                lock.recover_catalog(state, &lease).map_err(scan_error)?
+            }
+            Err(_) if !state.join("timeseries.db").exists() => {
+                lock.recover_catalog(state, &lease).map_err(scan_error)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        drop(lock);
+        drop(lease);
+        Ok(tidemark_store::catalog::Catalog::open_after_recovery(
+            state, files,
+        )?)
+    } else {
+        Ok(tidemark_store::catalog::Catalog::open(state, true)?)
+    }
+}
+
 fn require_absent_daemon(context: &crate::Context) -> anyhow::Result<()> {
     if daemon_connection(context)?.is_some() {
         return Err(crate::CliError::Precondition(
@@ -371,5 +437,41 @@ fn completed_outcome(
             "outcome unavailable for daemon scan {id}; no clean completed catalog entry"
         ))
         .into()),
+    }
+}
+
+#[cfg(test)]
+mod lease_refusal_tests {
+    #[test]
+    fn no_space_paths_have_identical_text_and_exit() {
+        let state = std::path::Path::new("/private/state");
+        let direct =
+            super::direct_scan_error(tidemark_scan::orchestrator::ScanError::NoSpace, state);
+        let daemon = super::daemon_scan_error(
+            crate::CliError::Unavailable("scan: NoSpace: floor".into()).into(),
+            state,
+        );
+        assert_eq!(direct.to_string(), "scan state: /private/state: NoSpace");
+        assert_eq!(direct.to_string(), daemon.to_string());
+        assert_eq!(
+            direct
+                .downcast_ref::<crate::CliError>()
+                .map(crate::CliError::exit_code),
+            Some(5)
+        );
+        assert_eq!(
+            daemon
+                .downcast_ref::<crate::CliError>()
+                .map(crate::CliError::exit_code),
+            Some(5)
+        );
+        assert!(matches!(
+            direct.downcast_ref::<crate::CliError>(),
+            Some(crate::CliError::Precondition(_))
+        ));
+        assert!(matches!(
+            daemon.downcast_ref::<crate::CliError>(),
+            Some(crate::CliError::Precondition(_))
+        ));
     }
 }

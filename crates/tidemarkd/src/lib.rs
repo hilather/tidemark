@@ -261,6 +261,109 @@ mod tests {
         assert_eq!(catalog.recovery_files().len(), 3);
     }
     #[test]
+    fn startup_refuses_pre_api_writer() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::pre_api_writer_child"])
+            .env("TIDEMARK_PRE_API_WRITER", dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("ready").exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut originals = Vec::new();
+        for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"corrupt fixture").unwrap();
+            originals.push((path.clone(), std::fs::metadata(path).unwrap().ino()));
+        }
+        let start = Instant::now();
+        let error = startup_catalog(dir.path(), 100, Duration::from_millis(60))
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("state directory in use by another tidemark process"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        for (path, inode) in originals {
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+            assert_eq!(std::fs::read(path).unwrap(), b"corrupt fixture");
+        }
+        assert!(!dir.path().join("timeseries-recovery-0").exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            startup_catalog(dir.path(), 100, Duration::ZERO)
+                .unwrap()
+                .recovery_files()
+                .len(),
+            3
+        );
+    }
+    #[test]
+    fn racing_corrupt_starts_recover_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("timeseries.db"), b"corruption").unwrap();
+        let mut children = Vec::new();
+        for id in ["one", "two"] {
+            children.push(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "tests::racing_start_child"])
+                    .env("TIDEMARK_RACING_START", dir.path())
+                    .env("TIDEMARK_RACING_ID", id)
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("one").exists() || !dir.path().join("two").exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(dir.path().join("go"), b"go").unwrap();
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        assert!(dir.path().join("timeseries-recovery-0").exists());
+        assert!(!dir.path().join("timeseries-recovery-1").exists());
+        assert!(tidemark_store::catalog::Catalog::open(dir.path(), false).is_ok());
+    }
+    #[test]
+    fn racing_start_child() {
+        let Some(path) = std::env::var_os("TIDEMARK_RACING_START") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        std::fs::write(
+            path.join(std::env::var_os("TIDEMARK_RACING_ID").unwrap()),
+            b"ready",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.join("go").exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let catalog = startup_catalog(&path, 100, Duration::from_secs(2)).unwrap();
+        assert!(catalog.list(None).unwrap().is_empty());
+    }
+    #[test]
+    fn pre_api_writer_child() {
+        let Some(path) = std::env::var_os("TIDEMARK_PRE_API_WRITER") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let _catalog = tidemark_store::catalog::Catalog::open(&path, true).unwrap();
+        let _series =
+            tidemark_store::timeseries::TimeSeries::open(&path.join("timeseries.db"), true)
+                .unwrap();
+        std::fs::write(path.join("ready"), b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+    #[test]
     fn recovery_scan_lock_child() {
         let Some(path) = std::env::var_os("TIDEMARK_RECOVERY_LOCK_CHILD") else {
             return;
@@ -274,10 +377,143 @@ mod tests {
     fn healthy_catalog_does_not_wait_for_scan_lock() {
         let dir = tempfile::tempdir().unwrap();
         drop(tidemark_store::catalog::Catalog::open(dir.path(), true).unwrap());
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::pre_api_writer_child"])
+            .env("TIDEMARK_PRE_API_WRITER", dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("ready").exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _lock = tidemark_scan::orchestrator::ScanLock::acquire(dir.path()).unwrap();
         let start = Instant::now();
         drop(startup_catalog(dir.path(), 100, Duration::from_secs(30)).unwrap());
         assert!(start.elapsed() < Duration::from_secs(1));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    #[test]
+    fn startup_pressure_types_retry_at_lock_and_store_seams() {
+        use tidemark_scan::orchestrator::ScanError;
+        for code in [24, 12] {
+            for seam in 0..7 {
+                let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
+                let shutdown = Shutdown::default();
+                let mut attempts = 0;
+                let result = retry_start("catalog", &state, &shutdown, || {
+                    attempts += 1;
+                    if attempts == 1 {
+                        let io = std::io::Error::from_raw_os_error(code);
+                        let io = if seam >= 4 {
+                            // StateDir retains ErrorKind but not errno in its path context.
+                            std::io::Error::new(
+                                io.kind(),
+                                format!("state directory /fixture: {io}"),
+                            )
+                        } else {
+                            io
+                        };
+                        let error = match seam % 4 {
+                            0 => startup_scan_error(ScanError::Io(io)),
+                            1 => startup_scan_error(ScanError::Store(
+                                tidemark_store::StoreError::Io(io),
+                            )),
+                            2 => startup_lease_error(io),
+                            _ => startup_scan_error(ScanError::Sys(
+                                rustix::io::Errno::from_raw_os_error(code),
+                            )),
+                        };
+                        assert!(daemon_pressure(&error));
+                        Err(error)
+                    } else {
+                        Ok(42)
+                    }
+                })
+                .unwrap();
+                assert_eq!(result, 42);
+                assert_eq!(attempts, 2);
+            }
+        }
+        let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
+        let mut attempts = 0;
+        let result = retry_start::<()>("catalog", &state, &Shutdown::default(), || {
+            attempts += 1;
+            Err(startup_scan_error(ScanError::Busy))
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("state directory in use"));
+        assert_eq!(attempts, 1);
+    }
+    #[test]
+    fn startup_retries_real_descriptor_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(tidemark_store::catalog::Catalog::open(dir.path(), true).unwrap());
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::startup_emfile_child"])
+            .env("TIDEMARK_STARTUP_EMFILE", dir.path())
+            .status()
+            .unwrap();
+        assert!(child.success());
+    }
+    #[test]
+    fn startup_emfile_child() {
+        let Some(path) = std::env::var_os("TIDEMARK_STARTUP_EMFILE") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        rustix::process::setrlimit(
+            rustix::process::Resource::Nofile,
+            rustix::process::Rlimit {
+                current: Some(64),
+                maximum: limit.maximum,
+            },
+        )
+        .unwrap();
+        let mut held = Vec::with_capacity(64);
+        for _ in 0..64 {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => held.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(24));
+                    break;
+                }
+            }
+        }
+        let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
+        let mut attempts = 0;
+        let catalog = retry_start("catalog", &state, &Shutdown::default(), || {
+            attempts += 1;
+            let result = startup_catalog(&path, 100, Duration::ZERO);
+            if attempts == 1 {
+                let error = result.err().unwrap();
+                assert!(daemon_pressure(&error), "{error}");
+                held.clear();
+                Err(error)
+            } else {
+                result
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert!(catalog.list(None).unwrap().is_empty());
+    }
+    #[test]
+    fn startup_initializes_empty_database_without_self_conflicting_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        tidemark_store::state_dir::StateDir::open(dir.path(), true)
+            .unwrap()
+            .open_leaf(std::ffi::OsStr::new("timeseries.db"), true, true)
+            .unwrap();
+        let catalog = startup_catalog(dir.path(), 100, Duration::ZERO).unwrap();
+        assert!(catalog.list(None).unwrap().is_empty());
+        assert!(catalog.recovery_files().is_empty());
+        assert!(dir.path().join("timeseries.db.bak-v0").exists());
+        assert!(!dir.path().join("timeseries-recovery-0").exists());
     }
     #[test]
     fn requested_shutdown_preserves_first_startup_attempt() {
@@ -691,7 +927,12 @@ fn retry_start<T>(
 
 // Resource pressure must be contained by the component owning the retry loop.
 pub(crate) fn resource_pressure(error: &std::io::Error) -> bool {
+    // The pinned toolchain maps EMFILE/ENFILE to a distinct kind whose variant
+    // name is still unstable. Compare typed kinds through the stable errno API.
+    let descriptor_kind =
+        std::io::Error::from_raw_os_error(rustix::io::Errno::MFILE.raw_os_error()).kind();
     error.kind() == std::io::ErrorKind::OutOfMemory
+        || error.kind() == descriptor_kind
         || error.raw_os_error().is_some_and(|code| {
             [
                 rustix::io::Errno::MFILE,
@@ -1184,8 +1425,21 @@ fn startup_catalog(
             drop(catalog);
             false
         }
-        Err(error) if corrupt(&error) => true,
+        Err(error) if corrupt(&error) || uninitialized(&error) => true,
         Err(_) => !storage.join("timeseries.db").exists(),
+    };
+    let recovery_lease = if needs_recovery {
+        Some(
+            tidemark_store::lease::RecoveryLease::acquire(storage, wait)
+                .map_err(startup_lease_error)?,
+        )
+    } else {
+        None
+    };
+    let writer_lease = if needs_recovery {
+        None
+    } else {
+        Some(tidemark_store::lease::WriterLease::acquire(storage).map_err(startup_lease_error)?)
     };
     let deadline = Instant::now() + wait;
     let lock = loop {
@@ -1203,15 +1457,47 @@ fn startup_catalog(
                 );
             }
             Err(tidemark_scan::orchestrator::ScanError::Busy) => break None,
-            Err(error) => return Err(DaemonError::Store(error.to_string())),
+            Err(error) => return Err(startup_scan_error(error)),
         }
     };
+    if let Some(lease) = recovery_lease {
+        let held = lock
+            .as_ref()
+            .ok_or_else(|| DaemonError::Store("recovery requires scan ownership".into()))?;
+        // A racing start may already have recovered while we waited for ownership.
+        let files = match tidemark_store::catalog::Catalog::open(storage, false) {
+            Ok(_) => Vec::new(),
+            Err(error) if corrupt(&error) => held
+                .recover_catalog(storage, &lease)
+                .map_err(startup_scan_error)?,
+            Err(_) if !storage.join("timeseries.db").exists() => held
+                .recover_catalog(storage, &lease)
+                .map_err(startup_scan_error)?,
+            Err(error) if uninitialized(&error) => {
+                tidemark_store::catalog::Catalog::initialize_with_lease(storage, &lease)
+                    .map_err(startup_store_error)?;
+                Vec::new()
+            }
+            Err(error) => return Err(startup_store_error(error)),
+        };
+        drop(lock);
+        drop(lease);
+        let catalog = tidemark_store::catalog::Catalog::open_after_recovery(storage, files)
+            .map_err(startup_store_error)?;
+        // Cleanup requires scan exclusion after normal writer ownership is retained.
+        match tidemark_scan::orchestrator::ScanLock::acquire(storage) {
+            Ok(_lock) => tidemark_store::catalog::cleanup_abandoned_scans(storage, now),
+            Err(tidemark_scan::orchestrator::ScanError::Busy) => {
+                tracing::info!("startup scan cleanup skipped: host scan lock is held");
+            }
+            Err(error) => return Err(startup_scan_error(error)),
+        }
+        return Ok(catalog);
+    }
+    let _writer_lease = writer_lease;
     let catalog = match &lock {
         Some(lock) => {
-            let catalog = lock.open_catalog(storage).map_err(|e| match e {
-                tidemark_scan::orchestrator::ScanError::Store(error) => startup_store_error(error),
-                error => DaemonError::Store(error.to_string()),
-            })?;
+            let catalog = lock.open_catalog(storage).map_err(startup_scan_error)?;
             tidemark_store::catalog::cleanup_abandoned_scans(storage, now);
             catalog
         }
@@ -1221,6 +1507,40 @@ fn startup_catalog(
         }
     };
     Ok(catalog)
+}
+
+fn startup_lease_error(source: std::io::Error) -> DaemonError {
+    if source.kind() == std::io::ErrorKind::WouldBlock {
+        DaemonError::Store(source.to_string())
+    } else {
+        DaemonError::Io {
+            context: "writer lease".into(),
+            source,
+        }
+    }
+}
+
+fn startup_scan_error(error: tidemark_scan::orchestrator::ScanError) -> DaemonError {
+    use tidemark_scan::orchestrator::ScanError;
+    match error {
+        ScanError::Io(source) => DaemonError::Io {
+            context: "startup scan ownership".into(),
+            source,
+        },
+        ScanError::Sys(source) => DaemonError::Io {
+            context: "startup scan ownership".into(),
+            source: source.into(),
+        },
+        ScanError::Store(error) => startup_store_error(error),
+        ScanError::Busy => {
+            DaemonError::Store("state directory in use by another tidemark process".into())
+        }
+        error => DaemonError::Store(error.to_string()),
+    }
+}
+
+fn uninitialized(error: &tidemark_store::StoreError) -> bool {
+    matches!(error, tidemark_store::StoreError::Invalid(message) if message == "uninitialized timeseries database")
 }
 
 fn corrupt(e: &tidemark_store::StoreError) -> bool {

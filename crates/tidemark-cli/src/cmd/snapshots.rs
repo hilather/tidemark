@@ -67,6 +67,16 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         )
         .into());
     }
+    if matches!(args.command, Command::RebuildCatalog { .. }) {
+        require_absent_daemon(context)?;
+        drop(super::scan::offline_catalog(context)?);
+    }
+    let _writer_lease = if mutation {
+        require_absent_daemon(context)?;
+        Some(Catalog::open(state, true)?)
+    } else {
+        None
+    };
     let lock = if mutation {
         require_absent_daemon(context)?;
         Some(
