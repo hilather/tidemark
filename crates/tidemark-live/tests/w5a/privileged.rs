@@ -392,3 +392,25 @@ fn paced_writer_child() {
         "VM cannot sustain calibrated load"
     );
 }
+
+#[test]
+fn watcher_mount_identity_matches_loop_xfs_mountinfo() {
+    let fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
+    let watch = watcher(options(&fs.mountpoint));
+    let mounts = tidemark_fs::mount::read_mountinfo().unwrap();
+    let mount_path = RawPath::from_path(&fs.mountpoint).unwrap();
+    let mounted = mounts.iter().find(|m| m.mount_point == mount_path).unwrap();
+    let parent_path = RawPath::from_path(fs.mountpoint.parent().unwrap()).unwrap();
+    let parent = mounts
+        .iter()
+        .filter(|m| parent_path.starts_with(&m.mount_point))
+        .max_by_key(|m| m.mount_point.as_bytes().len())
+        .unwrap();
+    assert_eq!(
+        watch.mount_identity().unwrap(),
+        (u64::from(mounted.id), mounted.major, mounted.minor)
+    );
+    assert_ne!(mounted.id, parent.id);
+    assert_ne!(mounted.dev, parent.dev);
+    watch.stop();
+}
