@@ -70,4 +70,24 @@ The first regression uses ordinary `umount` through LoopXfs cleanup, with no laz
 
 ## Validation
 
-Initial targeted suites: 292 passing test results, zero failures (includes guards and empty suites); ring follow-up: 15 passed; concurrent-shutdown regression: 1 passed. Commands use `timeout 1500` and offline dependencies. Final required check results and aggregate counts will be appended after completion.
+Initial targeted suites: 292 passing test results, zero failures (includes guards and empty suites); ring follow-up: 15 passed; concurrent-shutdown regression: 1 passed. Commands use `timeout 1500` and offline dependencies. Final results follow. Counts sum test-result summaries, including nested helper processes, empty suites and guarded early returns; they are not counts of distinct fully exercised scenarios.
+
+
+| Required check | Observed result | Evidence in attempt output library |
+|---|---|---|
+| `timeout 1500 cargo fmt --check` | Exit 0 on final source | `watch-fmt-final.log`, `.exit` |
+| `timeout 1500 cargo clippy --workspace --all-targets -- -D warnings` | Exit 0 on final source | `watch-clippy-final.log`, `.exit` |
+| `timeout 1500 cargo clippy --workspace --all-targets --features privileged -- -D warnings` | Exit 0 on final source; no privileged execution | `watch-priv-clippy-latest.log`, `.exit` |
+| `timeout 1500 cargo test --workspace --no-fail-fast` | Standalone exit 0, 859 passed, 0 failed, 14 ignored; final-source invocation through CI: 860 passed, 0 failed, 14 ignored, 79 summaries | `watch-workspace.log`, `.exit`; `watch-ci-final.log`; `counts.json` |
+| `timeout 1500 cargo build --workspace --features privileged --tests` | Standalone exit 0; final-source CI invocation also exit 0 | `watch-priv-build.log`, `.exit`; `watch-ci-final.log` |
+| `timeout 1500 tools/ci.sh` | Exit 0; 149 owner tags and forbidden-symbol scan passed; fmt, Clippy, tests and privileged build passed; cargo-deny explicitly skipped because absent | `watch-ci-final.log`, `.exit` |
+
+All commands used the pinned compiler via PATH, `CARGO_HOME=/tmp/watch-bounds-cargo`, `CARGO_NET_OFFLINE=true`, and the workspace/CI runs explicitly set `umask 022`. The standalone workspace run preceded the last FID regression; final CI covers that additional test and all final source changes. A separate final-source `w6a1 --nocapture` probe exited 0 with 30 reported passes and **five explicit readiness-test deferrals** because Unix socket binds are denied. Its central guarded readiness assertions were not executed here (`watch-readiness-guards.log`). Other socket/namespace/permission guards remain limits; ordinary-user CI and guests must exercise them. Syntax-only checks passed for `tools/ci.sh`, seven fault/install scripts; none of those fault/install scripts was executed (`watch-shell-syntax.log`).
+
+## Completion evidence and remaining uncertainty
+
+- Only `watch/fidmode.rs`, `watch/mod.rs`, `watch/rings.rs` and this handoff differ from the canonical baseline. The nine prior commits remain ancestors; no history rewriting or integration operation.
+- Public signatures called outside scope remain unchanged. Additional test coverage and changes use existing dependencies only.
+- Privileged normal-unmount test is written and compiled, **pending VM**. No privileged runtime, RSS soak, actual allocator-OOM injection, real ShellCheck or dependency-advisory acceptance is claimed.
+- Required local checks completed; independent review, merged-result CI and guest acceptance remain with the coordinator.
+- All changes committed before cleanup. Cargo-clean result, final clean Git status, candidate ID and submission receipt are retained in the attempt report/library.
