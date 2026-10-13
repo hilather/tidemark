@@ -184,28 +184,51 @@ impl MinuteHistory {
         };
         let start = last.started_at.saturating_sub((count as i64 - 1) * 60);
         let rows: Vec<_> = self.0.iter().filter(|m| m.started_at >= start).collect();
+        // Boundaries may be supplied by either adjacent completed minute.
+        // A gap removes hot data, but does not erase known cumulative totals.
+        let boundary = |at| {
+            let mut total = None;
+            for minute in &self.0 {
+                for candidate in [
+                    (minute.started_at, minute.overflow_total_at_start),
+                    (
+                        minute.started_at.saturating_add(60),
+                        minute.overflow_total_at_end,
+                    ),
+                ] {
+                    if candidate.0 == at {
+                        if total.is_some_and(|old| old != candidate.1) {
+                            return None;
+                        }
+                        total = Some(candidate.1);
+                    }
+                }
+            }
+            total
+        };
+        let consistent = rows
+            .iter()
+            .all(|m| m.overflow_total_at_end >= m.overflow_total_at_start)
+            && rows.windows(2).all(|pair| {
+                if pair[0].started_at.saturating_add(60) == pair[1].started_at {
+                    pair[0].overflow_total_at_end == pair[1].overflow_total_at_start
+                } else {
+                    pair[0].overflow_total_at_end <= pair[1].overflow_total_at_start
+                }
+            });
+        let overflows = if consistent {
+            boundary(start).and_then(|s| {
+                boundary(last.started_at.saturating_add(60)).and_then(|e| e.checked_sub(s))
+            })
+        } else {
+            None
+        };
         if rows.len() != count
             || rows
                 .iter()
                 .enumerate()
                 .any(|(i, m)| m.started_at != start + i as i64 * 60)
-        {
-            return (None, None);
-        }
-        let first = rows[0];
-        let consistent = rows
-            .iter()
-            .all(|m| m.overflow_total_at_end >= m.overflow_total_at_start)
-            && rows
-                .windows(2)
-                .all(|pair| pair[0].overflow_total_at_end == pair[1].overflow_total_at_start);
-        let overflows = consistent
-            .then(|| {
-                last.overflow_total_at_end
-                    .checked_sub(first.overflow_total_at_start)
-            })
-            .flatten();
-        if !consistent
+            || !consistent
             || rows.iter().any(|m| {
                 m.lossy
                     || m.truncated
@@ -452,7 +475,8 @@ mod tests {
         h.0[1].overflow_total_at_end = 15;
         assert_eq!(h.facts(2), (None, Some(5)));
         h.0[1].started_at = 180;
-        assert_eq!(h.facts(2), (None, None));
+        assert_eq!(h.facts(2), (None, Some(2)));
+        assert_eq!(h.facts(3), (None, Some(5)));
         h.0[1].started_at = 120;
         h.0[1].overflow_total_at_start = 9;
         assert_eq!(h.facts(2), (None, None));
@@ -479,6 +503,24 @@ mod tests {
             h.push(m);
         }
         assert_eq!(h.facts(11), (None, Some(0)));
+    }
+    #[test]
+    fn restart_and_duplicate_boundaries_do_not_supply_old_counts() {
+        let mut history = MinuteHistory::default();
+        history.push(minute(60, 0));
+        history.push(minute(120, 0));
+        assert_eq!(history.facts(2).1, Some(0));
+        // Production creates a fresh history whenever a watcher is replaced.
+        history = MinuteHistory::default();
+        history.push(minute(180, 0));
+        assert_eq!(history.facts(3), (None, None));
+        history.push(minute(180, 0));
+        assert_eq!(history.facts(2), (None, None));
+        let mut reset = minute(240, 0);
+        reset.overflow_total_at_start = 0;
+        reset.overflow_total_at_end = 0;
+        history.push(reset);
+        assert_eq!(history.facts(2), (None, None));
     }
     #[test]
     fn injected_watcher_minutes_publish_through_real_reader_and_engine() {
