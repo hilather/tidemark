@@ -8,6 +8,7 @@ if ! { [ "$#" -ge 1 ] && [ "$#" -le 2 ]; }; then
 fi
 package=$(realpath "$1")
 version=${2:-0.1.0}
+# shellcheck disable=SC2164 # set -e exits if this directory change fails.
 cd "$(dirname "$0")/.."
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "OK: $*"; }

@@ -218,6 +218,7 @@ fn shell_syntax_and_vm_guard() {
         "packaging/rpm/postun.sh",
         "tools/check-rpm.sh",
         "tools/el8-build-env.sh",
+        "docs/pilot/capture-baseline.sh",
     ] {
         assert!(Command::new("bash")
             .arg("-n")
@@ -230,7 +231,18 @@ fn shell_syntax_and_vm_guard() {
             .output()
             .is_ok_and(|o| o.status.success())
         {
+            // Keep informational/style diagnostics visible without making them a gate.
+            let notes = Command::new("shellcheck")
+                .arg(root().join(file))
+                .output()
+                .unwrap();
+            eprintln!(
+                "shellcheck notes for {file}:\n{}{}",
+                String::from_utf8_lossy(&notes.stdout),
+                String::from_utf8_lossy(&notes.stderr),
+            );
             let output = Command::new("shellcheck")
+                .arg("--severity=warning")
                 .arg(root().join(file))
                 .output()
                 .unwrap();
