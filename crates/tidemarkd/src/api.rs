@@ -3,10 +3,7 @@
 use crate::DaemonError;
 use std::{
     io::{Read, Write},
-    os::unix::{
-        fs::{FileTypeExt, PermissionsExt},
-        net::{UnixListener, UnixStream},
-    },
+    os::unix::net::{UnixListener, UnixStream},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -17,8 +14,78 @@ use tidemark_core::api::*;
 const LIMIT: usize = 1024 * 1024;
 const CONNECTIONS: usize = 32;
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Cooperative request cancellation and absolute handler deadline.
+/// Cancellation cannot interrupt a kernel/SQLite call already in progress (R3-7).
+#[derive(Clone)]
+pub struct Cancellation {
+    phase: Arc<AtomicUsize>,
+    shutdown: crate::Shutdown,
+    deadline: Instant,
+}
+impl Cancellation {
+    /// Create an execution budget that also observes lifecycle shutdown.
+    pub fn new(shutdown: crate::Shutdown, timeout: Duration) -> Self {
+        Self {
+            phase: Arc::new(AtomicUsize::new(0)),
+            shutdown,
+            deadline: Instant::now() + timeout,
+        }
+    }
+    /// Reject uncommitted work when cancellation, shutdown or the deadline wins.
+    pub fn check(&self) -> Result<(), DaemonError> {
+        if self.phase.load(Ordering::Acquire) == 1
+            || self.shutdown.load(Ordering::Acquire)
+            || Instant::now() >= self.deadline
+        {
+            Err(DaemonError::Shutdown)
+        } else {
+            Ok(())
+        }
+    }
+    fn cancel(&self) {
+        let _ = self
+            .phase
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+    }
+    /// Claim the configuration commit boundary atomically against cancellation.
+    /// Once claimed, publication completes even if a transport timeout follows;
+    /// clients must treat a timeout during commit as an uncertain outcome.
+    pub fn begin_commit(&self) -> Result<(), DaemonError> {
+        self.check()?;
+        self.phase
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| DaemonError::Shutdown)
+    }
+}
+/// Internal reload execution contract. Production implementations observe the budget.
+pub trait ReloadCallback: Send + Sync {
+    /// Execute a reload with cooperative cancellation and an absolute deadline.
+    fn call(&self, cancellation: &Cancellation) -> Result<ConfigReloadResult, DaemonError>;
+}
+// Retain compatibility for existing injected zero-argument test callbacks.
+// Such callbacks are owned/joined but cannot promise cooperative cancellation.
+impl<F> ReloadCallback for F
+where
+    F: Fn() -> Result<ConfigReloadResult, DaemonError> + Send + Sync,
+{
+    fn call(&self, cancellation: &Cancellation) -> Result<ConfigReloadResult, DaemonError> {
+        cancellation.check()?;
+        self()
+    }
+}
 /// Validating lifecycle reload callback, retaining the old config on failure.
-pub type Reload = Arc<dyn Fn() -> Result<ConfigReloadResult, DaemonError> + Send + Sync>;
+pub type Reload = Arc<dyn ReloadCallback>;
+/// Adapt a callback that explicitly consumes the request execution budget.
+pub struct CooperativeReload<F>(pub F);
+impl<F> ReloadCallback for CooperativeReload<F>
+where
+    F: Fn(&Cancellation) -> Result<ConfigReloadResult, DaemonError> + Send + Sync,
+{
+    fn call(&self, cancellation: &Cancellation) -> Result<ConfigReloadResult, DaemonError> {
+        (self.0)(cancellation)
+    }
+}
 /// Shared handler dependencies; measurements remain in LiveState.
 pub struct Context {
     /// Measurement publication handle.
@@ -70,6 +137,21 @@ pub fn dispatch(
     context: &Context,
     now: i64,
 ) -> Result<Response, DaemonError> {
+    dispatch_controlled(
+        request,
+        peer_uid,
+        context,
+        now,
+        &Cancellation::new(Arc::new(std::sync::atomic::AtomicBool::new(false)), TIMEOUT),
+    )
+}
+fn dispatch_controlled(
+    request: &Request,
+    peer_uid: u32,
+    context: &Context,
+    now: i64,
+    cancellation: &Cancellation,
+) -> Result<Response, DaemonError> {
     if peer_uid != 0 {
         return Ok(error(
             &request.id,
@@ -85,6 +167,7 @@ pub fn dispatch(
         ));
     }
     let result = (|| {
+        cancellation.check()?;
         let view = context.state.view_at(now);
         match request.method.as_str() {
             "status" => {
@@ -108,7 +191,7 @@ pub fn dispatch(
             "scan.cancel" => value(context.scans.cancel(&params(request)?)?),
             "config.reload" => {
                 let _: ConfigReloadParams = params(request)?;
-                value((context.reload)()?)
+                value(context.reload.call(cancellation)?)
             }
             _ => Err(DaemonError::Invalid("unknown method".into())),
         }
@@ -130,6 +213,17 @@ impl Drop for Permit {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
+// A connection owns its handler even after a transport timeout. Joining here
+// also makes service shutdown wait for callbacks and retain the admission slot.
+// R3-7: neither a deadline nor shutdown can interrupt kernel I/O in progress.
+struct Handler(Option<std::thread::JoinHandle<()>>);
+impl Drop for Handler {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = handle.join();
+        }
+    }
+}
 fn io(e: std::io::Error) -> DaemonError {
     DaemonError::Io {
         context: "API socket".into(),
@@ -149,7 +243,12 @@ impl Write for Frame {
         Ok(())
     }
 }
-fn send(stream: &mut UnixStream, response: &Response) -> std::io::Result<()> {
+fn send(
+    stream: &mut UnixStream,
+    response: &Response,
+    shutdown: &crate::Shutdown,
+    timeout: Duration,
+) -> std::io::Result<()> {
     let mut bytes = Frame(Vec::with_capacity(8192));
     if serde_json::to_writer(&mut bytes, response).is_err() {
         bytes.0.clear();
@@ -163,8 +262,32 @@ fn send(stream: &mut UnixStream, response: &Response) -> std::io::Result<()> {
         )
         .map_err(std::io::Error::other)?;
     }
-    stream.write_all(&bytes.0)?;
-    stream.write_all(b"\n")
+    bytes.0.push(b'\n');
+    let deadline = Instant::now() + timeout;
+    let mut offset = 0;
+    while offset < bytes.0.len() {
+        if shutdown.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        stream.set_write_timeout(Some(remaining.min(Duration::from_millis(50))))?;
+        match stream.write(&bytes.0[offset..]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => offset += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 fn connection(
     mut stream: UnixStream,
@@ -173,17 +296,27 @@ fn connection(
     permit: Permit,
     peer: PeerCredentials,
     timeout: Duration,
+    accepted: Instant,
 ) {
     let (uid, pid) = match peer(&stream) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    if uid != 0 {
+        return;
+    }
+    let mut read_deadline = accepted + timeout;
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .is_err()
+    {
+        return;
+    }
     let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
     let mut line = Vec::with_capacity(8192);
     let mut buffer = [0; 8192];
     let permit = Arc::new(permit);
-    while !shutdown.load(Ordering::Acquire) {
+    while !shutdown.load(Ordering::Acquire) && Instant::now() < read_deadline {
         let n = match stream.read(&mut buffer) {
             Ok(0) => return,
             Ok(n) => n,
@@ -200,13 +333,15 @@ fn connection(
             Err(_) => return,
         };
         for &b in &buffer[..n] {
-            if shutdown.load(Ordering::Acquire) {
+            if shutdown.load(Ordering::Acquire) || Instant::now() >= read_deadline {
                 return;
             }
             if line.len() + 1 > LIMIT {
                 let _ = send(
                     &mut stream,
                     &error("", ApiErrorCode::BadRequest, "request line exceeds 1 MiB"),
+                    &shutdown,
+                    timeout,
                 );
                 return;
             }
@@ -221,11 +356,14 @@ fn connection(
                     if send(
                         &mut stream,
                         &error("", ApiErrorCode::BadRequest, e.to_string()),
+                        &shutdown,
+                        timeout,
                     )
                     .is_err()
                     {
                         return;
                     }
+                    read_deadline = Instant::now() + timeout;
                     continue;
                 }
             };
@@ -235,24 +373,35 @@ fn connection(
             let ctx = context.clone();
             let retained = permit.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
+            let cancellation = Cancellation::new(shutdown.clone(), timeout);
+            let budget = cancellation.clone();
             // A timed-out handler retains its admission permit until it exits,
             // bounding even callbacks that cannot be cancelled by their owner.
             let spawned = std::thread::Builder::new()
                 .name("api-handler".into())
                 .spawn(move || {
                     let _retained = retained;
-                    let _ = tx.send(dispatch(&request, uid, &ctx, crate::unix_now()));
+                    let _ = tx.send(dispatch_controlled(
+                        &request,
+                        uid,
+                        &ctx,
+                        crate::unix_now(),
+                        &budget,
+                    ));
                 });
-            if spawned.is_err() {
-                return;
-            }
-            let deadline = Instant::now() + timeout;
+            let _handler = match spawned {
+                Ok(handle) => Handler(Some(handle)),
+                Err(_) => return,
+            };
+            let deadline = cancellation.deadline;
             let mut timed_out = false;
             let response = loop {
                 if shutdown.load(Ordering::Acquire) {
+                    cancellation.cancel();
                     return;
                 }
                 if Instant::now() >= deadline {
+                    cancellation.cancel();
                     timed_out = true;
                     break error(&id, ApiErrorCode::Unavailable, "handler timed out");
                 }
@@ -263,12 +412,204 @@ fn connection(
                     Err(_) => break error(&id, ApiErrorCode::Internal, "handler disconnected"),
                 }
             };
-            if send(&mut stream, &response).is_err() {
+            if send(&mut stream, &response, &shutdown, timeout).is_err() {
                 return;
             }
             // Do not admit more handlers on a connection with a stuck callback.
             if timed_out {
                 return;
+            }
+            read_deadline = Instant::now() + timeout;
+        }
+    }
+}
+// Unix bind/connect have no *at variant. Their pathname is derived exclusively
+// from this retained directory fd, never from the mutable configured ancestry.
+struct SocketPath {
+    parent: std::os::fd::OwnedFd,
+    name: std::ffi::OsString,
+    identity: Option<(u64, u64)>,
+}
+impl SocketPath {
+    fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        use rustix::fs::{self, Mode, OFlags};
+        use std::path::Component;
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("socket parent missing"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("socket name missing"))?;
+        if !path.is_absolute() {
+            return Err(std::io::Error::other("socket path must be absolute"));
+        }
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut fd = fs::open("/", flags, Mode::empty())?;
+        let uid = rustix::process::geteuid().as_raw();
+        let mut sticky = false;
+        for component in parent.components() {
+            let stat = fs::fstat(&fd)?;
+            // The sandbox has an immutable root filesystem owned by nobody.
+            // An untrusted owner cannot mutate a read-only mount; writable
+            // filesystems still require root or the daemon uid throughout.
+            if stat.st_uid != 0
+                && stat.st_uid != uid
+                && !fs::fstatvfs(&fd)?
+                    .f_flag
+                    .contains(fs::StatVfsMountFlags::RDONLY)
+            {
+                return Err(std::io::Error::other("socket ancestor has untrusted owner"));
+            }
+            if stat.st_mode & 0o022 != 0 {
+                if stat.st_mode & 0o1000 == 0 {
+                    return Err(std::io::Error::other(
+                        "socket ancestor is writable by another user",
+                    ));
+                }
+                sticky = true;
+            }
+            let name = match component {
+                Component::RootDir => continue,
+                Component::Normal(name) => name,
+                _ => return Err(std::io::Error::other("unsafe socket ancestor component")),
+            };
+            fd = match fs::openat(&fd, name, flags | OFlags::NOATIME, Mode::empty()) {
+                Err(rustix::io::Errno::PERM) => fs::openat(&fd, name, flags, Mode::empty())?,
+                result => result?,
+            };
+            if sticky {
+                let child = fs::fstat(&fd)?;
+                if child.st_uid != uid || child.st_mode & 0o777 != 0o700 {
+                    return Err(std::io::Error::other(
+                        "sticky ancestor requires a private owned descendant",
+                    ));
+                }
+                sticky = false;
+            }
+        }
+        let stat = fs::fstat(&fd)?;
+        if (stat.st_uid != 0 && stat.st_uid != uid) || stat.st_mode & 0o022 != 0 {
+            return Err(std::io::Error::other("socket parent is not trusted"));
+        }
+        // Serialize cooperating startup/stale removal in this API directory.
+        fs::flock(&fd, fs::FlockOperation::NonBlockingLockExclusive)?;
+        Ok(Self {
+            parent: fd,
+            name: name.to_owned(),
+            identity: None,
+        })
+    }
+    fn address(&self) -> std::path::PathBuf {
+        use std::os::fd::AsRawFd;
+        std::path::PathBuf::from(format!("/proc/self/fd/{}/", self.parent.as_raw_fd()))
+            .join(&self.name)
+    }
+    fn stat(&self) -> std::io::Result<rustix::fs::Stat> {
+        rustix::fs::statat(
+            &self.parent,
+            &self.name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(Into::into)
+    }
+    fn same(&self, identity: (u64, u64)) -> std::io::Result<bool> {
+        match self.stat() {
+            Ok(stat) => Ok((stat.st_dev, stat.st_ino) == identity
+                && rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                    == rustix::fs::FileType::Socket),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+    fn unlink(&self, identity: (u64, u64)) -> std::io::Result<()> {
+        if self.same(identity)? {
+            rustix::fs::unlinkat(&self.parent, &self.name, rustix::fs::AtFlags::empty())?;
+        }
+        Ok(())
+    }
+    fn prepare(&self, timeout: Duration) -> std::io::Result<()> {
+        let stat = match self.stat() {
+            Ok(stat) => stat,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Socket {
+            return Err(std::io::Error::other("API path is not a socket"));
+        }
+        let identity = (stat.st_dev, stat.st_ino);
+        use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+        let probe = net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )?;
+        let addr = SocketAddrUnix::new(self.address())?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match net::connect(&probe, &addr) {
+                Ok(()) => return Err(std::io::Error::other("API socket already active")),
+                Err(rustix::io::Errno::CONNREFUSED) => {
+                    if !self.same(identity)? {
+                        return Err(std::io::Error::other("API socket changed during probe"));
+                    }
+                    return self.unlink(identity);
+                }
+                Err(
+                    rustix::io::Errno::AGAIN
+                    | rustix::io::Errno::INPROGRESS
+                    | rustix::io::Errno::ALREADY,
+                ) => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    std::thread::park_timeout(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    fn secure(&mut self) -> std::io::Result<()> {
+        use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
+        use std::os::fd::AsRawFd;
+        // Linux rustix chmodat does not support SYMLINK_NOFOLLOW (including EL8).
+        // Pin the socket inode with O_PATH|NOFOLLOW, reject substituted symlinks,
+        // then chmod the pinned inode via its procfd. A replacement leaf cannot
+        // redirect this chmod to its target. No untrusted pathname is followed.
+        let leaf = fs::openat(
+            &self.parent,
+            &self.name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let stat = fs::fstat(&leaf)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Socket
+            || stat.st_uid != rustix::process::geteuid().as_raw()
+        {
+            return Err(std::io::Error::other("bound API socket replaced"));
+        }
+        let identity = (stat.st_dev, stat.st_ino);
+        self.identity = Some(identity);
+        if !self.same(identity)? {
+            return Err(std::io::Error::other("bound API socket changed"));
+        }
+        fs::chmodat(
+            &self.parent,
+            format!("/proc/self/fd/{}", leaf.as_raw_fd()),
+            Mode::from_raw_mode(0o600),
+            AtFlags::empty(),
+        )?;
+        if !self.same(identity)? {
+            return Err(std::io::Error::other("bound API socket changed"));
+        }
+        Ok(())
+    }
+}
+impl Drop for SocketPath {
+    fn drop(&mut self) {
+        if let Some(identity) = self.identity {
+            if let Err(error) = self.unlink(identity) {
+                tracing::warn!(%error, "API socket cleanup failed");
             }
         }
     }
@@ -310,25 +651,10 @@ pub fn start_with_peer_timeout(
     peer: PeerCredentials,
     timeout: Duration,
 ) -> Result<crate::ServiceHandle, DaemonError> {
-    let path = config.general.socket.clone();
-    match std::fs::symlink_metadata(&path) {
-        Ok(m) => {
-            if !m.file_type().is_socket() {
-                return Err(DaemonError::Invalid("API path is not a socket".into()));
-            }
-            match UnixStream::connect(&path) {
-                Ok(_) => return Err(DaemonError::Unavailable("API socket already active".into())),
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    std::fs::remove_file(&path).map_err(io)?
-                }
-                Err(e) => return Err(io(e)),
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io(e)),
-    }
-    let listener = UnixListener::bind(&path).map_err(io)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(io)?;
+    let mut path = SocketPath::open(&config.general.socket).map_err(io)?;
+    path.prepare(timeout).map_err(io)?;
+    let listener = UnixListener::bind(path.address()).map_err(io)?;
+    path.secure().map_err(io)?;
     listener.set_nonblocking(true).map_err(io)?;
     context
         .state
@@ -338,12 +664,23 @@ pub fn start_with_peer_timeout(
     std::thread::Builder::new()
         .name("api".into())
         .spawn(move || {
-            let mut clients = Vec::new();
+            let mut clients: Vec<std::thread::JoinHandle<()>> = Vec::new();
+            let mut outcome = Ok(());
             while !shutdown.load(Ordering::Acquire) {
-                clients.retain(|h: &std::thread::JoinHandle<()>| !h.is_finished());
+                let mut index = 0;
+                while index < clients.len() {
+                    if clients[index].is_finished() {
+                        let _ = clients.swap_remove(index).join();
+                    } else {
+                        index += 1;
+                    }
+                }
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if active.load(Ordering::Acquire) >= CONNECTIONS {
+                        let accepted = Instant::now();
+                        if clients.len() >= CONNECTIONS
+                            || active.load(Ordering::Acquire) >= CONNECTIONS
+                        {
                             drop(stream);
                             continue;
                         }
@@ -352,9 +689,12 @@ pub fn start_with_peer_timeout(
                         let ctx = context.clone();
                         let stop = shutdown.clone();
                         let peer = peer.clone();
-                        if let Ok(h) = std::thread::Builder::new()
-                            .name("api-client".into())
-                            .spawn(move || connection(stream, ctx, stop, permit, peer, timeout))
+                        if let Ok(h) =
+                            std::thread::Builder::new()
+                                .name("api-client".into())
+                                .spawn(move || {
+                                    connection(stream, ctx, stop, permit, peer, timeout, accepted)
+                                })
                         {
                             clients.push(h);
                         }
@@ -364,17 +704,18 @@ pub fn start_with_peer_timeout(
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(e) => {
-                        let _ = std::fs::remove_file(&path);
-                        return Err(io(e));
+                        outcome = Err(io(e));
+                        shutdown.store(true, Ordering::Release);
+                        break;
                     }
                 }
             }
             drop(listener);
-            std::fs::remove_file(&path).map_err(io)?;
+            drop(path);
             for h in clients {
                 let _ = h.join();
             }
-            Ok(())
+            outcome
         })
         .map_err(io)
 }
@@ -410,6 +751,7 @@ mod tests {
                 Permit(Arc::new(AtomicUsize::new(1))),
                 Arc::new(|_| Ok((0, 1))),
                 timeout,
+                Instant::now(),
             )
         });
         (BufReader::new(client), stop, h)
@@ -452,6 +794,148 @@ mod tests {
         h.join().unwrap();
     }
     #[test]
+    fn idle_and_drip_frames_have_absolute_deadlines() {
+        for drip in [false, true] {
+            let reload: Reload = Arc::new(|| unreachable!("incomplete frame dispatched"));
+            let (mut stream, _stop, handle) = pair(reload, Duration::from_millis(120));
+            let began = Instant::now();
+            if drip {
+                for _ in 0..4 {
+                    if stream.get_mut().write_all(b"x").is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(45));
+                }
+            }
+            let mut byte = [0];
+            assert_eq!(stream.get_mut().read(&mut byte).unwrap(), 0);
+            handle.join().unwrap();
+            assert!(began.elapsed() < Duration::from_secs(1));
+        }
+    }
+    #[test]
+    fn response_write_deadline_and_shutdown_interrupt_stalled_reader() {
+        for stopping in [false, true] {
+            let (mut server, _client) = UnixStream::pair().unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(stopping));
+            let response = Response {
+                v: 1,
+                id: "x".into(),
+                ok: true,
+                result: Some(serde_json::json!("x".repeat(900_000))),
+                error: None,
+            };
+            let began = Instant::now();
+            assert!(send(&mut server, &response, &stop, Duration::from_millis(120)).is_err());
+            assert!(began.elapsed() < Duration::from_secs(1));
+        }
+    }
+    #[test]
+    fn peer_refusal_precedes_malformed_frame_and_credential_failure_closes() {
+        for peer in [
+            Arc::new(|_: &UnixStream| Ok((1000u32, 42))) as PeerCredentials,
+            Arc::new(|_: &UnixStream| Err(std::io::ErrorKind::PermissionDenied.into())),
+        ] {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            client.write_all(b"{malformed}\n").unwrap();
+            let context = Arc::new(Context {
+                state: crate::state::LiveState::new(&tidemark_core::config::Config::default(), 0),
+                scans: crate::scheduler::ScanControl::default(),
+                reload: Arc::new(|| unreachable!("unauthorized dispatch")),
+            });
+            let active = Arc::new(AtomicUsize::new(1));
+            connection(
+                server,
+                context,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Permit(active.clone()),
+                peer,
+                TIMEOUT,
+                Instant::now(),
+            );
+            let mut byte = [0];
+            match client.read(&mut byte) {
+                Ok(n) => assert_eq!(n, 0, "unauthorized peer received response bytes"),
+                Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset),
+            }
+            assert_eq!(active.load(Ordering::Acquire), 0);
+        }
+    }
+    #[test]
+    fn cooperative_reload_exits_on_deadline_and_shutdown() {
+        for stopping in [false, true] {
+            let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+            let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = exited.clone();
+            let reload: Reload = Arc::new(CooperativeReload(move |budget: &Cancellation| {
+                entered_tx.send(()).unwrap();
+                while budget.check().is_ok() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                flag.store(true, Ordering::Release);
+                Err(DaemonError::Shutdown)
+            }));
+            let (mut stream, stop, handle) = pair(reload, Duration::from_millis(100));
+            stream
+                .get_mut()
+                .write_all(b"{\"v\":1,\"id\":\"x\",\"method\":\"config.reload\",\"params\":{}}\n")
+                .unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            if stopping {
+                stop.store(true, Ordering::Release);
+            } else {
+                assert_eq!(
+                    response(&mut stream).error.unwrap().code,
+                    ApiErrorCode::Unavailable
+                );
+            }
+            handle.join().unwrap();
+            assert!(exited.load(Ordering::Acquire));
+        }
+    }
+    #[test]
+    fn cancellation_and_commit_have_an_atomic_winner() {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = Cancellation::new(stop.clone(), TIMEOUT);
+        cancelled.cancel();
+        assert!(cancelled.begin_commit().is_err());
+        let committed = Cancellation::new(stop.clone(), TIMEOUT);
+        committed.begin_commit().unwrap();
+        committed.cancel();
+        assert_eq!(committed.phase.load(Ordering::Acquire), 2);
+        let expired = Cancellation::new(stop.clone(), Duration::ZERO);
+        assert!(expired.begin_commit().is_err());
+        let stopping = Cancellation::new(stop.clone(), TIMEOUT);
+        stop.store(true, Ordering::Release);
+        assert!(stopping.begin_commit().is_err());
+    }
+    #[test]
+    fn socket_parent_trust_and_no_follow_checks_without_listening() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let private = dir.path().join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match SocketPath::open(&private.join("api.sock")) {
+            Ok(_) => {}
+            Err(e) => panic!("trusted parent refused: {e}"),
+        }
+        let link = dir.path().join("link");
+        symlink(&private, &link).unwrap();
+        assert!(SocketPath::open(&link.join("api.sock")).is_err());
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(SocketPath::open(&private.join("api.sock")).is_err());
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(private.join("target"), private.join("api.sock")).unwrap();
+        let mut socket = SocketPath::open(&private.join("api.sock")).unwrap();
+        assert!(socket.prepare(Duration::from_millis(100)).is_err());
+        assert!(socket.secure().is_err());
+    }
+    #[test]
     fn pair_controllable_timeout_and_shutdown() {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let reload: Reload = Arc::new(move || {
@@ -470,7 +954,9 @@ mod tests {
             ApiErrorCode::Unavailable
         );
         stop.store(true, Ordering::Release);
-        h.join().unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!h.is_finished(), "server abandoned its blocked callback");
         tx.send(()).unwrap();
+        h.join().unwrap();
     }
 }
