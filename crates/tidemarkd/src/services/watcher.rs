@@ -73,7 +73,7 @@ pub fn start(
                         }
                     };
                     let changes = crate::mounts::reconcile_live(&config.watch.mounts, &mut identities, &mounts)?;
-                    crate::mounts::log(&changes, "watcher");
+
                     // Release old marks before any replacement starts.
                     for change in &changes {
                         let mount = RawPath::from_path(&change.path).map_err(|e| DaemonError::Config(e.to_string()))?.display_lossy();
@@ -97,6 +97,11 @@ pub fn start(
                         if !matches!(namespace, Ok(true)) || watchers.contains_key(&mount) { continue; }
                         match Watcher::start(options(&config, path)?, attribution.clone()) {
                             Ok(w) => {
+                                if let Err(error) = verify_identity(identities.get(path).copied().flatten(), || w.mount_identity()) {
+                                    drop(w);
+                                    state.publish_component(crate::component(&name, "error", error.to_string()))?;
+                                    continue;
+                                }
                                 let w = Arc::new(w);
                                 state.publish(Publication::Watcher((mount.clone(), w.clone())), crate::component(&name, "ok", "watcher started"))?;
                                 watchers.insert(mount, w);
@@ -131,6 +136,25 @@ pub fn start(
     }).map_err(|source| DaemonError::Io { context: "spawn watcher".into(), source })
 }
 
+fn verify_identity(
+    expected: Option<crate::mounts::Identity>,
+    actual: impl FnOnce() -> std::io::Result<(u64, u32, u32)>,
+) -> Result<(), DaemonError> {
+    let actual = match actual() {
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return Ok(()),
+        result => result.map_err(|source| DaemonError::Io {
+            context: "verify watcher mount identity".into(),
+            source,
+        })?,
+    };
+    if expected.map(|i| (u64::from(i.id), i.major, i.minor)) != Some(actual) {
+        return Err(DaemonError::Invalid(format!(
+            "watcher mount identity mismatch: configured {expected:?}, marked {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn persistence_rows(
     rows: Vec<tidemark_core::live::HotMinute>,
 ) -> Vec<tidemark_core::live::HotMinute> {
@@ -147,6 +171,27 @@ fn persistence_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn marked_identity_mismatch_fails_and_unsupported_is_accepted() {
+        let intended = crate::mounts::Identity {
+            id: 2,
+            major: 8,
+            minor: 1,
+        };
+        assert!(verify_identity(Some(intended), || Ok((2, 8, 1))).is_ok());
+        let error = verify_identity(Some(intended), || Ok((3, 8, 1)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("configured") && error.contains("marked (3, 8, 1)"));
+        assert!(verify_identity(Some(intended), || Err(std::io::Error::from(
+            std::io::ErrorKind::Unsupported
+        )))
+        .is_ok());
+        assert!(verify_identity(Some(intended), || Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )))
+        .is_err());
+    }
     #[test]
     fn persistence_keeps_fifty_per_minute_and_scope_in_rank_order() {
         let rows = [0, 60]
