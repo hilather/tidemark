@@ -7,11 +7,21 @@ use crate::{
 };
 use std::{sync::atomic::Ordering, sync::Arc, time::Duration};
 use tidemark_core::{api::LvmResult, config::Config};
-/// Retry delay, doubling from one second to five minutes, capped by the interval.
+/// Retry from max(interval, five minutes), doubling to max(interval, one hour).
 pub fn retry_delay(failures: u32, interval: Duration) -> Duration {
-    Duration::from_secs(1u64 << failures.saturating_sub(1).min(9))
-        .min(Duration::from_secs(300))
-        .min(interval)
+    interval
+        .max(Duration::from_secs(300))
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(31))
+        .min(interval.max(Duration::from_secs(3600)))
+}
+fn collection_delay(success: bool, failures: &mut u32, interval: Duration) -> Duration {
+    if success {
+        *failures = 0;
+        interval
+    } else {
+        *failures = failures.saturating_add(1);
+        retry_delay(*failures, interval)
+    }
 }
 /// Start LVM reporting. Disabled LVM performs no reporting command.
 /// Failed collections preserve latest successful data and report component errors.
@@ -87,22 +97,25 @@ where
                             crate::component("lvm", "ok", "report collected"),
                         )
                         .map_err(|e| e.to_string())?;
-                    writer
+                    if writer
                         .try_send(super::tswriter::Message::Lvm(samples))
-                        .map_err(|_| {
-                            "writer queue full or disconnected; persistence dropped".to_string()
-                        })?;
+                        .is_err()
+                    {
+                        state
+                            .publish_component(crate::component(
+                                "lvm",
+                                "degraded",
+                                "writer queue full or disconnected; persistence dropped",
+                            ))
+                            .map_err(|e| e.to_string())?;
+                    }
                     Ok(())
                 });
                 let delay = match result {
-                    Ok(()) => {
-                        failures = 0;
-                        config.lvm.interval
-                    }
+                    Ok(()) => collection_delay(true, &mut failures, config.lvm.interval),
                     Err(error) => {
-                        failures = failures.saturating_add(1);
                         state.publish_component(crate::component("lvm", "error", error))?;
-                        retry_delay(failures, config.lvm.interval)
+                        collection_delay(false, &mut failures, config.lvm.interval)
                     }
                 };
                 crate::wait_service(&state, generation, &shutdown, delay);
@@ -125,6 +138,73 @@ mod tests {
             assert!(Instant::now() < end);
             std::thread::yield_now();
         }
+    }
+    #[test]
+    fn retry_sequence_custom_intervals_and_success_reset() {
+        let interval = Duration::from_secs(300);
+        let mut failures = 0;
+        for seconds in [300, 600, 1200, 2400, 3600, 3600] {
+            assert_eq!(
+                collection_delay(false, &mut failures, interval).as_secs(),
+                seconds
+            );
+        }
+        assert_eq!(collection_delay(true, &mut failures, interval), interval);
+        assert_eq!(failures, 0);
+        assert_eq!(collection_delay(false, &mut failures, interval), interval);
+        for (interval, expected) in [
+            (1, vec![300, 600, 1200, 2400, 3600]),
+            (900, vec![900, 1800, 3600, 3600, 3600]),
+            (7200, vec![7200; 5]),
+        ] {
+            for (n, seconds) in expected.into_iter().enumerate() {
+                assert_eq!(
+                    retry_delay(n as u32 + 1, Duration::from_secs(interval)).as_secs(),
+                    seconds
+                );
+            }
+        }
+    }
+    #[test]
+    fn full_queue_does_not_recollect() {
+        let mut cfg = Config::default();
+        cfg.lvm.enabled = true;
+        cfg.lvm.interval = Duration::from_secs(3600);
+        let state = LiveState::new(&cfg, 0);
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        tx.send(super::super::tswriter::Message::Lvm(vec![]))
+            .unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = count.clone();
+        let stop = Shutdown::default();
+        let handle = start_worker(
+            state.clone(),
+            tx,
+            stop.clone(),
+            move |_, now| {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(tidemark_fs::lvm::LvmReport {
+                    lvs: vec![],
+                    vgs: vec![],
+                    sampled_at: now,
+                })
+            },
+            || Ok(vec![]),
+        )
+        .unwrap();
+        wait(|| {
+            state
+                .view()
+                .status(0)
+                .unwrap()
+                .components
+                .iter()
+                .any(|c| c.name == "lvm" && c.state == "degraded")
+        });
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(count.load(Ordering::Acquire), 1);
+        stop.store(true, Ordering::Release);
+        handle.join().unwrap().unwrap();
     }
     #[test]
     fn fixture_reports_and_failures() {

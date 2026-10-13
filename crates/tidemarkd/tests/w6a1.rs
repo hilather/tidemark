@@ -475,11 +475,11 @@ fn lvm_disabled_and_backoff() {
     h.join().unwrap().unwrap();
     assert_eq!(
         lvm::retry_delay(1, Duration::from_secs(300)),
-        Duration::from_secs(1)
+        Duration::from_secs(300)
     );
     assert_eq!(
         lvm::retry_delay(100, Duration::from_secs(4)),
-        Duration::from_secs(4)
+        Duration::from_secs(3600)
     );
 }
 #[test]
