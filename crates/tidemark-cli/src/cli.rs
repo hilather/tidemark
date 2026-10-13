@@ -66,7 +66,7 @@ pub enum Command {
     Diff(cmd::diff::Args),
     /// Hard-link topology.
     Links(cmd::links::Args),
-    /// Live symlink analysis.
+    /// Live symlink analysis reads link text and may update link access times according to the mount atime policy (never with noatime).
     Symlinks(cmd::symlinks::Args),
     /// Live situation.
     Now(cmd::now::Args),
