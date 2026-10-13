@@ -201,13 +201,6 @@ pub fn start(
                                 }
                             }
                         }
-                        if config.watch.mounts.is_empty() {
-                            state.publish_component(crate::component(
-                                "watcher",
-                                "disabled",
-                                "no watch mounts",
-                            ))?;
-                        }
                     }
                     for (mount, w) in &watchers {
                         let history = minutes
