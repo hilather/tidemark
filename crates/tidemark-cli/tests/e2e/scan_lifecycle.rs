@@ -273,3 +273,53 @@ fn unrelated_listener_does_not_redirect_direct_scan() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, "complete");
 }
+
+#[cfg(feature = "privileged")]
+#[test]
+fn strict_ancestry_refuses_second_uid_before_writes() {
+    use std::os::unix::{
+        fs::{MetadataExt, PermissionsExt},
+        process::CommandExt,
+    };
+    let temp = test_support::private_tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let foreign = temp.path().join("foreign");
+    assert!(rustix::process::geteuid().is_root(), "requires guest root");
+    let out = std::process::Command::new("mkdir")
+        .arg("-m")
+        .arg("755")
+        .arg(&foreign)
+        .uid(65533)
+        .gid(65533)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sentinel = temp.path().join("sentinel");
+    test_support::private_write(&sentinel, b"unchanged").unwrap();
+    let before = std::fs::metadata(&sentinel).unwrap();
+    let state = foreign.join("state");
+    let config = direct_config(temp.path(), "");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
+        .arg("--config")
+        .arg(config)
+        .env("TIDEMARK_STRICT_ANCESTRY", "1")
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("scan")
+        .arg(&foreign)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("untrusted owner"));
+    assert!(!state.exists());
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+    let after = std::fs::metadata(sentinel).unwrap();
+    assert_eq!(
+        (after.ino(), after.mode(), after.uid(), after.len()),
+        (before.ino(), before.mode(), before.uid(), before.len())
+    );
+}

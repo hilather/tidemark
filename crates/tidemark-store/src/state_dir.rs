@@ -50,7 +50,7 @@ struct PolicyInput {
 }
 
 // Pure integrity policy; Ok(true) requests the process-wide readability warning.
-fn policy(input: PolicyInput) -> Result<bool, &'static str> {
+fn policy(input: PolicyInput, strict: bool) -> Result<bool, &'static str> {
     let PolicyInput {
         owner,
         mode,
@@ -75,19 +75,30 @@ fn policy(input: PolicyInput) -> Result<bool, &'static str> {
             "not a directory (symbolic links are refused)"
         });
     }
-    let ancestor_owner =
-        owner == 0 || owner == effective_uid || (user_namespace && owner == overflow_uid);
+    let ancestor_owner = owner == 0
+        || owner == effective_uid
+        || (!strict && user_namespace && owner == overflow_uid);
     let owner_ok = match role {
-        Role::Ancestor => ancestor_owner || read_only_mount,
+        Role::Ancestor => ancestor_owner || (!strict && read_only_mount),
         Role::StickyChild => ancestor_owner,
         _ => owner == effective_uid,
     };
     if !owner_ok {
-        return Err("untrusted owner");
+        return Err(
+            if strict
+                && matches!(role, Role::Ancestor | Role::StickyChild)
+                && user_namespace
+                && owner == overflow_uid
+            {
+                "owner is not mapped in this user namespace"
+            } else if strict && read_only_mount && role == Role::Ancestor {
+                "foreign owner on a read-only mount is not trusted"
+            } else {
+                "untrusted owner"
+            },
+        );
     }
-    if mode & 0o022 != 0
-        && !(matches!(role, Role::Ancestor | Role::StickyChild) && mode & 0o1000 != 0)
-    {
+    if mode & 0o022 != 0 && !(role == Role::Ancestor && mode & 0o1000 != 0) {
         return Err("writable by group or others");
     }
     if role == Role::Leaf && links != 1 {
@@ -114,20 +125,34 @@ fn namespace() -> io::Result<(bool, u32)> {
         .map_err(|e| io::Error::other(e.clone()))
 }
 
+/// Whether ancestry exceptions are disabled for this process.
+pub fn strict_ancestry() -> bool {
+    !cfg!(debug_assertions)
+        || std::env::var_os("TIDEMARK_STRICT_ANCESTRY").is_some_and(|v| v == "1")
+}
+
 fn check(path: &Path, stat: &fs::Stat, role: Role, read_only_mount: bool) -> io::Result<()> {
     let (user_namespace, overflow_uid) = namespace()?;
-    let warn = policy(PolicyInput {
-        owner: stat.st_uid,
-        mode: stat.st_mode,
-        effective_uid: rustix::process::geteuid().as_raw(),
-        user_namespace,
-        overflow_uid,
-        read_only_mount,
-        role,
-        links: stat.st_nlink,
-        file_type: FileType::from_raw_mode(stat.st_mode),
-    })
+    let warn = policy(
+        PolicyInput {
+            owner: stat.st_uid,
+            mode: stat.st_mode,
+            effective_uid: rustix::process::geteuid().as_raw(),
+            user_namespace,
+            overflow_uid,
+            read_only_mount,
+            role,
+            links: stat.st_nlink,
+            file_type: FileType::from_raw_mode(stat.st_mode),
+        },
+        strict_ancestry(),
+    )
     .map_err(|reason| {
+        let reason = if reason == "owner is not mapped in this user namespace" {
+            format!("owner {} is not mapped in this user namespace", stat.st_uid)
+        } else {
+            reason.to_owned()
+        };
         error(
             path,
             format!(
@@ -137,6 +162,21 @@ fn check(path: &Path, stat: &fs::Stat, role: Role, read_only_mount: bool) -> io:
             ),
         )
     })?;
+    static EXCEPTION_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !strict_ancestry()
+        && matches!(role, Role::Ancestor | Role::StickyChild)
+        && stat.st_uid != 0
+        && stat.st_uid != rustix::process::geteuid().as_raw()
+        && !EXCEPTION_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        let exception = if user_namespace && stat.st_uid == overflow_uid {
+            "unmapped overflow owner"
+        } else {
+            "foreign owner on read-only mount"
+        };
+        tracing::warn!("development build: accepted ancestor {} owned by {} ({}); a release build refuses this", tidemark_core::path::display_lossy_bytes(path.as_os_str().as_bytes()), stat.st_uid, exception);
+    }
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if warn && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(
@@ -165,8 +205,8 @@ fn retained(path: &Path) -> bool {
         .is_some_and(|s| !s.is_empty() && s.iter().all(u8::is_ascii_digit))
 }
 /// Walk absolute directory ancestry without following links, retaining the final fd.
-/// Trusted owners are root/euid, or unmapped overflow owners in a user namespace
-/// (or any owner on a read-only mount). Writable
+/// Release builds trust root/euid owners only. Development builds warn when
+/// accepting namespace overflow owners or foreign owners on read-only mounts. Writable
 /// ancestors must be sticky; their children must be root/euid-owned and safe from writes.
 pub fn trusted_directory(path: &Path) -> io::Result<OwnedFd> {
     if !path.is_absolute() {
@@ -427,6 +467,11 @@ mod tests {
         tracing::subscriber::with_default(Capture(messages.clone()), || {
             let temp = ::test_support::private_tempdir().unwrap();
             let state = StateDir::open(temp.path(), false).unwrap();
+            let mut foreign = fs::fstat(state.fd()).unwrap();
+            foreign.st_uid = rustix::process::geteuid().as_raw().wrapping_add(1);
+            for _ in 0..2 {
+                check(temp.path(), &foreign, Role::Ancestor, true).unwrap();
+            }
             let leaf = temp.path().join("readable.db");
             ::test_support::private_write(&leaf, b"sentinel").unwrap();
             std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -439,7 +484,18 @@ mod tests {
             let sub = state.subdir(OsStr::new("child"), true).unwrap();
             std::fs::set_permissions(&sub.path, std::fs::Permissions::from_mode(0o750)).unwrap();
             state.subdir(OsStr::new("child"), false).unwrap();
-            let captured = messages.lock().unwrap();
+            let messages = messages.lock().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m.contains("development build: accepted ancestor"))
+                    .count(),
+                1
+            );
+            let captured: Vec<_> = messages
+                .iter()
+                .filter(|m| m.contains("state file readable by other users"))
+                .collect();
             assert_eq!(captured.len(), 1);
             assert!(captured[0].contains(&format!(
                 "state file readable by other users: {}",
@@ -562,7 +618,7 @@ mod tests {
                     mode: 0o1777,
                     ..base
                 },
-                Ok(false),
+                Err("writable by group or others"),
             ),
             (
                 "writable child",
@@ -604,62 +660,87 @@ mod tests {
             ),
         ];
         for (name, input, expected) in rows {
-            assert_eq!(policy(input), expected, "{name}");
+            assert_eq!(policy(input, false), expected, "{name}");
+            let strict = policy(input, true);
+            if input.owner == 65534 && input.user_namespace {
+                assert_eq!(strict, Err("owner is not mapped in this user namespace"));
+            } else if input.owner == 2000 && input.read_only_mount && input.role == Role::Ancestor {
+                assert_eq!(
+                    strict,
+                    Err("foreign owner on a read-only mount is not trusted")
+                );
+            } else {
+                assert_eq!(strict, expected, "strict {name}");
+            }
         }
-        for role in [Role::StateDirectory, Role::Subdirectory, Role::Leaf] {
-            let storage = PolicyInput {
-                role,
-                file_type: if role == Role::Leaf {
-                    FileType::RegularFile
-                } else {
-                    FileType::Directory
-                },
-                mode: 0o600,
-                ..base
-            };
-            assert_eq!(policy(storage), Ok(false));
-            for mode in [0o640, 0o644, 0o755] {
-                assert_eq!(policy(PolicyInput { mode, ..storage }), Ok(true));
-            }
-            assert_eq!(
-                policy(PolicyInput {
-                    mode: 0o711,
-                    ..storage
-                }),
-                Ok(false)
-            );
-            for mode in [0o620, 0o602, 0o1777] {
+        for strict in [false, true] {
+            for role in [Role::StateDirectory, Role::Subdirectory, Role::Leaf] {
+                let storage = PolicyInput {
+                    role,
+                    file_type: if role == Role::Leaf {
+                        FileType::RegularFile
+                    } else {
+                        FileType::Directory
+                    },
+                    mode: 0o600,
+                    ..base
+                };
+                assert_eq!(policy(storage, strict), Ok(false));
+                for mode in [0o640, 0o644, 0o755] {
+                    assert_eq!(policy(PolicyInput { mode, ..storage }, strict), Ok(true));
+                }
                 assert_eq!(
-                    policy(PolicyInput { mode, ..storage }),
-                    Err("writable by group or others")
+                    policy(
+                        PolicyInput {
+                            mode: 0o711,
+                            ..storage
+                        },
+                        strict
+                    ),
+                    Ok(false)
+                );
+                for mode in [0o620, 0o602, 0o1777] {
+                    assert_eq!(
+                        policy(PolicyInput { mode, ..storage }, strict),
+                        Err("writable by group or others")
+                    );
+                }
+                for owner in [0, 2000, 65534] {
+                    assert_eq!(
+                        policy(
+                            PolicyInput {
+                                owner,
+                                user_namespace: true,
+                                read_only_mount: true,
+                                ..storage
+                            },
+                            strict
+                        ),
+                        Err("untrusted owner")
+                    );
+                }
+                for file_type in [FileType::Symlink, FileType::Fifo, FileType::Socket] {
+                    assert!(policy(
+                        PolicyInput {
+                            file_type,
+                            ..storage
+                        },
+                        strict
+                    )
+                    .is_err());
+                }
+                assert_eq!(
+                    policy(
+                        PolicyInput {
+                            links: 2,
+                            ..storage
+                        },
+                        strict
+                    )
+                    .is_err(),
+                    role == Role::Leaf
                 );
             }
-            for owner in [0, 2000, 65534] {
-                assert_eq!(
-                    policy(PolicyInput {
-                        owner,
-                        user_namespace: true,
-                        read_only_mount: true,
-                        ..storage
-                    }),
-                    Err("untrusted owner")
-                );
-            }
-            for file_type in [FileType::Symlink, FileType::Fifo, FileType::Socket] {
-                assert!(policy(PolicyInput {
-                    file_type,
-                    ..storage
-                })
-                .is_err());
-            }
-            assert_eq!(
-                policy(PolicyInput {
-                    links: 2,
-                    ..storage
-                })
-                .is_err(),
-                role == Role::Leaf
-            );
         }
     }
 

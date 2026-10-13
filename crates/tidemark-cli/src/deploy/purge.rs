@@ -3,11 +3,12 @@
 
 use super::{DeployError, Marker, MARKER};
 use rustix::fs::{self, AtFlags, Dir, FileType, Mode, OFlags};
+use std::os::unix::ffi::OsStrExt;
 use std::{
     ffi::CString,
     io::{self, Read},
     os::fd::{AsRawFd, OwnedFd},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 // Limit simultaneous open directories; arbitrary width is streamed rather than collected.
@@ -87,24 +88,36 @@ pub(super) fn purge_guard(state_dir: &Path) -> Result<GuardedRoot, DeployError> 
             "state directory is a mount point".into(),
         ));
     }
-    walk(&root, mount, false)?;
+    walk(&root, state_dir, mount, false)?;
     Ok((parent, name, root))
 }
 struct Frame {
     fd: OwnedFd,
     entries: Dir,
     name: Option<CString>,
+    path: PathBuf,
 }
-fn walk(root: &OwnedFd, mount: u64, remove: bool) -> io::Result<()> {
+fn walk(root: &OwnedFd, path: &Path, mount: u64, remove: bool) -> io::Result<()> {
     let fd = rustix::io::dup(root)?;
     fs::seek(&fd, rustix::fs::SeekFrom::Start(0))?;
+    verify_directory(&fd, path, mount)?;
     let entries = Dir::new(rustix::io::dup(&fd)?)?;
     let mut stack = vec![Frame {
         fd,
         entries,
         name: None,
+        path: path.to_owned(),
     }];
-    while let Some(frame) = stack.last_mut() {
+    while !stack.is_empty() {
+        // Recheck attachment before each read/unlink, not only after deleting contents.
+        for pair in stack.windows(2) {
+            if let Some(name) = &pair[1].name {
+                verify_identity(&pair[0].fd, name, &pair[1].fd, &pair[1].path)?;
+            }
+        }
+        let Some(frame) = stack.last_mut() else {
+            break;
+        };
         match frame.entries.read() {
             Some(entry) => {
                 let entry = entry?;
@@ -115,11 +128,20 @@ fn walk(root: &OwnedFd, mount: u64, remove: bool) -> io::Result<()> {
                 let stat = fs::statat(&frame.fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
                 if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
                     let child = directory_at(&frame.fd, name)?;
-                    if mount_id(&child)? != mount {
-                        return Err(io::Error::other(
-                            "mount boundary in state directory; refusing purge",
-                        ));
-                    }
+                    let path = frame
+                        .path
+                        .join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+                    #[cfg(test)]
+                    AFTER_OPEN.with(|hook| {
+                        let mut hook = hook.borrow_mut();
+                        if hook.as_ref().is_some_and(|(target, _)| target == &path) {
+                            if let Some((_, hook)) = hook.take() {
+                                hook(&path);
+                            }
+                        }
+                    });
+                    verify_directory(&child, &path, mount)?;
+                    verify_identity(&frame.fd, name, &child, &path)?;
                     if stack.len() >= MAX_PURGE_DEPTH {
                         return Err(io::Error::other(
                             "state directory exceeds purge depth cap (256)",
@@ -130,6 +152,7 @@ fn walk(root: &OwnedFd, mount: u64, remove: bool) -> io::Result<()> {
                         fd: child,
                         entries,
                         name: Some(name.to_owned()),
+                        path,
                     });
                 } else if remove {
                     fs::unlinkat(&frame.fd, name, AtFlags::empty())?;
@@ -161,11 +184,59 @@ pub(super) fn purge_directory(parent: OwnedFd, name: CString, root: OwnedFd) -> 
     if current.st_dev != opened.st_dev || current.st_ino != opened.st_ino {
         return Err(io::Error::other("state directory replaced before purge"));
     }
-    walk(&root, mount_id(&root)?, true)?;
+    let path = PathBuf::from(format!("/proc/self/fd/{}/.", root.as_raw_fd()));
+    walk(&root, &path, mount_id(&root)?, true)?;
     let current = fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)?;
     if current.st_dev != opened.st_dev || current.st_ino != opened.st_ino {
         return Err(io::Error::other("state directory replaced during purge"));
     }
     fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR)?;
     Ok(())
+}
+
+fn verify_directory(fd: &OwnedFd, path: &Path, mount: u64) -> io::Result<()> {
+    let stat = fs::fstat(fd)?;
+    #[cfg(test)]
+    let stat = super::files::FOREIGN_OWNER.with(|owner| {
+        let mut stat = stat;
+        if owner.borrow().as_deref() == Some(path) {
+            stat.st_uid = rustix::process::geteuid().as_raw().wrapping_add(1);
+        }
+        stat
+    });
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o022 != 0
+        || mount_id(fd)? != mount
+    {
+        return Err(io::Error::other(format!("unsafe purge directory {}: requires effective-uid ownership, no group/world write and the state mount", tidemark_core::path::display_lossy_bytes(path.as_os_str().as_bytes()))));
+    }
+    Ok(())
+}
+fn verify_identity(
+    parent: &OwnedFd,
+    name: &std::ffi::CStr,
+    child: &OwnedFd,
+    path: &Path,
+) -> io::Result<()> {
+    let current = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| {
+        io::Error::other(format!(
+            "state subtree unavailable during purge {}: {e}",
+            tidemark_core::path::display_lossy_bytes(path.as_os_str().as_bytes())
+        ))
+    })?;
+    let opened = fs::fstat(child)?;
+    if current.st_dev != opened.st_dev || current.st_ino != opened.st_ino {
+        return Err(io::Error::other(format!(
+            "state subtree replaced during purge: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+#[cfg(test)]
+type OpenHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    pub(super) static AFTER_OPEN: std::cell::RefCell<Option<(PathBuf, OpenHook)>> = const { std::cell::RefCell::new(None) };
 }

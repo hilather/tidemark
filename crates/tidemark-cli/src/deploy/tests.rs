@@ -1265,3 +1265,77 @@ fn eligibility_error_escapes_non_utf8_and_control_path_bytes() {
     assert!(!error.contains('\n'));
     assert!(error.contains("owner") && error.contains("mode") && error.contains("links"));
 }
+
+#[test]
+fn purge_checks_unknown_and_nested_directories_before_stop() {
+    for (relative, mode, foreign) in [
+        ("unknown", 0o770, false),
+        ("unknown/nested", 0o707, false),
+        ("unknown/nested", 0o700, true),
+    ] {
+        let f = Fixture::new();
+        f.stage();
+        f.sys.calls.borrow_mut().clear();
+        let child = f.state.join(relative);
+        fs::create_dir_all(&child).unwrap();
+        fs::set_permissions(f.state.join("unknown"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(mode)).unwrap();
+        fs::write(child.join("sentinel"), b"unchanged").unwrap();
+        let before = tree_bytes(&f.state);
+        let _probe = OwnerProbe;
+        if foreign {
+            FOREIGN_OWNER.with(|o| *o.borrow_mut() = Some(child.clone()));
+        }
+        let error = unstage(&f.state, true, &f.sys).unwrap_err();
+        assert!(error.to_string().contains(relative), "{error}");
+        assert!(f.sys.calls.borrow().is_empty());
+        assert_eq!(tree_bytes(&f.state), before);
+    }
+}
+fn tree_bytes(path: &Path) -> Vec<(std::path::PathBuf, u32, Vec<u8>)> {
+    let mut result = Vec::new();
+    let mut pending = vec![path.to_owned()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let bytes = if metadata.is_file() {
+            fs::read(&path).unwrap()
+        } else {
+            Vec::new()
+        };
+        result.push((path.clone(), metadata.permissions().mode(), bytes));
+        if metadata.is_dir() {
+            for e in fs::read_dir(path).unwrap() {
+                pending.push(e.unwrap().path());
+            }
+        }
+    }
+    result.sort();
+    result
+}
+#[test]
+fn purge_after_open_rename_preserves_moved_contents() {
+    let f = Fixture::new();
+    f.stage();
+    f.sys.calls.borrow_mut().clear();
+    let child = f.state.join("unknown");
+    fs::create_dir(&child).unwrap();
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(child.join("sentinel"), b"outside sentinel").unwrap();
+    let outside = f._dir.path().join("moved");
+    let moved = outside.clone();
+    super::purge::AFTER_OPEN.with(|h| {
+        *h.borrow_mut() = Some((
+            child.clone(),
+            Box::new(move |opened| {
+                fs::rename(opened, moved).unwrap();
+            }),
+        ))
+    });
+    assert!(unstage(&f.state, true, &f.sys).is_err());
+    assert!(f.sys.calls.borrow().is_empty());
+    assert_eq!(
+        fs::read(outside.join("sentinel")).unwrap(),
+        b"outside sentinel"
+    );
+    assert!(f.state.join(MARKER).exists());
+}

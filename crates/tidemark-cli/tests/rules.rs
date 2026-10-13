@@ -244,3 +244,36 @@ exec "$@"
         );
     }
 }
+
+#[test]
+fn strict_namespace_ancestry_refuses_before_creation() {
+    let t = ::test_support::private_tempdir().unwrap();
+    fs::set_permissions(t.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let root = t.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let original = command(t.path());
+    let out = Command::new("unshare")
+        .args(["--user", "--map-root-user"])
+        .arg(copied_binary(t.path()))
+        .args(original.get_args())
+        .arg("scan")
+        .arg(&root)
+        .env("TIDEMARK_STRICT_ANCESTRY", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success()
+        && (stderr.contains("unshare failed")
+            || stderr.contains("write failed /proc/self/uid_map")
+            || stderr.contains("write failed /proc/self/gid_map"))
+    {
+        eprintln!("namespace cannot be created: {}", stderr.trim());
+        return;
+    }
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("owner 65534 is not mapped in this user namespace"),
+        "{stderr}"
+    );
+    assert!(!t.path().join("state").exists());
+}

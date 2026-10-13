@@ -561,16 +561,23 @@ impl SocketPath {
         let mut sticky = false;
         for component in parent.components() {
             let stat = fs::fstat(&fd)?;
-            // The sandbox has an immutable root filesystem owned by nobody.
-            // An untrusted owner cannot mutate a read-only mount; writable
-            // filesystems still require root or the daemon uid throughout.
-            if stat.st_uid != 0
-                && stat.st_uid != uid
-                && !fs::fstatvfs(&fd)?
+            if stat.st_uid != 0 && stat.st_uid != uid {
+                use std::os::fd::AsRawFd;
+                let ancestor = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+                let ancestor = tidemark_core::path::display_lossy_bytes(
+                    ancestor.as_os_str().as_encoded_bytes(),
+                );
+                let read_only = fs::fstatvfs(&fd)?
                     .f_flag
-                    .contains(fs::StatVfsMountFlags::RDONLY)
-            {
-                return Err(std::io::Error::other("socket ancestor has untrusted owner"));
+                    .contains(fs::StatVfsMountFlags::RDONLY);
+                if tidemark_store::state_dir::strict_ancestry() || !read_only {
+                    return Err(std::io::Error::other(format!("socket ancestor {ancestor} has untrusted owner {}; foreign owner on a read-only mount is not trusted", stat.st_uid)));
+                }
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!("development build: accepted ancestor {} owned by {} (foreign owner on read-only mount); a release build refuses this", ancestor, stat.st_uid);
+                }
             }
             if stat.st_mode & 0o022 != 0 {
                 if stat.st_mode & 0o1000 == 0 {
