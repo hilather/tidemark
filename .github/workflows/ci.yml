@@ -17,8 +17,6 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-    # Becomes required once the first findings are resolved.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
       - name: Install pinned toolchain
