@@ -46,39 +46,67 @@ pub fn start(
     crate::state::validate_bounds(&config)?;
     std::thread::Builder::new().name("watcher".into()).spawn(move || {
         let mut previous = None;
+        let mut identities = BTreeMap::new();
         let mut watchers: BTreeMap<String, Arc<Watcher>> = BTreeMap::new();
+        let attribution = Arc::new(tidemark_fs::attribution::AttributionCache::new(Duration::from_secs(60), 10_000));
         let result = (|| {
             while !shutdown.load(Ordering::Acquire) {
                 let (config, generation) = state.config();
                 if previous.as_ref() != Some(&config.watch) {
                     for mount in watchers.keys() { state.remove_watcher(mount); }
                     watchers.clear();
-                    if !config.watch.enabled {
-                        state.publish_component(crate::component("watcher", "disabled", "disabled by config"))?;
-                    } else {
-                        // Watcher::start repeats this check immediately before probing/marking.
-                        match tidemark_live::watch::namespace_ok() {
-                            Ok(true) => {
-                                let attribution = Arc::new(tidemark_fs::attribution::AttributionCache::new(Duration::from_secs(60), 10_000));
-                                for path in &config.watch.mounts {
-                                    if shutdown.load(Ordering::Acquire) { break; }
-                                    let mount = RawPath::from_path(path).map_err(|e| DaemonError::Config(e.to_string()))?.display_lossy();
-                                    let name = format!("watcher:{mount}");
-                                    match Watcher::start(options(&config, path)?, attribution.clone()) {
-                                        Ok(w) => {
-                                            let w = Arc::new(w);
-                                            state.publish(Publication::Watcher((mount.clone(), w.clone())), crate::component(&name, "ok", "watcher started"))?;
-                                            watchers.insert(mount, w);
-                                        }
-                                        Err(e) => { state.publish_component(crate::component(&name, "error", e.to_string()))?; }
-                                    }
-                                }
-                                if config.watch.mounts.is_empty() { state.publish_component(crate::component("watcher", "disabled", "no watch mounts"))?; }
+                    identities.retain(|path, _| config.watch.mounts.contains(path));
+                    previous = Some(config.watch.clone());
+                }
+                if !config.watch.enabled {
+                    state.publish_component(crate::component("watcher", "disabled", "disabled by config"))?;
+                } else {
+                    let mounts = match crate::mounts::read() {
+                        Ok(mounts) => mounts,
+                        Err(error) => {
+                            // An unreadable table cannot authorize retaining a mark.
+                            for mount in watchers.keys() { state.remove_watcher(mount); }
+                            watchers.clear();
+                            state.publish_component(crate::component("watcher", "degraded", error.to_string()))?;
+                            crate::wait_service(&state, generation, &shutdown, Duration::from_secs(1));
+                            continue;
+                        }
+                    };
+                    let changes = crate::mounts::reconcile_live(&config.watch.mounts, &mut identities, &mounts)?;
+                    crate::mounts::log(&changes, "watcher");
+                    // Release old marks before any replacement starts.
+                    for change in &changes {
+                        let mount = RawPath::from_path(&change.path).map_err(|e| DaemonError::Config(e.to_string()))?.display_lossy();
+                        state.remove_watcher(&mount);
+                        watchers.remove(&mount);
+                    }
+                    let namespace = tidemark_live::watch::namespace_ok();
+                    if !matches!(namespace, Ok(true)) {
+                        for mount in watchers.keys() { state.remove_watcher(mount); }
+                        watchers.clear();
+                        state.publish_component(crate::component("watcher", "error", format!("host mount namespace check failed: {namespace:?}")))?;
+                    }
+                    for path in &config.watch.mounts {
+                        if shutdown.load(Ordering::Acquire) { break; }
+                        let mount = RawPath::from_path(path).map_err(|e| DaemonError::Config(e.to_string()))?.display_lossy();
+                        let name = format!("watcher:{mount}");
+                        if identities.get(path) == Some(&None) {
+                            state.publish_component(crate::component(&name, "degraded", "not mounted"))?;
+                            continue;
+                        }
+                        if !matches!(namespace, Ok(true)) || watchers.contains_key(&mount) { continue; }
+                        match Watcher::start(options(&config, path)?, attribution.clone()) {
+                            Ok(w) => {
+                                let w = Arc::new(w);
+                                state.publish(Publication::Watcher((mount.clone(), w.clone())), crate::component(&name, "ok", "watcher started"))?;
+                                watchers.insert(mount, w);
                             }
-                            result => { state.publish_component(crate::component("watcher", "error", format!("host mount namespace check failed: {result:?}")))?; }
+                            Err(e) => { state.publish_component(crate::component(&name, "error", e.to_string()))?; }
                         }
                     }
-                    previous = Some(config.watch.clone());
+                    if config.watch.mounts.is_empty() {
+                        state.publish_component(crate::component("watcher", "disabled", "no watch mounts"))?;
+                    }
                 }
                 for (mount, w) in &watchers {
                     let rows = w.drain_completed_minutes(1000);

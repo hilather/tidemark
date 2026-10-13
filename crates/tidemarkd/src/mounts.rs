@@ -42,7 +42,7 @@ fn normalized(path: &Path) -> Result<RawPath, DaemonError> {
 
 /// Resolve only an exact mount point; never accept its containing filesystem.
 pub fn identity(mounts: &[MountInfo], path: &Path) -> Result<Option<Identity>, DaemonError> {
-    let raw = normalized(path)?;
+    let raw = RawPath::from_path(path).map_err(|e| DaemonError::Config(e.to_string()))?;
     Ok(mount::mount_for_path(mounts, &raw)
         .filter(|m| m.mount_point == raw)
         .map(|m| Identity {
@@ -50,6 +50,13 @@ pub fn identity(mounts: &[MountInfo], path: &Path) -> Result<Option<Identity>, D
             major: m.major,
             minor: m.minor,
         }))
+}
+
+pub(crate) fn live_identity(
+    mounts: &[MountInfo],
+    path: &Path,
+) -> Result<Option<Identity>, DaemonError> {
+    identity(mounts, normalized(path)?.as_path())
 }
 
 /// Refuse a scan covered by any absent configured sampler or watcher mount.
@@ -60,7 +67,7 @@ pub fn check_scan(
 ) -> Result<(), DaemonError> {
     let root = normalized(root.as_path())?;
     for path in config.sampler.mounts.iter().chain(&config.watch.mounts) {
-        if root.starts_with(&normalized(path)?) && identity(mounts, path)?.is_none() {
+        if root.starts_with(&normalized(path)?) && live_identity(mounts, path)?.is_none() {
             return Err(DaemonError::Invalid(format!(
                 "mount not present: {}",
                 RawPath::from_path(path)
@@ -83,17 +90,36 @@ pub struct Transition {
     pub current: Option<Identity>,
 }
 
-/// Reconcile configured entries with one table, emitting each transition once.
+/// Pure reconciliation over configured paths, previous identities and one table.
+/// Emits each presence transition once; None-to-Some starts, Some-to-None stops,
+/// and Some-to-different-Some stops before starting a replacement.
 /// Memory is bounded by the validated configured mount inventory.
 pub fn reconcile(
     paths: &[PathBuf],
     previous: &mut BTreeMap<PathBuf, Option<Identity>>,
     mounts: &[MountInfo],
 ) -> Result<Vec<Transition>, DaemonError> {
+    reconcile_with(paths, previous, mounts, identity)
+}
+
+pub(crate) fn reconcile_live(
+    paths: &[PathBuf],
+    previous: &mut BTreeMap<PathBuf, Option<Identity>>,
+    mounts: &[MountInfo],
+) -> Result<Vec<Transition>, DaemonError> {
+    reconcile_with(paths, previous, mounts, live_identity)
+}
+
+fn reconcile_with(
+    paths: &[PathBuf],
+    previous: &mut BTreeMap<PathBuf, Option<Identity>>,
+    mounts: &[MountInfo],
+    resolve: impl Fn(&[MountInfo], &Path) -> Result<Option<Identity>, DaemonError>,
+) -> Result<Vec<Transition>, DaemonError> {
     previous.retain(|p, _| paths.contains(p));
     let mut changes = Vec::new();
     for path in paths {
-        let current = identity(mounts, path)?;
+        let current = resolve(mounts, path)?;
         if previous.get(path) != Some(&current) {
             changes.push(Transition {
                 path: path.clone(),
@@ -109,7 +135,9 @@ pub fn reconcile(
 /// Log each reconciled transition at its specified level.
 pub fn log(changes: &[Transition], service: &str) {
     for change in changes {
-        let path = change.path.display();
+        let path = RawPath::from_path(&change.path)
+            .map(|p| p.display_lossy())
+            .unwrap_or_else(|_| "invalid configured mount path".into());
         match (change.previous, change.current) {
             (_, None) => tracing::warn!(%path, service, "not mounted"),
             (None, Some(identity)) => {
@@ -162,6 +190,52 @@ mod tests {
         );
         assert!(identity(&over, Path::new("/data/child")).unwrap().is_none());
     }
+    #[test]
+    fn logger_emits_one_line_per_transition_and_device_changes_restart() {
+        use std::{io::Write, sync::Arc};
+        #[derive(Clone)]
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Sink(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let paths = vec!["/data".into()];
+            let mut previous = BTreeMap::new();
+            for table in [
+                vec![],
+                vec![],
+                table(2),
+                table(2),
+                parse(b"2 1 8:2 / /data rw - xfs /dev/new rw\n").unwrap(),
+                vec![],
+                vec![],
+            ] {
+                log(
+                    &reconcile(&paths, &mut previous, &table).unwrap(),
+                    "watcher",
+                );
+            }
+        });
+        let log = String::from_utf8(bytes.lock().clone()).unwrap();
+        assert_eq!(log.lines().count(), 4, "{log}");
+        assert_eq!(log.matches("not mounted").count(), 2);
+        assert_eq!(log.matches("mount identity changed").count(), 1);
+        assert_eq!(log.matches("INFO").count(), 1);
+    }
+
     #[test]
     fn scan_coverage_is_component_wise_and_includes_disabled_watch_entries() {
         let mut config = Config::default();
