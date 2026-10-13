@@ -530,6 +530,16 @@ fn decode_information(b: &[u8], metadata_len: usize, len: usize) -> io::Result<F
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn unidentified_handle_is_rejected() {
+        let mount = tempfile::tempfile().unwrap();
+        let mut handle = EventHandle::default();
+        assert_eq!(
+            handle.reopen(mount.as_fd()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
     fn metadata(mask: u64, fd: i32, len: u32) -> Vec<u8> {
         let mut b = vec![0; 24];
         b[..4].copy_from_slice(&len.to_ne_bytes());
