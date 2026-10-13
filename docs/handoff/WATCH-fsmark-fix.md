@@ -53,8 +53,23 @@ tidemark hot --window 5m
 journalctl -u tidemarkd --since '-5 minutes' --no-pager
 ```
 
-The coordinator's existing eight-writer guest harness must also rerun: plain host, PrivateTmp=yes, PrivateMounts=yes, ProtectHome plus ProtectSystem, subdirectory bind, whole-filesystem bind, RootDirectory plus BindPaths, and chroot. Keep its prior writer/unit/byte fixtures; expect each once, correct unit/bytes, and its actual directory rather than the mount root, with zero unmapped events. Namespace/root/bind setup belongs solely to that disposable guest harness. Inspect status/hot/journal with the commands above after all eight writes. On 8.8 confirm mount fallback and its existing visibility warning; the filesystem regression may skip when unsupported. If failures recur, preserve status detail and strace of name_to_handle_at/open_by_handle_at, including mount and target flags and final errno.
+Assumption: the coordinator retains the harness/setup used for the measured eight-writer run (its complete namespace/root/bind setup commands were not supplied here). Rerun that check: plain host, PrivateTmp=yes, PrivateMounts=yes, ProtectHome plus ProtectSystem, subdirectory bind, whole-filesystem bind, RootDirectory plus BindPaths, and chroot. Keep its prior writer/unit/byte fixtures; expect each once, correct unit/bytes, and its actual directory rather than the mount root, with zero unmapped events. Namespace/root/bind setup belongs solely to that disposable guest harness. Inspect status/hot/journal with the commands above after all eight writes. On 8.8 confirm mount fallback and its existing visibility warning; the filesystem regression may skip when unsupported. If failures recur, preserve status detail and strace of name_to_handle_at/open_by_handle_at, including mount and target flags and final errno.
 
 ## Local validation
 
 Results and remaining limits are appended after the required checks. Logs are in this attempt's output library. All Cargo commands use pinned Rust 1.98.0, offline dependencies via a copied cache in /tmp/fsmark-cargo, and timeout 1500; privileged features are only compiled/linted, never run. Socket readiness guards may defer five known daemon scenarios in this sandbox. Independent review and actual namespace/bind/chroot, normal unmount, atime and FD-soak evidence remain pending VM.
+
+## Final local check results
+
+| Command (timeout 1500, offline environment) | Exit | Evidence |
+|---|---|---|
+| `cargo fmt --check` | 0 | `library/fmt.log`, `library/fmt.exit` |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 0 | `library/clippy.log`, `library/clippy.exit` |
+| `cargo clippy --workspace --all-targets --features privileged -- -D warnings` | 0 | `library/privileged-clippy.log`, `library/privileged-clippy.exit` |
+| `cargo test --workspace --no-fail-fast` | 0 | `library/tests.log`, `library/tests.exit` |
+| `cargo build --workspace --features privileged --tests` | 0 | `library/privileged-build.log`, `library/privileged-build.exit` |
+| `tools/ci.sh` | 0 | `library/ci.log`, `library/ci.exit` |
+
+Reported Cargo summaries: targeted watcher tests {'passed': 27, 'failed': 0, 'ignored': 0, 'summaries': 1}; standalone workspace {'passed': 899, 'failed': 0, 'ignored': 14, 'summaries': 84}; final CI {'passed': 899, 'failed': 0, 'ignored': 14, 'summaries': 84}. Counts include nested subprocess summaries and guarded early returns, not distinct fully exercised scenarios. The standalone Clippy checks preceded the final rustdoc-only clarification; final CI covers final source formatting, Clippy, tests and privileged build.
+
+CI source checks passed: 150 owner tags and forbidden-symbol scan. cargo-deny was absent and CI explicitly skipped its check. Privileged compilation/lint passed; no privileged test executed. Five known readiness scenarios have socket-availability guards, so local green output does not certify those assertions. Pending VM limits above still apply. No independent acceptance or integration is claimed.
