@@ -7,6 +7,7 @@ use crate::cmd;
 #[command(
     name = "tidemark",
     version,
+    long_version = concat!(env!("CARGO_PKG_VERSION"), "\ncommit: ", env!("TIDEMARK_BUILD_COMMIT"), " (", env!("TIDEMARK_BUILD_DATE"), ")\ntarget: ", env!("TIDEMARK_BUILD_TARGET"), ", profile ", env!("TIDEMARK_BUILD_PROFILE")),
     about = "Disk-usage intelligence",
     disable_help_subcommand = true
 )]

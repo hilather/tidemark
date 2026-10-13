@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 /// Daemon invocation options.
 #[derive(Debug, Parser)]
-#[command(name = "tidemarkd", version, about = "Tidemark monitoring daemon")]
+#[command(name = "tidemarkd", version, long_version = concat!(env!("CARGO_PKG_VERSION"), "\ncommit: ", env!("TIDEMARK_BUILD_COMMIT"), " (", env!("TIDEMARK_BUILD_DATE"), ")\ntarget: ", env!("TIDEMARK_BUILD_TARGET"), ", profile ", env!("TIDEMARK_BUILD_PROFILE")), about = "Tidemark monitoring daemon")]
 pub struct Args {
     /// Configuration file.
     #[arg(
@@ -777,6 +777,14 @@ pub fn run_controlled(
         sync::{atomic::Ordering, Arc},
         time::{Duration, Instant},
     };
+    tracing::info!(
+        "tidemarkd {} starting: commit {} ({}), target {}, profile {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("TIDEMARK_BUILD_COMMIT"),
+        env!("TIDEMARK_BUILD_DATE"),
+        env!("TIDEMARK_BUILD_TARGET"),
+        env!("TIDEMARK_BUILD_PROFILE")
+    );
     validate_config(&config)?;
     let limit = raise_fd_limit(
         || rustix::process::getrlimit(rustix::process::Resource::Nofile),

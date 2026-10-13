@@ -49,11 +49,32 @@ pub fn container_args(root: &Path, version: &str) -> Result<Vec<OsString>> {
     ])
 }
 
+/// Pass host-resolved identity directly to the container without shell interpolation.
+pub fn container_identity_args(
+    root: &Path,
+    version: &str,
+    identity: &[(&str, &str)],
+) -> Result<Vec<OsString>> {
+    let mut command = container_args(root, version)?;
+    for (key, value) in identity {
+        command.splice(
+            3..3,
+            [
+                OsString::from("--env"),
+                OsString::from(format!("{key}={value}")),
+            ],
+        );
+    }
+    Ok(command)
+}
+
 /// Parsed RPM build options; container mode remains the default.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
     /// Build directly on the current host.
     pub native: bool,
+    /// Reject tracked changes before a native release build.
+    pub require_clean: bool,
     /// Permit Cargo dependency fetching during the release build.
     pub online: bool,
     /// Explicitly bypass the EL8 host guard.
@@ -68,6 +89,7 @@ pub struct Options {
 pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
     let mut options = Options {
         native: false,
+        require_clean: false,
         online: false,
         allow_foreign_host: false,
         version: "0.1.0".into(),
@@ -81,6 +103,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
         }
         match arg.as_str() {
             "--native" => options.native = true,
+            "--require-clean" => options.require_clean = true,
             "--upgrade-fixture" => options.upgrade_fixture = true,
             "--container" => {}
             "--online" => options.online = true,
@@ -92,8 +115,8 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
     if options.native && seen.contains("--container") {
         bail!("--native and --container conflict");
     }
-    if !options.native && (options.online || options.allow_foreign_host) {
-        bail!("--online and --allow-foreign-host require --native");
+    if !options.native && (options.online || options.allow_foreign_host || options.require_clean) {
+        bail!("--online, --allow-foreign-host and --require-clean require --native");
     }
     if options.upgrade_fixture && (!options.native || options.version != "0.1.1") {
         bail!("--upgrade-fixture requires --native and --version 0.1.1");
@@ -125,6 +148,8 @@ pub struct NativeCommand {
     pub args: Vec<String>,
     /// Optional workspace-relative file receiving standard output.
     pub stdout: Option<String>,
+    /// Build identity environment keys, resolved once on the host.
+    pub identity_env: Vec<String>,
 }
 
 /// Assemble the ordered build, completion, manual and generator commands.
@@ -160,11 +185,13 @@ pub fn native_commands(
             program: "cargo".into(),
             args: build,
             stdout: None,
+            identity_env: vec!["TIDEMARK_BUILD_COMMIT".into(), "TIDEMARK_BUILD_DATE".into()],
         },
         NativeCommand {
             program: "target/release/tidemark".into(),
             args: vec!["completions".into(), "bash".into()],
             stdout: Some("target/release/tidemark.bash".into()),
+            identity_env: vec![],
         },
         NativeCommand {
             program: "cargo".into(),
@@ -180,11 +207,13 @@ pub fn native_commands(
                 args
             },
             stdout: None,
+            identity_env: vec![],
         },
         NativeCommand {
             program: "cargo".into(),
             args: rpm_args,
             stdout: None,
+            identity_env: vec![],
         },
     ])
 }
@@ -192,6 +221,37 @@ pub fn native_commands(
 /// Build natively on EL8 or in the existing pre-provisioned container.
 pub fn run(root: &Path, args: impl Iterator<Item = String>) -> Result<()> {
     let options = parse_args(args)?;
+    let git = |args: &[&str]| -> Option<String> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let dirty =
+        git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
+    if options.require_clean && dirty {
+        bail!("--require-clean rejects changes to tracked files");
+    }
+    let commit = std::env::var("TIDEMARK_BUILD_COMMIT")
+        .ok()
+        .unwrap_or_else(|| {
+            git(&["rev-parse", "--short=12", "HEAD"])
+                .map(|c| if dirty { format!("{c}-dirty") } else { c })
+                .unwrap_or_else(|| "unknown".into())
+        });
+    let date = std::env::var("TIDEMARK_BUILD_DATE")
+        .ok()
+        .or_else(|| git(&["show", "-s", "--format=%cs", "HEAD"]))
+        .unwrap_or_else(|| "unknown".into());
+    let identity = [
+        ("TIDEMARK_BUILD_COMMIT", commit.as_str()),
+        ("TIDEMARK_BUILD_DATE", date.as_str()),
+    ];
     if options.native {
         if !options.allow_foreign_host
             && !is_el8(
@@ -212,6 +272,11 @@ pub fn run(root: &Path, args: impl Iterator<Item = String>) -> Result<()> {
         for spec in native_commands(&options.version, options.online, options.upgrade_fixture)? {
             let mut command = Command::new(&spec.program);
             command.args(&spec.args).current_dir(root);
+            for key in &spec.identity_env {
+                if let Some((_, value)) = identity.iter().find(|(name, _)| name == key) {
+                    command.env(key, value);
+                }
+            }
             if let Some(path) = spec.stdout {
                 command.stdout(std::fs::File::create(root.join(path))?);
             }
@@ -224,7 +289,7 @@ pub fn run(root: &Path, args: impl Iterator<Item = String>) -> Result<()> {
         }
         return Ok(());
     }
-    let command = container_args(root, &options.version)?;
+    let command = container_identity_args(root, &options.version, &identity)?;
     let tool = ["podman", "docker"]
         .into_iter()
         .find(|tool| {
