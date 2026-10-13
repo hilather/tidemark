@@ -165,7 +165,8 @@ fn retained(path: &Path) -> bool {
         .is_some_and(|s| !s.is_empty() && s.iter().all(u8::is_ascii_digit))
 }
 /// Walk absolute directory ancestry without following links, retaining the final fd.
-/// Trusted owners are root/euid (or any owner on a read-only mount). Writable
+/// Trusted owners are root/euid, or unmapped overflow owners in a user namespace
+/// (or any owner on a read-only mount). Writable
 /// ancestors must be sticky; their children must be root/euid-owned and safe from writes.
 pub fn trusted_directory(path: &Path) -> io::Result<OwnedFd> {
     if !path.is_absolute() {
@@ -251,7 +252,7 @@ impl StateDir {
     }
     /// Verify a snapshot directory hierarchy, creating private children if requested.
     /// Paths beneath `snapshots` validate every child of the enclosing state root.
-    /// Standalone snapshot directories retain the same private-directory policy.
+    /// Standalone snapshot directories retain the same storage integrity policy.
     pub fn snapshot_dir(path: &Path, create: bool) -> io::Result<Self> {
         let boundary = path
             .components()
@@ -335,7 +336,7 @@ impl StateDir {
         self.leaf(name, &fs::fstat(&fd)?)?;
         Ok(File::from(fd))
     }
-    /// Open or create a private child relative to the verified descriptor.
+    /// Open an integrity-checked child, or create it privately, relative to this descriptor.
     pub fn subdir(&self, name: &OsStr, create: bool) -> io::Result<Self> {
         self.name(name)?;
         let path = self.path.join(name);
