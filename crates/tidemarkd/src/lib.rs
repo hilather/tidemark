@@ -72,11 +72,11 @@ pub fn run_args(args: &Args, output: &mut impl Write) -> u8 {
         }
         return 0;
     }
-    let config = match tidemark_core::config::Config::load(&args.config) {
-        Ok(config) => config,
+    let config = match load_config(&args.config) {
+        Ok((config, _)) => config,
         Err(error) => {
             let _ = writeln!(output, "{error}");
-            if let tidemark_core::error::CoreError::Io(error) = &error {
+            if let DaemonError::Io { source: error, .. } = &error {
                 if error.kind() == std::io::ErrorKind::PermissionDenied {
                     let _ = writeln!(
                         output,
@@ -170,6 +170,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("366 days"));
+    }
+    #[test]
+    fn captured_config_bytes_determine_both_parse_and_hash() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = b"[sampler]\ninterval='1h'\n";
+        std::fs::write(&path, original).unwrap();
+        let captured = std::fs::read(&path).unwrap();
+        // Change the inode contents after capture. Parsing has no path/fd to reread.
+        std::fs::write(&path, b"[sampler]\ninterval='2h'\n").unwrap();
+        let (config, hash) = parse_config_bytes(&captured).unwrap();
+        assert_eq!(
+            config.sampler.interval,
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(hash, format!("{:x}", Sha256::digest(original)));
+        let (later, later_hash) = load_config(&path).unwrap();
+        assert_eq!(later.sampler.interval, std::time::Duration::from_secs(7200));
+        assert_ne!(hash, later_hash);
     }
     #[test]
     fn example_and_unknown_key() {
@@ -892,11 +912,7 @@ fn load_config(
     path: &std::path::Path,
 ) -> Result<(tidemark_core::config::Config, String), DaemonError> {
     use rustix::fs::{self, FileType, Mode, OFlags};
-    use sha2::{Digest, Sha256};
-    use std::{
-        io::{Read, Seek},
-        os::fd::AsRawFd,
-    };
+    use std::io::Read;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -946,23 +962,15 @@ fn load_config(
     if bytes.len() > 1024 * 1024 {
         return Err(DaemonError::Config("config exceeds 1 MiB".into()));
     }
-    let config = tidemark_core::config::Config::load(std::path::Path::new(&format!(
-        "/proc/self/fd/{}",
-        file.as_raw_fd()
-    )))
-    .map_err(|e| DaemonError::Config(e.to_string()))?;
-    file.rewind()
+    parse_config_bytes(&bytes)
+}
+fn parse_config_bytes(
+    bytes: &[u8],
+) -> Result<(tidemark_core::config::Config, String), DaemonError> {
+    use sha2::{Digest, Sha256};
+    let config = tidemark_core::config::Config::from_toml_bytes(bytes)
         .map_err(|e| DaemonError::Config(e.to_string()))?;
-    let mut after = Vec::new();
-    file.take(1024 * 1024 + 1)
-        .read_to_end(&mut after)
-        .map_err(|e| DaemonError::Config(e.to_string()))?;
-    if bytes != after {
-        return Err(DaemonError::Config(
-            "config changed during load; retry".into(),
-        ));
-    }
-    Ok((config, format!("{:x}", Sha256::digest(&bytes))))
+    Ok((config, format!("{:x}", Sha256::digest(bytes))))
 }
 
 /// Injectable Unix clock for service scheduling and compaction tests.
