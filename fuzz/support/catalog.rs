@@ -1,7 +1,10 @@
 //! Owned by: W7-C3-fuzz
 //! Reach stored-path resolution using a temporary catalog and raw SQL fixture.
+// Fixture setup failures should fail the test or fuzz execution immediately.
+#![allow(clippy::unwrap_used)]
 use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
 use tidemark_store::catalog::{Catalog, ScanEntry};
+/// Feed adversarial bytes through the public parser seam in disposable state.
 pub fn exercise(bytes: &[u8]) {
     let dir = tempfile::tempdir().unwrap();
     let catalog = Catalog::open(dir.path(), true).unwrap();
