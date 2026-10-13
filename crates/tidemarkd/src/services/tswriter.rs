@@ -243,7 +243,15 @@ fn start_supervised_with_clocks(
     Ok((sender, handle))
 }
 fn store_error(error: tidemark_store::StoreError) -> crate::DaemonError {
-    crate::DaemonError::Store(error.to_string())
+    if crate::store_pressure(&error) {
+        crate::DaemonError::Unavailable(format!("resource pressure: {error}"))
+    } else {
+        crate::DaemonError::Store(error.to_string())
+    }
+}
+fn writer_pressure(error: &crate::DaemonError) -> bool {
+    matches!(error, crate::DaemonError::Unavailable(detail) if detail.starts_with("resource pressure:"))
+        || matches!(error, crate::DaemonError::Io { source, .. } if crate::resource_pressure(source))
 }
 fn writer_loop(
     config: std::sync::Arc<tidemark_core::config::Config>,
@@ -259,6 +267,7 @@ fn writer_loop(
     let mut compact_at = monotonic().saturating_add(3600);
     let mut fs_batch = Vec::new();
     let mut failure = None;
+    let mut pressure = false;
     loop {
         let mut recovered = false;
         let message = match receiver.recv_timeout(Duration::from_millis(50)) {
@@ -277,7 +286,13 @@ fn writer_loop(
                         if fs_batch.len() + rows.len() > MAX_BATCH_ROWS {
                             let result = flush_fs(&ts, &mut fs_batch);
                             recovered = result.is_ok();
-                            fs_batch.extend(rows);
+                            if result
+                                .as_ref()
+                                .err()
+                                .is_none_or(|error| !writer_pressure(error))
+                            {
+                                fs_batch.extend(rows);
+                            }
                             result
                         } else {
                             fs_batch.extend(rows);
@@ -290,6 +305,7 @@ fn writer_loop(
                     match message {
                         Message::Flush(ack) => {
                             if let Err(e) = flushed {
+                                pressure = writer_pressure(&e);
                                 failure = Some(e.to_string());
                             }
                             // The legacy unit ack is a completion barrier; health carries failures.
@@ -299,30 +315,58 @@ fn writer_loop(
                         Message::ScanStarted(entry, ack) => {
                             let r = flushed
                                 .and_then(|()| catalog.record_start(&entry).map_err(store_error));
-                            let failed = r.as_ref().err().map(ToString::to_string);
+                            let failed = r
+                                .as_ref()
+                                .err()
+                                .map(|error| (error.to_string(), writer_pressure(error)));
                             let _ = ack.try_send(r);
-                            failed.map_or(Ok(()), |s| Err(crate::DaemonError::Store(s)))
+                            failed.map_or(Ok(()), |(s, pressure)| {
+                                Err(if pressure {
+                                    crate::DaemonError::Unavailable(format!(
+                                        "resource pressure: {s}"
+                                    ))
+                                } else {
+                                    crate::DaemonError::Store(s)
+                                })
+                            })
                         }
                         Message::ScanFinished(entry, ack) => {
                             let r = flushed
                                 .and_then(|()| catalog.record_finish(&entry).map_err(store_error));
-                            let failed = r.as_ref().err().map(ToString::to_string);
+                            let failed = r
+                                .as_ref()
+                                .err()
+                                .map(|error| (error.to_string(), writer_pressure(error)));
                             let _ = ack.try_send(r);
-                            failed.map_or(Ok(()), |s| Err(crate::DaemonError::Store(s)))
+                            failed.map_or(Ok(()), |(s, pressure)| {
+                                Err(if pressure {
+                                    crate::DaemonError::Unavailable(format!(
+                                        "resource pressure: {s}"
+                                    ))
+                                } else {
+                                    crate::DaemonError::Store(s)
+                                })
+                            })
                         }
                         other => flushed.and_then(|()| persist(&ts, &state, other)),
                     }
                 }
             };
             match result {
-                Err(error) => failure = Some(error.to_string()),
+                Err(error) => {
+                    pressure = writer_pressure(&error);
+                    failure = Some(error.to_string());
+                }
                 Ok(()) => recovered |= persisted,
             }
         }
         if receiver.is_empty() {
             let had_rows = !fs_batch.is_empty();
             match flush_fs(&ts, &mut fs_batch) {
-                Err(error) => failure = Some(error.to_string()),
+                Err(error) => {
+                    pressure = writer_pressure(&error);
+                    failure = Some(error.to_string());
+                }
                 Ok(()) => recovered |= had_rows,
             }
         }
@@ -330,13 +374,18 @@ fn writer_loop(
         if monotonic() >= compact_at {
             let policy = state.config().0.retention.samples.clone();
             if let Err(error) = ts.compact(now, &policy) {
+                pressure = crate::store_pressure(&error);
                 failure = Some(error.to_string());
             }
             compact_at = monotonic().saturating_add(3600);
         }
         if let Some(error) = failure.take() {
             tracing::error!(%error,"time-series writer failure");
-            state.publish_component(crate::component("tswriter", "error", error))?;
+            state.publish_component(crate::component(
+                "tswriter",
+                if pressure { "degraded" } else { "error" },
+                error,
+            ))?;
         } else if recovered {
             state.publish_component(crate::component("tswriter", "ok", "persistence recovered"))?;
         }
@@ -344,7 +393,17 @@ fn writer_loop(
             break;
         }
     }
-    flush_fs(&ts, &mut fs_batch)?;
+    if let Err(error) = flush_fs(&ts, &mut fs_batch) {
+        if writer_pressure(&error) {
+            state.publish_component(crate::component(
+                "tswriter",
+                "degraded",
+                format!("shutdown flush unavailable: {error}"),
+            ))?;
+        } else {
+            return Err(error);
+        }
+    }
     let _ = config;
     Ok(())
 }
@@ -357,19 +416,28 @@ fn flush_fs(
     }
     // The frozen primary key is mount/res/whole-second timestamp. Reloads and
     // quick restarts can repeat a key; keep its first persisted observation.
-    let mut keys = std::collections::BTreeSet::new();
-    let mut unique = Vec::with_capacity(rows.len());
-    for row in rows.drain(..) {
-        if keys.insert((row.mount.clone(), row.ts))
-            && ts
-                .query_fs(&row.mount, row.ts, row.ts)
-                .map_err(store_error)?
-                .is_empty()
-        {
-            unique.push(row);
+    let result = (|| {
+        let mut keys = std::collections::BTreeSet::new();
+        let mut unique = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            if keys.insert((row.mount.clone(), row.ts))
+                && ts.query_fs(&row.mount, row.ts, row.ts)?.is_empty()
+            {
+                unique.push(row.clone());
+            }
         }
+        ts.insert_fs(&unique)
+    })();
+    // Retain bounded pending rows only for transient failures. Invalid rows must
+    // be dropped so that a later valid batch can recover (existing behavior).
+    if result
+        .as_ref()
+        .err()
+        .is_none_or(|error| !crate::store_pressure(error))
+    {
+        rows.clear();
     }
-    ts.insert_fs(&unique).map_err(store_error)
+    result.map_err(store_error)
 }
 fn persist(
     ts: &tidemark_store::timeseries::TimeSeries,

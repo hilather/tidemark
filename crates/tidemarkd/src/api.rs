@@ -713,6 +713,7 @@ pub fn start_with_peer_timeout(
         .spawn(move || {
             let mut clients: Vec<std::thread::JoinHandle<()>> = Vec::new();
             let mut outcome = Ok(());
+            let mut pressure = AcceptPressure::default();
             while !shutdown.load(Ordering::Acquire) {
                 let mut index = 0;
                 while index < clients.len() {
@@ -722,8 +723,33 @@ pub fn start_with_peer_timeout(
                         index += 1;
                     }
                 }
-                match listener.accept() {
-                    Ok((stream, _)) => {
+                let accepted = accept_once(
+                    &mut pressure,
+                    || listener.accept(),
+                    |error, log| {
+                        if log {
+                            tracing::warn!(%error, "API accept degraded; retrying");
+                        }
+                        let _ = context.state.publish_component(crate::component(
+                            "api",
+                            "degraded",
+                            error.to_string(),
+                        ));
+                    },
+                    |delay| {
+                        let end = Instant::now() + delay;
+                        while !shutdown.load(Ordering::Acquire) && Instant::now() < end {
+                            std::thread::park_timeout(Duration::from_millis(20));
+                        }
+                    },
+                );
+                match accepted {
+                    Ok(Some((stream, _))) => {
+                        let _ = context.state.publish_component(crate::component(
+                            "api",
+                            "ok",
+                            "Unix socket listening",
+                        ));
                         let accepted = Instant::now();
                         if clients.len() >= CONNECTIONS
                             || active.load(Ordering::Acquire) >= CONNECTIONS
@@ -746,10 +772,7 @@ pub fn start_with_peer_timeout(
                             clients.push(h);
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::park_timeout(Duration::from_millis(20))
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Ok(None) => {}
                     Err(e) => {
                         outcome = Err(io(e));
                         shutdown.store(true, Ordering::Release);
@@ -765,6 +788,53 @@ pub fn start_with_peer_timeout(
             outcome
         })
         .map_err(io)
+}
+fn accept_once<T>(
+    pressure: &mut AcceptPressure,
+    accept: impl FnOnce() -> std::io::Result<T>,
+    mut report: impl FnMut(&std::io::Error, bool),
+    mut wait: impl FnMut(Duration),
+) -> std::io::Result<Option<T>> {
+    match accept() {
+        Ok(client) => {
+            pressure.failures = 0;
+            Ok(Some(client))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            pressure.failures = 0;
+            wait(Duration::from_millis(20));
+            Ok(None)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(None),
+        Err(error)
+            if crate::resource_pressure(&error)
+                || error.raw_os_error() == Some(rustix::io::Errno::CONNABORTED.raw_os_error()) =>
+        {
+            let (delay, log) = pressure.retry(Instant::now());
+            report(&error, log);
+            wait(delay);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+#[derive(Default)]
+struct AcceptPressure {
+    failures: u32,
+    last_log: Option<Instant>,
+}
+impl AcceptPressure {
+    fn retry(&mut self, now: Instant) -> (Duration, bool) {
+        let delay = Duration::from_millis(50u64 << self.failures.min(4));
+        self.failures = self.failures.saturating_add(1);
+        let log = self
+            .last_log
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(60));
+        if log {
+            self.last_log = Some(now);
+        }
+        (delay, log)
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -807,6 +877,45 @@ mod tests {
         let mut line = String::new();
         s.read_line(&mut line).unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+    #[test]
+    fn twenty_resource_accept_failures_back_off_then_recover() {
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut pressure = AcceptPressure::default();
+        let mut warnings = 0;
+        let mut degraded = 0;
+        for n in 0..21u32 {
+            let result = accept_once(
+                &mut pressure,
+                || {
+                    if n < 20 {
+                        Err(std::io::Error::from_raw_os_error(24))
+                    } else {
+                        Ok(42)
+                    }
+                },
+                |_, log| {
+                    degraded += 1;
+                    warnings += usize::from(log);
+                },
+                |delay| assert_eq!(delay.as_millis(), 50u128 << n.min(4)),
+            )
+            .unwrap();
+            assert_eq!(result, if n < 20 { None } else { Some(42) });
+            assert!(!shutdown.load(Ordering::Acquire));
+        }
+        assert_eq!((warnings, degraded, pressure.failures), (1, 20, 0));
+        assert_eq!(
+            pressure.retry(Instant::now() + Duration::from_secs(61)),
+            (Duration::from_millis(50), true)
+        );
+        assert!(accept_once::<()>(
+            &mut pressure,
+            || Err(std::io::Error::from_raw_os_error(9)),
+            |_, _| panic!("fatal error"),
+            |_| panic!("fatal error")
+        )
+        .is_err());
     }
     #[test]
     fn pair_framing_partial_malformed_oversize_and_idle_stop() {

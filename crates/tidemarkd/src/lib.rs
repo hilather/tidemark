@@ -141,6 +141,43 @@ pub fn main_entry() -> std::process::ExitCode {
 mod tests {
     use super::*;
     #[test]
+    fn per_mount_descriptor_budget_reserves_headroom() {
+        assert_eq!(fd_budget(Some(1024), 2), 256);
+        assert_eq!(fd_budget(Some(1024), 4), 128);
+        assert_eq!(fd_budget(Some(640), 4), 32);
+        assert_eq!(fd_budget(Some(64), 1), 16);
+        assert_eq!(fd_budget(None, 100), 256);
+        assert_eq!(fd_budget(Some(64), 0), 256);
+    }
+    #[test]
+    fn descriptor_limit_raise_equal_and_refused() {
+        use rustix::process::Rlimit;
+        use std::cell::Cell;
+        let limit = Cell::new(Rlimit {
+            current: Some(64),
+            maximum: Some(1024),
+        });
+        let calls = Cell::new(0);
+        let raised = raise_fd_limit(
+            || limit.get(),
+            |next| {
+                calls.set(calls.get() + 1);
+                limit.set(next);
+                Ok(())
+            },
+        );
+        assert_eq!(raised.current, Some(1024));
+        assert_eq!(calls.get(), 1);
+        raise_fd_limit(|| limit.get(), |_| panic!("equal limits must not be set"));
+        limit.set(Rlimit {
+            current: Some(64),
+            maximum: Some(1024),
+        });
+        let refused = raise_fd_limit(|| limit.get(), |_| Err(rustix::io::Errno::PERM));
+        assert_eq!(refused.current, Some(64));
+    }
+
+    #[test]
     fn operational_intervals_have_inclusive_366_day_cap() {
         let max = std::time::Duration::from_secs(366 * 86400);
         let setters: [fn(&mut tidemark_core::config::Config, std::time::Duration); 7] = [
@@ -345,6 +382,74 @@ pub enum DaemonError {
     #[error("internal: {0}")]
     Internal(String),
 }
+fn raise_fd_limit(
+    get: impl Fn() -> rustix::process::Rlimit,
+    set: impl Fn(rustix::process::Rlimit) -> Result<(), rustix::io::Errno>,
+) -> rustix::process::Rlimit {
+    let limit = get();
+    if limit.current != limit.maximum {
+        if let Err(error) = set(rustix::process::Rlimit {
+            current: limit.maximum,
+            ..limit
+        }) {
+            tracing::warn!(%error, "could not raise descriptor soft limit");
+        }
+    }
+    get()
+}
+
+fn fd_budget(limit: Option<u64>, mounts: usize) -> usize {
+    limit.map_or(256, |limit| {
+        if mounts == 0 {
+            256
+        } else {
+            (limit.saturating_sub(512) / mounts as u64).clamp(16, 256) as usize
+        }
+    })
+}
+
+pub(crate) fn watch_fd_budget(mounts: usize) {
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+    let needed = (mounts as u64).saturating_mul(256).saturating_add(512);
+    let batch = fd_budget(limit, mounts);
+    tidemark_live::watch::set_fd_batch(batch);
+    if limit.is_some_and(|limit| limit < needed) {
+        tracing::warn!(
+            ?limit,
+            needed,
+            mounts,
+            batch,
+            "descriptor budget reduced; minimum batch may exceed available reserve"
+        );
+    }
+}
+
+// Resource pressure must be contained by the component owning the retry loop.
+pub(crate) fn resource_pressure(error: &std::io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        [
+            rustix::io::Errno::MFILE,
+            rustix::io::Errno::NFILE,
+            rustix::io::Errno::NOMEM,
+            rustix::io::Errno::NOBUFS,
+        ]
+        .iter()
+        .any(|errno| errno.raw_os_error() == code)
+    })
+}
+
+pub(crate) fn store_pressure(error: &tidemark_store::StoreError) -> bool {
+    match error {
+        tidemark_store::StoreError::Io(error) => resource_pressure(error),
+        // SQLite preserves its extended result code, but not the underlying errno.
+        // CANTOPEN, NOMEM and IOERR are retried by read-only scheduling passes.
+        tidemark_store::StoreError::Sql(error) => error
+            .sqlite_error_code()
+            .is_some_and(|code| matches!(code as i32, 7 | 10 | 14)),
+        _ => false,
+    }
+}
+
 /// Shared shutdown flag; lifecycle owner broadcasts by setting it true.
 pub type Shutdown = std::sync::Arc<std::sync::atomic::AtomicBool>;
 /// Service thread joined during bounded shutdown. Shape proposed by W6-prep; the owning task may refine it inside its own file.
@@ -403,6 +508,11 @@ pub fn run_controlled(
         time::{Duration, Instant},
     };
     validate_config(&config)?;
+    let limit = raise_fd_limit(
+        || rustix::process::getrlimit(rustix::process::Resource::Nofile),
+        |limit| rustix::process::setrlimit(rustix::process::Resource::Nofile, limit),
+    );
+    tracing::info!(soft=?limit.current, hard=?limit.maximum, "effective descriptor limit");
     let (loaded, hash) = load_config(&options.config_path)?;
     if loaded != config {
         return Err(DaemonError::Config(

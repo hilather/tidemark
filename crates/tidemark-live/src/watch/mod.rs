@@ -19,6 +19,49 @@ use tidemark_core::{
 use tidemark_fs::attribution::AttributionCache;
 use tidemark_sys::fanotify::{mask, Fanotify, InitMode, RawEvent};
 
+const FD_EVENT_BYTES: usize = 24;
+const MAX_FD_BATCH: usize = 256;
+static FD_BATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MAX_FD_BATCH);
+
+/// Set the process-wide fd-mode read budget, including already running watchers.
+/// The transport holds between 16 and 256 descriptors per mount per read.
+pub fn set_fd_batch(events: usize) {
+    FD_BATCH.store(events.clamp(16, MAX_FD_BATCH), Ordering::Release);
+}
+
+fn fd_buffer_len() -> usize {
+    fd_read_len(FD_BATCH.load(Ordering::Acquire))
+}
+fn fd_read_len(batch: usize) -> usize {
+    batch.clamp(16, MAX_FD_BATCH) * FD_EVENT_BYTES
+}
+fn read_batch<T>(
+    buffer: &mut [u8],
+    length: usize,
+    read: impl FnOnce(&mut [u8]) -> io::Result<T>,
+) -> io::Result<T> {
+    read(&mut buffer[..length])
+}
+
+fn descriptor_limit_reached() -> bool {
+    let Some(limit) = rustix::process::getrlimit(rustix::process::Resource::Nofile).current else {
+        return false;
+    };
+    // Opening fdinfo also fails at the limit; do not silently treat that as healthy.
+    match std::fs::read_dir("/proc/self/fd") {
+        Ok(entries) => {
+            entries
+                .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                .count() as u64
+                >= limit
+        }
+        Err(error) => error.raw_os_error().is_some_and(|code| {
+            code == rustix::io::Errno::MFILE.raw_os_error()
+                || code == rustix::io::Errno::NFILE.raw_os_error()
+        }),
+    }
+}
+
 /// Settings for one mount-scoped watcher.
 pub struct WatcherOptions {
     /// Contract field.
@@ -286,7 +329,15 @@ impl Watcher {
         let thread = std::thread::Builder::new()
             .name("tidemark-watch".into())
             .spawn(move || {
-                let mut buffer = vec![0; 65536];
+                let fd_mode = mode == WatchMode::FdMount;
+                let mut buffer = vec![
+                    0;
+                    if fd_mode {
+                        MAX_FD_BATCH * FD_EVENT_BYTES
+                    } else {
+                        65536
+                    }
+                ];
                 let mut processor = Processor {
                     own_pid: std::process::id() as i32,
                     cfg: &cfg,
@@ -342,9 +393,14 @@ impl Watcher {
                     }
                     let Some(events) = read_recover(
                         || {
-                            group
-                                .read(&mut buffer)
-                                .map(|events| events.collect::<Vec<_>>())
+                            let len = if fd_mode {
+                                fd_buffer_len()
+                            } else {
+                                buffer.len()
+                            };
+                            read_batch(&mut buffer, len, |bytes| {
+                                group.read(bytes).map(|events| events.collect::<Vec<_>>())
+                            })
                         },
                         &mut processor,
                         &worker_state,
@@ -354,6 +410,11 @@ impl Watcher {
                     ) else {
                         break;
                     };
+                    if fd_mode && descriptor_limit_reached() {
+                        processor.loss(now(), &worker_state);
+                        let mut state = worker_state.lock();
+                        state.read_errors = state.read_errors.saturating_add(1);
+                    }
                     for event in events {
                         if worker_stopping.load(Ordering::Relaxed) {
                             break;
@@ -567,7 +628,7 @@ fn select_group<T>(
         None => fd().map(|group| (group, WatchMode::FdMount)),
     }
 }
-// A read is bounded by the 64 KiB transport buffer, including this collected batch.
+// Reads are bounded by the mode-specific transport buffer, including collected batches.
 fn read_recover<T>(
     mut read: impl FnMut() -> io::Result<T>,
     processor: &mut Processor<'_>,
@@ -845,6 +906,25 @@ impl std::fmt::Display for WatchMode {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn fd_reader_drains_five_thousand_in_bounded_batches() {
+        for batch in [256, 32, 16] {
+            let mut remaining = 5000;
+            let mut buffer = vec![0; 65536];
+            let mut reads = 0;
+            while remaining > 0 {
+                let count = read_batch(&mut buffer, fd_read_len(batch), |bytes| {
+                    let count = remaining.min(bytes.len() / FD_EVENT_BYTES);
+                    assert!(count <= batch);
+                    Ok(count)
+                })
+                .unwrap();
+                remaining -= count;
+                reads += 1;
+            }
+            assert_eq!(reads, 5000usize.div_ceil(batch));
+        }
+    }
     #[test]
     fn injected_watcher_minutes_and_shared_persistence() {
         for legacy_first in [false, true] {
