@@ -14,7 +14,6 @@ workspace = true
 [dependencies]
 serde_json.workspace = true
 serde.workspace = true
-ureq.workspace = true
 tracing-journald.workspace = true
 globset.workspace = true
 rustix.workspace = true
@@ -29,6 +28,5 @@ tidemark-core.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
-tiny_http.workspace = true
 tempfile.workspace = true
 test-support.workspace = true

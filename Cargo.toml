@@ -46,8 +46,6 @@ toml = "1"
 humantime-serde = "1"
 bytesize = "2"
 serde_json = "1"
-ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
-tiny_http = "0.12"
 sd-notify = "0.4"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rustc-hash = "2"

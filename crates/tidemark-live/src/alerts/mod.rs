@@ -371,7 +371,7 @@ pub enum AlertError {
     NotYetImplemented,
 }
 
-pub use deliver::{Deliver, DeliverError, JournalDeliver, WebhookDeliver};
+pub use deliver::{Deliver, DeliverError, JournalDeliver};
 
 #[cfg(test)]
 mod tests;
