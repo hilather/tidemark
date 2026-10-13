@@ -189,3 +189,118 @@ fn watcher_final_drop_joins_worker_on_vm() {
     wait(|| threads() == before);
     assert!(state.view_at(0).watch_stats().is_none_or(|s| s.is_empty()));
 }
+
+#[test]
+fn missing_watch_mount_is_degraded_and_has_no_watcher() {
+    let (dir, mut cfg) = config();
+    cfg.watch.enabled = true;
+    cfg.watch.mounts = vec![dir.path().to_path_buf()];
+    let name = format!("watcher:{}", dir.path().display());
+    let state = LiveState::new(&cfg, 100);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, _rx) = crossbeam_channel::bounded(1);
+    let worker = watcher::start(Arc::new(cfg), state.clone(), tx, stop.clone()).unwrap();
+    wait(|| {
+        state
+            .view_at(100)
+            .status(100)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == name && c.state == "degraded" && c.detail == "not mounted")
+    });
+    assert!(state
+        .view_at(100)
+        .watch_stats()
+        .is_none_or(|s| s.is_empty()));
+    stop.store(true, Ordering::Release);
+    worker.join().unwrap().unwrap();
+}
+
+#[cfg(feature = "privileged")]
+#[test]
+fn watcher_follows_mount_arrival_detach_and_remount_on_vm() {
+    use std::{path::PathBuf, process::Command};
+    assert_eq!(
+        std::env::var("TIDEMARK_DEPLOY_TEST_VM").as_deref(),
+        Ok("1"),
+        "disposable VM only"
+    );
+    assert!(rustix::process::geteuid().is_root());
+    struct Mounted(PathBuf);
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            let _ = Command::new("umount").arg("-l").arg(&self.0).status();
+        }
+    }
+    struct Worker {
+        stop: Arc<AtomicBool>,
+        handle: Option<tidemarkd::ServiceHandle>,
+    }
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+    let fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
+    let (dir, mut cfg) = config();
+    let target = dir.path().join("late-mount");
+    std::fs::create_dir(&target).unwrap();
+    let mounted = Mounted(target.clone());
+    cfg.watch.enabled = true;
+    cfg.watch.mounts = vec![target.clone()];
+    let state = LiveState::new(&cfg, 100);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, _rx) = crossbeam_channel::bounded(64);
+    let _worker = Worker {
+        stop: stop.clone(),
+        handle: Some(watcher::start(Arc::new(cfg), state.clone(), tx, stop).unwrap()),
+    };
+    let name = format!("watcher:{}", target.display());
+    let absent = || {
+        state
+            .view_at(100)
+            .status(100)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == name && c.state == "degraded" && c.detail == "not mounted")
+    };
+    wait(absent);
+    for n in 0..2 {
+        assert!(Command::new("mount")
+            .arg("--bind")
+            .arg(&fs.mountpoint)
+            .arg(&target)
+            .status()
+            .unwrap()
+            .success());
+        wait(|| {
+            state
+                .view_at(100)
+                .watch_stats()
+                .is_some_and(|s| s.len() == 1)
+        });
+        std::fs::write(target.join(format!("event-{n}")), vec![42; 4096]).unwrap();
+        wait(|| {
+            state
+                .view_at(100)
+                .watch_stats()
+                .is_some_and(|s| s.iter().any(|(_, stats)| stats.events_total > 0))
+        });
+        assert!(Command::new("umount")
+            .arg("-l")
+            .arg(&mounted.0)
+            .status()
+            .unwrap()
+            .success());
+        wait(absent);
+        assert!(state
+            .view_at(100)
+            .watch_stats()
+            .is_none_or(|s| s.is_empty()));
+    }
+}

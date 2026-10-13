@@ -6,6 +6,16 @@ use std::{
     process::{Child, Command, Output},
     time::Instant,
 };
+fn containing_mount(path: &std::path::Path) -> std::path::PathBuf {
+    let mounts = tidemark_fs::mount::read_mountinfo().unwrap();
+    let raw =
+        tidemark_core::path::RawPath::from_path(&std::fs::canonicalize(path).unwrap()).unwrap();
+    tidemark_fs::mount::mount_for_path(&mounts, &raw)
+        .unwrap()
+        .mount_point
+        .as_path()
+        .to_path_buf()
+}
 struct Daemon(Child);
 impl Drop for Daemon {
     fn drop(&mut self) {
@@ -70,7 +80,7 @@ fn real_operator_status_scan_top_now_reload_cancel_and_sigterm() {
     let config = dir.path().join("config.toml");
     let socket = dir.path().join("api.sock");
     let state = dir.path().join("state");
-    let text=format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='1s'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[throttle]\nmin_ops_per_sec=10\nmax_ops_per_sec=10\n[[roots]]\npath='{}'\nmode='walk'\nschedule='off'\n",state.display(),socket.display(),root.display(),dir.path().join("metrics.prom").display(),root.display());
+    let text=format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='1s'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[throttle]\nmin_ops_per_sec=10\nmax_ops_per_sec=10\n[[roots]]\npath='{}'\nmode='walk'\nschedule='off'\n",state.display(),socket.display(),containing_mount(&root).display(),dir.path().join("metrics.prom").display(),root.display());
     std::fs::write(&config, &text).unwrap();
     // Root-only production API requires root for this full operator scenario.
     if rustix::process::geteuid().as_raw() != 0 {
@@ -116,10 +126,25 @@ fn real_operator_status_scan_top_now_reload_cancel_and_sigterm() {
     let reload = query(&socket, "config.reload", serde_json::json!({}));
     assert!(reload.ok);
     assert_eq!(reload.result.unwrap()["reloaded"], true);
+    wait(&stderr_path, || {
+        let now = query(&socket, "now", serde_json::json!({}));
+        now.ok && now.result.unwrap().to_string().contains("operator_changed")
+    });
     std::fs::write(&config, "unknown_config_key=true").unwrap();
     let reload = query(&socket, "config.reload", serde_json::json!({}));
-    assert!(!reload.ok);
-    assert_eq!(reload.error.unwrap().code, ApiErrorCode::BadRequest);
+    assert!(reload.ok);
+    let result = reload.result.unwrap();
+    assert_eq!(result["reloaded"], false);
+    assert!(result["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().is_some_and(|w| w.contains("unknown_config_key"))));
+    // The retained rule remains visible in now's unevaluable diagnostics even
+    // because the rule targets the unsampled temporary scan root.
+    let now = query(&socket, "now", serde_json::json!({}));
+    assert!(now.ok);
+    assert!(now.result.unwrap().to_string().contains("operator_changed"));
     std::fs::write(&config, &changed).unwrap();
     // A large inventory with a ten-op gate ensures cancellation is observed
     // before completion without guessing a sleep duration.
@@ -188,7 +213,7 @@ fn real_binary_scheduled_scan_publishes_then_exits_cleanly() {
     let state = dir.path().join("state");
     let config = dir.path().join("config.toml");
     let stderr_path = dir.path().join("daemon.stderr");
-    let text = format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='1h'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[[roots]]\npath='{}'\nmode='walk'\nthrottle='max'\nschedule='every 1h'\n", state.display(), dir.path().join("api.sock").display(), root.display(), dir.path().join("metrics.prom").display(), root.display());
+    let text = format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='1h'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[[roots]]\npath='{}'\nmode='walk'\nthrottle='max'\nschedule='every 1h'\n", state.display(), dir.path().join("api.sock").display(), containing_mount(&root).display(), dir.path().join("metrics.prom").display(), root.display());
     std::fs::write(&config, text).unwrap();
     let diagnostics = || std::fs::read_to_string(&stderr_path).unwrap_or_default();
     let mut daemon = Daemon(

@@ -27,7 +27,13 @@ fn signal(child: &Child, signal: rustix::process::Signal) {
 }
 fn write_config(path: &Path, threshold: u32) {
     let p = path.parent().unwrap();
-    std::fs::write(path,format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='1s'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[scan]\nthreads=1\n[throttle]\nmin_ops_per_sec=10\nmax_ops_per_sec=10\n[[roots]]\npath='{}'\nmode='walk'\nschedule='every 1h'\nthrottle='normal'\n[[alerts.rule]]\nname='vm-reload'\nkind='fs_used_pct'\nmount='{}'\nabove={}\nfor='0s'\nresolve_for='0s'\n",p.join("state").display(),p.join("api.sock").display(),p.join("mount").display(),p.join("metrics.prom").display(),p.join("mount").display(),p.join("mount").display(),threshold)).unwrap();
+    let table = tidemark_fs::mount::read_mountinfo().unwrap();
+    let raw = tidemark_core::path::RawPath::from_path(&std::fs::canonicalize(p).unwrap()).unwrap();
+    let mount = tidemark_fs::mount::mount_for_path(&table, &raw)
+        .unwrap()
+        .mount_point
+        .as_path();
+    std::fs::write(path,format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='1s'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[scan]\nthreads=1\n[throttle]\nmin_ops_per_sec=10\nmax_ops_per_sec=10\n[[roots]]\npath='{}'\nmode='walk'\nschedule='every 1h'\nthrottle='normal'\n[[alerts.rule]]\nname='vm-reload'\nkind='fs_used_pct'\nmount='{}'\nabove={}\nfor='0s'\nresolve_for='0s'\n",p.join("state").display(),p.join("api.sock").display(),mount.display(),p.join("metrics.prom").display(),p.join("mount").display(),mount.display(),threshold)).unwrap();
 }
 #[test]
 fn daemon_reload_and_shutdown() {

@@ -45,9 +45,18 @@ fn sample(ts: i64, used: u64) -> FsSample {
 fn publish(s: &LiveState, p: Publication) {
     s.publish(p, health()).unwrap();
 }
+fn containing_mount(path: &Path) -> PathBuf {
+    let mounts = tidemark_fs::mount::read_mountinfo().unwrap();
+    let raw = RawPath::from_path(&std::fs::canonicalize(path).unwrap()).unwrap();
+    tidemark_fs::mount::mount_for_path(&mounts, &raw)
+        .unwrap()
+        .mount_point
+        .as_path()
+        .to_path_buf()
+}
 fn write_config(path: &Path, interval: &str) {
     let p = path.parent().unwrap();
-    std::fs::write(path,format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='{}'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[[roots]]\npath='{}'\nschedule='off'\n",p.join("state").display(),p.join("api.sock").display(),p.join("mount").display(),interval,p.join("metrics.prom").display(),p.join("mount").display())).unwrap();
+    std::fs::write(path,format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='{}'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[[roots]]\npath='{}'\nschedule='off'\n",p.join("state").display(),p.join("api.sock").display(),containing_mount(p).display(),interval,p.join("metrics.prom").display(),p.join("mount").display())).unwrap();
 }
 fn fixture() -> (tempfile::TempDir, PathBuf, Config) {
     let dir = tempfile::tempdir().unwrap();
@@ -1005,4 +1014,46 @@ fn now_uses_watcher_directories_without_exact_alert_windows() {
         .unwrap();
     assert!(report.mounts[0].hot_dirs_5m.is_empty());
     assert!(!report.degraded.iter().any(|d| d.starts_with("hot_dirs_5m")));
+}
+
+#[test]
+fn missing_configured_mount_has_no_sample_or_persistence_and_unhealthy_firstboot() {
+    let (dir, _, mut config) = fixture();
+    config.sampler.mounts = vec![dir.path().join("mount")];
+    let state = LiveState::new(&config, 100);
+    state
+        .publish(
+            Publication::Deployment {
+                config_sha256: "test".into(),
+                started_at: 100,
+            },
+            health(),
+        )
+        .unwrap();
+    for name in ["scheduler", "api", "tswriter"] {
+        state
+            .publish_component(component(name, "ok", "fixture"))
+            .unwrap();
+    }
+    let (tx, rx) = crossbeam_channel::bounded(4);
+    let stop = Shutdown::default();
+    let worker = sampler::start(Arc::new(config), state.clone(), tx, stop.clone()).unwrap();
+    wait(|| {
+        state
+            .view_at(100)
+            .status(100)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| {
+                c.name == "sampler" && c.state == "degraded" && c.detail.contains("not mounted:")
+            })
+    });
+    assert!(state.view_at(100).fs_samples().is_none());
+    assert!(rx.try_recv().is_err());
+    assert!(
+        !tidemarkd::firstboot::build(&state.view_at(100).firstboot_inputs().unwrap(), 100).healthy
+    );
+    stop.store(true, Ordering::Release);
+    worker.join().unwrap().unwrap();
 }
