@@ -38,6 +38,15 @@ impl Harness {
         Self::with_clock(schedule, throttle, nested, Arc::new(tidemarkd::unix_now))
     }
     fn with_clock(schedule: &str, throttle: &str, nested: bool, clock: tidemarkd::Clock) -> Self {
+        Self::with_root_count(schedule, throttle, nested, clock, 1)
+    }
+    fn with_root_count(
+        schedule: &str,
+        throttle: &str,
+        nested: bool,
+        clock: tidemarkd::Clock,
+        root_count: usize,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("child")).unwrap();
         std::fs::write(root.path().join("child/file"), b"fixture").unwrap();
@@ -56,6 +65,11 @@ impl Harness {
             throttle: throttle.into(),
             ..RootConfig::default()
         }];
+        for n in 1..root_count {
+            let mut extra = cfg.roots[0].clone();
+            extra.path = root.path().join(format!("root-{n}"));
+            cfg.roots.push(extra);
+        }
         cfg.scan.threads = 1;
         let state = LiveState::new(&cfg, tidemarkd::unix_now());
         state.bind_storage(std::fs::File::open(storage.path()).unwrap().into());
@@ -759,26 +773,24 @@ fn bound_storage_snapshot_readable_in_separate_process_without_sockets() {
 
 #[test]
 fn exact_capacity_root_replacement_and_cumulative_churn_keep_scheduler_alive() {
-    let h = Harness::new("off", "max");
-    h.idle();
-    let mut cfg = h.cfg.clone();
-    cfg.roots = (0..128)
-        .map(|n| {
-            let mut root = h.cfg.roots[0].clone();
-            root.path = h.cfg.roots[0].path.join(format!("root-{n}"));
-            root
-        })
-        .collect();
-    h.state.replace_config(cfg).unwrap();
-    wait(|| h.state.view().scans().unwrap().len() == 128);
+    let h = Harness::with_root_count("off", "max", false, Arc::new(tidemarkd::unix_now), 128);
+    wait(|| {
+        h.state
+            .view()
+            .scans()
+            .is_some_and(|scans| scans.len() == 128)
+    });
     for n in 0..140 {
         let mut cfg = h.cfg.clone();
+        cfg.roots.truncate(1);
         cfg.roots[0].path = h.cfg.roots[0].path.join(format!("replacement-{n}"));
         let label = cfg.roots[0].path.to_string_lossy().into_owned();
         h.state.replace_config(cfg).unwrap();
         wait(|| {
-            let scans = h.state.view().scans().unwrap();
-            scans.len() == 1 && scans[0].root == label
+            h.state
+                .view()
+                .scans()
+                .is_some_and(|scans| scans.len() == 1 && scans[0].root == label)
         });
         assert!(!h.stop.load(Ordering::Acquire));
     }
