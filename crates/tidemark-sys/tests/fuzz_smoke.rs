@@ -74,3 +74,15 @@ fn pure_parser_never_closes_a_real_descriptor() {
     seams::generated(exercise, &[&bytes]);
     assert!(file.metadata().unwrap().is_dir());
 }
+
+#[test]
+fn four_byte_aligned_fid_records_are_valid_and_ranges_are_absolute() {
+    let seed = include_bytes!("../../../fuzz/corpus/fanotify_events/dfid_name");
+    assert_eq!(seed.len(), 52);
+    let bytes = seed.repeat(2);
+    let records: Vec<_> = parse_event_buffer(&bytes).map(Result::unwrap).collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].information, 24..52);
+    assert_eq!(records[1].information, 76..104);
+    assert_eq!(records[0].raw_fd, -1);
+}

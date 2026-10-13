@@ -244,9 +244,9 @@ pub struct EventRecord {
     pub information: std::ops::Range<usize>,
 }
 
-/// Decode kernel event bytes without syscalls, descriptor ownership or allocation.
+/// Decode kernel event bytes without syscalls, descriptor ownership or record allocation.
 /// Each record consumes at least 24 bytes; the first malformed record yields an
-/// InvalidData error and ends iteration. Event lengths must be 8-byte aligned.
+/// InvalidData error and ends iteration. Event lengths must be 4-byte aligned.
 /// Information records are validated for FID-mode notifications, as in EventIter.
 #[doc(hidden)]
 pub fn parse_event_buffer(buffer: &[u8]) -> EventRecords<'_> {
@@ -286,10 +286,10 @@ fn parse_record(b: &[u8], offset: usize) -> io::Result<EventRecord> {
     if b[4] != 3
         || len < 24
         || len > b.len()
-        || len % 8 != 0
+        || !len.is_multiple_of(4)
         || meta < 24
         || meta > len
-        || meta % 8 != 0
+        || !meta.is_multiple_of(4)
     {
         return Err(invalid("invalid fanotify metadata"));
     }
@@ -416,7 +416,7 @@ fn decode_information(b: &[u8], metadata_len: usize, len: usize) -> io::Result<F
             return Err(invalid("truncated info header"));
         }
         let record_len = u16::from_ne_bytes([b[at + 2], b[at + 3]]) as usize;
-        if record_len < 4 || record_len > len - at {
+        if record_len < 4 || record_len > len - at || !record_len.is_multiple_of(4) {
             return Err(invalid("invalid info length"));
         }
         let r = &b[at..at + record_len];
@@ -493,7 +493,7 @@ mod tests {
         if named {
             record.extend(b"raw\xff\0");
         }
-        record.resize(record.len().next_multiple_of(8), 0);
+        record.resize(record.len().next_multiple_of(4), 0);
         let len = record.len() as u16;
         record[2..4].copy_from_slice(&len.to_ne_bytes());
         let mut bytes = metadata(mask::CREATE, -1, 24 + u32::from(len));
