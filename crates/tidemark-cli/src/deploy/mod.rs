@@ -11,6 +11,7 @@ use std::{
 use tidemark_core::config::Config;
 
 const UNIT: &str = "tidemarkd";
+#[cfg(test)]
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 /// State ownership marker, created only after successful staging.
 const MARKER: &str = ".tidemark-state.json";
@@ -129,6 +130,15 @@ pub trait Env {
     /// Atomically write a private file and sync its directory.
     fn atomic_write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         atomic_write(path, bytes)
+    }
+    /// Publish configuration under its retained, verified parent.
+    fn config_write(
+        &self,
+        parent: &std::os::fd::OwnedFd,
+        name: &std::ffi::OsStr,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        files::write_at(parent, name, bytes, false)
     }
     /// Publish under an already verified state directory handle.
     fn state_write(
@@ -317,7 +327,18 @@ pub fn stage(
     let (existing_state, existing_deploy) = files::state_handles(&cfg.general.state_dir, false)?;
     files::optional_at(existing_deploy.as_ref(), "firstboot.json")?;
     let installed = env.config_path();
-    let old_config = optional_read(env, installed)?;
+    let config_parent_path = installed
+        .parent()
+        .ok_or_else(|| io::Error::other("missing config parent"))?;
+    let config_parent = match files::directory(config_parent_path, false) {
+        Ok(fd) => Some(fd),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let config_name = installed
+        .file_name()
+        .ok_or_else(|| io::Error::other("missing config name"))?;
+    let old_config = files::optional_name_at(config_parent.as_ref(), config_name)?;
     let old_record = files::optional_at(existing_deploy.as_ref(), "staged.json")?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
     let enabled = sys.is_enabled(UNIT)?;
@@ -364,21 +385,24 @@ pub fn stage(
     let record_bytes = serde_json::to_vec(&record)?;
     let mut backup_name = installed.file_name().unwrap_or_default().to_os_string();
     backup_name.push(format!(".{}.bak", record.staged_at));
-    let backup = installed.with_file_name(backup_name);
     let differing = old_config.as_ref().is_some_and(|old| *old != bytes);
     // Never overwrite an earlier backup when the injected timestamp is reused.
-    if differing && optional_read(env, &backup)?.is_some() {
+    if differing && files::optional_name_at(config_parent.as_ref(), &backup_name)?.is_some() {
         return Err(DeployError::Guard("config backup already exists".into()));
     }
+    let config_parent = match config_parent {
+        Some(fd) => fd,
+        None => files::directory(config_parent_path, true)?,
+    };
     let (state_fd, deploy_fd) =
         files::complete_handles(&cfg.general.state_dir, existing_state, existing_deploy)?;
     let result = (|| -> Result<(), DeployError> {
         if differing {
             if let Some(old) = &old_config {
-                env.atomic_write(&backup, old)?;
+                env.config_write(&config_parent, &backup_name, old)?;
             }
         }
-        env.atomic_write(installed, &bytes)?;
+        env.config_write(&config_parent, config_name, &bytes)?;
         sys.enable(UNIT)?;
         if opts.start_now {
             sys.restart(UNIT)?;
@@ -393,7 +417,7 @@ pub fn stage(
     })();
     if let Err(error) = result {
         let mut failures = Vec::new();
-        if let Err(e) = restore(env, installed, old_config.as_deref()) {
+        if let Err(e) = restore_at(env, &config_parent, config_name, old_config.as_deref()) {
             failures.push(e.to_string());
         }
         for (fd, name, old) in [
@@ -412,7 +436,7 @@ pub fn stage(
             }
         }
         if differing {
-            if let Err(e) = env.remove(&backup) {
+            if let Err(e) = files::remove_at(&config_parent, &backup_name) {
                 failures.push(e.to_string());
             }
         }
@@ -450,17 +474,15 @@ pub fn stage(
     }
     Ok(record)
 }
-fn optional_read(env: &dyn Env, path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match env.read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-fn restore(env: &dyn Env, path: &Path, old: Option<&[u8]>) -> io::Result<()> {
+fn restore_at(
+    env: &dyn Env,
+    parent: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    old: Option<&[u8]>,
+) -> io::Result<()> {
     match old {
-        Some(bytes) => env.atomic_write(path, bytes),
-        None => env.remove(path),
+        Some(bytes) => env.config_write(parent, name, bytes),
+        None => files::remove_at(parent, name),
     }
 }
 
@@ -600,7 +622,7 @@ fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
     files::read(path)
 }
 fn read_json(path: &Path) -> io::Result<serde_json::Value> {
-    serde_json::from_slice(&read_bytes(path)?).map_err(io::Error::other)
+    serde_json::from_slice(&files::read_state(path)?).map_err(io::Error::other)
 }
 fn remove_if_exists(path: &Path) -> io::Result<()> {
     files::remove(path)
@@ -636,20 +658,16 @@ pub(crate) fn state_guard(path: &Path, cfg: Option<&Config>) -> io::Result<()> {
         }),
     )?;
     files::validate_state(&path.join("deploy"), std::iter::empty::<&Path>())?;
-    files::state_handles(path, false)?;
-    match files::read(&path.join(MARKER)) {
-        Ok(bytes) => {
-            let marker: Marker = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-            if marker.format != "tidemark-state-v1" || marker.state_dir.as_path() != path {
-                return Err(io::Error::other("state marker path mismatch"));
-            }
+    let (state, deploy) = files::state_handles(path, false)?;
+    if let Some(bytes) = files::optional_at(state.as_ref(), MARKER)? {
+        let marker: Marker = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        if marker.format != "tidemark-state-v1" || marker.state_dir.as_path() != path {
+            return Err(io::Error::other("state marker path mismatch"));
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
     }
-    for name in [MARKER, "deploy/staged.json", "deploy/firstboot.json"] {
-        files::inspect(&path.join(name))?;
-    }
+    // Preserve the bounded-record admission contract before verify/service work.
+    files::optional_at(deploy.as_ref(), "staged.json")?;
+    files::optional_at(deploy.as_ref(), "firstboot.json")?;
     Ok(())
 }
 #[derive(Serialize, Deserialize)]
@@ -659,7 +677,7 @@ struct Marker {
     config_path: tidemark_core::path::RawPath,
 }
 
-/// Stop and disable, then remove staging metadata; purge additionally requires an authentic marker.
+/// Stop and disable, then remove staging metadata; purge additionally requires an ownership-checked marker.
 pub fn unstage(
     state_dir: &Path,
     purge_state: bool,

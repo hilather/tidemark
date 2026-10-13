@@ -590,7 +590,12 @@ pub fn write_textfile(path: &Path, text: &str) -> std::io::Result<()> {
     let name = path
         .file_name()
         .ok_or_else(|| std::io::Error::other("missing textfile name"))?;
-    let dir = std::fs::File::open(parent)?;
+    let absolute = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(parent)
+    };
+    let dir = std::fs::File::from(tidemark_store::state_dir::trusted_directory(&absolute)?);
     let mut tmp = name.to_os_string();
     tmp.push(".tmp");
     let fd = openat(
@@ -638,7 +643,7 @@ pub fn write_textfile(path: &Path, text: &str) -> std::io::Result<()> {
         Err(error) => return Err(error.into()),
     }
     renameat(&dir, &tmp, &dir, name)?;
-    Ok(())
+    dir.sync_all()
 }
 /// Start the reload-aware textfile exporter with bounded shutdown polling.
 pub fn start(

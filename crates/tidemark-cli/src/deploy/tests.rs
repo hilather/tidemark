@@ -64,6 +64,7 @@ struct FakeEnv {
     fail_name: RefCell<Option<String>>,
     fail_restore: Cell<bool>,
     mutations: Cell<usize>,
+    move_config_parent: Cell<bool>,
     source_replacement: RefCell<Option<(PathBuf, Vec<u8>)>>,
 }
 impl FakeEnv {
@@ -166,6 +167,23 @@ impl Env for FakeEnv {
         }
         files::write_at(parent, name, bytes, false)
     }
+    fn config_write(
+        &self,
+        parent: &std::os::fd::OwnedFd,
+        name: &std::ffi::OsStr,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        self.write_probe(name, bytes)?;
+        if self.move_config_parent.replace(false) {
+            let original = self.installed.parent().unwrap();
+            let retained = original.with_file_name("retained-config");
+            let target = original.with_file_name("config-target");
+            fs::rename(original, retained)?;
+            fs::create_dir(&target)?;
+            symlink(&target, original)?;
+        }
+        files::write_at(parent, name, bytes, false)
+    }
     fn atomic_write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         self.write_probe(path.file_name().unwrap(), bytes)?;
         if path.file_name().is_some_and(|name| name == "staged.json")
@@ -208,6 +226,7 @@ impl Fixture {
             fail_name: RefCell::new(None),
             fail_restore: Cell::new(false),
             mutations: Cell::new(0),
+            move_config_parent: Cell::new(false),
             source_replacement: RefCell::new(None),
         };
         Self {
@@ -990,8 +1009,11 @@ fn unsafe_existing_directories_refuse_unstage_without_marker() {
             fs::write(&outside, b"outside").unwrap();
             let error = unstage(&f.state, false, &f.sys).unwrap_err().to_string();
             assert!(error.contains(&bad.display().to_string()));
-            assert!(error.contains(&format!("{:04o}", mode)));
-            assert!(error.contains(&format!("owner {}", rustix::process::geteuid().as_raw())));
+            assert!(error.contains(&format!("{:o}", mode)));
+            assert!(
+                error.contains("owner")
+                    && error.contains(&rustix::process::geteuid().as_raw().to_string())
+            );
             assert!(f.sys.calls.borrow().is_empty());
             assert_eq!(f.sys.queries.get(), 0);
             assert_eq!(
@@ -1073,3 +1095,173 @@ impl Drop for OwnerProbe {
 
 #[path = "scenarios.rs"]
 mod scenarios;
+
+#[test]
+fn marker_never_waives_owner_or_write_permissions() {
+    for foreign in [false, true] {
+        let f = Fixture::new();
+        f.stage();
+        f.sys.calls.borrow_mut().clear();
+        f.sys.queries.set(0);
+        if foreign {
+            FOREIGN_OWNER.with(|o| *o.borrow_mut() = Some(f.state.clone()));
+        } else {
+            fs::set_permissions(&f.state, fs::Permissions::from_mode(0o770)).unwrap();
+        }
+        let _probe = OwnerProbe;
+        let before = fs::read(f.state.join(MARKER)).unwrap();
+        assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+        assert!(unstage(&f.state, true, &f.sys).is_err());
+        assert_eq!(fs::read(f.state.join(MARKER)).unwrap(), before);
+        assert!(f.sys.calls.borrow().is_empty());
+        assert_eq!(f.sys.queries.get(), 0);
+        if !foreign {
+            assert_eq!(
+                fs::metadata(&f.state).unwrap().permissions().mode() & 0o777,
+                0o770
+            );
+        }
+    }
+}
+
+#[test]
+fn unsafe_marker_and_state_content_are_refused_without_changes() {
+    for name in [
+        MARKER,
+        "timeseries.db",
+        "timeseries.db-wal",
+        "timeseries.db-journal",
+        "scan.lock",
+        "deploy/staged.json",
+        "deploy/firstboot.json",
+    ] {
+        for kind in ["link", "hardlink", "writable", "foreign", "fifo"] {
+            let f = Fixture::new();
+            f.stage();
+            f.sys.calls.borrow_mut().clear();
+            f.sys.queries.set(0);
+            let target = f._dir.path().join("sentinel");
+            fs::write(&target, b"sentinel").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            let leaf = f.state.join(name);
+            let _ = fs::remove_file(&leaf);
+            match kind {
+                "link" => std::os::unix::fs::symlink(&target, &leaf).unwrap(),
+                "hardlink" => fs::hard_link(&target, &leaf).unwrap(),
+                "fifo" => rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    &leaf,
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                    0,
+                )
+                .unwrap(),
+                _ => {
+                    fs::write(&leaf, b"planted").unwrap();
+                    fs::set_permissions(
+                        &leaf,
+                        fs::Permissions::from_mode(if kind == "writable" { 0o620 } else { 0o600 }),
+                    )
+                    .unwrap();
+                }
+            }
+            let _probe = OwnerProbe;
+            if kind == "foreign" {
+                FOREIGN_OWNER.with(|o| *o.borrow_mut() = Some(leaf.clone()));
+            }
+            let error =
+                match stage(&f.source, &StageOptions::default(), &f.sys, &f.env).unwrap_err() {
+                    DeployError::Preflight(checks) => checks
+                        .iter()
+                        .map(|c| c.detail.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    e => e.to_string(),
+                };
+            assert!(error.contains(name), "{kind} {name}: {error}");
+            assert!(
+                error.contains("owner") && error.contains("mode") && error.contains("links"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"sentinel");
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(f.sys.calls.borrow().is_empty());
+            assert_eq!(f.sys.queries.get(), 0);
+        }
+    }
+}
+
+#[test]
+fn stage_refuses_writable_ancestor() {
+    let f = Fixture::new();
+    fs::set_permissions(f._dir.path(), fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+    assert!(!f.state.exists());
+    assert!(!f.env.installed.exists());
+    assert!(f.sys.calls.borrow().is_empty());
+}
+
+#[test]
+fn config_publication_retains_verified_parent_after_path_replacement() {
+    let f = Fixture::new();
+    f.env.move_config_parent.set(true);
+    f.stage();
+    let retained = f._dir.path().join("retained-config/tidemark.toml");
+    assert_eq!(fs::read(retained).unwrap(), fs::read(&f.source).unwrap());
+    assert_eq!(
+        fs::read_dir(f._dir.path().join("config-target"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[cfg(feature = "privileged")]
+#[test]
+fn real_foreign_owner_marker_cannot_authorize_root_stage_or_purge() {
+    assert_eq!(
+        std::env::var("TIDEMARK_DEPLOY_TEST_VM").as_deref(),
+        Ok("1"),
+        "disposable VM only"
+    );
+    assert!(rustix::process::geteuid().is_root());
+    let f = Fixture::new();
+    f.stage();
+    f.sys.calls.borrow_mut().clear();
+    let state = files::directory(&f.state, false).unwrap();
+    let marker = rustix::fs::openat(
+        &state,
+        MARKER,
+        rustix::fs::OFlags::RDONLY,
+        rustix::fs::Mode::empty(),
+    )
+    .unwrap();
+    let foreign = rustix::process::Uid::from_raw(65534);
+    rustix::fs::fchown(&marker, Some(foreign), None).unwrap();
+    rustix::fs::fchown(&state, Some(foreign), None).unwrap();
+    let before = fs::read(f.state.join(MARKER)).unwrap();
+    assert!(stage(&f.source, &StageOptions::default(), &f.sys, &f.env).is_err());
+    assert!(unstage(&f.state, true, &f.sys).is_err());
+    assert_eq!(fs::read(f.state.join(MARKER)).unwrap(), before);
+    assert!(f.sys.calls.borrow().is_empty());
+}
+
+#[test]
+fn eligibility_error_escapes_non_utf8_and_control_path_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"state-\xff\n"));
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).unwrap();
+    let error = files::state_handles(&path, false).unwrap_err().to_string();
+    assert!(error.contains(&tidemark_core::path::display_lossy_bytes(
+        path.as_os_str().as_bytes()
+    )));
+    assert!(!error.contains('\n'));
+    assert!(error.contains("owner") && error.contains("mode") && error.contains("links"));
+}

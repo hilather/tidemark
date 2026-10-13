@@ -145,6 +145,74 @@ mod log_tests;
 mod tests {
     use super::*;
     #[test]
+    fn preflight_refuses_foreign_database_leaves_before_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                state_files::FOREIGN_OWNER.with(|o| *o.borrow_mut() = None);
+            }
+        }
+        for name in [
+            "timeseries.db",
+            "timeseries.db-wal",
+            "timeseries.db-journal",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("state");
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let leaf = path.join(name);
+            std::fs::write(&leaf, b"sentinel").unwrap();
+            let mut config = tidemark_core::config::Config::default();
+            config.general.state_dir = path.clone();
+            let _reset = Reset;
+            state_files::FOREIGN_OWNER.with(|o| *o.borrow_mut() = Some(leaf.clone()));
+            let error = prepare_state(&config).unwrap_err().to_string();
+            assert!(
+                error.contains(name) && error.contains("owner") && error.contains("links"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(leaf).unwrap(), b"sentinel");
+            assert!(!path.join("deploy").exists());
+            assert!(!path.join("scan.lock").exists());
+        }
+    }
+
+    #[cfg(feature = "privileged")]
+    #[test]
+    fn real_foreign_database_owner_refused_before_daemon_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::env::var("TIDEMARK_DEPLOY_TEST_VM").as_deref(),
+            Ok("1"),
+            "disposable VM only"
+        );
+        assert!(rustix::process::geteuid().is_root());
+        for name in [
+            "timeseries.db",
+            "timeseries.db-wal",
+            "timeseries.db-journal",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = temp.path().join(name);
+            std::fs::write(&path, b"sentinel").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            rustix::fs::chown(&path, Some(rustix::process::Uid::from_raw(65534)), None).unwrap();
+            let mut config = tidemark_core::config::Config::default();
+            config.general.state_dir = temp.path().to_owned();
+            let error = prepare_state(&config).unwrap_err().to_string();
+            assert!(
+                error.contains(name) && error.contains("65534") && error.contains("links"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"sentinel");
+            assert!(!temp.path().join("deploy").exists());
+        }
+    }
+
+    #[test]
     fn typed_memory_pressure_is_degraded() {
         assert!(resource_pressure(&std::io::Error::new(
             std::io::ErrorKind::OutOfMemory,
@@ -1235,7 +1303,7 @@ fn validate_output_paths(c: &tidemark_core::config::Config) -> Result<(), Daemon
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(DaemonError::Config(format!(
                 "output parent {}: {e}",
-                parent.display()
+                state_files::display(parent)
             ))),
         }
     }
@@ -1252,8 +1320,8 @@ fn validate_output_paths(c: &tidemark_core::config::Config) -> Result<(), Daemon
             {
                 return Err(DaemonError::Config(format!(
                     "metrics.textfile collides with API output: {} and {}",
-                    metrics.display(),
-                    api.display()
+                    state_files::display(metrics),
+                    state_files::display(api)
                 )));
             }
         }
@@ -1391,29 +1459,8 @@ fn validate_state_paths(
         context: "unsafe state_dir refused".into(),
         source,
     })?;
-    if c.general.state_dir.join("deploy").exists() {
-        state_files::validate_state(
-            &c.general.state_dir.join("deploy"),
-            std::iter::empty::<&std::path::Path>(),
-        )
-        .map_err(|source| DaemonError::Io {
-            context: "unsafe deploy directory".into(),
-            source,
-        })?;
-    }
-    for name in [
-        ".tidemark-state.json",
-        "deploy/staged.json",
-        "deploy/firstboot.json",
-    ] {
-        state_files::inspect(&c.general.state_dir.join(name)).map_err(|source| {
-            DaemonError::Io {
-                context: format!("inspect {name}"),
-                source,
-            }
-        })?;
-    }
-    for name in ["snapshots", "tmp"] {
+    // Preserve existing child mount-boundary rejection alongside integrity checks.
+    for name in ["deploy", "snapshots", "tmp"] {
         let path = c.general.state_dir.join(name);
         if std::fs::symlink_metadata(&path).is_ok() {
             state_files::validate_state(&path, std::iter::empty::<&std::path::Path>()).map_err(
@@ -1441,35 +1488,12 @@ fn validate_state_paths(
     Ok((state, deploy))
 }
 fn prepare_state(c: &tidemark_core::config::Config) -> Result<std::os::fd::OwnedFd, DaemonError> {
-    use rustix::fs::{self, AtFlags, FileType};
     let (state, deploy) = validate_state_paths(c)?;
     let (fd, _deploy) = state_files::complete_handles(&c.general.state_dir, state, deploy)
         .map_err(|source| DaemonError::Io {
             context: "complete private state directories".into(),
             source,
         })?;
-    for name in [
-        "timeseries.db",
-        "timeseries.db-wal",
-        "timeseries.db-shm",
-        "timeseries.db.bak-v0",
-    ] {
-        match fs::statat(&fd, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(s) if FileType::from_raw_mode(s.st_mode) != FileType::RegularFile => {
-                return Err(DaemonError::Config(format!(
-                    "nonregular state artifact: {name}"
-                )))
-            }
-            Ok(_) => {}
-            Err(rustix::io::Errno::NOENT) => {}
-            Err(e) => {
-                return Err(DaemonError::Io {
-                    context: format!("inspect {name}"),
-                    source: e.into(),
-                })
-            }
-        }
-    }
     Ok(fd)
 }
 fn load_config(

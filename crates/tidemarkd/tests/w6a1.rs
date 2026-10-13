@@ -635,9 +635,21 @@ fn nonprivate_state_directories_refused_without_creation() {
             Shutdown::default(),
         )
         .unwrap_err();
+        let detail = error.to_string();
         assert!(
-            error.to_string().contains("no group/world permissions"),
+            detail.contains("no group/world permissions")
+                || detail.contains("writable by group or others"),
             "{error}"
+        );
+        assert!(
+            detail.contains(&cfg.general.state_dir.display().to_string()),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(&format!("{mode:04o}"))
+                && detail.contains("owner")
+                && detail.contains("links"),
+            "{detail}"
         );
         assert_eq!(
             std::fs::read_dir(&cfg.general.state_dir).unwrap().count(),

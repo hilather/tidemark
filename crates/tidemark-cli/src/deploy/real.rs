@@ -53,6 +53,14 @@ impl Env for RealEnv {
     fn atomic_write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         super::atomic_write_owned(path, bytes, true)
     }
+    fn config_write(
+        &self,
+        parent: &std::os::fd::OwnedFd,
+        name: &std::ffi::OsStr,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        super::files::write_at(parent, name, bytes, true)
+    }
     fn state_write(
         &self,
         parent: &std::os::fd::OwnedFd,
@@ -189,7 +197,7 @@ pub(super) fn installation(cfg: &Config, installed: &Path, required: &[&Path]) -
         if !std::fs::metadata(path)?.is_file() {
             return Err(io::Error::other(format!(
                 "missing installed file: {}",
-                path.display()
+                super::files::display(path)
             )));
         }
     }

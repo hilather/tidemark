@@ -51,7 +51,7 @@ pub struct FirstbootReport {
 }
 /// Cross-task contract reserved for the owning task.
 pub fn needs_report(state_dir: &Path, config_sha256: &str) -> bool {
-    if files::read(&state_dir.join("deploy/staged.json")).is_err() {
+    if files::read_state(&state_dir.join("deploy/staged.json")).is_err() {
         return false;
     }
     read_report(&state_dir.join("deploy/firstboot.json"))
@@ -75,7 +75,7 @@ impl Followup {
             return Ok(());
         }
         self.next = Some(monotonic.saturating_add(10));
-        if files::read(&state_dir.join("deploy/staged.json")).is_err() {
+        if files::read_state(&state_dir.join("deploy/staged.json")).is_err() {
             return Ok(());
         }
         let Ok(previous) = read_report(&state_dir.join("deploy/firstboot.json")) else {
@@ -99,7 +99,7 @@ impl Followup {
     }
 }
 fn read_report(path: &Path) -> io::Result<FirstbootReport> {
-    let bytes = files::read(path)?;
+    let bytes = files::read_state(path)?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 /// Build the report using the supplied logical clock and Linux boot timestamp.
@@ -324,7 +324,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("65534"));
-            assert!(error.contains("0700"));
+            assert!(error.contains("700"));
             assert!(error.contains(&bad.display().to_string()));
             assert!(!dir.path().join("deploy/firstboot.json").exists());
             assert_eq!(

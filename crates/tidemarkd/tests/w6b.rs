@@ -719,3 +719,85 @@ fn exporter_retries_busy_temporary_and_clears_health_on_next_success() {
         .unwrap()
         .contains("tidemark_up 1"));
 }
+
+#[test]
+fn metrics_refuses_writable_ancestry_without_creating_or_changing_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = test_support::private_tempdir().unwrap();
+    let parent = temp.path().join("unsafe");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let collector = parent.join("collector");
+    std::fs::create_dir(&collector).unwrap();
+    let path = collector.join("out.prom");
+    let error = metrics::write_textfile(&path, "planted").unwrap_err();
+    assert!(error.to_string().contains("writable"));
+    assert_eq!(std::fs::read_dir(&collector).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+        0o770
+    );
+}
+
+#[test]
+fn exporter_rechecks_directory_each_pass_and_recovers_after_symlink_replacement() {
+    let temp = test_support::private_tempdir().unwrap();
+    let collector = temp.path().join("collector");
+    let retained = temp.path().join("retained");
+    let target = temp.path().join("target");
+    std::fs::create_dir(&collector).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("sentinel"), b"untouched").unwrap();
+    let mut config = Config::default();
+    config.roots.clear();
+    config.general.state_dir = temp.path().join("state");
+    tidemark_store::catalog::Catalog::open(&config.general.state_dir, true).unwrap();
+    config.metrics.textfile = collector.join("out.prom");
+    config.metrics.interval = Duration::from_millis(10);
+    let state = LiveState::new(&config, 0);
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = metrics::start(Arc::new(config.clone()), state.clone(), stop.clone()).unwrap();
+    let health = |status: &str| {
+        state
+            .view()
+            .status(0)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "metrics" && c.state == status)
+    };
+    wait(|| config.metrics.textfile.exists() && health("ok"));
+    std::fs::rename(&collector, &retained).unwrap();
+    std::os::unix::fs::symlink(&target, &collector).unwrap();
+    wait(|| health("degraded"));
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read(target.join("sentinel")).unwrap(),
+        b"untouched"
+    );
+    std::fs::remove_file(&collector).unwrap();
+    std::fs::rename(&retained, &collector).unwrap();
+    wait(|| health("ok"));
+    stop.store(true, Ordering::Release);
+    handle.join().unwrap().unwrap();
+}
+
+#[cfg(feature = "privileged")]
+#[test]
+fn metrics_refuses_real_foreign_owned_ancestor() {
+    assert_eq!(
+        std::env::var("TIDEMARK_DEPLOY_TEST_VM").as_deref(),
+        Ok("1"),
+        "disposable VM only"
+    );
+    assert!(rustix::process::geteuid().is_root());
+    let temp = test_support::private_tempdir().unwrap();
+    let home = temp.path().join("user-home");
+    let collector = home.join("collector");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&collector).unwrap();
+    rustix::fs::chown(&home, Some(rustix::process::Uid::from_raw(65534)), None).unwrap();
+    let error = metrics::write_textfile(&collector.join("out.prom"), "refused").unwrap_err();
+    assert!(error.to_string().contains("65534"));
+    assert_eq!(std::fs::read_dir(collector).unwrap().count(), 0);
+}
