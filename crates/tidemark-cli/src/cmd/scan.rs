@@ -293,7 +293,9 @@ impl tidemark_scan::orchestrator::ScanRecorder for DirectRecorder {
     }
 }
 
-fn daemon_connection(context: &crate::Context) -> anyhow::Result<Option<crate::client::Client>> {
+pub(crate) fn daemon_connection(
+    context: &crate::Context,
+) -> anyhow::Result<Option<crate::client::Client>> {
     match crate::client::Client::connect(
         &context.config.general.socket,
         std::time::Duration::from_secs(11),

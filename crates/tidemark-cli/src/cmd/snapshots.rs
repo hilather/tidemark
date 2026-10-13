@@ -63,12 +63,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         .into());
     }
     let lock = if mutation {
-        if std::os::unix::net::UnixStream::connect(&context.config.general.socket).is_ok() {
-            return Err(crate::CliError::Precondition(
-                "catalog mutation requires the daemon to be stopped".into(),
-            )
-            .into());
-        }
+        require_absent_daemon(context)?;
         Some(
             tidemark_scan::orchestrator::ScanLock::acquire(state)
                 .map_err(super::scan::scan_error)?,
@@ -76,6 +71,9 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     } else {
         None
     };
+    if mutation {
+        require_absent_daemon(context)?;
+    }
     let catalog = if matches!(args.command, Command::RebuildCatalog { .. }) {
         lock.as_ref()
             .ok_or_else(|| {
@@ -199,6 +197,15 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 writeln!(out, "Rebuilt catalog: {count} snapshots")?;
             }
         }
+    }
+    Ok(())
+}
+fn require_absent_daemon(context: &crate::Context) -> anyhow::Result<()> {
+    if super::scan::daemon_connection(context)?.is_some() {
+        return Err(crate::CliError::Precondition(
+            "catalog mutation requires the daemon to be stopped".into(),
+        )
+        .into());
     }
     Ok(())
 }

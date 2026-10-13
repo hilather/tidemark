@@ -436,9 +436,15 @@ fn scan_invalid_endpoint_never_writes_state() {
         .unwrap()
         .replace("api.sock'", "api.sock/child'");
     std::fs::write(&p, config).unwrap();
-    let out = cli(&p, &["scan", "/"]);
-    assert_eq!(out.status.code(), Some(4));
-    assert!(!dir.path().join("state").exists());
+    for args in [
+        vec!["scan", "/"],
+        vec!["snapshots", "rebuild-catalog"],
+        vec!["snapshots", "prune"],
+    ] {
+        let out = cli(&p, &args);
+        assert_eq!(out.status.code(), Some(4));
+        assert!(!dir.path().join("state").exists());
+    }
 }
 #[test]
 fn cells_and_prose_fit_injected_widths_without_splitting_escapes() {
@@ -513,15 +519,23 @@ fn scan_full_backlog_expires_without_direct_state_writes() {
         return;
     }
     // cli() allows 20 seconds, longer than the shared 11-second connect deadline.
-    let out = cli(&p, &["scan", "/"]);
-    assert_eq!(
-        out.status.code(),
-        Some(4),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
-    assert!(!dir.path().join("state").exists());
+    for args in [
+        vec!["scan", "/"],
+        vec!["snapshots", "rebuild-catalog"],
+        vec!["snapshots", "prune"],
+    ] {
+        let start = std::time::Instant::now();
+        let out = cli(&p, &args);
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(15));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
+        assert!(!dir.path().join("state").exists());
+    }
 }
 
 fn example_now() -> tidemark_core::live::NowReport {
@@ -723,10 +737,16 @@ fn scan_permission_error_never_falls_back() {
         eprintln!("permission coverage unavailable: process can traverse mode-000 directory");
         return;
     }
-    let out = cli(&p, &["scan", "/"]);
+    for args in [
+        vec!["scan", "/"],
+        vec!["snapshots", "rebuild-catalog"],
+        vec!["snapshots", "prune"],
+    ] {
+        let out = cli(&p, &args);
+        assert_eq!(out.status.code(), Some(4));
+        assert!(!dir.path().join("state").exists());
+    }
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(out.status.code(), Some(4));
-    assert!(!dir.path().join("state").exists());
 }
 
 // CLI-display2: packaged-daemon regressions, independent of sockets or terminal state.
