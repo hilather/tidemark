@@ -264,6 +264,9 @@ impl Catalog {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
+        if let Some(directory) = snapshot_dir.as_ref() {
+            verify_snapshot_tree(directory, &snapshots)?;
+        }
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             if preserve_lifecycle {
@@ -344,6 +347,34 @@ impl Catalog {
     }
 }
 
+// Validate the whole used namespace before a transaction or recovery mutates state.
+// Width is streamed; only the two-level snapshot hierarchy is traversed.
+fn verify_snapshot_tree(
+    directory: &crate::state_dir::StateDir,
+    path: &Path,
+) -> Result<(), StoreError> {
+    for root in fs::read_dir(path)? {
+        let root = root?;
+        if root.file_type()?.is_symlink() {
+            return Err(StoreError::Invalid(format!(
+                "state snapshot directory {}: symbolic link refused",
+                tidemark_core::path::display_lossy_bytes(root.path().as_os_str().as_bytes())
+            )));
+        }
+        if !root.file_type()?.is_dir() {
+            continue;
+        }
+        let child = directory.subdir(&root.file_name(), false)?;
+        for leaf in fs::read_dir(root.path())? {
+            let leaf = leaf?;
+            if leaf.file_name().as_bytes().ends_with(b".db") {
+                child.check_leaf(&leaf.file_name())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Recover with a retained scan-lock descriptor, verifying its identity and exclusion.
 /// All local catalog/sample connections must be closed before calling this function.
 /// The legacy recovery entry point remains for existing callers; production callers
@@ -407,6 +438,11 @@ fn recover_catalog_owned(state_dir: &Path) -> Result<Catalog, StoreError> {
         "timeseries.db.bak-v0-journal",
     ] {
         verified.check_leaf(std::ffi::OsStr::new(name))?;
+    }
+    match verified.subdir(std::ffi::OsStr::new("snapshots"), false) {
+        Ok(directory) => verify_snapshot_tree(&directory, &state_dir.join("snapshots"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     // A private, exclusively created directory supplies a collision-free namespace.
     let mut recovery = None;
