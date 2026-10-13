@@ -23,7 +23,10 @@ fn mutated(seed: &[u8], cut: usize, byte: u8, mode: u8) -> Vec<u8> {
             }
         }
         2 => out.extend_from_slice(seed),
-        3 => out.extend(std::iter::repeat_n(byte, cut % 4096)),
+        3 => {
+            let i = cut % (out.len() + 1);
+            out.splice(i..i, std::iter::repeat_n(byte, cut % 4096));
+        }
         _ => {
             let i = cut % (out.len() + 1);
             out.splice(i..i, [0, 255, byte]);
@@ -64,6 +67,7 @@ fn large_and_deep_inputs_finish_within_two_seconds_each() {
     let mut deep = vec![b'['; 512];
     deep.extend(std::iter::repeat_n(b']', 512));
     cases.push(deep);
+    cases.push(format!("deep = {}0{}", "[".repeat(512), "]".repeat(512)).into_bytes());
     for seed in SEEDS {
         cases.push(seed.repeat((1024 * 1024 / seed.len()).max(1)));
     }
@@ -98,4 +102,38 @@ fn deployment_reader_bounds() {
         assert!(start.elapsed() < Duration::from_secs(2));
     }
     deploy::exercise(format!("{}0{}", "[".repeat(512), "]".repeat(512)).as_bytes());
+}
+#[test]
+fn config_documented_size_limit_refuses() {
+    let bytes = vec![b' '; 1024 * 1024 + 1];
+    let start = Instant::now();
+    assert!(tidemark_core::config::Config::from_toml_bytes(&bytes).is_err());
+    assert!(start.elapsed() < Duration::from_secs(2));
+}
+#[path = "../../../fuzz/support/client.rs"]
+mod client;
+proptest! {
+    #![proptest_config(config())]
+    #[test]
+    fn public_client_response_decoder(bytes in prop::collection::vec(any::<u8>(), 0..8192)) {
+        let _ = client::exercise(&bytes);
+    }
+    #[test]
+    fn public_client_response_mutations(cut in any::<usize>(), byte in any::<u8>(), mode in any::<u8>()) {
+        let mut seed = SEEDS[2].to_vec();
+        seed.push(b'\n');
+        let _ = client::exercise(&mutated(&seed, cut, byte, mode));
+    }
+}
+#[test]
+fn public_client_response_bounds() {
+    if !client::exercise(b"{\"v\":1,\"id\":\"c1\",\"ok\":true,\"result\":7}\n") {
+        eprintln!(
+            "public client decoder pending unrestricted host: AF_UNIX listener denied (EPERM)"
+        );
+        return;
+    }
+    let start = Instant::now();
+    assert!(client::exercise(&vec![b'x'; 1024 * 1024 + 1]));
+    assert!(start.elapsed() < Duration::from_secs(2));
 }

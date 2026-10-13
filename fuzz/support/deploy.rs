@@ -1,5 +1,7 @@
 //! Owned by: W7-C3-fuzz
 //! Exercise record readers with inert service and API boundaries.
+// Fixture setup failures should fail the test or fuzz execution immediately.
+#![allow(clippy::unwrap_used)]
 use std::{fs, io, os::unix::fs::PermissionsExt, time::Duration};
 use tidemark_cli::deploy::{ApiPing, Systemctl};
 struct Inert;
@@ -25,6 +27,7 @@ impl ApiPing for Inert {
         Ok(())
     }
 }
+/// Feed adversarial bytes through the public parser seam in disposable state.
 pub fn exercise(bytes: &[u8]) {
     let dir = tempfile::tempdir().unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -37,9 +40,10 @@ pub fn exercise(bytes: &[u8]) {
     let result = tidemark_cli::deploy::verify(dir.path(), Duration::ZERO, &Inert, &Inert);
     if bytes.len() > 1024 * 1024 {
         assert!(result.is_err());
+        return;
     }
+    let result = result.unwrap();
     if bytes == b"{}" {
-        let result = result.unwrap();
         assert!(result.staged.is_some());
         assert!(result.firstboot.is_some());
     }
