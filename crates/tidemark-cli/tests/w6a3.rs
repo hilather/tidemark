@@ -1041,3 +1041,32 @@ fn daemon_scan_space_refusal_matches_direct_exit_and_wording() {
         }
     }
 }
+
+#[test]
+fn catalog_mutations_preserve_existing_corrupt_state_on_uncertain_endpoint() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let p = config(&dir);
+    std::fs::write(dir.path().join("api.sock"), b"not a directory").unwrap();
+    let text = std::fs::read_to_string(&p)
+        .unwrap()
+        .replace("api.sock'", "api.sock/child'");
+    std::fs::write(&p, text).unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let mut original = Vec::new();
+    for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
+        let path = state.join(name);
+        std::fs::write(&path, b"preserve corrupt state").unwrap();
+        original.push((path.clone(), std::fs::metadata(&path).unwrap().ino()));
+    }
+    for operation in ["rebuild-catalog", "prune"] {
+        let out = cli(&p, &["snapshots", operation]);
+        assert_eq!(out.status.code(), Some(4));
+        assert_eq!(std::fs::read_dir(&state).unwrap().count(), 3);
+        for (path, inode) in &original {
+            assert_eq!(std::fs::metadata(path).unwrap().ino(), *inode);
+            assert_eq!(std::fs::read(path).unwrap(), b"preserve corrupt state");
+        }
+    }
+}
