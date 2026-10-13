@@ -652,12 +652,23 @@ pub fn start(
             let empty = SnapshotMetrics::default();
             let (initial_config, _) = state.config();
             // Failed seeding is retried and reported by the first export below.
-            let _ = reconcile(&state, &initial_config);
+            if !initial_config.metrics.textfile.as_os_str().is_empty() {
+                let _ = reconcile(&state, &initial_config);
+            }
             let mut generation = None;
             let mut next = Some(Instant::now());
             let mut last_log: Option<Instant> = None;
             while !shutdown.load(Ordering::Acquire) {
                 let (config, g) = state.config();
+                if config.metrics.textfile.as_os_str().is_empty() {
+                    state.publish_component(crate::component(
+                        "metrics",
+                        "disabled",
+                        "not configured: metrics textfile path is empty",
+                    ))?;
+                    crate::wait_service(&state, g, &shutdown, config.metrics.interval);
+                    continue;
+                }
                 if generation != Some(g) {
                     generation = Some(g);
                     next = if Instant::now()
@@ -712,12 +723,7 @@ pub fn start(
                         }
                         state.publish_component(crate::component("metrics", "degraded", error))?;
                     } else {
-                        let disabled = config.metrics.textfile.as_os_str().is_empty();
-                        state.publish_component(crate::component(
-                            "metrics",
-                            if disabled { "disabled" } else { "ok" },
-                            "exported",
-                        ))?;
+                        state.publish_component(crate::component("metrics", "ok", "exported"))?;
                     }
                     if let Some(deadline) = Instant::now()
                         .checked_add(config.metrics.interval.max(Duration::from_millis(1)))
@@ -745,3 +751,37 @@ pub fn start(
 #[cfg(test)]
 #[path = "../tests/w6b/source.rs"]
 mod tests;
+
+#[cfg(test)]
+mod disabled_tests {
+    #[test]
+    fn disabled_exporter_reports_why_without_reconciling_snapshots() {
+        let mut config = tidemark_core::config::Config::default();
+        config.metrics.textfile = Default::default();
+        let state = crate::state::LiveState::new(&config, 0);
+        let shutdown = crate::Shutdown::default();
+        let handle =
+            super::start(std::sync::Arc::new(config), state.clone(), shutdown.clone()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if state
+                .view_at(0)
+                .status(0)
+                .unwrap()
+                .components
+                .iter()
+                .any(|c| {
+                    c.name == "metrics"
+                        && c.state == "disabled"
+                        && c.detail == "not configured: metrics textfile path is empty"
+                })
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        handle.join().unwrap().unwrap();
+    }
+}
