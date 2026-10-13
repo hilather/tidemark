@@ -10,6 +10,8 @@ use tidemark_core::snapshot::DirRow;
 use tidemark_store::reader::Snapshot;
 
 const PAGE: usize = 1_000;
+// Match the store query ceiling; never retain an unlimited live child cache.
+const MAX_LIVE_CHILDREN: usize = 1_000_000;
 #[derive(Default)]
 struct Pages {
     cursor: Option<DirRow>,
@@ -19,6 +21,7 @@ struct Pages {
     instances: Vec<(i64, tidemark_core::snapshot::LinkInstanceRow)>,
     inode: Option<u64>,
     live: Option<Vec<(DirRow, Option<i128>)>>,
+    live_order: Option<state::Sort>,
 }
 struct Refresh {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -58,7 +61,10 @@ impl Browser {
             ));
         }
         if let Some(live) = &mut self.pages.live {
-            self.state.order(live);
+            if self.pages.live_order != Some(self.state.sort) {
+                self.state.order(live);
+                self.pages.live_order = Some(self.state.sort);
+            }
             self.rows = live
                 .iter()
                 .filter(|(r, _)| byte_contains(&r.name, self.state.filter.as_bytes()))
@@ -153,6 +159,8 @@ impl Browser {
         if self.state.pane == Pane::Instances {
             return self.instance_page(reverse, false);
         }
+        let previous_offset = self.pages.offset;
+        let previous_selection = self.state.selected;
         if self.pages.live.is_some() || self.state.sort == state::Sort::Growth {
             if reverse {
                 self.pages.offset = self.pages.offset.saturating_sub(PAGE);
@@ -177,17 +185,25 @@ impl Browser {
         let previous = self.rows.clone();
         self.load()?;
         if self.rows.is_empty() {
+            self.pages.offset = previous_offset;
+            self.state.selected = previous_selection;
             self.rows = previous;
         }
         Ok(())
     }
     fn cycle_sort(&mut self) -> anyhow::Result<()> {
-        let next = self.state.sort.next();
+        let mut next = self.state.sort.next();
+        if next == state::Sort::Growth && self.state.growth_refused {
+            next = state::Sort::Name;
+        }
         if next == state::Sort::Growth && self.snapshot.children_count(self.dir.id, b"")? > 10_000 {
-            self.message = "Growth sort requires at most 10,000 children".into();
+            self.state.growth_refused = true;
+            self.message =
+                "Growth sort requires at most 10,000 children; s advances to name".into();
             return Ok(());
         }
         self.state.sort = next;
+        self.state.growth_refused = false;
         self.boundary(false)
     }
     fn instance_page(&mut self, reverse: bool, boundary: bool) -> anyhow::Result<()> {
@@ -250,8 +266,14 @@ impl Browser {
         let Some(refresh) = &self.refresh else {
             return Ok(());
         };
-        let Ok(result) = refresh.rx.try_recv() else {
-            return Ok(());
+        let result = match refresh.rx.try_recv() {
+            Ok(result) => result,
+            Err(crossbeam_channel::TryRecvError::Empty) => return Ok(()),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.refresh = None;
+                self.message = "Live refresh worker stopped without a result".into();
+                return Ok(());
+            }
         };
         let cancelled = refresh.cancel.load(std::sync::atomic::Ordering::Acquire);
         self.refresh = None;
@@ -267,6 +289,10 @@ impl Browser {
             }
         };
         let root = rows.iter().find(|r| r.path == self.dir.path).map(|r| r.id);
+        if rows.iter().filter(|r| r.parent_id == root).count() > MAX_LIVE_CHILDREN {
+            self.message = "Live refresh exceeds the 1,000,000-child display cap".into();
+            return Ok(());
+        }
         let mut children = Vec::new();
         for row in rows {
             if Some(row.id) == root {
@@ -288,6 +314,7 @@ impl Browser {
             *delta = delta.map(|baseline| i128::from(row.t_disk) - baseline);
         }
         self.pages.live = Some(children);
+        self.pages.live_order = None;
         self.pages.offset = 0;
         self.load()?;
         self.message = "live values; delta against snapshot".into();
@@ -511,6 +538,13 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         if key.kind == KeyEventKind::Release {
             continue;
         }
+        if key.code == KeyCode::Esc {
+            if let Some(refresh) = &browser.refresh {
+                refresh
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         if browser.state.editing {
             match key.code {
                 KeyCode::Enter | KeyCode::Esc => browser.state.editing = false,
@@ -528,6 +562,19 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         let result: anyhow::Result<()> = (|| {
             match key.code {
                 KeyCode::Char('q') => return Ok(()),
+                KeyCode::Up if browser.state.pane == Pane::Main && browser.state.selected == 0 => {
+                    let first = browser.rows.first().map(|r| r.0.id);
+                    browser.page(true)?;
+                    if browser.rows.first().map(|r| r.0.id) != first {
+                        browser.state.selected = browser.count().saturating_sub(1);
+                    }
+                }
+                KeyCode::Down
+                    if browser.state.pane == Pane::Main
+                        && browser.state.selected + 1 == browser.count() =>
+                {
+                    browser.page(false)?
+                }
                 KeyCode::Up => browser.state.move_by(-1, browser.count()),
                 KeyCode::Down => browser.state.move_by(1, browser.count()),
                 KeyCode::Home | KeyCode::End if browser.state.pane == Pane::Main => {

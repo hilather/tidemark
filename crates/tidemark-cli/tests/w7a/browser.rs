@@ -239,12 +239,14 @@ fn million_directory_navigation() {
         let nav = std::time::Instant::now();
         b.state.move_by(1, b.count());
         println!("navigation_ms={:.3}", nav.elapsed().as_secs_f64() * 1000.0);
+        let page = std::time::Instant::now();
         b.page(false).unwrap();
+        println!("next_page_ms={:.3}", page.elapsed().as_secs_f64() * 1000.0);
     }
 }
 
 #[test]
-fn preorder_pages_skip_nested_subtrees_and_support_back() {
+fn query_pages_skip_nested_subtrees_and_support_back() {
     let temp = tempfile::tempdir().unwrap();
     let mut rows = vec![
         fixture::row(0, None, b"/fixture", 10),
@@ -354,6 +356,8 @@ fn growth_limit_preserves_current_sort() {
     b.cycle_sort().unwrap();
     assert_eq!(b.state.sort, state::Sort::Newest);
     assert!(b.message.contains("10,000"));
+    b.cycle_sort().unwrap();
+    assert_eq!(b.state.sort, state::Sort::Name);
     let (_temp, mut b) = browser(10_000);
     b.state.sort = state::Sort::Newest;
     b.cycle_sort().unwrap();
@@ -443,7 +447,7 @@ size = 8192
     assert!(b.pages.live.is_some(), "{}", b.message);
     assert_eq!(
         b.rows[0].0.t_disk,
-        test_support::oracle::du_disk(&fixture.root.join("a"))
+        test_support::oracle::du_disk(fixture.root.join("a"))
     );
     assert_eq!(
         b.rows[0].1,
@@ -465,4 +469,78 @@ size = 8192
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(b.message.contains("cancelled"));
+}
+
+#[test]
+fn distinct_metrics_and_previous_snapshot_order_across_pages() {
+    let (_temp, mut b) = browser(2500);
+    let store = tempfile::tempdir().unwrap();
+    let previous = tempfile::tempdir().unwrap();
+    let mut rows = vec![fixture::row(0, None, b"/fixture", 1)];
+    rows[0].subtree_end = 2500;
+    for id in 1..=2500 {
+        let mut row = fixture::row(
+            id,
+            Some(0),
+            format!("/fixture/{id:08}").as_bytes(),
+            u64::from(id * 37 % 2501),
+        );
+        row.t_reclaimable = u64::from(id * 19 % 2501);
+        row.t_files = u64::from(id * 13 % 2501);
+        row.newest_mtime = i64::from(id * 7 % 2501);
+        rows.push(row);
+    }
+    let mut old_rows = rows.clone();
+    for row in old_rows.iter_mut().skip(1) {
+        row.t_disk = u64::from(row.id * 29 % 2501);
+    }
+    b.old = Some(Snapshot::open(&fixture::snapshot(previous.path(), &old_rows, 900_000)).unwrap());
+    b.snapshot = Snapshot::open(&fixture::snapshot(store.path(), &rows, 1_000_000)).unwrap();
+    b.dir = b.snapshot.root().unwrap();
+    for sort in [
+        state::Sort::Size,
+        state::Sort::Reclaim,
+        state::Sort::Files,
+        state::Sort::Newest,
+        state::Sort::Growth,
+        state::Sort::Name,
+    ] {
+        b.state.sort = sort;
+        b.state.filter = "00001".into(); // More than one SQL page; matches raw child names.
+        b.boundary(false).unwrap();
+        let mut expected = rows
+            .iter()
+            .skip(1)
+            .filter(|r| byte_contains(&r.name, b"00001"))
+            .collect::<Vec<_>>();
+        let value = |r: &DirRow| match sort {
+            state::Sort::Size => i128::from(r.t_disk),
+            state::Sort::Reclaim => i128::from(r.t_reclaimable),
+            state::Sort::Files => i128::from(r.t_files),
+            state::Sort::Newest => i128::from(r.newest_mtime),
+            state::Sort::Growth => {
+                i128::from(r.t_disk) - i128::from(old_rows[r.id as usize].t_disk)
+            }
+            state::Sort::Name => 0,
+        };
+        expected.sort_by(|a, b| value(b).cmp(&value(a)).then_with(|| a.name.cmp(&b.name)));
+        assert!(expected.len() > PAGE);
+        let mut actual = Vec::new();
+        loop {
+            actual.extend(b.rows.iter().map(|r| r.0.id));
+            if b.rows.len() < PAGE {
+                break;
+            }
+            b.page(false).unwrap();
+        }
+        assert_eq!(
+            actual,
+            expected.iter().map(|r| r.id).collect::<Vec<_>>(),
+            "{sort:?}"
+        );
+        b.boundary(true).unwrap();
+        assert_eq!(b.rows.last().unwrap().0.id, expected.last().unwrap().id);
+        b.boundary(false).unwrap();
+        assert_eq!(b.rows.first().unwrap().0.id, expected.first().unwrap().id);
+    }
 }

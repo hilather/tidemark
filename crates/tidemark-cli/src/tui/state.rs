@@ -39,6 +39,7 @@ pub(crate) struct State {
     pub(crate) selected: usize,
     pub(crate) pane: Pane,
     pub(crate) sort: Sort,
+    pub(crate) growth_refused: bool,
     pub(crate) filter: String,
     pub(crate) editing: bool,
     pub(crate) page_start: u32,
@@ -49,6 +50,7 @@ impl State {
             selected: 0,
             pane: Pane::Main,
             sort: Sort::Size,
+            growth_refused: false,
             filter: String::new(),
             editing: false,
             page_start: start,
@@ -62,6 +64,7 @@ impl State {
     }
     pub(crate) fn reset(&mut self, start: u32) {
         self.selected = 0;
+        self.growth_refused = false;
         self.page_start = start;
         self.pane = Pane::Main;
     }
