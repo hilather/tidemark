@@ -1,19 +1,10 @@
 //! Owned by: W7-C3-fuzz
 //! Deterministic state-reader smoke coverage (this crate lacks proptest).
 #![forbid(unsafe_code)]
-use std::{
-    fs,
-    time::{Duration, Instant},
-};
-use tidemarkd::firstboot::needs_report;
-fn exercise(bytes: &[u8]) {
-    let dir = tempfile::tempdir().unwrap();
-    fs::create_dir(dir.path().join("deploy")).unwrap();
-    fs::write(dir.path().join("deploy/staged.json"), bytes).unwrap();
-    fs::write(dir.path().join("deploy/firstboot.json"), bytes).unwrap();
-    let _ = needs_report(dir.path(), "abc");
-    let _: Result<tidemarkd::firstboot::FirstbootReport, _> = serde_json::from_slice(bytes);
-}
+use std::time::{Duration, Instant};
+#[path = "../../../fuzz/support/firstboot.rs"]
+mod support;
+use support::exercise;
 #[test]
 fn mutated_reports_and_large_inputs() {
     let seed = br#"{"version":"test","config_sha256":"abc","daemon_started_at":1,"components":[],"watch_modes":[],"first_fs_sample":null,"first_lvm_sample":null,"next_scans":[],"booted_at":0,"healthy":false,"written_at":2}"#;
