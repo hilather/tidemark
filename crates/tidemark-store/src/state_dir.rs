@@ -90,7 +90,7 @@ fn policy(input: PolicyInput, strict: bool) -> Result<bool, &'static str> {
                 && user_namespace
                 && owner == overflow_uid
             {
-                "owner 65534 is not mapped in this user namespace"
+                "owner is not mapped in this user namespace"
             } else if strict && read_only_mount && role == Role::Ancestor {
                 "foreign owner on a read-only mount is not trusted"
             } else {
@@ -148,6 +148,11 @@ fn check(path: &Path, stat: &fs::Stat, role: Role, read_only_mount: bool) -> io:
         strict_ancestry(),
     )
     .map_err(|reason| {
+        let reason = if reason == "owner is not mapped in this user namespace" {
+            format!("owner {} is not mapped in this user namespace", stat.st_uid)
+        } else {
+            reason.to_owned()
+        };
         error(
             path,
             format!(
@@ -462,6 +467,11 @@ mod tests {
         tracing::subscriber::with_default(Capture(messages.clone()), || {
             let temp = ::test_support::private_tempdir().unwrap();
             let state = StateDir::open(temp.path(), false).unwrap();
+            let mut foreign = fs::fstat(state.fd()).unwrap();
+            foreign.st_uid = rustix::process::geteuid().as_raw().wrapping_add(1);
+            for _ in 0..2 {
+                check(temp.path(), &foreign, Role::Ancestor, true).unwrap();
+            }
             let leaf = temp.path().join("readable.db");
             ::test_support::private_write(&leaf, b"sentinel").unwrap();
             std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -475,6 +485,13 @@ mod tests {
             std::fs::set_permissions(&sub.path, std::fs::Permissions::from_mode(0o750)).unwrap();
             state.subdir(OsStr::new("child"), false).unwrap();
             let messages = messages.lock().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m.contains("development build: accepted ancestor"))
+                    .count(),
+                1
+            );
             let captured: Vec<_> = messages
                 .iter()
                 .filter(|m| m.contains("state file readable by other users"))
@@ -646,10 +663,7 @@ mod tests {
             assert_eq!(policy(input, false), expected, "{name}");
             let strict = policy(input, true);
             if input.owner == 65534 && input.user_namespace {
-                assert_eq!(
-                    strict,
-                    Err("owner 65534 is not mapped in this user namespace")
-                );
+                assert_eq!(strict, Err("owner is not mapped in this user namespace"));
             } else if input.owner == 2000 && input.read_only_mount && input.role == Role::Ancestor {
                 assert_eq!(
                     strict,

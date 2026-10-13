@@ -277,21 +277,30 @@ fn unrelated_listener_does_not_redirect_direct_scan() {
 #[cfg(feature = "privileged")]
 #[test]
 fn strict_ancestry_refuses_second_uid_before_writes() {
-    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    use std::os::unix::{
+        fs::{MetadataExt, PermissionsExt},
+        process::CommandExt,
+    };
     let temp = test_support::private_tempdir().unwrap();
-    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
     let foreign = temp.path().join("foreign");
-    test_support::private_dir(&foreign).unwrap();
-    std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let out = std::process::Command::new("true")
+    assert!(rustix::process::geteuid().is_root(), "requires guest root");
+    let out = std::process::Command::new("mkdir")
+        .arg("-m")
+        .arg("755")
+        .arg(&foreign)
         .uid(65533)
         .gid(65533)
         .output()
         .unwrap();
-    assert!(out.status.success());
-    rustix::fs::chown(&foreign, Some(rustix::process::Uid::from_raw(65533)), None).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let sentinel = temp.path().join("sentinel");
     test_support::private_write(&sentinel, b"unchanged").unwrap();
+    let before = std::fs::metadata(&sentinel).unwrap();
     let state = foreign.join("state");
     let config = direct_config(temp.path(), "");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
@@ -307,5 +316,10 @@ fn strict_ancestry_refuses_second_uid_before_writes() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("untrusted owner"));
     assert!(!state.exists());
-    assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+    let after = std::fs::metadata(sentinel).unwrap();
+    assert_eq!(
+        (after.ino(), after.mode(), after.uid(), after.len()),
+        (before.ino(), before.mode(), before.uid(), before.len())
+    );
 }
