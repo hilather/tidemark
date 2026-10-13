@@ -123,3 +123,8 @@ impl Command {
         }
     }
 }
+
+/// Build the same command definition used by the CLI parser.
+pub fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
+}

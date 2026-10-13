@@ -27,6 +27,11 @@ package metadata comes from `packaging/rpm/rpm.toml`. Asset and script paths
 are relative to the workspace root, where the generator command must run. See the
 [generator metadata documentation](https://github.com/cat-in-136/cargo-generate-rpm#configuration).
 Bash completion is generated from the release CLI before packaging.
+The build then runs `cargo run --locked -p xtask -- man` (offline by default),
+generating `target/man/` from the real clap definitions before `cargo generate-rpm`.
+For a standalone preview, use `cargo xtask man [--out DIR]`.
+All visible CLI subcommands (including nested commands) ship in section 1;
+`tidemarkd` ships in section 8.
 
 Only config/state/runtime are private (0600/0700 root:root); binaries are 0755
 and public unit/docs/completion files 0644 root:root. No account is created.

@@ -4,6 +4,8 @@ For administrators on Rocky Linux 8 with access through `sudo`. Examples use `/d
 
 ## Install and inspect the host
 
+The RPM includes command manuals: `man tidemark` and `man tidemarkd`.
+
 Obtain the approved EL8 RPM and its checksum from your release pipeline. Replace the filename below with that artifact.
 
 ```sh

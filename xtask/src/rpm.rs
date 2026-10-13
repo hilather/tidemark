@@ -31,7 +31,7 @@ pub fn container_args(root: &Path, version: &str) -> Result<Vec<OsString>> {
     let mut volume = root.as_os_str().to_os_string();
     volume.push(":/src");
     let script = format!(
-        "set -eu; cargo generate-rpm --version >/dev/null 2>&1 || {{ echo 'Install cargo-generate-rpm in the build image' >&2; exit 1; }}; cargo build --offline --locked --release -p tidemark-cli -p tidemarkd; target/release/tidemark completions bash > target/release/tidemark.bash; cargo {}",
+        "set -eu; cargo generate-rpm --version >/dev/null 2>&1 || {{ echo 'Install cargo-generate-rpm in the build image' >&2; exit 1; }}; cargo build --offline --locked --release -p tidemark-cli -p tidemarkd; target/release/tidemark completions bash > target/release/tidemark.bash; cargo run --offline --locked -p xtask -- man; cargo {}",
         rpm.iter().map(|s| format!("'{}'", s.replace('\'', "'\\''"))).collect::<Vec<_>>().join(" ")
     );
     Ok(vec![
@@ -127,7 +127,7 @@ pub struct NativeCommand {
     pub stdout: Option<String>,
 }
 
-/// Assemble the ordered build, completion and generator commands.
+/// Assemble the ordered build, completion, manual and generator commands.
 pub fn native_commands(
     version: &str,
     online: bool,
@@ -165,6 +165,21 @@ pub fn native_commands(
             program: "target/release/tidemark".into(),
             args: vec!["completions".into(), "bash".into()],
             stdout: Some("target/release/tidemark.bash".into()),
+        },
+        NativeCommand {
+            program: "cargo".into(),
+            args: {
+                let mut args = vec!["run", "--locked", "-p", "xtask"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>();
+                if !online {
+                    args.push("--offline".into());
+                }
+                args.extend(["--".into(), "man".into()]);
+                args
+            },
+            stdout: None,
         },
         NativeCommand {
             program: "cargo".into(),
