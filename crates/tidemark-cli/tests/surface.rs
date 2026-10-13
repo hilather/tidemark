@@ -464,3 +464,78 @@ fn failures_name_operation_subject_and_preserve_status() {
         "{text}"
     );
 }
+
+#[test]
+fn unreadable_configuration_names_path_and_keeps_access_hint() {
+    use std::os::unix::fs::PermissionsExt;
+    let work = test_support::private_tempdir().unwrap();
+    let config = work.path().join("unreadable.toml");
+    std::fs::write(&config, "").unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"));
+    let drop_uid = rustix::process::geteuid().is_root();
+    if drop_uid {
+        use std::os::unix::process::CommandExt;
+        // Execute a private copy so restrictive checkout ancestry cannot mask
+        // the intended configuration-file permission failure after dropping DAC.
+        let binary = work.path().join("tidemark");
+        std::fs::copy(env!("CARGO_BIN_EXE_tidemark"), &binary).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(work.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        command = std::process::Command::new(binary);
+        command.gid(65534).uid(65534);
+    }
+    let out = match command.arg("-c").arg(&config).arg("status").output() {
+        Ok(output) => output,
+        Err(error)
+            if drop_uid
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::Unsupported
+                ) =>
+        {
+            eprintln!(
+                "pending ordinary-user CI: sandbox refuses test child UID/GID change: {error}"
+            );
+            return;
+        }
+        Err(error) => panic!("unreadable-config child could not start: {error}"),
+    };
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("load configuration:")
+            && text.contains(&config.display().to_string())
+            && text.to_ascii_lowercase().contains("permission denied"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(&format!("\n{}\n", tidemark_cli::ACCESS_HINT)),
+        "{text}"
+    );
+}
+
+#[test]
+fn final_error_boundary_escapes_hostile_configuration_path() {
+    use std::os::unix::ffi::OsStringExt;
+    let work = test_support::private_tempdir().unwrap();
+    let path = work.path().join(std::ffi::OsString::from_vec(
+        b"admin\x1b[31m\nforged\xff.toml".to_vec(),
+    ));
+    std::fs::write(&path, "invalid = [").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
+        .arg("-c")
+        .arg(&path)
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("admin\\x1B[31m\\x0Aforged\\xFF.toml"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{1b}') && !text.contains("\nforged"));
+}

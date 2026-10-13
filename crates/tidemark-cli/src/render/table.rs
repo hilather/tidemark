@@ -352,3 +352,20 @@ mod fitting_tests {
         }
     }
 }
+
+/// Escape control characters in one human diagnostic cell, preserving prior path escapes.
+/// Layout newlines are emitted by the caller separately from untrusted message text.
+pub fn diagnostic(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            let mut bytes = [0; 4];
+            output.push_str(&tidemark_core::path::display_lossy_bytes(
+                ch.encode_utf8(&mut bytes).as_bytes(),
+            ));
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}

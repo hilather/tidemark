@@ -10,7 +10,12 @@ pub(super) fn checks(checks: &[CheckResult], output: &mut impl Write) -> anyhow:
             CheckStatus::Warn => "WARN",
             CheckStatus::Fail => "FAIL",
         };
-        writeln!(output, "{status:4} {:18} {}", check.name, check.detail)?;
+        writeln!(
+            output,
+            "{status:4} {:18} {}",
+            crate::render::table::diagnostic(check.name),
+            crate::render::table::diagnostic(&check.detail)
+        )?;
     }
     Ok(())
 }
@@ -24,8 +29,8 @@ pub(super) fn staged(record: &StagedRecord, json: bool) -> anyhow::Result<()> {
         writeln!(
             output,
             "Staged {} (config {}); {}",
-            record.version,
-            record.config_sha256,
+            crate::render::table::diagnostic(&record.version),
+            crate::render::table::diagnostic(&record.config_sha256),
             if record.start_now {
                 "immediate start requested"
             } else {
@@ -78,4 +83,30 @@ pub(super) fn unstaged(json: bool) -> anyhow::Result<()> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hostile_path_in_check_is_one_escaped_diagnostic_line() {
+        let path = "/tmp/admin\u{1b}[31m\nforged PASS";
+        let check = crate::deploy::CheckResult {
+            name: "destination",
+            status: crate::deploy::CheckStatus::Fail,
+            detail: format!("cannot use {path}: not eligible"),
+        };
+        let mut out = Vec::new();
+        super::checks(std::slice::from_ref(&check), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(
+            text.contains("/tmp/admin\\x1B[31m\\x0Aforged PASS"),
+            "{text}"
+        );
+        assert!(!text.contains('\u{1b}'));
+        assert_eq!(
+            serde_json::to_value(check).unwrap()["detail"],
+            format!("cannot use {path}: not eligible")
+        );
+    }
 }
