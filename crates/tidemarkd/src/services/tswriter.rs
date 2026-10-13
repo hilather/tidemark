@@ -190,12 +190,13 @@ fn start_supervised_with_clocks(
                 }) {
                     failures = 0;
                 }
+                let transient = result.as_ref().err().is_some_and(writer_pressure);
                 let cause = result
                     .err()
                     .map_or_else(|| "writer exited unexpectedly".into(), |e| e.to_string());
                 state.publish_component(crate::component(
                     "tswriter",
-                    "error",
+                    if transient { "degraded" } else { "error" },
                     format!("persistence lost: {cause}"),
                 ))?;
                 failures = failures.saturating_add(1);
@@ -227,7 +228,11 @@ fn start_supervised_with_clocks(
                         Err(error) => {
                             state.publish_component(crate::component(
                                 "tswriter",
-                                "error",
+                                if crate::store_pressure(&error) {
+                                    "degraded"
+                                } else {
+                                    "error"
+                                },
                                 format!("persistence lost: {error}"),
                             ))?;
                             failures = failures.saturating_add(1);
