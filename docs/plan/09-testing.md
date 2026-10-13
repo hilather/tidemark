@@ -187,6 +187,10 @@ Record these Wave 1 findings on both VMs in `docs/handoff/W1-gate.md`; preserve 
 
 ## 6. Fault injection
 
+Harness-phase tests print a skip line unless their phase/RPM variables are supplied; explicitly requested tests require the explicit VM marker, never inferred. `cargo xtask vm-test --no-fail-fast` passes the option to Cargo before -- and rejects it for script suites. Systemd-launched test binaries are copied out of home to an executable location with restored labels. SSH is the first ssh on PATH, enabling wrappers. Loop/md fixtures do not survive reboot: external harness restores them before verify. Compile-only, printed skips and socket-denied early returns are not guest acceptance. (13 R4-14.)
+
+Packaging assertions follow 13 R4-5: Unit values have no trailing comments; the existing normative unit remains unchanged. Install neither starts nor enables. Upgrade/reinstall uses guarded `try-restart`: restart a running daemon and leave a stopped daemon stopped, preserving enablement. Erase stops/disables and retains state. The install gate requires effective memory limit 2147483648, notify/root, NoNewPrivileges and exact capability names, and rejects installed-unit parser warnings. Active upgrade must change a nonzero PID and regain API readiness; stopped reinstall stays inactive. Edited config survives, and the changed-default fixture must produce root:root 0600 `.rpmnew` with its marker. Enable and prove active/enabled before erase, then assert inactive/disabled and no wants entry even as a dangling symlink; retained `.rpmsave` matches edited bytes and mode 0600. Require SELinux Enforcing unless an explicit permissive override labels SELinux acceptance untested. Post-reboot verification requires an external writer’s hot directory on restored disposable XFS; any post-mount restart is explicit.
+
 | Fault | Method | Expected |
 |-------|--------|----------|
 | Directory removed mid-scan | Background thread deletes subtrees during the scan | Counted as races; snapshot complete; no panic |
@@ -238,10 +242,14 @@ Pass criteria:
 
 ## 9. CI
 
+The CLI manifest contains an empty `[package.metadata.generate-rpm]` table for external metadata. `cargo xtask rpm --native` builds on EL8; the changed-default test package requires `--native --version 0.1.1 --upgrade-fixture`. Native mode installs nothing, defaults offline and rejects foreign hosts/missing generator. `tools/check-rpm.sh` checks package identity, exact assets/modes/owners/config flags, scriptlets and extracted ELF binaries. `tools/el8-build-env.sh` prepares disposable EL8 build environments, pinning 8.8 repositories to the vault. GitHub Actions has a `ci` job and separate Rocky 8.8/8.10 `rpm` matrix, locked fetching, package/install verification, checksums and artifacts. ShellCheck runs on GitHub at default severity. Owner decision: push main to GitHub after each green local gate; this task does not push. (13 R4-4.)
+
+The implemented GitHub jobs below are ci and rpm; VM/fuzz/bench rows describe required external gates, not evidence of additional hosted jobs.
+
 | Job | Trigger | Content |
 |-----|---------|---------|
 | `ci` | Every push | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, `cargo deny check` |
-| `build-el8` | Every push to main | Build in a `rockylinux:8` container; upload artifacts |
+| `rpm` | Workflow push/PR/tag/dispatch triggers | Rocky 8.8 (vault-pinned) and 8.10 native build, package inspection, install/version/rpm verification, checksums and separate artifacts |
 | `vm-test` | Nightly + before each wave gate | Privileged suite on Rocky 8.8 and 8.10 VMs |
 | `fuzz` | Nightly | 10 minutes per fuzz target |
 | `bench` | Manual / per release | Staging only |

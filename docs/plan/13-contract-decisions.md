@@ -158,7 +158,7 @@ Legacy v1 bulkstat has a 16-bit link count: 65,537 arrives as 1 without detectab
 
 `tidemark_sys::xfs::bulkstat` uses `XFS_IOC_BULKSTAT` v5 with 32-bit `bs_nlink` only, returning `Unsupported` when unavailable. `bulkstat_probe` still reports `BulkstatSupport { v1, v5 }`. Auto chooses bulk only with v5; explicit `--mode bulk` without it fails with exit code 5 and a message naming the reason. Walk uses exact `statx` counts.
 
-The EL8 userspace header (`xfsprogs-devel-5.0.0-12.el8`, `/usr/include/xfs/xfs_fs.h`) lacks the v5 structures and `XFS_IOC_BULKSTAT`. Module-binary inspection of `xfs.ko` in `kernel-core-4.18.0-477.27.1.el8_8` (Rocky 8.8) and kernel 4.18.0-553.172.1.el8_10 (Rocky 8.10) found `xfs_ioc_bulkstat`, `xfs_bulk_ireq_setup` and `xfs_bulkstat_to_bstat`. This establishes handler presence, not successful ioctl execution; runtime probes on both VMs remain a Wave 1 gate item.
+The EL8 userspace header (`xfsprogs-devel-5.0.0-12.el8`, `/usr/include/xfs/xfs_fs.h`) lacks the v5 structures and `XFS_IOC_BULKSTAT`. Module-binary inspection of `xfs.ko` in `kernel-core-4.18.0-477.27.1.el8_8` (Rocky 8.8) and kernel 4.18.0-553.172.1.el8_10 (Rocky 8.10) found `xfs_ioc_bulkstat`, `xfs_bulk_ireq_setup` and `xfs_bulkstat_to_bstat`. First real runs on 2026-10-12 establish successful v5 ioctl execution on both releases (13 R4-15); independent block-unit and scale gates remain.
 
 Bindings are hand-transcribed, not bindgen output, and pinned by layout tests to sizes and offsets measured with `gcc`: `xfs_bstat` 136 bytes, `xfs_bstime` 16, `xfs_fsop_bulkreq` 32, `xfs_fsop_geom` 112 from the EL8 header; `xfs_bulkstat` 192, `xfs_bulk_ireq` 64 and `XFS_IOC_BULKSTAT` `0x8040587f` measured against `xfsprogs-devel-6.4.0-7.el9` (same kernel ABI).
 
@@ -692,7 +692,7 @@ Minute buckets discard the event timing needed for arbitrary alert durations. Tr
 
 Watcher-backed rules (`hot_dir_growth` and `watch_lossy`) accept only exact whole-minute windows from 1 through 60 minutes. Other durations are not evaluable, with a diagnostic; never round or clamp. Keep 60 whole-minute buckets and a cumulative overflow total. Sample that total at each completed-minute boundary; a window overflow count is the difference between its two boundary samples, unavailable if either sample is missing. Hot data consists of per-minute top lists, not a complete inventory. If any included minute overflowed or was truncated at its cap, hot data for the window is unavailable. The ordinary hot API retains its four ranked-list windows.
 
-Implementation evidence (`W6-A2b.md`) is more restrictive: row-only completed-minute drains omit empty-minute/loss/boundary facts, so no `WatchWindow` measurements are currently published. Watcher-backed rules remain not evaluable until that producer/state seam is resolved. The proposed `drain_minutes`/`CompletedMinute` and freshness reader in that note are follow-up proposals, not adopted signatures.
+Updated by 13 R4-7: LIVE-minutes implements CompletedMinute, drain_minutes and mount_identity with empty-minute and boundary-loss facts. The daemon exact-window/freshness consumer remains open; watcher-backed rules are still not evaluable.
 
 Plan locations: 07 §3.3/§6.2; W5/W6/W7. Affected tasks: W5-A/D, W6-A1/A2b, W7-C/D.
 
@@ -858,3 +858,180 @@ In bulk mode regular-file `apparent` is the size XFS has recorded on disk. Data 
 Tests flush fixture filesystems after writing/copying and before comparing modes or apparent-size oracles. Materialization performs one `rustix::fs::syncfs` on the fixture root after the whole fixture is written, replacing per-file syncs. A privileged writeback test permits spontaneous writeback: unflushed bulk apparent size must be no larger than walk, disk bytes must agree, and flushed rows must agree after ordinary mode-only normalization.
 
 Plan locations: 01 FR-3/NFR-1; 03 §2/§3 apparent definition/oracle/invariant 6; 04 mode table/output oracle, §5.1 and §10; 08 §1 scan modes; 09 §3/§5; 11 first-night mode choice; W2-B tests. Affected tasks: W0-C (fixture writer), W2-B/C, W7-B/D.
+
+
+## First real runs and Wave 6 review decisions
+
+Recorded 2026-10-12 from the first real Rocky runs, owner decisions and fix handoffs. All listed source notes exist. Exact implemented contracts below follow the notes where more precise than the brief; open producer/state seams are distinguished from implemented behavior. R4 decisions supersede earlier conflicting plan text.
+
+### R4-1 — Retained daemon state directory
+
+**Decision: accepted.**
+
+The daemon addresses its retained verified state directory as `/proc/self/fd/<n>/.`, so no-follow directory opens address the directory rather than the final procfs symlink. Daemon tests bind storage as production does.
+
+Sources: `W6-fix-daemon-scan.md`.
+
+Plan locations: 08 daemon lifecycle; W6-A1/A2.
+
+### R4-2 — Scan failures and scheduler recovery
+
+**Decision: accepted.**
+
+Log one WARN per actual failed scan (root, mode, source, attempt and retry time), and INFO on admitted start and successful completion with scan id. Scheduler health remains degraded for each failed root until that root completes successfully or leaves configuration; waiting, another root’s success and reload do not establish recovery. Scheduled retries are 30, 60, 120, 240, 480, 960, 1920, then 3600 seconds, capped there. Completion and accepted reload reset retry delay/attempts. Busy and cancellation are not failures and use fixed 30-second deferral. Operator requests bypass backoff. Requested roots outside configuration retain failure health until recovery.
+
+Sources: `W6-fix-daemon-scan.md`.
+
+Plan locations: 04 §8; W6-A2.
+
+### R4-3 — Portable catalog paths
+
+**Decision: accepted.**
+
+`scans.file` stores raw bytes relative to the catalog state directory, retaining its SQL TEXT type. `record_start`, `record_finish` and `rebuild_from_files` remove dot components and strip the lexical state-directory prefix; outside paths, unanchored relative inputs and parent traversal are invalid. No symlink resolution occurs. `list`, `latest`, `nearest_before` and `get` join against the reader’s state directory. Existing legacy absolute files are returned unchanged; missing absolute files use the tail beginning at the last `snapshots` component if that file exists locally, otherwise remain unchanged. Rebuild repairs legacy rows to relative paths. `ScanEntry` and Catalog signatures are unchanged.
+
+Sources: `STORE-catalog-paths.md`.
+
+Plan locations: 05 §4.
+
+### R4-4 — RPM construction and continuous integration
+
+**Decision: accepted.**
+
+The CLI manifest contains an empty `[package.metadata.generate-rpm]` table for external metadata. `cargo xtask rpm --native` builds on EL8; the changed-default test package requires `--native --version 0.1.1 --upgrade-fixture`. Native mode installs nothing, defaults offline and rejects foreign hosts/missing generator. `tools/check-rpm.sh` checks package identity, exact assets/modes/owners/config flags, scriptlets and extracted ELF binaries. `tools/el8-build-env.sh` prepares disposable EL8 build environments, pinning 8.8 repositories to the vault. GitHub Actions has a `ci` job and separate Rocky 8.8/8.10 `rpm` matrix, locked fetching, package/install verification, checksums and artifacts. ShellCheck runs on GitHub at default severity. Owner decision: push main to GitHub after each green local gate; this task does not push.
+
+Sources: `PKG-rpm-metadata.md`, `CI-rpm.md`, `INSTALL-assert.md`.
+
+Plan locations: 09 §9; W6-C.
+
+### R4-5 — Service lifecycle and discriminating install assertions
+
+**Decision: accepted.**
+
+Unit values have no trailing comments; the existing normative unit remains unchanged. Install neither starts nor enables. Upgrade/reinstall uses guarded `try-restart`: restart a running daemon and leave a stopped daemon stopped, preserving enablement. Erase stops/disables and retains state. The install gate requires effective memory limit 2147483648, notify/root, NoNewPrivileges and exact capability names, and rejects installed-unit parser warnings. Active upgrade must change a nonzero PID and regain API readiness; stopped reinstall stays inactive. Edited config survives, and the changed-default fixture must produce root:root 0600 `.rpmnew` with its marker. Enable and prove active/enabled before erase, then assert inactive/disabled and no wants entry even as a dangling symlink; retained `.rpmsave` matches edited bytes and mode 0600. Require SELinux Enforcing unless an explicit permissive override labels SELinux acceptance untested. Post-reboot verification requires an external writer’s hot directory on restored disposable XFS; any post-mount restart is explicit.
+
+Sources: `PKG-unit-fix.md`, `PKG-upgrade-restart.md`, `INSTALL-assert.md`.
+
+Plan locations: 09 packaging gate; 11 rollout; W6-C.
+
+### R4-6 — Live hot report and attribution
+
+**Decision: accepted.**
+
+`now.hot_dirs_5m` is the watcher’s ranked five-minute directory list including the current minute, bounded by writers row limit and preserving lossy flags; it does not establish exact alert windows. Missing/failed watchers are unmeasured; an empty running list is measured. `top_unit` is the unit with greatest sum of absolute byte deltas, ties to the lexicographically smaller name, using at most eight private space-saving candidates per row/minute (approximate beyond eight). Unit rows identify themselves; unattributed rows have None. A process gone before `/proc` lookup stays unattributed without retry/guessing. Persisted `HotMinute` has no `top_unit`. Multi-minute `files` sums per-minute distinct counts, not distinct files across the window.
+
+Sources: `LIVE-hot.md`, `EDGE-cli.md`.
+
+Plan locations: 07 §3.3/§7/§7a; 08 live CLI.
+
+### R4-7 — Completed minutes and watcher identity
+
+**Decision: accepted.**
+
+`tidemark_live::watch::CompletedMinute` (Clone, Debug) has `started_at: i64`, `overflow_total_at_start: u64`, `overflow_total_at_end: u64`, `lossy: bool`, `truncated: bool`, `dirs: Vec<HotEntry>`, `persisted: Vec<HotMinute>`. `Watcher::drain_minutes(&self, top_k: usize) -> Vec<CompletedMinute>` shares the persistence-row cursor with legacy drains, while minute facts have an independent monotonic watermark. New drains exclude the startup partial minute, materialize idle minutes and remain bounded by 60 buckets; top_k is clamped to 1000 per scope, cuts mark truncation/loss. Retention gaps mark the first surviving minute lossy; rollback never replays emitted timestamps/rows and marks the replay interval lossy. Only actual queue overflow increments totals; contiguous boundaries chain. `Watcher::mount_identity(&self) -> std::io::Result<(u64, u32, u32)>` returns retained descriptor mount id, device major/minor from bounded fdinfo/fstat; injected watchers return Unsupported. Marks target the retained `/proc/self/fd/<fd>/.` directory.
+
+The daemon consumer must retain at most 60 completed facts per watcher identity, discard on replacement and persist only `persisted`. Exact n-minute windows require 1 <= n <= 60, end E of latest completed minute, start S = E - n*60, and measured_at E (never refreshed artificially). Overflow differences need consistent nondecreasing exact S/E boundary totals; otherwise None. Known endpoints suffice even with interior loss. Hot requires n consecutive healthy, untruncated, overflow-free minutes; otherwise None. Sum raw-key rows with saturating counts/deltas, rank signed bytes descending then raw key ascending; healthy empty is Some(empty). A daemon union cap cut makes hot unavailable. Minute leaders cannot reconstruct exact cross-minute unit leadership. These consumer publications remain open.
+
+`AttributionCache::lookup_watcher` may reuse PID/starttime validation for less than one second, separately from its 60-second attribution TTL. Older hits revalidate; failed/recycled identities invalidate and fresh loads recheck. Failed lookups are not cached. Exact process-scanner callers validate every lookup.
+
+Sources: `LIVE-minutes.md`, `WATCH-perf.md`.
+
+Plan locations: 07 §3/§4.3; W7 hardening.
+
+### R4-8 — EL8 watcher CPU budget
+
+**Decision: accepted.**
+
+Owner decision: fd-mode watcher budget is 5% of one core per 1,000 close-write events/s, or 50 microseconds/event, replacing 1%. EL8 kernels 4.18.0-477 and -553 offer no measured FID mode. Optimised 8.10 guest measured 45.6 microseconds/event at 2,000/s (9.1% of one core) with host under load. Owner will measure real servers; this is no universal performance guarantee. The 2,000/s scale test threshold is 10% of one core, replacing 2%. Idle CPU and write-throughput impact remain separate gates.
+
+Sources: `docs/handoff/WATCH-perf.md`; owner decision in PLAN-round4 brief.
+
+Plan locations: 01 NFR-4; 07 §8; 12 risks; w5a privileged scale test.
+
+### R4-9 — Exact configured mount presence
+
+**Decision: accepted.**
+
+A normalized sampler.mounts/watch.mounts path must exactly equal a mount point in the daemon namespace; identity is topmost mount id plus device major/minor. Absent entries produce no samples/persistence or watcher and report `not mounted`. Presence checks pick up arrivals (sampler at most ten seconds, watcher every second); identity changes release the old watcher before replacement. Open sampling descriptor identity is checked before statvfs. Covered scheduled and requested scan roots are refused before run_scan, following existing error/backoff handling; unrelated roots remain eligible. Firstboot is unhealthy for absent entries, but startup readiness is prompt.
+
+Open: clearing in-memory filesystem rate series/removing stale samples across appearance/disappearance/remount; current removable missing-mount reasons in `now.degraded`; daemon consumption of retained watcher mark identity and the residual check-to-mark race. Service persistence deduplication reset is not a rate-ring reset. The proposed future state behavior in W6-mount-presence is not claimed implemented.
+
+Sources: `W6-mount-presence.md`, `LIVE-minutes.md`.
+
+Plan locations: 07 §1/§3; 04 §8; 12 open risks.
+
+### R4-10 — Transactional configuration reload
+
+**Decision: accepted.**
+
+Invalid config.reload returns ok with `reloaded: false` and the error in warnings, keeping previous config/generation. Inventory/capacity/catalog/history/schedule preflight failures are contained the same way, without stopping scheduler. Reserve current configured roots transactionally within the 128-entry inventory, evict inactive manual history deterministically if needed, retire removed inactive roots and retain admitted/running roots until completion. Stale schedule generations cannot resurrect removed roots.
+
+Sources: `docs/handoff/W6-mount-presence.md`, `docs/handoff/CORE-fix-1.md` B2.
+
+Plan locations: 08 API config.reload; W6-A1/A2.
+
+### R4-11 — Shutdown and pre-publication validation
+
+**Decision: accepted.**
+
+One shared monotonic shutdown deadline governs recorder queue/acknowledgement waits and startup-error cleanup; poll cancellation/deadline at most every 50 ms while preserving eight-second per-operation limits. Before admission work is uncommitted; interruption after admission reports persistence uncertain. Retain/join worker handles even after reporting deadline expiry; the ten-second overall bound is unchanged and arbitrary blocked kernel/SQLite operations remain a limitation. Parse exactly the bounded no-follow captured bytes that are hashed. Startup, reload and --check-config validate core/bounds, scheduler schedules/windows and alert predicates before publication. Runtime intervals (throttle sample, sampler, LVM interval/timeout, procscan, metrics, alert renotify/for/resolve_for and every schedules) are at most 366 days inclusive; historical retention horizons are exempt.
+
+Sources: `docs/handoff/CORE-fix-1.md` B1, S6, S9 and F12.
+
+Plan locations: 08 validation; W6 lifecycle.
+
+### R4-12 — CLI scan ownership and presentation
+
+**Decision: accepted.**
+
+Scan falls back directly only when socket is absent/refuses, with an absolute connection deadline rechecked under scan lock. Other connection failures exit 4 before direct state mutation. Follow only the started scan id and read its persisted outcome; degraded, partial or unknown outcome exits 3. Never follow a replacement scan or automatically cancel another id. Root-only scan.cancel remains an explicit root operation. Tables use positive stdout TTY width or 100 otherwise, shortening cells in the middle while preserving escaped tokens; prose wraps at whitespace. Human absolute times are UTC with Z; JSON integers remain integers. now displays provided rate_15m in hourly units and provided one-hour ttf_secs without recomputation.
+
+Open: `tidemark.lvm.v1` names both direct and reduced daemon shapes; scan.cancel cannot atomically condition on scan id under the frozen API.
+
+Sources: `EDGE-cli.md`.
+
+Plan locations: 08 CLI/methods/exit codes; 12 open risks.
+
+### R4-13 — Bounded metrics selection and restart recovery
+
+**Decision: accepted.**
+
+Independent global directory rankings retain at most the configured series cap per family and count omitted eligible rows exactly, with deterministic raw root/path ties, rather than refusing large inventories before selection. Startup and root/depth/capacity reload reconcile a read-only latest-complete snapshot cache. Crash-left owned single-link regular staging files are flocked, truncated and reused through a collector-directory handle; hostile or live staging files are refused. Nonrepresentable metrics interval reports component error until a new generation.
+
+HTTP removal is separately assigned ADR-020 work: do not adopt EDGE-metrics’ HTTP proposal here. Existing metrics.listen and alerts.webhook text is intentionally retained; see the PLAN-round4 handoff inventory.
+
+Sources: `EDGE-metrics.md`.
+
+Plan locations: W6-B; 09 metrics tests.
+
+### R4-14 — Guest harness execution rules
+
+**Decision: accepted.**
+
+Harness-phase tests print a skip line unless their phase/RPM variables are supplied; explicitly requested tests require the explicit VM marker, never inferred. `cargo xtask vm-test --no-fail-fast` passes the option to Cargo before -- and rejects it for script suites. Systemd-launched test binaries are copied out of home to an executable location with restored labels. SSH is the first ssh on PATH, enabling wrappers. Loop/md fixtures do not survive reboot: external harness restores them before verify. Compile-only, printed skips and socket-denied early returns are not guest acceptance.
+
+Sources: `TEST-vm-harness.md`.
+
+Plan locations: 09 VM tests; 11 rollout.
+
+### R4-15 — Measured Rocky platform facts
+
+**Decision: accepted.**
+
+First real runs on Rocky 8.8/8.10: bulkstat v5 works on both; statx supplies no mount id on either. fanotify fd mode works on both; filesystem marks work on 8.10, while 8.8 uses mount marks and cannot observe writes through another mount of that filesystem. On 8.10 the package installs/upgrades/erases and survives reboot under SELinux Enforcing without denials. Tidemark ships no SELinux policy and supports Enforcing, Permissive or Disabled; enforcing is a test posture, not a product prerequisite. Do not infer remaining VM/soak gates passed from these observations.
+
+Sources: first-run evidence in PLAN-round4 brief; `docs/handoff/TEST-vm-harness.md`, `docs/handoff/WATCH-perf.md`.
+
+Plan locations: 04 §5.1; 07 §3.1; 12 platform facts.
+
+### R4-16 — Open work after the reviews
+
+**Status: open risks; no behavior change decided.**
+
+Open, not new accepted behavior: watcher-backed alert rules remain unevaluable until daemon publishes exact CompletedMinute windows (R4-7); W6-A2b alert reconfiguration continuity, component removal and cancellable process scan; mount rate-ring reset/current now.degraded (R4-9); one intermittent cancellation deadline miss on 8.8 in scan_lifecycle::interrupted_cancelled_and_failed_scans; firstboot report rewritten on every start with changed config; LVM schema/cancel-id gaps (R4-12).
+
+Review findings without landed fix notes: core S1 writer rollover failure/supervision, S2 stale collector alert availability, S3 procscan published-lock contention, S4 LVM retry units/backpressure, S5 wall-clock operational deadlines, S7 late sampler generation resurrection, S8 internal alert capacity; edge F02 incomplete-request API deadline, F03 abandoned handler cancellation, F04 mutable API parent path operations. B1/B2/S6/S9 have CORE-fix-1; F05–F08 EDGE-cli; F09–F12 EDGE-metrics plus CORE-fix-1 validation; F13 INSTALL-assert. F01 has an EDGE-metrics fix note but HTTP removal/ADR-020 is separately assigned and not resolved by this plan task. Landed notes establish implementation evidence, not independent verification; unrestricted socket tests and guest gates remain required.
+
+Sources: `docs/reviews/W6-core-review.md`, `docs/reviews/W6-edge-review.md` and the fix notes listed above.
+
+Plan locations: 12 open risks; W7 gate.

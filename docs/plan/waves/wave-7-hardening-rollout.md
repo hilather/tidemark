@@ -17,9 +17,17 @@
 
 ### Gate-review contracts to carry into hardening and rollout
 
+Read 13 R4-1–R4-16 and the first-real-run risks in 12. Owner decision: fd-mode watcher budget is 5% of one core per 1,000 close-write events/s, or 50 microseconds/event, replacing 1%. EL8 kernels 4.18.0-477 and -553 offer no measured FID mode. Optimised 8.10 guest measured 45.6 microseconds/event at 2,000/s (9.1% of one core) with host under load. Owner will measure real servers; this is no universal performance guarantee. The 2,000/s scale test threshold is 10% of one core, replacing 2%. Idle CPU and write-throughput impact remain separate gates.
+
+Open, not new accepted behavior: watcher-backed alert rules remain unevaluable until daemon publishes exact CompletedMinute windows (R4-7); W6-A2b alert reconfiguration continuity, component removal and cancellable process scan; mount rate-ring reset/current now.degraded (R4-9); one intermittent cancellation deadline miss on 8.8 in scan_lifecycle::interrupted_cancelled_and_failed_scans; firstboot report rewritten on every start with changed config; LVM schema/cancel-id gaps (R4-12).
+
+Review findings without landed fix notes: core S1 writer rollover failure/supervision, S2 stale collector alert availability, S3 procscan published-lock contention, S4 LVM retry units/backpressure, S5 wall-clock operational deadlines, S7 late sampler generation resurrection, S8 internal alert capacity; edge F02 incomplete-request API deadline, F03 abandoned handler cancellation, F04 mutable API parent path operations. B1/B2/S6/S9 have CORE-fix-1; F05–F08 EDGE-cli; F09–F12 EDGE-metrics plus CORE-fix-1 validation; F13 INSTALL-assert. F01 has an EDGE-metrics fix note but HTTP removal/ADR-020 is separately assigned and not resolved by this plan task. Landed notes establish implementation evidence, not independent verification; unrestricted socket tests and guest gates remain required.
+
+W7-D preserves byte-relative catalog portability, explicit invalid reload warnings and CLI scan-id ownership/exit 3. W7-C verifies shared recorder deadlines, exact hashed-byte parsing and 366-day validation, actual retained watcher mount identity and mount transition state. W7-B measures the revised watcher budget on real servers independently of idle CPU and writer impact.
+
 Read 13 R3-1–R3-15 and 12’s open risks before implementing or claiming gate acceptance. Preserve uid-0-only SO_PEERCRED authorization, labelled CLI status configuration, reduced daemon LVM fields, direct fallback notices and daemon scan override refusal. Watcher rules evaluate only supported whole-minute 1–60 windows with boundary samples; hot data is per-minute top lists and lossy/truncated windows are unavailable. Current A2b producer/state seams leave all watcher-rule measurements unavailable. Growth is computed in scan_finished before dir_series and retention; potentially truncated growth is unavailable. Do not pre-lock run_scan or equate queueing with persistence.
 
-W7-A/D preserve indexed notable-file ID paging and diff From/To headers plus the existing JSON notice, without schema or payload extensions. W7-C checks capability-based O_NOATIME fallback (uid 0 alone proves nothing), independently reviews syscall charging beyond counting-gate tests, and tests real peer credentials/listener behavior. W7-D explains stage-only local-state eligibility and blocking-preflight versus runtime compensation; unstage/purge remain usable on ineligible storage. W7-B/C/D must resolve or report 12’s open limitations, including finish timestamp, leaf no-follow, LVM cancellation, current-run alert history and duplicate deployment helper. No privileged test has run in the supplied evidence; execute Rocky/XFS/fanotify/service/reboot gates on disposable VMs and retain results rather than treating compile-only or socket-pair tests as acceptance.
+W7-A/D preserve indexed notable-file ID paging and diff From/To headers plus the existing JSON notice, without schema or payload extensions. W7-C checks capability-based O_NOATIME fallback (uid 0 alone proves nothing), independently reviews syscall charging beyond counting-gate tests, and tests real peer credentials/listener behavior. W7-D explains stage-only local-state eligibility and blocking-preflight versus runtime compensation; unstage/purge remain usable on ineligible storage. W7-B/C/D must resolve or report 12’s open limitations, including finish timestamp, leaf no-follow, LVM cancellation, current-run alert history and duplicate deployment helper. R4-15 records first-run platform evidence; execute remaining Rocky/XFS/fanotify/service/reboot gates on disposable VMs and retain results rather than treating compile-only or socket-pair tests as acceptance.
 
 ## W7-A — TUI browser
 
@@ -96,7 +104,7 @@ W7-A/D preserve indexed notable-file ID paging and diff From/To headers plus the
 - [ ] With the `normal` profile during a scan, the leaf block devices' utilisation and average wait (from `/sys/block/*/stat`, using the adaptive gate's samples) stay within the profile's configured targets, apart from short excursions the controller corrects.
 - [ ] Watcher overhead measured by comparing fixture-generator throughput in mutate mode with and without the watcher.
 - [ ] Peak RSS ≤ `memory_budget` at the target scale.
-- [ ] Daemon steady-state RSS ≤ 300 MiB and CPU ≤ 2% of one core outside scans (72 h soak, below).
+- [ ] Daemon steady-state RSS ≤ 300 MiB and idle CPU ≤ 2% of one core outside scans; active watcher CPU ≤ 5% per 1,000 close-write events/s (R4-8) (72 h soak, below).
 
 ### 72-hour soak (with W7-D)
 
@@ -131,7 +139,7 @@ On staging: daemon at defaults, generator in mutate mode, hourly scans. Pass cri
   - Data sent in webhooks (escaped paths/subjects and documented fields; no separate v1 redaction key or rule, 13 R2-10).
   - The read-only guarantee (no metadata, mount or LVM writes) and the `xtask ci` forbidden-call check.
   - `deploy stage`/`unstage` safety (pre-flight failures change nothing; later failures attempt compensation; unsafe-state refusal and no-follow handles; purge guard, 13 R2-7).
-  - The SELinux posture (`unconfined_service_t`, and a possible future policy module).
+  - The SELinux posture (no shipped policy or required SELinux mode; 8.10 enforcing first-run evidence with no denials, R4-15).
   - Supply chain (`cargo-deny`, pinned toolchain, reproducible container build).
 - **Dependency review:** `cargo deny check` clean; an explanation for each crate with `unsafe` in its dependency tree that touches our data paths.
 
@@ -164,7 +172,7 @@ Review the implemented contracts in `13` R2-1–10: record/resource refusals, ch
   - `thin-pool-filling.md` (`lvm` → which thin LVs grow → `now`/`hot` on their mounts → extend the pool or free space)
   - `deploy-verify-failed.md` (read `deploy verify --json` → `tidemark status` → journal → fix config → re-stage or unstage)
 - **Man pages:** `tidemark(1)` and `tidemarkd(8)` generated by `cargo xtask man`, which calls the `clap` command builders exported from the `tidemark-cli`/`tidemarkd` lib targets and renders them with `clap_mangen`. Shipped in the RPM (a W6-C follow-up adds the files to `rpm.toml`).
-- **`docs/pilot/`:** the pilot checklist from `11` as a fill-in form; a sign-off template; and a baseline-capture script (`iostat -x`, Postgres latency, `df`, `du` on sample subtrees) to run before and after each phase.
+- **`docs/pilot/`:** the pilot checklist from `11` as a fill-in form; a sign-off template; and a baseline-capture script (`iostat -x`, existing workload latency, `df`, `du` on sample subtrees) to run before and after each phase.
 - **Rehearse `11-rollout-runbook.md`** phases P0–P5 on staging and correct the runbook where reality differs.
 
 ### Acceptance

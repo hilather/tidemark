@@ -20,7 +20,7 @@ It tracks **both filesystems, `/` and `/data`**, separately. It is **strictly re
 |-------|---------|-----|------|
 | **L0 Sampling** | "How full is each filesystem/volume, and how fast is it filling?" | `statvfs` every 30 s; LVM (`lvs`/`vgs`, read-only) every 5 min, including **thin-pool usage** and VG headroom | Negligible |
 | **L1 Index** | "Where exactly is the space, what grew since yesterday, what would deleting X free?" | Scheduled, self-throttling scans in quiet windows (`getdents64`+`statx`, or **XFS bulkstat**, the Linux analogue of reading the NTFS MFT) into immutable SQLite snapshots: the history | Moderate, controlled |
-| **L2 Live** | "Who is writing what right now? What's hidden?" | fanotify close-write events with PID → systemd unit; `/proc` scan for deleted-but-open and growing files | Light (≈1% of a core) |
+| **L2 Live** | "Who is writing what right now? What's hidden?" | fanotify close-write events with PID → systemd unit; `/proc` scan for deleted-but-open and growing files | 5% of one core per 1,000 close-writes/s (13 R4-8) |
 
 Two commands do most of the work during an incident:
 

@@ -8,6 +8,10 @@ All live components run inside `tidemarkd` and write to `LiveState` (in memory) 
 
 ## 1. Filesystem and LVM samplers
 
+A normalized sampler.mounts/watch.mounts path must exactly equal a mount point in the daemon namespace; identity is topmost mount id plus device major/minor. Absent entries produce no samples/persistence or watcher and report `not mounted`. Presence checks pick up arrivals (sampler at most ten seconds, watcher every second); identity changes release the old watcher before replacement. Open sampling descriptor identity is checked before statvfs. Covered scheduled and requested scan roots are refused before run_scan, following existing error/backoff handling; unrelated roots remain eligible. Firstboot is unhealthy for absent entries, but startup readiness is prompt.
+
+Open: clearing in-memory filesystem rate series/removing stale samples across appearance/disappearance/remount; current removable missing-mount reasons in `now.degraded`; daemon consumption of retained watcher mark identity and the residual check-to-mark race. Service persistence deduplication reset is not a rate-ring reset. The proposed future state behavior in W6-mount-presence is not claimed implemented. (13 R4-9.)
+
 | Source | Call | Interval | Stored as |
 |--------|------|----------|-----------|
 | Filesystem totals for each tracked mount (`/`, `/data`) | `statvfs(mount)`: size, used, avail (`f_bavail`), inodes, inodes used | 30 s | `fs_samples`, `LiveState.fs[mount]` |
@@ -37,6 +41,8 @@ pub fn time_to_full(avail: u64, rate: f64) -> Option<Duration>;
 ## 3. fanotify watcher (`tidemark-live::watch`, W5-A)
 
 ### 3.1 Modes and probing
+
+Measured on Rocky 8.8 (4.18.0-477) and 8.10 (-553): fd mode, no FID mode on either. Filesystem marks work on 8.10; 8.8 uses mount marks, so writes through another mount of the same filesystem are invisible (13 R4-15). Continue probing on other kernels.
 
 | Mode | Kernel need (upstream) | What we get | Default |
 |------|------------------------|-------------|---------|
@@ -94,18 +100,26 @@ Retry EMFILE/ENFILE/ENOMEM/ENOBUFS with shutdown-aware exponential 50–800 ms w
 
 ### 3.3 Aggregation (`LiveState.hot`)
 
+`now.hot_dirs_5m` is the watcher’s ranked five-minute directory list including the current minute, bounded by writers row limit and preserving lossy flags; it does not establish exact alert windows. Missing/failed watchers are unmeasured; an empty running list is measured. `top_unit` is the unit with greatest sum of absolute byte deltas, ties to the lexicographically smaller name, using at most eight private space-saving candidates per row/minute (approximate beyond eight). Unit rows identify themselves; unattributed rows have None. A process gone before `/proc` lookup stays unattributed without retry/guessing. Persisted `HotMinute` has no `top_unit`. Multi-minute `files` sums per-minute distinct counts, not distinct files across the window. (13 R4-6.)
+
+`tidemark_live::watch::CompletedMinute` (Clone, Debug) has `started_at: i64`, `overflow_total_at_start: u64`, `overflow_total_at_end: u64`, `lossy: bool`, `truncated: bool`, `dirs: Vec<HotEntry>`, `persisted: Vec<HotMinute>`. `Watcher::drain_minutes(&self, top_k: usize) -> Vec<CompletedMinute>` shares the persistence-row cursor with legacy drains, while minute facts have an independent monotonic watermark. New drains exclude the startup partial minute, materialize idle minutes and remain bounded by 60 buckets; top_k is clamped to 1000 per scope, cuts mark truncation/loss. Retention gaps mark the first surviving minute lossy; rollback never replays emitted timestamps/rows and marks the replay interval lossy. Only actual queue overflow increments totals; contiguous boundaries chain. `Watcher::mount_identity(&self) -> std::io::Result<(u64, u32, u32)>` returns retained descriptor mount id, device major/minor from bounded fdinfo/fstat; injected watchers return Unsupported. Marks target the retained `/proc/self/fd/<fd>/.` directory.
+
+The daemon consumer must retain at most 60 completed facts per watcher identity, discard on replacement and persist only `persisted`. Exact n-minute windows require 1 <= n <= 60, end E of latest completed minute, start S = E - n*60, and measured_at E (never refreshed artificially). Overflow differences need consistent nondecreasing exact S/E boundary totals; otherwise None. Known endpoints suffice even with interior loss. Hot requires n consecutive healthy, untruncated, overflow-free minutes; otherwise None. Sum raw-key rows with saturating counts/deltas, rank signed bytes descending then raw key ascending; healthy empty is Some(empty). A daemon union cap cut makes hot unavailable. Minute leaders cannot reconstruct exact cross-minute unit leadership. These consumer publications remain open.
+
+`AttributionCache::lookup_watcher` may reuse PID/starttime validation for less than one second, separately from its 60-second attribution TTL. Older hits revalidate; failed/recycled identities invalidate and fresh loads recheck. Failed lookups are not cached. Exact process-scanner callers validate every lookup. (13 R4-7; LIVE-minutes is the precise source for drain and consumer semantics.)
+
 - 60 one-minute buckets (a ring). Each bucket has three bounded maps:
   - `dir → {events, files, bytes_delta}`
   - `unit → {…}`
   - `comm → {…}`
 - Map caps: the **current** minute's bucket holds up to 20,000 keys per scope (the smallest half by `bytes_delta` is evicted when full, marking it `approx`). When a minute completes it is **shrunk to its top 1,000 keys per scope**. Worst case is about 20k + 59 × 3k entries, which is well under 100 MB; typical use is far less.
 - Windows of 1, 5, 15 and 60 minutes are computed by summing buckets.
-- Each minute, the top 50 keys per scope are persisted to `hot_minutes`.
+- Persist the rows returned by the chosen completed-minute drain; requested top_k is capped at 1,000 per scope. Legacy and new drains share the persistence cursor. The new consumer should drain_minutes(1000) for the full completed-row cap (R4-7); requested cuts are reflected in truncation facts.
 - `dirty` is a set of directories with events since the last completed scan of their root, capped at 200,000 and taken independently per root only after its successful scan publishes. It drives `tidemark top --live` hints and future incremental refresh.
 
 Watcher-backed rules (`hot_dir_growth` and `watch_lossy`) accept only exact whole-minute windows from 1 through 60 minutes. Other durations are not evaluable, with a diagnostic; never round or clamp. Keep 60 whole-minute buckets and a cumulative overflow total. Sample that total at each completed-minute boundary; a window overflow count is the difference between its two boundary samples, unavailable if either sample is missing. Hot data consists of per-minute top lists, not a complete inventory. If any included minute overflowed or was truncated at its cap, hot data for the window is unavailable. The ordinary hot API retains its four ranked-list windows.
 
-Implementation evidence (`W6-A2b.md`) is more restrictive: row-only completed-minute drains omit empty-minute/loss/boundary facts, so no `WatchWindow` measurements are currently published. Watcher-backed rules remain not evaluable until that producer/state seam is resolved. The proposed `drain_minutes`/`CompletedMinute` and freshness reader in that note are follow-up proposals, not adopted signatures.
+Updated by 13 R4-7: LIVE-minutes implements CompletedMinute, drain_minutes and mount_identity with empty-minute and boundary-loss facts. The daemon exact-window/freshness consumer remains open; watcher-backed rules are still not evaluable.
 
 `Watcher::take_dirty(&self, under: &RawPath) -> Vec<RawPath>` returns `under` itself after a loss, independently for every root, until that root has been taken. A parent, child or sibling take does not acknowledge another root. Loss acknowledgements use a FIFO capped at 1,024 roots; eviction conservatively makes a forgotten root dirty again, repeated loss resets acknowledgements, and clock rollback invalidates them. Ordinary ancestor dirty entries are retained for other callers; descendants are drained, sorted and deduplicated. The scheduler takes dirtiness only after that root's successful scan has published; failed/cancelled scans clear nothing.
 
@@ -146,6 +160,8 @@ This catches log files and long-running writers, including runaway database temp
 `ProcScanResult { at: i64, fds_seen: u64, writers_full: bool, writer_evictions: u64, duration: Duration }` describes a completed pass. `writers_full` says writer candidates exceeded the history cap; `writer_evictions` counts histories evicted for admission during that pass. The daemon publishes these diagnostics with `fds_seen` and persistence drops in component health. Permission-error counts are not reported in v1; do not fabricate a zero or extend frozen report DTOs to add them.
 
 ### 4.3 Attribution helper (shared with the watcher)
+
+Watcher lookup may reuse PID/starttime validation for less than one second via `lookup_watcher`; older entries revalidate identity, failures invalidate without negative caching. Exact process-scanner lookup validates every time. A writer already gone from /proc stays unattributed (13 R4-6/7).
 
 `OpenFile.starttime: u64` is the process identity validated around enumeration. Compare it with later `Attribution.starttime`; mismatch produces comm `?` and no unit for both phantom and writers. `/proc` reads do no disk I/O and are not charged to Gate; O_NOATIME does not apply. Existing bounded scanner caps remain. Writer reports use the actual baseline-to-latest timestamp span, not the requested window; positive growth with zero measured span is omitted.
 
@@ -232,6 +248,8 @@ Pure `tidemark_core::config::default_rules(cfg)` owns generation; W5-D wraps/re-
 
 ## 7. The `now` view (FR-18)
 
+The ranked watcher five-minute list includes the current minute and is not an exact alert window. `files` sums minute-distinct counts. Human output uses UTC and terminal-width middle shortening, default width 100; JSON retains integer timestamps. Present rate_15m in hourly units and supplied one-hour ttf_secs without recomputation (13 R4-6/12).
+
 The daemon builds a `NowReport` from `LiveState` in under 50 ms; the CLI renders it.
 
 ```rust
@@ -310,9 +328,11 @@ There is no separate `Hot` or `Growth` type: hot lists use `HotEntry`, and scan-
 
 ## 8. Overhead budget and safeguards
 
+Owner decision: fd-mode watcher budget is 5% of one core per 1,000 close-write events/s, or 50 microseconds/event, replacing 1%. EL8 kernels 4.18.0-477 and -553 offer no measured FID mode. Optimised 8.10 guest measured 45.6 microseconds/event at 2,000/s (9.1% of one core) with host under load. Owner will measure real servers; this is no universal performance guarantee. The 2,000/s scale test threshold is 10% of one core, replacing 2%. Idle CPU and write-throughput impact remain separate gates.
+
 | Component | Budget | Safeguard |
 |-----------|--------|-----------|
 | Samplers | < 0.1% CPU | `statvfs` every 30 s; `lvs`/`vgs` every 5 min with a timeout |
-| Watcher | ≤ 1% of one core at 1,000 events/s | Close-write only; bounded queue; capped maps |
+| Watcher | ≤ 5% of one core per 1,000 close-write events/s (50 µs/event; R4-8) | Close-write only; bounded queue; capped maps |
 | Procscan | < 1 s per pass | 60 s interval; skips non-matching devices early |
 | Memory | ≤ 300 MiB steady (NFR-4) | Fixed rings; capped LRUs and maps |

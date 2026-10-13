@@ -16,7 +16,7 @@ Tidemark is read-only and makes no fstab, LVM, kernel or file-metadata changes. 
 
 Gate-review contracts: stage requires allowlisted local state storage (or its longest existing ancestor); refusal exits 5 without changes. Unstage/purge remain available on an ineligible filesystem. Blocking pre-flight failure is change-free; later failure has best-effort compensation and may leave downtime, timestamps or empty directories. See 08 §5 and 13 R3-3/R3-12.
 
-Run live commands with sudo: API peers must be uid 0. `status --show-config` labels CLI configuration; `lvm` omits segment type/other LVs in daemon mode, while absent daemon causes lvm/writers/phantom direct fallback with one notice. now/hot/alerts/status exit 4. Watcher alerts require complete supported 1–60 whole-minute observations and otherwise report not evaluable; top-list truncation or overflow makes hot data unavailable. Review the open risks in 12, and require real VM/listener/credential/reboot tests before rollout; no supplied privileged runtime test has run.
+Run live commands with sudo: API peers must be uid 0. `status --show-config` labels CLI configuration; `lvm` omits segment type/other LVs in daemon mode, while absent daemon causes lvm/writers/phantom direct fallback with one notice. now/hot/alerts/status exit 4. Watcher alerts require complete supported 1–60 whole-minute observations and otherwise report not evaluable; top-list truncation or overflow makes hot data unavailable. Review the open risks in 12, and require real VM/listener/credential/reboot tests before rollout; first runs provide the platform evidence in 13 R4-15, while remaining privileged gates require recorded execution.
 
 ## P0 — Preconditions and baseline
 
@@ -87,7 +87,7 @@ Action: `tidemark scan --cancel` (or let the adaptive throttle settle if it's al
 Daily:
 
 - `tidemark now` and `tidemark diff --since 24h --explain`. Are the answers sensible?
-- Daemon RSS and CPU (`systemctl status tidemarkd`): the targets are ≤ 300 MiB and ≤ 2% of a core outside scans.
+- Daemon RSS and CPU (`systemctl status tidemarkd`): the targets are ≤ 300 MiB and ≤ 2% of a core when idle outside scans; active watcher allowance is 5% per 1,000 close-write events/s (R4-8).
 - `tidemark_watch_overflows_total` should stay near 0.
 - Snapshot store size (`du -sh /var/lib/tidemark`) against root filesystem headroom; adjust `retention` if needed.
 - Alert noise: tune thresholds, especially `time_to_full` and `thin_pool_pct`.
@@ -111,3 +111,14 @@ Use the same steps as P3 in each host's next hotfix cycle, with the tuned config
   - snapshot store size;
   - which questions people still answer with `du` (each one is a feature gap to log).
 - If instant per-tree totals ever become a requirement, revisit `06-project-quotas-deferred.md`, with its audit-first approach.
+
+
+## First-run operational contracts (13 R4)
+
+Unit values have no trailing comments; the existing normative unit remains unchanged. Install neither starts nor enables. Upgrade/reinstall uses guarded `try-restart`: restart a running daemon and leave a stopped daemon stopped, preserving enablement. Erase stops/disables and retains state. The install gate requires effective memory limit 2147483648, notify/root, NoNewPrivileges and exact capability names, and rejects installed-unit parser warnings. Active upgrade must change a nonzero PID and regain API readiness; stopped reinstall stays inactive. Edited config survives, and the changed-default fixture must produce root:root 0600 `.rpmnew` with its marker. Enable and prove active/enabled before erase, then assert inactive/disabled and no wants entry even as a dangling symlink; retained `.rpmsave` matches edited bytes and mode 0600. Require SELinux Enforcing unless an explicit permissive override labels SELinux acceptance untested. Post-reboot verification requires an external writer’s hot directory on restored disposable XFS; any post-mount restart is explicit.
+
+Harness-phase tests print a skip line unless their phase/RPM variables are supplied; explicitly requested tests require the explicit VM marker, never inferred. `cargo xtask vm-test --no-fail-fast` passes the option to Cargo before -- and rejects it for script suites. Systemd-launched test binaries are copied out of home to an executable location with restored labels. SSH is the first ssh on PATH, enabling wrappers. Loop/md fixtures do not survive reboot: external harness restores them before verify. Compile-only, printed skips and socket-denied early returns are not guest acceptance.
+
+First real runs on Rocky 8.8/8.10: bulkstat v5 works on both; statx supplies no mount id on either. fanotify fd mode works on both; filesystem marks work on 8.10, while 8.8 uses mount marks and cannot observe writes through another mount of that filesystem. On 8.10 the package installs/upgrades/erases and survives reboot under SELinux Enforcing without denials. Tidemark ships no SELinux policy and supports Enforcing, Permissive or Disabled; enforcing is a test posture, not a product prerequisite. Do not infer remaining VM/soak gates passed from these observations.
+
+When a configured mount is absent, status reports not mounted; sampling/watching waits for its arrival and covered scans are refused. Check exact mount points rather than merely existing directories. Scheduler failures retain degraded health and retry with the R4-2 30-second to one-hour backoff; manual requests bypass it. Invalid reload returns ok/reloaded=false with warnings and preserves prior configuration. Read 12’s R4 open risks before rollout; ranked now hot lists cannot validate watcher alerts.
