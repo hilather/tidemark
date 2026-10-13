@@ -107,6 +107,39 @@ impl AlertEngine {
             },
         })
     }
+    /// Atomically validate and replace rules, preserving state for identical definitions
+    /// by configured name, including pending/clearing continuity and notifications.
+    /// Changed or removed rules lose their state; internal state-space and clock survive.
+    pub fn reconfigure(
+        &mut self,
+        rules: &[AlertRule],
+        renotify: Duration,
+    ) -> Result<(), AlertError> {
+        let replacement = Self::new(rules, renotify)?;
+        let indices: std::collections::BTreeMap<_, _> = replacement
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(i, rule)| (rule.cfg.name.as_str(), i))
+            .collect();
+        let mapping: std::collections::BTreeMap<_, _> = self
+            .rules
+            .iter()
+            .enumerate()
+            .filter_map(|(old, rule)| {
+                let new = *indices.get(rule.cfg.name.as_str())?;
+                (rule.cfg == replacement.rules[new].cfg).then_some((old, new))
+            })
+            .collect();
+        self.states = std::mem::take(&mut self.states)
+            .into_iter()
+            .filter_map(|((old, subject), state)| Some(((*mapping.get(&old)?, subject), state)))
+            .collect();
+        self.rules = replacement.rules;
+        self.renotify = renotify;
+        self.diagnostics.clear();
+        Ok(())
+    }
     /// Evaluate at injected Unix seconds. Backward clocks reset continuity timers.
     pub fn evaluate(&mut self, now: i64, inputs: &AlertInputs) -> Vec<AlertEvent> {
         if self.last_now.is_some_and(|previous| now < previous) {

@@ -642,3 +642,54 @@ fn capacity_never_evicts_unavailable_clearing_alert() {
     assert!(e.active().iter().any(|a| a.rule == "FsUsedPct"));
     assert_eq!(e.diagnostics().len(), 2);
 }
+
+#[test]
+fn reconfigure_preserves_identity_definition_continuity_and_internal_state() {
+    let mut first = cfg(AlertKind::FsUsedPct);
+    first.for_ = Duration::from_secs(10);
+    let mut second = first.clone();
+    second.name = "other".into();
+    let mut e =
+        AlertEngine::new(&[first.clone(), second.clone()], Duration::from_secs(100)).unwrap();
+    let source = Source {
+        used: Some(90),
+        ..Default::default()
+    };
+    assert!(evaluate(&mut e, 0, &source).is_empty());
+    second.above = Some(AlertThreshold::Number(95.));
+    // Rule reorder remaps private indices, preserving only the identical definition.
+    e.reconfigure(&[second.clone(), first.clone()], Duration::from_secs(100))
+        .unwrap();
+    assert_eq!(evaluate(&mut e, 10, &source)[0].rule, first.name);
+    let active = e.active();
+    e.evaluate(
+        10,
+        &AlertInputs {
+            source: &source,
+            state_space_refused: true,
+        },
+    );
+    e.reconfigure(&[first.clone()], Duration::from_secs(100))
+        .unwrap();
+    assert_eq!(
+        e.active().iter().find(|a| a.rule == first.name).unwrap(),
+        &active[0]
+    );
+    assert!(e.active().iter().any(|a| a.rule == "state_space"));
+    // Invalid replacements are atomic and retain active and compiled state.
+    assert!(e.reconfigure(&[first.clone()], Duration::ZERO).is_err());
+    assert_eq!(e.active().len(), 2);
+    let healthy = Source {
+        used: Some(0),
+        ..Default::default()
+    };
+    assert!(evaluate(&mut e, 20, &healthy).is_empty());
+    e.reconfigure(&[second, first.clone()], Duration::from_secs(100))
+        .unwrap();
+    assert_eq!(
+        evaluate(&mut e, 30, &healthy)[0].state,
+        AlertState::Resolved
+    );
+    e.reconfigure(&[], Duration::from_secs(100)).unwrap();
+    assert!(e.active().iter().all(|a| a.rule == "state_space"));
+}
