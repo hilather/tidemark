@@ -163,10 +163,26 @@ fn tiny_bench_matches_du() {
     let out = t.path().join("results");
     fs::create_dir(&root).unwrap();
     assert!(generate(&root, 500, &[]).status.success());
+    // Measure the debug CLI of this test build: explicitly build the other
+    // workspace binary beside this one (as tidemark-cli's surface test does)
+    // so that a unit-test run needs no release build.
+    let build = Command::new(env!("CARGO"))
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+        .args(["build", "--offline", "--bin", "tidemark"])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let cli = Path::new(env!("CARGO_BIN_EXE_xtask")).with_file_name("tidemark");
     let result = xtask()
         .args(["bench", "--root"])
         .arg(&root)
-        .args(["--modes", "du,walk", "--cache", "warm", "--out"])
+        .args(["--modes", "du,walk", "--cache", "warm", "--tidemark"])
+        .arg(&cli)
+        .arg("--out")
         .arg(&out)
         .output()
         .unwrap();

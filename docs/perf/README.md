@@ -2,7 +2,7 @@
 
 Run these tools only on a disposable staging copy of the Rocky Linux 8/XFS workload. Administrators use sudo; there is no access-granting tidemark group. Never drop caches on a developer workstation or production server. No PostgreSQL-specific workload or gate is required.
 
-Use the pinned toolchain and cached dependencies. The harness builds `target/release/tidemark` with `cargo build --offline --locked --release -p tidemark-cli` when missing. Rebuild it explicitly after source changes. GNU `du`, `date`, `getconf`, procfs and sysfs are required; install GNU `/usr/bin/time` on staging for rusage evidence. Keep results/state on a different filesystem from the fixture if possible; `--out` must be outside the fixture. The harness creates a unique private config, socket and state directories, avoiding a system daemon.
+Use the pinned toolchain and cached dependencies. The harness measures `release/tidemark` in the cargo target directory, or the CLI given with `--tidemark PATH`. It builds the default CLI with `cargo build --offline --locked --release -p tidemark-cli` when missing. Rebuild it explicitly after source changes. GNU `du`, `date`, `getconf`, procfs and sysfs are required; install GNU `/usr/bin/time` on staging for rusage evidence. Keep results/state on a different filesystem from the fixture if possible; `--out` must be outside the fixture. The harness creates a unique private config, socket and state directories, avoiding a system daemon.
 
 Create existing empty roots on the staging XFS filesystem, then run from the repository root:
 
@@ -16,6 +16,8 @@ sudo target/release/xtask bench --root /data/tidemark-20m --modes du,walk,bulk -
 sudo target/release/xtask bench --root /data/tidemark-20m --modes walk,bulk --cache warm --throttle normal --out docs/perf/normal
 sudo target/release/xtask bench --root /data/tidemark-5m --watcher-overhead --duration 60 --mutate-rate 1000000 --out docs/perf/watcher
 ```
+
+Use `--tidemark PATH` to measure an existing CLI without building the release CLI.
 
 Cold mode flushes writes and writes `3` to `/proc/sys/vm/drop_caches` before **each** measured command, including each du variant. Explicit `--drop-caches-on-this-host` is mandatory. It requires effective uid 0, refuses a running tidemarkd or one-minute load exceeding available CPUs, and prints the host-wide action. `--force` overrides daemon/load guards only; use it only after recording why on staging. Warm runs execute an unmeasured warm-up for each invocation. The cold performance gate uses `--throttle max` (the default).
 

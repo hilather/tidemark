@@ -28,6 +28,19 @@ fn wait(mut f: impl FnMut() -> bool) {
         std::thread::yield_now();
     }
 }
+fn wait_ready(
+    handle: tidemarkd::ServiceHandle,
+    mut ready: impl FnMut() -> bool,
+) -> tidemarkd::ServiceHandle {
+    wait(|| ready() || handle.is_finished());
+    if handle.is_finished() {
+        panic!(
+            "daemon lifecycle exited before readiness: {:?}",
+            handle.join().unwrap()
+        );
+    }
+    handle
+}
 fn health() -> ComponentState {
     component("test", "ok", "measured")
 }
@@ -59,7 +72,11 @@ fn write_config(path: &Path, interval: &str) {
     std::fs::write(path,format!("[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='{}'\n[lvm]\nenabled=false\n[watch]\nenabled=false\nmounts=[]\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[[roots]]\npath='{}'\nschedule='off'\n",p.join("state").display(),p.join("api.sock").display(),containing_mount(p).display(),interval,p.join("metrics.prom").display(),p.join("mount").display())).unwrap();
 }
 fn fixture() -> (tempfile::TempDir, PathBuf, Config) {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
+    // The API socket lives in this directory. Under a sticky ancestor such as
+    // /tmp the daemon requires an owned 0700 directory; tempfile yields 0755.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::create_dir(dir.path().join("mount")).unwrap();
     let path = dir.path().join("config.toml");
     write_config(&path, "1h");
@@ -509,7 +526,7 @@ fn lifecycle_reload_and_shutdown() {
             )
         })
     };
-    wait(|| {
+    let h = wait_ready(h, || {
         s.view()
             .status(100)
             .unwrap()
@@ -644,7 +661,7 @@ fn private_and_missing_state_directories_start() {
                 )
             })
         };
-        wait(|| {
+        let handle = wait_ready(handle, || {
             state
                 .view()
                 .status(1)
@@ -801,7 +818,7 @@ fn corrupt_catalog_is_preserved_before_recovery() {
             )
         })
     };
-    wait(|| {
+    let h = wait_ready(h, || {
         state
             .view()
             .status(1)
@@ -885,7 +902,7 @@ fn startup_reads_last_complete_from_catalog() {
             )
         })
     };
-    wait(|| {
+    let h = wait_ready(h, || {
         state
             .view()
             .status(100)
