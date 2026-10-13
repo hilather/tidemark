@@ -243,3 +243,5 @@ mod tests {
 pub mod client;
 /// Staged deployment.
 pub mod deploy;
+
+mod tui;
