@@ -1248,3 +1248,20 @@ fn real_foreign_owner_marker_cannot_authorize_root_stage_or_purge() {
     assert_eq!(fs::read(f.state.join(MARKER)).unwrap(), before);
     assert!(f.sys.calls.borrow().is_empty());
 }
+
+#[test]
+fn eligibility_error_escapes_non_utf8_and_control_path_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"state-\xff\n"));
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).unwrap();
+    let error = files::state_handles(&path, false).unwrap_err().to_string();
+    assert!(error.contains(&tidemark_core::path::display_lossy_bytes(
+        path.as_os_str().as_bytes()
+    )));
+    assert!(!error.contains('\n'));
+    assert!(error.contains("owner") && error.contains("mode") && error.contains("links"));
+}
