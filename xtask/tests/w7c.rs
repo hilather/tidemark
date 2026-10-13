@@ -62,8 +62,22 @@ fn fault_scripts_are_guarded_and_valid_shell() {
             String::from_utf8_lossy(&output.stderr)
         );
         if has_shellcheck {
+            // Follow the same sources for advisory diagnostics and the warning gate.
+            let notes = Command::new("shellcheck")
+                .current_dir(root)
+                .arg("-x")
+                .arg(&path)
+                .output()
+                .unwrap();
+            eprintln!(
+                "shellcheck notes for {}:\n{}\n{}",
+                path.display(),
+                String::from_utf8_lossy(&notes.stdout),
+                String::from_utf8_lossy(&notes.stderr),
+            );
             let output = Command::new("shellcheck")
                 .current_dir(root)
+                .arg("--severity=warning")
                 .arg("-x")
                 .arg(&path)
                 .output()
