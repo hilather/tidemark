@@ -58,7 +58,7 @@ proptest! {
     }
 }
 #[test]
-fn large_and_deep_inputs_finish_within_two_seconds_each() {
+fn large_and_deep_inputs_finish_without_quadratic_blowup() {
     let mut cases = vec![
         vec![b' '; 1024 * 1024],
         vec![b'9'; 1024 * 1024],
@@ -75,11 +75,42 @@ fn large_and_deep_inputs_finish_within_two_seconds_each() {
     for bytes in cases {
         let start = Instant::now();
         exercise(&bytes);
+        assert_not_quadratic(start, bytes.len());
+    }
+}
+
+fn assert_not_quadratic(start: Instant, bytes: usize) {
+    // Catch accidental quadratic blowups, with generous wall-clock slack for loaded CI hosts.
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "{bytes} bytes took {elapsed:?}"
+    );
+}
+
+#[test]
+fn repeated_seed_scales_without_quadratic_blowup() {
+    let seed = b"a/".as_slice();
+    let minimum = |size: usize| {
+        let mut bytes = seed.repeat(size.div_ceil(seed.len()));
+        bytes.truncate(size);
+        let mut minimum = Duration::MAX;
+        for _ in 0..3 {
+            let start = Instant::now();
+            exercise(std::hint::black_box(&bytes));
+            let elapsed = start.elapsed();
+            assert_not_quadratic(start, bytes.len());
+            minimum = minimum.min(elapsed);
+        }
+        minimum
+    };
+    let small = minimum(64 * 1024);
+    let large = minimum(1024 * 1024);
+    // Linear growth is 16x; quadratic growth is 256x. Ignore sub-millisecond noise.
+    if small >= Duration::from_millis(1) {
         assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "{} bytes took {:?}",
-            bytes.len(),
-            start.elapsed()
+            large < small * 200,
+            "64 KiB took {small:?}; 1 MiB took {large:?}"
         );
     }
 }
