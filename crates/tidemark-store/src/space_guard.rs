@@ -33,7 +33,7 @@ fn totals(path: &Path) -> io::Result<FsTotals> {
         .ok_or_else(|| io::Error::other("filesystem available size overflow"))?;
     Ok(FsTotals { size, avail })
 }
-fn mount_id(fd: impl std::os::fd::AsFd) -> io::Result<u64> {
+pub(crate) fn mount_id(fd: impl std::os::fd::AsFd) -> io::Result<u64> {
     use std::{io::Read, os::fd::AsRawFd};
     // fdinfo exposes metadata, not target contents. mnt_id is available on EL8.
     let file = std::fs::File::open(format!("/proc/self/fdinfo/{}", fd.as_fd().as_raw_fd()))?;

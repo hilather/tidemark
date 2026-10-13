@@ -121,6 +121,8 @@ fn run_scan_with_environment(
         .build()
         .map_err(|e| ScanError::Configuration(e.to_string()))?;
     let _lock = ScanLock::acquire(&cfg.general.state_dir)?;
+    let preflight_now = clock();
+    tidemark_store::catalog::cleanup_abandoned_scans(&cfg.general.state_dir, preflight_now);
     // The daemon can have a live sample writer: recovery belongs to startup,
     // or to the daemon-absent CLI preflight with all connections closed.
     let catalog = tidemark_store::catalog::Catalog::open(&cfg.general.state_dir, true)?;
@@ -165,7 +167,7 @@ fn run_scan_with_environment(
             &cfg.general.state_dir,
             &catalog,
             cfg.retention.snapshots.recent,
-            clock(),
+            preflight_now,
             || {
                 Ok(tidemark_store::space_guard::space_check(
                     &cfg.general.state_dir,
@@ -603,7 +605,7 @@ fn run_scan_with_environment(
                         delete_snapshot(&cfg.general.state_dir, path)?;
                     }
                 }
-                catalog.rebuild_from_files()?;
+                catalog.rebuild_after_scan()?;
                 tracing::info!(
                     memory_estimate,
                     peak_rss_bytes = observed_peak_rss(),
@@ -1050,7 +1052,7 @@ fn guard_and_prune(
         {
             if let Some(file) = &e.file {
                 delete_snapshot(state, file)?;
-                catalog.rebuild_from_files()?;
+                catalog.rebuild_after_scan()?;
                 if matches!(check()?, SpaceVerdict::Ok) {
                     return Ok(());
                 }
@@ -1080,7 +1082,7 @@ fn guard_and_prune(
         for e in group.into_iter().skip(recent.max(1)).rev() {
             if let Some(file) = &e.file {
                 delete_snapshot(state, file)?;
-                catalog.rebuild_from_files()?;
+                catalog.rebuild_after_scan()?;
                 if matches!(check()?, SpaceVerdict::Ok) {
                     return Ok(());
                 }
