@@ -1701,7 +1701,6 @@ dependencies = [
  "tidemark-scan",
  "tidemark-store",
  "tidemark-sys",
- "tiny_http",
  "tracing",
  "tracing-journald",
  "tracing-subscriber",

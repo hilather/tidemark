@@ -283,26 +283,45 @@ fn atomic_publication_and_modes() {
     assert!(metrics::write_textfile(&tmp.path().join("absent/file"), "x").is_err());
     let staging = path.with_extension("prom.tmp");
     std::fs::write(&staging, "reserved").unwrap();
-    assert!(metrics::write_textfile(&path, "new").is_err());
-    assert_eq!(std::fs::read_to_string(staging).unwrap(), "reserved");
+    metrics::write_textfile(&path, "new").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    assert!(!staging.exists());
+    std::os::unix::fs::symlink(&path, &staging).unwrap();
+    assert!(metrics::write_textfile(&path, "refused").is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
 }
 #[test]
 fn loopback_http_only_get_metrics() {
     assert!(metrics::listen("0.0.0.0:0").is_err());
-    let server = metrics::listen("127.0.0.1:0").unwrap();
-    let address = server.server_addr().to_ip().unwrap();
+    let server = match metrics::listen("127.0.0.1:0") {
+        Ok(server) => server,
+        Err(error) => {
+            eprintln!("TCP bind unavailable: {error}");
+            return;
+        }
+    };
+    let address = server.local_addr().unwrap();
     let worker = std::thread::spawn(move || {
-        for _ in 0..4 {
-            let request = server
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap()
-                .unwrap();
-            metrics::respond(request, "tidemark_up 1\n").unwrap();
+        for _ in 0..6 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                match server.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline);
+                        std::thread::yield_now();
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            metrics::respond(stream, "tidemark_up 1\n", &Arc::new(AtomicBool::new(false))).unwrap();
         }
     });
     for (method, url, code) in [
         ("GET", "/metrics", 200),
-        ("POST", "/metrics", 404),
+        ("HEAD", "/metrics", 200),
+        ("POST", "/metrics", 405),
+        ("G ET", "/metrics", 400),
         ("GET", "/", 404),
         ("GET", "/metrics?x", 404),
     ] {
@@ -319,7 +338,11 @@ fn loopback_http_only_get_metrics() {
         );
         if code == 200 {
             assert!(response.contains("version=0.0.4"));
-            assert!(response.ends_with("tidemark_up 1\n"));
+            if method == "HEAD" {
+                assert!(response.ends_with("\r\n\r\n"));
+            } else {
+                assert!(response.ends_with("tidemark_up 1\n"));
+            }
         }
     }
     worker.join().unwrap();
@@ -395,5 +418,341 @@ fn vm_xfs_textfile_publication_root_owned_and_readable() {
     let md = std::fs::metadata(&output).unwrap();
     assert_eq!((md.uid(), md.gid()), (0, 0));
     assert_eq!(md.permissions().mode() & 0o777, 0o644);
-    assert_eq!(std::fs::read_to_string(output).unwrap(), "tidemark_up 1\n");
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "tidemark_up 1\n");
+    let staging = output.with_extension("prom.tmp");
+    std::fs::write(&staging, "other owner").unwrap();
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o666)).unwrap();
+    rustix::fs::chown(&staging, Some(rustix::process::Uid::from_raw(65534)), None).unwrap();
+    assert!(metrics::write_textfile(&output, "refused").is_err());
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "tidemark_up 1\n");
+}
+
+#[test]
+fn huge_interval_reports_error_and_recovers_after_reload() {
+    let mut config = Config::default();
+    config.roots.clear();
+    config.metrics.textfile = Default::default();
+    config.metrics.interval = Duration::from_secs(u64::MAX);
+    let state = LiveState::new(&config, 0);
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = metrics::start(Arc::new(config.clone()), state.clone(), stop.clone()).unwrap();
+    wait(|| {
+        state
+            .view()
+            .status(0)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "metrics" && c.state == "error" && c.detail.contains("interval"))
+    });
+    config.metrics.interval = Duration::from_millis(10);
+    state.replace_config(config).unwrap();
+    wait(|| {
+        state
+            .view()
+            .status(0)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "metrics" && c.state == "disabled")
+    });
+    stop.store(true, Ordering::Release);
+    worker.join().unwrap().unwrap();
+}
+#[test]
+fn temporary_live_writer_and_nonregular_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("out.prom");
+    let staging = tmp.path().join("out.prom.tmp");
+    std::fs::write(&staging, "live").unwrap();
+    let file = std::fs::File::open(&staging).unwrap();
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+    assert!(metrics::write_textfile(&output, "new").is_err());
+    assert_eq!(std::fs::read_to_string(&staging).unwrap(), "live");
+    drop(file);
+    metrics::write_textfile(&output, "recovered").unwrap();
+    std::fs::create_dir(&staging).unwrap();
+    assert!(metrics::write_textfile(&output, "refused").is_err());
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "recovered");
+}
+#[test]
+fn ranked_large_inventory_keeps_both_families_and_exact_counts() {
+    let (_tmp, snapshot) = snapshot(100_001);
+    let (used, reclaimable, count, _) = snapshot.metrics_candidates(1, 3).unwrap();
+    assert_eq!(count, 100_001);
+    assert_eq!(used.len(), 3);
+    assert_eq!(reclaimable.len(), 3);
+    assert_eq!(used[0].id, 100_000);
+    let cache = SnapshotMetrics::default();
+    let (_previous_dir, previous) = self::snapshot(5);
+    cache.refresh(&previous, 1).unwrap();
+    cache.refresh(&snapshot, 1).unwrap();
+    let config = Config::default();
+    let state = LiveState::new(&config, 0);
+    let output = metrics::render(&state.view(), &cache, &config.metrics, 0).unwrap();
+    let parsed = parse(&output);
+    for name in ["tidemark_dir_used_bytes", "tidemark_dir_reclaimable_bytes"] {
+        assert_eq!(parsed[name].len(), 500);
+        assert!(output.contains(&format!(
+            "tidemark_metrics_dropped_series{{metric=\"{name}\"}} 99501"
+        )));
+    }
+    cache.refresh(&snapshot, 0).unwrap();
+    let output = metrics::render(&state.view(), &cache, &config.metrics, 0).unwrap();
+    assert_eq!(parse(&output)["tidemark_dir_used_bytes"].len(), 1);
+}
+#[test]
+fn exporter_seeds_restart_and_reconciles_depth_and_root_removal() {
+    let (tmp, snapshot) = snapshot(20);
+    let catalog = tidemark_store::catalog::Catalog::open(tmp.path(), true).unwrap();
+    let meta = snapshot.meta();
+    let entry = tidemark_store::catalog::ScanEntry {
+        scan_id: meta.scan_id.to_string(),
+        root: meta.root.clone(),
+        mode: meta.mode,
+        started_at: meta.started_at,
+        finished_at: Some(meta.finished_at),
+        status: "complete".into(),
+        degraded: false,
+        file: Some(snapshot.metrics_candidates(0, 1).unwrap().3),
+        t_disk: None,
+        t_inodes: None,
+        t_dirs: None,
+        errors: Some(7),
+        duration_ms: None,
+    };
+    catalog.record_start(&entry).unwrap();
+    catalog.record_finish(&entry).unwrap();
+    let mut second_meta = fixtures::meta();
+    second_meta.root = tidemark_core::path::RawPath::new(b"/second".to_vec()).unwrap();
+    second_meta.scan_id = serde_json::from_str("\"20260101T000001Z-00000000\"").unwrap();
+    second_meta.dirs = 20;
+    second_meta.errors = 8;
+    let mut writer =
+        tidemark_store::writer::SnapshotWriter::create(tmp.path(), &second_meta).unwrap();
+    let rows: Vec<_> = (0..20)
+        .map(|id| {
+            let mut row = fixtures::dir(id);
+            row.path = if id == 0 {
+                second_meta.root.clone()
+            } else {
+                second_meta.root.join(
+                    &tidemark_core::path::RawName::new(format!("{id:08}").into_bytes()).unwrap(),
+                )
+            };
+            row.path_hash = row.path.hash64();
+            row.subtree_end = if id == 0 { 19 } else { id };
+            row
+        })
+        .collect();
+    writer.put_dirs(&rows).unwrap();
+    let second_file = writer.finish(&second_meta).unwrap();
+    let second_entry = tidemark_store::catalog::ScanEntry {
+        scan_id: second_meta.scan_id.to_string(),
+        root: second_meta.root.clone(),
+        mode: second_meta.mode,
+        started_at: second_meta.started_at,
+        finished_at: Some(second_meta.finished_at),
+        status: "complete".into(),
+        degraded: false,
+        file: Some(second_file),
+        t_disk: None,
+        t_inodes: None,
+        t_dirs: None,
+        errors: Some(8),
+        duration_ms: None,
+    };
+    catalog.record_start(&second_entry).unwrap();
+    catalog.record_finish(&second_entry).unwrap();
+    drop(catalog);
+    let mut config = Config::default();
+    config.general.state_dir = tmp.path().into();
+    config.roots.truncate(1);
+    use std::os::unix::ffi::OsStringExt;
+    config.roots[0].path = std::ffi::OsString::from_vec(meta.root.as_bytes().to_vec()).into();
+    config.roots[0].schedule = "off".into();
+    let mut second_root = config.roots[0].clone();
+    second_root.path = "/second".into();
+    config.roots.push(second_root);
+    config.metrics.textfile = tmp.path().join("out.prom");
+    config.metrics.interval = Duration::from_millis(10);
+    config.metrics.dir_metrics_depth = 0;
+    for _ in 0..2 {
+        let state = LiveState::new(&config, 0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = metrics::start(Arc::new(config.clone()), state.clone(), stop.clone()).unwrap();
+        wait(|| {
+            std::fs::read_to_string(&config.metrics.textfile).is_ok_and(|s| {
+                s.contains("tidemark_scan_errors")
+                    && parse(&s)["tidemark_dir_used_bytes"].len() == 2
+            })
+        });
+        let mut changed = config.clone();
+        changed.metrics.dir_metrics_depth = 1;
+        state.replace_config(changed.clone()).unwrap();
+        wait(|| {
+            std::fs::read_to_string(&config.metrics.textfile).is_ok_and(|s| {
+                parse(&s)
+                    .get("tidemark_dir_used_bytes")
+                    .is_some_and(|r| r.len() == 40)
+            })
+        });
+        changed.roots.clear();
+        state.replace_config(changed).unwrap();
+        wait(|| {
+            std::fs::read_to_string(&config.metrics.textfile)
+                .is_ok_and(|s| !s.contains("tidemark_dir_used_bytes"))
+        });
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap().unwrap();
+        std::fs::remove_file(&config.metrics.textfile).unwrap();
+    }
+}
+
+#[test]
+fn global_candidates_across_roots_and_replacement_uncover_previous_rows() {
+    use tidemark_core::path::{RawName, RawPath};
+    let mut sources = Vec::new();
+    for (root, offset, errors) in [
+        (b"/a".as_slice(), 10000u64, 8),
+        (b"/b".as_slice(), 0, 9),
+        (b"/a".as_slice(), 0, 10),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut meta = fixtures::meta();
+        meta.root = RawPath::new(root.to_vec()).unwrap();
+        meta.dirs = 601;
+        meta.errors = errors;
+        let mut writer = tidemark_store::writer::SnapshotWriter::create(tmp.path(), &meta).unwrap();
+        let rows: Vec<_> = (0..601)
+            .map(|id| {
+                let mut row = fixtures::dir(id);
+                row.path = meta
+                    .root
+                    .join(&RawName::new(format!("{id:08}").into_bytes()).unwrap());
+                row.path_hash = row.path.hash64();
+                row.subtree_end = if id == 0 { 600 } else { id };
+                row.t_disk = offset + u64::from(id);
+                row.t_reclaimable = offset + u64::from(601 - id);
+                row
+            })
+            .collect();
+        writer.put_dirs(&rows).unwrap();
+        let file = writer.finish(&meta).unwrap();
+        sources.push((tmp, tidemark_store::reader::Snapshot::open(&file).unwrap()));
+    }
+    let cache = SnapshotMetrics::default();
+    let config = Config::default();
+    let state = LiveState::new(&config, 0);
+    cache.refresh(&sources[0].1, 1).unwrap();
+    cache.refresh(&sources[1].1, 1).unwrap();
+    let output = metrics::render(&state.view(), &cache, &config.metrics, 0).unwrap();
+    let parsed = parse(&output);
+    for name in ["tidemark_dir_used_bytes", "tidemark_dir_reclaimable_bytes"] {
+        assert_eq!(parsed[name].len(), 500);
+        assert!(parsed[name]
+            .iter()
+            .all(|(label, _)| label.contains("root=\"/a\"")));
+        assert!(output.contains(&format!(
+            "tidemark_metrics_dropped_series{{metric=\"{name}\"}} 702"
+        )));
+    }
+    cache.refresh(&sources[2].1, 1).unwrap();
+    let parsed = parse(&metrics::render(&state.view(), &cache, &config.metrics, 0).unwrap());
+    assert!(parsed["tidemark_dir_used_bytes"]
+        .iter()
+        .any(|(label, _)| label.contains("root=\"/b\"")));
+    assert!(parsed["tidemark_scan_errors"]
+        .iter()
+        .any(|(label, value)| label.contains("root=\"/a\"") && *value == 10.0));
+}
+
+#[test]
+fn exporter_http_scrape_matches_textfile_and_idle_shutdown_is_bounded() {
+    let listener = match metrics::listen("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("TCP bind unavailable: {error}");
+            return;
+        }
+    };
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.roots.clear();
+    config.metrics.listen = address.to_string();
+    config.metrics.textfile = tmp.path().join("out.prom");
+    config.metrics.interval = Duration::from_millis(10);
+    let state = LiveState::new(&config, 0);
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = metrics::start(Arc::new(config.clone()), state.clone(), stop.clone()).unwrap();
+    wait(|| config.metrics.textfile.exists());
+    let readiness_deadline = Instant::now() + Duration::from_secs(2);
+    let mut scrape = loop {
+        if let Ok(stream) = std::net::TcpStream::connect(address) {
+            break stream;
+        }
+        assert!(
+            !worker.is_finished() && Instant::now() < readiness_deadline,
+            "HTTP readiness failed: {:?}",
+            state.view().status(0)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    scrape
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    scrape
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    scrape.read_to_string(&mut response).unwrap();
+    let body = response.split_once("\r\n\r\n").unwrap().1;
+    assert_eq!(
+        body,
+        std::fs::read_to_string(&config.metrics.textfile).unwrap()
+    );
+    drop(scrape);
+    let clients: Vec<_> = (0..8)
+        .map(|_| std::net::TcpStream::connect(address).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(100));
+    config.metrics.listen.clear();
+    state.replace_config(config.clone()).unwrap();
+    wait(|| std::net::TcpStream::connect(address).is_err());
+    for mut client in clients {
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(client.read(&mut [0; 1]).unwrap(), 0);
+    }
+    config.metrics.listen = address.to_string();
+    state.replace_config(config).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let first = loop {
+        if let Ok(stream) = std::net::TcpStream::connect(address) {
+            break stream;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "same-address metrics reload did not bind"
+        );
+        std::thread::yield_now();
+    };
+    let mut clients = vec![first];
+    clients.extend((0..7).map(|_| std::net::TcpStream::connect(address).unwrap()));
+    std::thread::sleep(Duration::from_millis(100));
+    let start = Instant::now();
+    stop.store(true, Ordering::Release);
+    while !worker.is_finished() {
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "HTTP idle clients delayed shutdown"
+        );
+        std::thread::yield_now();
+    }
+    worker.join().unwrap().unwrap();
+    assert!(std::net::TcpStream::connect(address).is_err());
+    drop(clients);
 }
