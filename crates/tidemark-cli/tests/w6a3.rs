@@ -436,9 +436,15 @@ fn scan_invalid_endpoint_never_writes_state() {
         .unwrap()
         .replace("api.sock'", "api.sock/child'");
     std::fs::write(&p, config).unwrap();
-    let out = cli(&p, &["scan", "/"]);
-    assert_eq!(out.status.code(), Some(4));
-    assert!(!dir.path().join("state").exists());
+    for args in [
+        vec!["scan", "/"],
+        vec!["snapshots", "rebuild-catalog"],
+        vec!["snapshots", "prune"],
+    ] {
+        let out = cli(&p, &args);
+        assert_eq!(out.status.code(), Some(4));
+        assert!(!dir.path().join("state").exists());
+    }
 }
 #[test]
 fn cells_and_prose_fit_injected_widths_without_splitting_escapes() {
@@ -513,15 +519,23 @@ fn scan_full_backlog_expires_without_direct_state_writes() {
         return;
     }
     // cli() allows 20 seconds, longer than the shared 11-second connect deadline.
-    let out = cli(&p, &["scan", "/"]);
-    assert_eq!(
-        out.status.code(),
-        Some(4),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
-    assert!(!dir.path().join("state").exists());
+    for args in [
+        vec!["scan", "/"],
+        vec!["snapshots", "rebuild-catalog"],
+        vec!["snapshots", "prune"],
+    ] {
+        let start = std::time::Instant::now();
+        let out = cli(&p, &args);
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(15));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
+        assert!(!dir.path().join("state").exists());
+    }
 }
 
 fn example_now() -> tidemark_core::live::NowReport {
@@ -723,10 +737,16 @@ fn scan_permission_error_never_falls_back() {
         eprintln!("permission coverage unavailable: process can traverse mode-000 directory");
         return;
     }
-    let out = cli(&p, &["scan", "/"]);
+    for args in [
+        vec!["scan", "/"],
+        vec!["snapshots", "rebuild-catalog"],
+        vec!["snapshots", "prune"],
+    ] {
+        let out = cli(&p, &args);
+        assert_eq!(out.status.code(), Some(4));
+        assert!(!dir.path().join("state").exists());
+    }
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(out.status.code(), Some(4));
-    assert!(!dir.path().join("state").exists());
 }
 
 // CLI-display2: packaged-daemon regressions, independent of sockets or terminal state.
@@ -1018,6 +1038,35 @@ fn daemon_scan_space_refusal_matches_direct_exit_and_wording() {
         assert!(error.contains(expected), "{error}");
         if exit == 5 {
             assert!(!error.contains("scan:"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn catalog_mutations_preserve_existing_corrupt_state_on_uncertain_endpoint() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let p = config(&dir);
+    std::fs::write(dir.path().join("api.sock"), b"not a directory").unwrap();
+    let text = std::fs::read_to_string(&p)
+        .unwrap()
+        .replace("api.sock'", "api.sock/child'");
+    std::fs::write(&p, text).unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let mut original = Vec::new();
+    for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
+        let path = state.join(name);
+        std::fs::write(&path, b"preserve corrupt state").unwrap();
+        original.push((path.clone(), std::fs::metadata(&path).unwrap().ino()));
+    }
+    for operation in ["rebuild-catalog", "prune"] {
+        let out = cli(&p, &["snapshots", operation]);
+        assert_eq!(out.status.code(), Some(4));
+        assert_eq!(std::fs::read_dir(&state).unwrap().count(), 3);
+        for (path, inode) in &original {
+            assert_eq!(std::fs::metadata(path).unwrap().ino(), *inode);
+            assert_eq!(std::fs::read(path).unwrap(), b"preserve corrupt state");
         }
     }
 }

@@ -157,12 +157,12 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     {
         // Recover only in direct mode, under the scan lock, before any recorder
         // or catalog connections are retained.
-        let _lock =
+        let lock =
             tidemark_scan::orchestrator::ScanLock::acquire(&context.config.general.state_dir)
                 .map_err(scan_error)?;
         require_absent_daemon(context)?;
         drop(
-            tidemark_scan::orchestrator::open_catalog(&context.config.general.state_dir, true)
+            lock.open_catalog(&context.config.general.state_dir)
                 .map_err(scan_error)?,
         );
     }
@@ -293,7 +293,9 @@ impl tidemark_scan::orchestrator::ScanRecorder for DirectRecorder {
     }
 }
 
-fn daemon_connection(context: &crate::Context) -> anyhow::Result<Option<crate::client::Client>> {
+pub(crate) fn daemon_connection(
+    context: &crate::Context,
+) -> anyhow::Result<Option<crate::client::Client>> {
     match crate::client::Client::connect(
         &context.config.general.socket,
         std::time::Duration::from_secs(11),

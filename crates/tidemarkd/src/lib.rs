@@ -34,6 +34,7 @@ pub mod state;
 
 use clap::Parser;
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 /// Daemon invocation options.
 #[derive(Debug, Parser)]
@@ -140,6 +141,63 @@ pub fn main_entry() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_wait_preserves_busy_database_and_sidecars() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::recovery_scan_lock_child"])
+            .env("TIDEMARK_RECOVERY_LOCK_CHILD", dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("ready").exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut originals = Vec::new();
+        for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"corrupt fixture").unwrap();
+            originals.push((path.clone(), std::fs::metadata(&path).unwrap().ino()));
+        }
+        let start = Instant::now();
+        let error = startup_catalog(dir.path(), 100, Duration::from_millis(60))
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("state directory in use by another tidemark process"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        for (path, inode) in originals {
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+            assert_eq!(std::fs::read(path).unwrap(), b"corrupt fixture");
+        }
+        assert!(!dir.path().join("timeseries-recovery-0").exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let catalog = startup_catalog(dir.path(), 100, Duration::ZERO).unwrap();
+        assert_eq!(catalog.recovery_files().len(), 3);
+    }
+    #[test]
+    fn recovery_scan_lock_child() {
+        let Some(path) = std::env::var_os("TIDEMARK_RECOVERY_LOCK_CHILD") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let _lock = tidemark_scan::orchestrator::ScanLock::acquire(&path).unwrap();
+        std::fs::write(path.join("ready"), b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+    #[test]
+    fn healthy_catalog_does_not_wait_for_scan_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(tidemark_store::catalog::Catalog::open(dir.path(), true).unwrap());
+        let _lock = tidemark_scan::orchestrator::ScanLock::acquire(dir.path()).unwrap();
+        let start = Instant::now();
+        drop(startup_catalog(dir.path(), 100, Duration::from_secs(30)).unwrap());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
     #[test]
     fn requested_shutdown_preserves_first_startup_attempt() {
         let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
@@ -659,31 +717,9 @@ pub fn run_controlled(
     )?;
     // Both storage opens perform header preflight before SQLite. Recovery is corruption-only.
     let storage = state.storage_path();
-    let catalog = match retry_start("catalog", &state, &shutdown, || {
-        match tidemark_store::catalog::Catalog::open(&storage, true) {
-            Err(error) if store_pressure(&error) => Err(startup_store_error(error)),
-            result => Ok(result),
-        }
-    })? {
-        Ok(c) => c,
-        Err(error) if corrupt(&error) => {
-            let c = retry_start("catalog", &state, &shutdown, || {
-                tidemark_store::catalog::recover_catalog(&storage).map_err(startup_store_error)
-            })?;
-            for path in c.recovery_files() {
-                tracing::warn!(path=%path.display(), "preserved corrupt catalog artifact");
-            }
-            c
-        }
-        Err(error) => return Err(DaemonError::Store(error.to_string())),
-    };
-    match tidemark_scan::orchestrator::ScanLock::acquire(&storage) {
-        Ok(_lock) => tidemark_store::catalog::cleanup_abandoned_scans(&storage, options.now),
-        Err(tidemark_scan::orchestrator::ScanError::Busy) => {
-            tracing::info!("startup scan cleanup skipped: host scan lock is held");
-        }
-        Err(error) => tracing::warn!(%error, "startup scan cleanup lock failed"),
-    }
+    let catalog = retry_start("catalog", &state, &shutdown, || {
+        startup_catalog(&storage, options.now, Duration::from_secs(30))
+    })?;
     // Read catalog history before treating any configured root as measured never-scanned.
     for root in &config.roots {
         let raw = tidemark_core::path::RawPath::from_path(&root.path)
@@ -888,6 +924,7 @@ pub fn run_controlled(
             );
             tracing::info!("daemon ready");
             let mut firstboot_followup = firstboot::Followup::default();
+            let firstboot_elapsed = monotonic_clock();
             let mut firstboot_due = Instant::now();
             while !shutdown.load(Ordering::Acquire) {
                 if reload_flag.swap(false, Ordering::AcqRel) {
@@ -909,6 +946,7 @@ pub fn run_controlled(
                             &state.config().0.general.state_dir,
                             &inputs,
                             unix_now(),
+                            firstboot_elapsed(),
                         ) {
                             tracing::warn!(%error, "firstboot followup failed");
                         }
@@ -1034,6 +1072,56 @@ fn join_until(
     }
     result
 }
+fn startup_catalog(
+    storage: &std::path::Path,
+    now: i64,
+    wait: Duration,
+) -> Result<tidemark_store::catalog::Catalog, DaemonError> {
+    // Probe without migrations or writes before deciding whether to wait.
+    let needs_recovery = match tidemark_store::catalog::Catalog::open(storage, false) {
+        Ok(catalog) => {
+            drop(catalog);
+            false
+        }
+        Err(error) if corrupt(&error) => true,
+        Err(_) => !storage.join("timeseries.db").exists(),
+    };
+    let deadline = Instant::now() + wait;
+    let lock = loop {
+        match tidemark_scan::orchestrator::ScanLock::acquire(storage) {
+            Ok(lock) => break Some(lock),
+            Err(tidemark_scan::orchestrator::ScanError::Busy) if needs_recovery => {
+                if Instant::now() >= deadline {
+                    return Err(DaemonError::Store(
+                        "state directory in use by another tidemark process".into(),
+                    ));
+                }
+                std::thread::sleep(
+                    Duration::from_millis(25)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(tidemark_scan::orchestrator::ScanError::Busy) => break None,
+            Err(error) => return Err(DaemonError::Store(error.to_string())),
+        }
+    };
+    let catalog = match &lock {
+        Some(lock) => {
+            let catalog = lock.open_catalog(storage).map_err(|e| match e {
+                tidemark_scan::orchestrator::ScanError::Store(error) => startup_store_error(error),
+                error => DaemonError::Store(error.to_string()),
+            })?;
+            tidemark_store::catalog::cleanup_abandoned_scans(storage, now);
+            catalog
+        }
+        None => {
+            tracing::info!("startup scan cleanup skipped: host scan lock is held");
+            tidemark_store::catalog::Catalog::open(storage, true).map_err(startup_store_error)?
+        }
+    };
+    Ok(catalog)
+}
+
 fn corrupt(e: &tidemark_store::StoreError) -> bool {
     // Match the exposed SQLite error code without adding a direct rusqlite dependency.
     matches!(e,tidemark_store::StoreError::Sql(e) if e.sqlite_error_code().is_some_and(|code|matches!(format!("{code:?}").as_str(),"DatabaseCorrupt"|"NotADatabase")))
@@ -1049,6 +1137,7 @@ fn validate_config(c: &tidemark_core::config::Config) -> Result<(), DaemonError>
                 .join("; "),
         ));
     }
+    validate_output_paths(c)?;
     state::validate_bounds(c)?;
     for (index, root) in c.roots.iter().enumerate() {
         scheduler::parse_schedule(&root.schedule)
@@ -1086,6 +1175,64 @@ fn validate_config(c: &tidemark_core::config::Config) -> Result<(), DaemonError>
     }
     tidemark_live::alerts::AlertEngine::new(&c.alerts.rule, c.alerts.renotify)
         .map_err(|e| DaemonError::Config(format!("alerts: {e}")))?;
+    Ok(())
+}
+fn validate_output_paths(c: &tidemark_core::config::Config) -> Result<(), DaemonError> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Component, Path, PathBuf};
+    fn suffix(path: &Path, suffix: &str) -> PathBuf {
+        let mut name = path.file_name().unwrap_or(path.as_os_str()).to_os_string();
+        name.push(suffix);
+        path.with_file_name(name)
+    }
+    fn normalize(path: &Path) -> PathBuf {
+        let mut result = PathBuf::new();
+        for part in path.components() {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    result.pop();
+                }
+                part => result.push(part.as_os_str()),
+            }
+        }
+        result
+    }
+    fn identity(path: &Path) -> Result<Option<(u64, u64, std::ffi::OsString)>, DaemonError> {
+        let Some(parent) = path.parent() else {
+            return Ok(None);
+        };
+        let Some(name) = path.file_name() else {
+            return Ok(None);
+        };
+        match std::fs::metadata(parent) {
+            Ok(md) => Ok(Some((md.dev(), md.ino(), name.to_os_string()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(DaemonError::Config(format!(
+                "output parent {}: {e}",
+                parent.display()
+            ))),
+        }
+    }
+    let textfile = &c.metrics.textfile;
+    if textfile.as_os_str().is_empty() {
+        return Ok(());
+    }
+    for api in [&c.general.socket, &suffix(&c.general.socket, ".lock")] {
+        for metrics in [textfile, &suffix(textfile, ".tmp")] {
+            let api_identity = identity(api)?;
+            let metrics_identity = identity(metrics)?;
+            if normalize(api) == normalize(metrics)
+                || api_identity.is_some() && api_identity == metrics_identity
+            {
+                return Err(DaemonError::Config(format!(
+                    "metrics.textfile collides with API output: {} and {}",
+                    metrics.display(),
+                    api.display()
+                )));
+            }
+        }
+    }
     Ok(())
 }
 fn validate_interval(field: &str, duration: std::time::Duration) -> Result<(), DaemonError> {

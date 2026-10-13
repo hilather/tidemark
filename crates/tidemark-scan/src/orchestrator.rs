@@ -678,6 +678,32 @@ pub struct ScanLock {
     _file: std::fs::File,
 }
 impl ScanLock {
+    /// Open or recover shared storage while this scan ownership guard is retained.
+    pub fn open_catalog(
+        &self,
+        state: &std::path::Path,
+    ) -> Result<tidemark_store::catalog::Catalog, ScanError> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self._file.metadata()?;
+        let named = std::fs::symlink_metadata(state.join("scan.lock"))?;
+        if held.dev() != named.dev() || held.ino() != named.ino() {
+            return Err(ScanError::Busy);
+        }
+        match tidemark_store::catalog::Catalog::open(state, true) {
+            Ok(catalog) => Ok(catalog),
+            Err(tidemark_store::StoreError::Sql(ref error))
+                if error
+                    .sqlite_error()
+                    .is_some_and(|e| matches!(e.extended_code & 255, 11 | 26)) =>
+            {
+                Ok(tidemark_store::catalog::recover_catalog_with_lock(
+                    state,
+                    &self._file,
+                )?)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
     /// Create only inside state_dir and refuse a concurrent scan.
     pub fn acquire(state: &std::path::Path) -> Result<Self, ScanError> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -700,26 +726,16 @@ impl ScanLock {
         }
     }
 }
-/// Open without destructive recovery; preserve corrupt files only after a reported corruption.
-/// Caller must hold the host lock and have no other sample/catalog connections.
+/// Open shared storage, acquiring scan ownership for writable opens and recovery.
+/// Callers already holding a scan lock use `ScanLock::open_catalog` instead.
 pub fn open_catalog(
     state: &std::path::Path,
     rw: bool,
 ) -> Result<tidemark_store::catalog::Catalog, ScanError> {
-    match tidemark_store::catalog::Catalog::open(state, rw) {
-        Ok(c) => Ok(c),
-        Err(tidemark_store::StoreError::Sql(ref e))
-            if e.sqlite_error()
-                .is_some_and(|e| matches!(e.extended_code & 255, 11 | 26))
-                && rw =>
-        {
-            let c = tidemark_store::catalog::recover_catalog(state)?;
-            for p in c.recovery_files() {
-                tracing::warn!(path=%p.display(), "preserved catalog recovery file");
-            }
-            Ok(c)
-        }
-        Err(e) => Err(e.into()),
+    if rw {
+        ScanLock::acquire(state)?.open_catalog(state)
+    } else {
+        Ok(tidemark_store::catalog::Catalog::open(state, false)?)
     }
 }
 fn open_directory(

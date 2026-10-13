@@ -331,12 +331,50 @@ impl Catalog {
     }
 }
 
+/// Recover with a retained scan-lock descriptor, verifying its identity and exclusion.
+/// All local catalog/sample connections must be closed before calling this function.
+/// The legacy recovery entry point remains for existing callers; production callers
+/// should use this checked entry point.
+pub fn recover_catalog_with_lock(
+    state_dir: &Path,
+    scan_lock: &fs::File,
+) -> Result<Catalog, StoreError> {
+    use std::os::unix::fs::MetadataExt;
+    let held = scan_lock.metadata()?;
+    let named = fs::symlink_metadata(state_dir.join("scan.lock"))?;
+    if !named.is_file() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+        return Err(StoreError::Invalid(
+            "recovery requires the state directory scan lock".into(),
+        ));
+    }
+    rustix::fs::flock(
+        scan_lock,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .map_err(std::io::Error::from)?;
+    recover_catalog_owned(state_dir)
+}
+
 /// Preserve the shared database and sidecars, then rebuild from published snapshots.
 ///
 /// The caller must stop writers and close all catalog/sample connections first.
+/// This compatibility entry point acquires the scan lock itself; callers already
+/// holding it must use `recover_catalog_with_lock` instead.
 /// Historical samples remain in `Catalog::recovery_files()` and are unavailable in
 /// the new database. Ordinary `Catalog::open` never performs this recovery.
 pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(state_dir.join("scan.lock"))?;
+    recover_catalog_with_lock(state_dir, &lock)
+}
+fn recover_catalog_owned(state_dir: &Path) -> Result<Catalog, StoreError> {
     // A private, exclusively created directory supplies a collision-free namespace.
     let mut recovery = None;
     for sequence in 0..10_000u32 {

@@ -69,11 +69,12 @@ impl Followup {
         state_dir: &Path,
         inputs: &FirstbootInputs,
         now: i64,
+        monotonic: i64,
     ) -> io::Result<()> {
-        if self.next.is_some_and(|next| now < next) {
+        if self.next.is_some_and(|next| monotonic < next) {
             return Ok(());
         }
-        self.next = Some(now.saturating_add(10));
+        self.next = Some(monotonic.saturating_add(10));
         if files::read(&state_dir.join("deploy/staged.json")).is_err() {
             return Ok(());
         }
@@ -81,11 +82,6 @@ impl Followup {
             return Ok(());
         };
         if previous.config_sha256 == inputs.config_sha256 && previous.healthy {
-            return Ok(());
-        }
-        if previous.config_sha256 == inputs.config_sha256
-            && now < previous.written_at.saturating_add(10)
-        {
             return Ok(());
         }
         // Ignore volatile sample/scan timestamps: retries are driven by component changes.
@@ -212,7 +208,7 @@ mod tests {
         std::fs::write(dir.path().join("deploy/staged.json"), b"{}").unwrap();
         assert!(!needs_report(dir.path(), "abc"));
         let mut followup = Followup::default();
-        followup.poll(dir.path(), &input, 30).unwrap();
+        followup.poll(dir.path(), &input, 30, 0).unwrap();
         assert_eq!(
             read_report(&dir.path().join("deploy/firstboot.json"))
                 .unwrap()
@@ -220,7 +216,7 @@ mod tests {
             20
         );
         input.components[0].state = "ok".into();
-        followup.poll(dir.path(), &input, 39).unwrap();
+        followup.poll(dir.path(), &input, -500, 9).unwrap();
         assert!(
             !read_report(&dir.path().join("deploy/firstboot.json"))
                 .unwrap()
@@ -228,27 +224,50 @@ mod tests {
         );
         // A new coordinator resumes a persisted unhealthy report.
         let mut restarted = Followup::default();
-        restarted.poll(dir.path(), &input, 40).unwrap();
+        restarted.poll(dir.path(), &input, -1000, 0).unwrap();
         let report = read_report(&dir.path().join("deploy/firstboot.json")).unwrap();
         assert!(report.healthy);
-        assert_eq!(report.written_at, 40);
+        assert_eq!(report.written_at, -1000);
         assert_eq!(report.booted_at, 5);
         input.components[0].state = "degraded".into();
-        restarted.poll(dir.path(), &input, 50).unwrap();
+        restarted.poll(dir.path(), &input, 100000, 10).unwrap();
         assert_eq!(
             read_report(&dir.path().join("deploy/firstboot.json"))
                 .unwrap()
                 .written_at,
-            40
+            -1000
         );
         input.config_sha256 = "changed".into();
-        restarted.poll(dir.path(), &input, 60).unwrap();
+        restarted.poll(dir.path(), &input, -2000, 20).unwrap();
         assert_eq!(
             read_report(&dir.path().join("deploy/firstboot.json"))
                 .unwrap()
                 .config_sha256,
             "changed"
         );
+    }
+    #[test]
+    fn followup_uses_elapsed_time_across_wall_steps() {
+        let dir = private_tempdir();
+        let mut input = inputs();
+        input.components[0].state = "degraded".into();
+        write(dir.path(), &build_with_boot(&input, 1000, 5)).unwrap();
+        std::fs::write(dir.path().join("deploy/staged.json"), b"{}").unwrap();
+        let mut followup = Followup::default();
+        followup.poll(dir.path(), &input, 1010, 0).unwrap();
+        input.components[0].state = "ok".into();
+        for (wall, elapsed) in [(1000000, 1), (-1000000, 9)] {
+            followup.poll(dir.path(), &input, wall, elapsed).unwrap();
+            assert!(
+                !read_report(&dir.path().join("deploy/firstboot.json"))
+                    .unwrap()
+                    .healthy
+            );
+        }
+        followup.poll(dir.path(), &input, -1000000, 10).unwrap();
+        let report = read_report(&dir.path().join("deploy/firstboot.json")).unwrap();
+        assert!(report.healthy);
+        assert_eq!(report.written_at, -1000000);
     }
     #[test]
     fn unsafe_existing_directory_permissions_refused() {
