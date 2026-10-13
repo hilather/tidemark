@@ -109,6 +109,8 @@ pub struct WatcherOptions {
 pub enum WatchMode {
     /// Contract variant.
     FdMount,
+    /// Descriptor events covering all mounts of the filesystem.
+    FdFilesystem,
     /// Worker exited after an unrecoverable transport error.
     Failed,
     /// Contract variant.
@@ -207,6 +209,7 @@ struct State {
     read_errors: u64,
     stream: Option<VecDeque<WatchEvent>>,
     dropped_events: u64,
+    unmapped_events: u64,
 }
 impl State {
     fn mark_loss(&mut self) {
@@ -259,6 +262,7 @@ impl Watcher {
                 read_errors: 0,
                 stream: None,
                 dropped_events: 0,
+                unmapped_events: 0,
             })),
             shutdown: Arc::new(rustix::event::eventfd(
                 0,
@@ -315,16 +319,22 @@ impl Watcher {
                 }
             }
         }
-        let (group, mode) = select_group(selected, || {
+        let mut fd_mode_selected = WatchMode::FdMount;
+        let (group, mut mode) = select_group(selected, || {
             if !caps.fd_mode {
                 return Err(WatchError::Unsupported);
             }
             let group = Fanotify::init(InitMode::FdMode).map_err(|_| WatchError::Unsupported)?;
-            group
-                .mark_mount(&mark_path, event_mask)
-                .map_err(|_| WatchError::Unsupported)?;
+            fd_mode_selected = select_fd_mark(
+                caps.mark_filesystem,
+                || group.mark_filesystem(&mark_path, event_mask),
+                || group.mark_mount(&mark_path, event_mask),
+            )?;
             Ok(group)
         })?;
+        if mode == WatchMode::FdMount {
+            mode = fd_mode_selected;
+        }
         let shutdown = Arc::new(
             rustix::event::eventfd(
                 0,
@@ -345,19 +355,30 @@ impl Watcher {
             read_errors: 0,
             stream: None,
             dropped_events: 0,
+            unmapped_events: 0,
         }));
         state.lock().rings.advance(now());
+        let filesystem_mount = if mode == WatchMode::FdFilesystem {
+            Some(descriptor_mount_id(mount_fd.as_fd())?)
+        } else {
+            None
+        };
         let worker_mount_fd = mount_fd.clone();
         let worker_state = state.clone();
         let worker_shutdown = shutdown.clone();
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = stopping.clone();
         let mount = cfg.mount.clone();
+        if mode == WatchMode::FdMount {
+            tracing::warn!(mount = %mount.display_lossy(), "writes from other mount namespaces and bind mounts are not seen");
+        } else if mode == WatchMode::FdFilesystem {
+            tracing::info!(mount = %mount.display_lossy(), "all mounts of the filesystem are seen");
+        }
         tracing::info!(mode = %mode, mount = %mount.display_lossy(), "watcher started: mount {}, mode {mode}", mount.display_lossy());
         let thread = std::thread::Builder::new()
             .name("tidemark-watch".into())
             .spawn(move || {
-                let fd_mode = mode == WatchMode::FdMount;
+                let fd_mode = matches!(mode, WatchMode::FdMount | WatchMode::FdFilesystem);
                 let mut buffer = vec![
                     0;
                     if fd_mode {
@@ -367,6 +388,8 @@ impl Watcher {
                     }
                 ];
                 let mut processor = Processor {
+                    filesystem_mount,
+                    event_handle: Default::default(),
                     own_pid: std::process::id() as i32,
                     cfg: &cfg,
                     attribution: &attribution,
@@ -627,6 +650,10 @@ impl Watcher {
             read_errors: state.read_errors,
         }
     }
+    /// Events whose path could not be mapped into the watched directory tree.
+    pub fn unmapped_events(&self) -> u64 {
+        self.state.lock().unmapped_events
+    }
     /// Wake the worker and join it, closing the group and all event descriptors.
     pub fn stop(mut self) {
         self.shutdown_worker();
@@ -656,6 +683,27 @@ pub fn parse_mount_id(text: &str) -> io::Result<u64> {
                 "missing or invalid fdinfo mount id",
             )
         })
+}
+fn descriptor_mount_id(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<u64> {
+    use std::io::Read;
+    let file = std::fs::File::open(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))?;
+    let mut text = String::new();
+    file.take(16_385).read_to_string(&mut text)?;
+    if text.len() > 16_384 {
+        return Err(io::Error::other("fdinfo exceeds cap"));
+    }
+    parse_mount_id(&text)
+}
+fn select_fd_mark(
+    supported: bool,
+    filesystem: impl FnOnce() -> io::Result<()>,
+    mount: impl FnOnce() -> io::Result<()>,
+) -> Result<WatchMode, WatchError> {
+    if supported && filesystem().is_ok() {
+        return Ok(WatchMode::FdFilesystem);
+    }
+    mount().map_err(|_| WatchError::Unsupported)?;
+    Ok(WatchMode::FdMount)
 }
 fn select_group<T>(
     rich: Option<(T, WatchMode)>,
@@ -721,6 +769,8 @@ pub fn namespace_ok() -> io::Result<bool> {
 }
 
 struct Processor<'a> {
+    filesystem_mount: Option<u64>,
+    event_handle: tidemark_sys::fanotify::EventHandle,
     own_pid: i32,
     cfg: &'a WatcherOptions,
     attribution: &'a AttributionCache,
@@ -782,7 +832,40 @@ impl Processor<'_> {
                 if pid == self.own_pid {
                     return;
                 }
-                fdmode::resolve_event(fd.as_fd()).map(|(p, s, created)| (pid, p, Some(s), created))
+                fdmode::resolve_event_with_fallback(
+                    fd.as_fd(),
+                    self.filesystem_mount.map(|_| &self.cfg.mount),
+                )
+                .map(|(mut p, s, created)| {
+                    if let Some(watched) = self.filesystem_mount {
+                        let event_mount = self.event_handle.identify(fd.as_fd()).ok();
+                        let reopened = if event_mount.is_some_and(|id| id != watched) {
+                            self.event_handle
+                                .reopen(mount_fd)
+                                .ok()
+                                .and_then(|host| fdmode::descriptor_path(host.as_fd()).ok())
+                                .and_then(|path| RawPath::from_path(&path).ok())
+                        } else {
+                            None
+                        };
+                        if let Some(mapped) = fdmode::mapped_path(
+                            event_mount,
+                            watched,
+                            &p,
+                            reopened.as_ref(),
+                            &self.cfg.mount,
+                        ) {
+                            if event_mount != Some(watched) {
+                                p = mapped.clone();
+                            }
+                        } else {
+                            p = self.cfg.mount.clone();
+                            let mut locked = state.lock();
+                            locked.unmapped_events = locked.unmapped_events.saturating_add(1);
+                        }
+                    }
+                    (pid, p, Some(s), created)
+                })
             }
             RawEvent::Fid {
                 pid,
@@ -941,6 +1024,7 @@ impl std::fmt::Display for WatchMode {
         f.write_str(match self {
             Self::Failed => "failed",
             Self::FdMount => "fd/mount",
+            Self::FdFilesystem => "fd/filesystem",
             Self::DfidNameMount => "dfid-name/mount",
             Self::DfidNameFilesystem => "dfid-name/filesystem",
         })
@@ -951,6 +1035,68 @@ impl std::fmt::Display for WatchMode {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn unmapped_event_keeps_totals_and_root_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("child");
+        std::fs::write(&path, b"fixture").unwrap();
+        let cfg = WatcherOptions {
+            mount: RawPath::from_path(temp.path()).unwrap(),
+            events: vec![],
+            hot_depth: 6,
+            exclude_prefixes: vec![],
+            lru_entries: 10,
+        };
+        let watcher = Watcher::from_injected_events(cfg.mount.clone(), []).unwrap();
+        let attribution = AttributionCache::new(std::time::Duration::from_secs(60), 10);
+        let mount = std::fs::File::open(temp.path()).unwrap();
+        let at = now();
+        let mut processor = Processor {
+            filesystem_mount: Some(u64::MAX),
+            event_handle: Default::default(),
+            own_pid: -1,
+            cfg: &cfg,
+            attribution: &attribution,
+            mount_fd: mount.as_fd(),
+            sizes: fdmode::Sizes::new(10, at),
+            paths: fidmode::PathSizes::new(10),
+            handles: fidmode::HandlePaths::new(10),
+        };
+        processor.process(
+            RawEvent::Fd {
+                mask: mask::CLOSE_WRITE,
+                pid: 0,
+                fd: std::fs::File::open(path).unwrap().into(),
+            },
+            at,
+            &watcher.state,
+        );
+        assert_eq!(watcher.unmapped_events(), 1);
+        assert_eq!(watcher.stats().events_total, 1);
+        for scope in [HotScope::Dir, HotScope::Unit, HotScope::Comm] {
+            let rows = watcher.hot(5, scope, 10);
+            assert_eq!(rows.len(), 1);
+            if matches!(scope, HotScope::Dir) {
+                assert_eq!(rows[0].key, cfg.mount.as_bytes());
+            }
+        }
+    }
+    #[test]
+    fn fd_mark_selection() {
+        assert_eq!(
+            select_fd_mark(true, || Ok(()), || panic!("extra mark")).unwrap(),
+            WatchMode::FdFilesystem
+        );
+        assert_eq!(
+            select_fd_mark(true, || Err(io::Error::other("unsupported")), || Ok(())).unwrap(),
+            WatchMode::FdMount
+        );
+        assert_eq!(
+            select_fd_mark(false, || panic!("unsupported probe"), || Ok(())).unwrap(),
+            WatchMode::FdMount
+        );
+        assert_eq!(WatchMode::FdFilesystem.to_string(), "fd/filesystem");
+    }
     #[test]
     fn descriptor_limit_counts_and_unreadable_pressure_are_lossy() {
         assert_eq!(count_descriptors(1).unwrap(), 1);
@@ -1167,6 +1313,7 @@ mod tests {
             read_errors: 0,
             stream: None,
             dropped_events: 0,
+            unmapped_events: 0,
         })
     }
     fn dirty_watcher() -> Watcher {
@@ -1197,6 +1344,8 @@ mod tests {
         };
         let attribution = AttributionCache::new(std::time::Duration::from_secs(60), 10);
         let mut processor = Processor {
+            filesystem_mount: None,
+            event_handle: Default::default(),
             own_pid: std::process::id() as i32,
             cfg: &cfg,
             attribution: &attribution,
@@ -1332,6 +1481,8 @@ mod tests {
         };
         let attribution = AttributionCache::new(std::time::Duration::from_secs(60), 10);
         let mut processor = Processor {
+            filesystem_mount: None,
+            event_handle: Default::default(),
             own_pid: std::process::id() as i32,
             cfg: &cfg,
             attribution: &attribution,
@@ -1613,6 +1764,8 @@ mod tests {
         let attribution = AttributionCache::new(std::time::Duration::from_secs(60), 10);
         let at = now();
         let mut processor = Processor {
+            filesystem_mount: None,
+            event_handle: Default::default(),
             own_pid: std::process::id() as i32,
             cfg: &cfg,
             attribution: &attribution,

@@ -107,8 +107,11 @@ fn event_stat(s: rustix::fs::Statx) -> io::Result<(EventStat, i64)> {
     };
     Ok((stat, created))
 }
-pub(super) fn resolve_event(fd: BorrowedFd<'_>) -> io::Result<(RawPath, EventStat, i64)> {
-    resolve_with(fd, || {
+pub(super) fn resolve_event_with_fallback(
+    fd: BorrowedFd<'_>,
+    fallback: Option<&RawPath>,
+) -> io::Result<(RawPath, EventStat, i64)> {
+    resolve_with_fallback(fd, fallback, || {
         rustix::fs::statx(
             fd,
             "",
@@ -118,8 +121,16 @@ pub(super) fn resolve_event(fd: BorrowedFd<'_>) -> io::Result<(RawPath, EventSta
         .map_err(Into::into)
     })
 }
+#[cfg(test)]
 fn resolve_with(
     fd: BorrowedFd<'_>,
+    stat: impl FnOnce() -> io::Result<rustix::fs::Statx>,
+) -> io::Result<(RawPath, EventStat, i64)> {
+    resolve_with_fallback(fd, None, stat)
+}
+fn resolve_with_fallback(
+    fd: BorrowedFd<'_>,
+    fallback: Option<&RawPath>,
     stat: impl FnOnce() -> io::Result<rustix::fs::Statx>,
 ) -> io::Result<(RawPath, EventStat, i64)> {
     let (stat, created) = match stat().and_then(event_stat) {
@@ -131,8 +142,15 @@ fn resolve_with(
             (stat, stat.st_ctime)
         }
     };
-    let path = descriptor_path(fd)?;
-    let raw = RawPath::from_path(&path).map_err(io::Error::other)?;
+    let raw = match descriptor_path(fd)
+        .and_then(|path| RawPath::from_path(&path).map_err(io::Error::other))
+    {
+        Ok(path) => path,
+        Err(error) => match fallback {
+            Some(root) => root.clone(),
+            None => return Err(error),
+        },
+    };
     Ok((raw, stat, created))
 }
 pub(super) fn descriptor_path(fd: BorrowedFd<'_>) -> io::Result<std::path::PathBuf> {
@@ -254,13 +272,19 @@ mod tests {
 }
 
 /// Select a host path only when its mount provenance is known. None means root fallback.
-pub(super) fn mapped_path<'a>(event_mount: Option<u64>, watched_mount: u64, original: &'a RawPath, reopened: Option<&'a RawPath>, mount: &RawPath) -> Option<&'a RawPath> {
+pub(super) fn mapped_path<'a>(
+    event_mount: Option<u64>,
+    watched_mount: u64,
+    original: &'a RawPath,
+    reopened: Option<&'a RawPath>,
+    mount: &RawPath,
+) -> Option<&'a RawPath> {
     let path = match event_mount {
         Some(id) if id == watched_mount => Some(original),
         Some(_) => reopened,
         None => None,
     }?;
-    (path.as_bytes() != b"/" && path.starts_with(mount)).then_some(path)
+    (path.as_bytes() != b"/" && path != mount && path.starts_with(mount)).then_some(path)
 }
 
 #[cfg(test)]
@@ -273,7 +297,10 @@ mod mapping_tests {
         let foreign = RawPath::new(b"/bind/a".to_vec()).unwrap();
         let root = RawPath::new(b"/".to_vec()).unwrap();
         assert_eq!(mapped_path(Some(1), 1, &host, None, &mount), Some(&host));
-        assert_eq!(mapped_path(Some(2), 1, &foreign, Some(&host), &mount), Some(&host));
+        assert_eq!(
+            mapped_path(Some(2), 1, &foreign, Some(&host), &mount),
+            Some(&host)
+        );
         for reopened in [None, Some(&foreign), Some(&root)] {
             assert_eq!(mapped_path(Some(2), 1, &foreign, reopened, &mount), None);
         }

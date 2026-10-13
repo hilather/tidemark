@@ -190,7 +190,13 @@ impl EventHandle {
         // the empty C string and mount-id output remain valid throughout the call.
         let result = unsafe {
             (*ptr).handle_bytes = 128;
-            libc::name_to_handle_at(fd.as_raw_fd(), c"".as_ptr(), ptr, &mut mount_id, libc::AT_EMPTY_PATH)
+            libc::name_to_handle_at(
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                ptr,
+                &mut mount_id,
+                libc::AT_EMPTY_PATH,
+            )
         };
         if result < 0 {
             return Err(io::Error::last_os_error());
@@ -198,15 +204,29 @@ impl EventHandle {
         u64::try_from(mount_id).map_err(io::Error::other)
     }
     /// Reopen the identified inode in the watched mount for metadata-only path resolution.
-    pub fn reopen(&self, mount: BorrowedFd<'_>) -> io::Result<OwnedFd> {
-        let ptr = self.storage.as_ptr().cast::<libc::file_handle>();
+    pub fn reopen(&mut self, mount: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+        let ptr = self.storage.as_mut_ptr().cast::<libc::file_handle>();
         // SAFETY: identify initialized the bounded aligned handle; no contents are read.
-        let mut fd = unsafe { libc::open_by_handle_at(mount.as_raw_fd(), ptr, libc::O_PATH | libc::O_CLOEXEC) };
+        let mut fd = unsafe {
+            libc::open_by_handle_at(mount.as_raw_fd(), ptr, libc::O_PATH | libc::O_CLOEXEC)
+        };
         if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
             // SAFETY: same valid handle, with nonblocking, no-follow, no-atime read-only flags.
-            fd = unsafe { libc::open_by_handle_at(mount.as_raw_fd(), ptr, libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOATIME | libc::O_CLOEXEC) };
+            fd = unsafe {
+                libc::open_by_handle_at(
+                    mount.as_raw_fd(),
+                    ptr,
+                    libc::O_RDONLY
+                        | libc::O_NONBLOCK
+                        | libc::O_NOFOLLOW
+                        | libc::O_NOATIME
+                        | libc::O_CLOEXEC,
+                )
+            };
         }
-        if fd < 0 { return Err(io::Error::last_os_error()); }
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
         // SAFETY: the successful syscall returned a new uniquely owned descriptor.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }

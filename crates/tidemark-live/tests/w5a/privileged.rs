@@ -415,3 +415,75 @@ fn watcher_mount_identity_matches_loop_xfs_mountinfo() {
     assert_ne!(mounted.dev, parent.dev);
     watch.stop();
 }
+
+#[test]
+fn filesystem_mark_maps_namespace_bind_and_chroot() {
+    let fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
+    if !tidemark_sys::fanotify::probe(&fs.mountpoint)
+        .unwrap()
+        .mark_filesystem
+    {
+        println!("SKIP filesystem marks unsupported by this kernel");
+        return;
+    }
+    let deep = fs.mountpoint.join("deep");
+    std::fs::create_dir(&deep).unwrap();
+    let bind = tempfile::tempdir().unwrap();
+    struct BindGuard(std::path::PathBuf);
+    impl Drop for BindGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("umount").arg(&self.0).status();
+        }
+    }
+    assert!(Command::new("mount")
+        .arg("--bind")
+        .arg(&deep)
+        .arg(bind.path())
+        .status()
+        .unwrap()
+        .success());
+    let guard = BindGuard(bind.path().to_path_buf());
+    let watch = watcher(options(&fs.mountpoint));
+    assert_eq!(watch.mode(), tidemark_live::watch::WatchMode::FdFilesystem);
+    watch.enable_events();
+    assert!(Command::new("unshare")
+        .args(["-m", "sh", "-c", "printf private > \"$1\"", "writer"])
+        .arg(deep.join("private"))
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("sh")
+        .args(["-c", "printf bind > \"$1\"", "writer"])
+        .arg(bind.path().join("bind"))
+        .status()
+        .unwrap()
+        .success());
+    // Open the file after chroot without requiring a shell inside the fixture.
+    assert!(Command::new("python3").args(["-c", "import os,sys; os.chroot(sys.argv[1]); f=open('/chroot','wb'); f.write(b'chroot'); f.close()"]).arg(bind.path()).status().unwrap().success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut events = Vec::new();
+    while Instant::now() < deadline && events.len() < 3 {
+        events.extend(watch.drain_events(100));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    events.extend(watch.drain_events(100));
+    for name in ["private", "bind", "chroot"] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.path.as_path() == deep.join(name))
+                .count(),
+            1
+        );
+    }
+    assert_eq!(watch.unmapped_events(), 0);
+    assert_eq!(watch.stats().events_total, 3);
+    assert!(watch
+        .hot(5, HotScope::Dir, 10)
+        .iter()
+        .any(|r| r.key == deep.as_os_str().as_encoded_bytes()));
+    drop(guard);
+    watch.stop();
+    // LoopXfs Drop unmounts the filesystem after all watcher descriptors close.
+}
