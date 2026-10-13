@@ -268,7 +268,13 @@ fn watcher_component(
     } else {
         "ok"
     };
-    crate::component(&format!("watcher:{mount}"), health, format!("mode={} recovering={} overflows_total={} read_errors={} persistence_dropped={dropped}; windows: {published} published; {}", stats.mode, stats.recovering, stats.overflows_total, stats.read_errors, watcher.health_detail()))
+    let mut detail = format!("mode={} recovering={} overflows_total={} read_errors={} persistence_dropped={dropped}; windows: {published} published", stats.mode, stats.recovering, stats.overflows_total, stats.read_errors);
+    let reasons = watcher.health_detail();
+    if !reasons.is_empty() {
+        detail.push_str("; ");
+        detail.push_str(&reasons);
+    }
+    crate::component(&format!("watcher:{mount}"), health, detail)
 }
 
 // Retain only facts: persistence rows are removed before insertion.
@@ -518,7 +524,11 @@ mod tests {
         for minute in watcher.drain_minutes(1000) {
             history.push(minute);
         }
-        let (hot, overflows) = history.facts(1);
+        let (hot, overflows) = history.facts(history.0.len());
+        assert!(history
+            .0
+            .iter()
+            .any(|minute| minute.truncated && minute.lossy));
         assert!(hot.is_none());
         assert_eq!(overflows, Some(0));
         let component = watcher_component("/fixture", &watcher, false, 1);

@@ -596,6 +596,7 @@ impl Watcher {
         paths
     }
     /// Explain caps and loss in the retained fifteen-minute history.
+    /// Reports at most eight causes, each with its latest affected UTC minute.
     /// Truncation diagnostics do not change legacy lossy flags or alert availability.
     pub fn health_detail(&self) -> String {
         let state = self.state.lock();
