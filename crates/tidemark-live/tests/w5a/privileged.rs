@@ -221,6 +221,13 @@ fn watcher_sixty_second_load_and_ten_minute_fd_stability() {
     };
     let prior_tasks = tasks();
     let watch = watcher(options(&fs.mountpoint));
+    println!("scale watcher mode={}", watch.mode());
+    if tidemark_sys::fanotify::probe(&fs.mountpoint)
+        .unwrap()
+        .mark_filesystem
+    {
+        assert_eq!(watch.mode(), tidemark_live::watch::WatchMode::FdFilesystem);
+    }
     let deadline = Instant::now() + Duration::from_secs(2);
     let tid = loop {
         let current = tasks();
@@ -418,7 +425,7 @@ fn watcher_mount_identity_matches_loop_xfs_mountinfo() {
 
 #[test]
 fn filesystem_mark_maps_namespace_bind_and_chroot() {
-    let fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
+    let mut fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
     if !tidemark_sys::fanotify::probe(&fs.mountpoint)
         .unwrap()
         .mark_filesystem
@@ -485,5 +492,5 @@ fn filesystem_mark_maps_namespace_bind_and_chroot() {
         .any(|r| r.key == deep.as_os_str().as_encoded_bytes()));
     drop(guard);
     watch.stop();
-    // LoopXfs Drop unmounts the filesystem after all watcher descriptors close.
+    fs.cleanup().unwrap();
 }

@@ -274,6 +274,17 @@ impl Watcher {
             mount_fd: None,
         })
     }
+    /// Build attributed test events with an explicitly selected reporting mode.
+    #[doc(hidden)]
+    pub fn from_injected_events_in_mode(
+        mount: RawPath,
+        events: impl IntoIterator<Item = (i64, [Vec<u8>; 3], i64, Option<String>, (u64, u64))>,
+        mode: WatchMode,
+    ) -> io::Result<Self> {
+        let mut watcher = Self::from_injected_events(mount, events)?;
+        watcher.mode = mode;
+        Ok(watcher)
+    }
     /// Check the host namespace, negotiate reporting, and spawn one worker.
     pub fn start(
         cfg: WatcherOptions,
@@ -780,6 +791,11 @@ struct Processor<'a> {
     handles: fidmode::HandlePaths,
 }
 impl Processor<'_> {
+    fn unmapped_path(&self, state: &Mutex<State>) -> RawPath {
+        let mut locked = state.lock();
+        locked.unmapped_events = locked.unmapped_events.saturating_add(1);
+        self.cfg.mount.clone()
+    }
     fn loss(&mut self, at: i64, state: &Mutex<State>) {
         self.handles.clear();
         self.paths.clear();
@@ -848,20 +864,20 @@ impl Processor<'_> {
                         } else {
                             None
                         };
-                        if let Some(mapped) = fdmode::mapped_path(
+                        if fdmode::mapped_path(
                             event_mount,
                             watched,
                             &p,
                             reopened.as_ref(),
                             &self.cfg.mount,
-                        ) {
-                            if event_mount != Some(watched) {
-                                p = mapped.clone();
+                        )
+                        .is_some()
+                        {
+                            if let Some(host) = reopened {
+                                p = host;
                             }
                         } else {
-                            p = self.cfg.mount.clone();
-                            let mut locked = state.lock();
-                            locked.unmapped_events = locked.unmapped_events.saturating_add(1);
+                            p = self.unmapped_path(state);
                         }
                     }
                     (pid, p, Some(s), created)
@@ -1062,12 +1078,13 @@ mod tests {
             paths: fidmode::PathSizes::new(10),
             handles: fidmode::HandlePaths::new(10),
         };
-        processor.process(
-            RawEvent::Fd {
-                mask: mask::CLOSE_WRITE,
-                pid: 0,
-                fd: std::fs::File::open(path).unwrap().into(),
-            },
+        let file = std::fs::File::open(path).unwrap();
+        let stat = fdmode::EventStat::from(rustix::fs::fstat(file.as_fd()).unwrap());
+        let fallback = processor.unmapped_path(&watcher.state);
+        processor.record(
+            (0, fallback, Some(stat), at),
+            mask::CLOSE_WRITE,
+            false,
             at,
             &watcher.state,
         );
