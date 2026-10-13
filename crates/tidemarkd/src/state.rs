@@ -1515,20 +1515,44 @@ mod presence_lock_tests {
                     )
                     .unwrap();
             });
-            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let entered = entered_rx.recv_timeout(Duration::from_secs(10));
             let (read_tx, read_rx) = crossbeam_channel::bounded(1);
             let reader_state = state.clone();
             let reader = std::thread::spawn(move || {
                 read_tx.send(reader_state.view_at(0).status(0)).unwrap();
             });
-            let read = read_rx.recv_timeout(Duration::from_millis(200));
-            if phase == 2 {
-                state.replace_config(config).unwrap();
-            }
-            release_tx.send(()).unwrap();
-            worker.join().unwrap();
-            reader.join().unwrap();
+            let read = read_rx.recv_timeout(Duration::from_secs(10));
+            let (reload, reload_worker) = if phase == 2 {
+                let reload_state = state.clone();
+                let (reload_tx, reload_rx) = crossbeam_channel::bounded(1);
+                let reload_worker = std::thread::spawn(move || {
+                    let _ = reload_tx.send(reload_state.replace_config(config));
+                });
+                let progress = reload_rx.recv_timeout(Duration::from_secs(10));
+                (Some(progress), Some(reload_worker))
+            } else {
+                (None, None)
+            };
+            // Even a regressed publisher holding the global lock can now finish:
+            // no assertion or synchronous reload can retain its release signal.
+            let release = release_tx.send(());
+            let published = worker.join();
+            let read_joined = reader.join();
+            let reload_joined = reload_worker.map(std::thread::JoinHandle::join);
+            assert!(
+                entered.is_ok(),
+                "publisher did not enter during phase {phase}"
+            );
+            assert!(release.is_ok());
+            assert!(published.is_ok() && read_joined.is_ok());
+            assert!(reload_joined.is_none_or(|result| result.is_ok()));
             assert!(read.is_ok(), "reader blocked during phase {phase}");
+            if phase == 2 {
+                assert!(
+                    matches!(reload, Some(Ok(Ok(())))),
+                    "reload blocked during phase 2"
+                );
+            }
             assert_eq!(state.0.read().presence.is_empty(), phase == 2);
         }
     }
