@@ -270,7 +270,17 @@ fn watcher_sixty_second_load_and_ten_minute_fd_stability() {
     .trim()
     .parse::<f64>()
     .unwrap();
-    let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+    // Event batches transiently own many descriptors. Compare idle minima.
+    let count = || {
+        let mut minimum = usize::MAX;
+        for sample in 0..10 {
+            if sample != 0 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            minimum = minimum.min(std::fs::read_dir("/proc/self/fd").unwrap().count());
+        }
+        minimum
+    };
     let before = count();
     let cpu_before = cpu_ticks();
     let started = Instant::now();
