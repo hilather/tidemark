@@ -11,13 +11,36 @@ pub fn write(
     show_config: bool,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
+    write_width(
+        report,
+        scans,
+        context,
+        show_config,
+        crate::render::table::terminal_width(),
+        out,
+    )
+}
+
+/// Render using an injected terminal width.
+pub fn write_width(
+    report: &StatusResult,
+    scans: &[ScanStatus],
+    context: &crate::Context,
+    show_config: bool,
+    width: usize,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
     if context.json {
         return crate::render::json("tidemark.status.v1", report, out);
     }
+    let destination = out;
+    let mut buffer = Vec::new();
+    let out = &mut buffer;
     writeln!(
         out,
         "tidemarkd {} · uptime {}s",
-        report.version, report.uptime_s
+        display(report.version.as_bytes()),
+        report.uptime_s
     )?;
     let mut rows: Vec<_> = report.components.iter().collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -29,7 +52,7 @@ pub fn write(
             display(r.detail.as_bytes()),
         ]);
     }
-    out.write_all(crate::render::table::aligned(&table).as_bytes())?;
+    out.write_all(crate::render::table::aligned_width(&table, width).as_bytes())?;
     let mut modes = report.watch_modes.clone();
     modes.sort();
     for (mount, mode) in modes {
@@ -47,7 +70,7 @@ pub fn write(
             out,
             "last error {} at {}: {}",
             display(name.as_bytes()),
-            ts,
+            crate::render::size::timestamp(ts),
             display(message.as_bytes())
         )?;
     }
@@ -57,11 +80,16 @@ pub fn write(
     for s in scans {
         writeln!(
             out,
-            "{}  {}  {:?}  {:?}",
+            "{}  {}  {}  {}",
             display(s.root.as_bytes()),
-            s.running.is_some(),
-            s.next_due,
-            s.last_complete.as_ref().map(|s| s.finished_at)
+            if s.running.is_some() { "yes" } else { "no" },
+            s.next_due
+                .map(crate::render::size::timestamp)
+                .unwrap_or_else(|| "-".into()),
+            s.last_complete
+                .as_ref()
+                .map(|s| crate::render::size::timestamp(s.finished_at))
+                .unwrap_or_else(|| "-".into())
         )?;
     }
     if show_config {
@@ -72,6 +100,8 @@ pub fn write(
         serde_json::to_writer_pretty(&mut *out, &context.config)?;
         writeln!(out)?;
     }
+    destination
+        .write_all(crate::render::table::wrap(&String::from_utf8(buffer)?, width).as_bytes())?;
     Ok(())
 }
 

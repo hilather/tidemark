@@ -7,6 +7,16 @@ use tidemark_core::{
 };
 /// Render active alerts in rule/subject order.
 pub fn active(rows: &[AlertSummary], json: bool, out: &mut impl Write) -> anyhow::Result<()> {
+    active_width(rows, json, crate::render::table::terminal_width(), out)
+}
+
+/// Render using an injected terminal width.
+pub fn active_width(
+    rows: &[AlertSummary],
+    json: bool,
+    width: usize,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
     let mut rows: Vec<_> = rows.iter().collect();
     rows.sort_by(|a, b| (&a.rule, &a.subject).cmp(&(&b.rule, &b.subject)));
     if json {
@@ -19,16 +29,26 @@ pub fn active(rows: &[AlertSummary], json: bool, out: &mut impl Write) -> anyhow
         table.push(vec![
             display(r.rule.as_bytes()),
             display(r.subject.as_bytes()),
-            r.since.to_string(),
+            crate::render::size::timestamp(r.since),
             r.value.map_or_else(|| "?".into(), |v| v.to_string()),
             display(r.message.as_bytes()),
         ]);
     }
-    out.write_all(crate::render::table::aligned(&table).as_bytes())?;
+    out.write_all(crate::render::table::aligned_width(&table, width).as_bytes())?;
     Ok(())
 }
 /// Render history, explicitly limited to the current daemon run.
 pub fn history(rows: &[AlertEvent], json: bool, out: &mut impl Write) -> anyhow::Result<()> {
+    history_width(rows, json, crate::render::table::terminal_width(), out)
+}
+
+/// Render using an injected terminal width.
+pub fn history_width(
+    rows: &[AlertEvent],
+    json: bool,
+    width: usize,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
     let mut rows: Vec<_> = rows.iter().collect();
     rows.sort_by(|a, b| {
         b.ts.cmp(&a.ts)
@@ -42,7 +62,7 @@ pub fn history(rows: &[AlertEvent], json: bool, out: &mut impl Write) -> anyhow:
         .to_vec()];
     for r in rows {
         table.push(vec![
-            r.ts.to_string(),
+            crate::render::size::timestamp(r.ts),
             display(r.rule.as_bytes()),
             display(r.subject.as_bytes()),
             format!("{:?}", r.state).to_lowercase(),
@@ -50,7 +70,7 @@ pub fn history(rows: &[AlertEvent], json: bool, out: &mut impl Write) -> anyhow:
             display(r.message.as_bytes()),
         ]);
     }
-    out.write_all(crate::render::table::aligned(&table).as_bytes())?;
+    out.write_all(crate::render::table::aligned_width(&table, width).as_bytes())?;
     writeln!(out, "History covers the current daemon run only.")?;
     Ok(())
 }

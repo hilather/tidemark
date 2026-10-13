@@ -38,5 +38,11 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     };
     let mut client = super::now::connect(context)?;
     let rows: Vec<tidemark_core::live::HotEntry> = super::now::call(&mut client, "hot", &params)?;
-    crate::render::hot::write(&rows, context.json, &mut std::io::stdout().lock())
+    crate::render::hot::write_grouped(
+        &rows,
+        context.json,
+        crate::render::table::terminal_width(),
+        matches!(params.by, HotBy::Unit),
+        &mut std::io::stdout().lock(),
+    )
 }

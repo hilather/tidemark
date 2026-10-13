@@ -49,11 +49,24 @@ fn display(s: &str) -> String {
 }
 /// Render a report to the supplied writer.
 pub(crate) fn write(report: &Report, json: bool, output: &mut impl Write) -> anyhow::Result<()> {
+    write_width(report, json, super::table::terminal_width(), output)
+}
+/// Render the direct report using an injected width.
+pub(crate) fn write_width(
+    report: &Report,
+    json: bool,
+    width: usize,
+    output: &mut impl Write,
+) -> anyhow::Result<()> {
     if json {
         return super::json("tidemark.lvm.v1", report, output);
     }
+    let destination = output;
+    let mut buffer = Vec::new();
+    let output = &mut buffer;
     if report.status == "n/a" {
         writeln!(output, "LVM: n/a")?;
+        destination.write_all(super::table::wrap(&String::from_utf8(buffer)?, width).as_bytes())?;
         return Ok(());
     }
     for row in &report.tracked {
@@ -106,6 +119,8 @@ pub(crate) fn write(report: &Report, json: bool, output: &mut impl Write) -> any
             display(&lv.segtype)
         )?;
     }
+    destination
+        .write_all(crate::render::table::wrap(&String::from_utf8(buffer)?, width).as_bytes())?;
     Ok(())
 }
 fn pct(v: Option<f64>) -> String {
@@ -113,4 +128,49 @@ fn pct(v: Option<f64>) -> String {
 }
 fn rate(v: Option<f64>) -> String {
     v.map_or_else(|| "n/a".into(), |v| format!("{v:+.2}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn direct_report_fits_width_without_changing_json() {
+        let report = super::Report {
+            status: "ok".into(),
+            sampled_at: 0,
+            tracked: vec![super::TrackedLv {
+                mount: serde_json::json!({"path":"/data"}),
+                mount_display: format!("/begin/{}/last", "x".repeat(200)),
+                current: tidemark_core::live::LvmNow {
+                    vg: "v".repeat(200),
+                    lv: "lv".into(),
+                    lv_size: 1,
+                    vg_free: 2,
+                    thin_pool: None,
+                    data_pct: None,
+                    meta_pct: None,
+                    sampled_at: 0,
+                },
+                segtype: "linear".into(),
+                trend: None,
+            }],
+            vgs: vec![],
+            other_lvs: vec![],
+        };
+        for width in [80, 100, 200] {
+            let mut out = Vec::new();
+            super::write_width(&report, false, width, &mut out).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.lines().all(|line| line.chars().count() <= width));
+            assert!(text.contains("/begin/") && text.contains("/last") && text.contains("..."));
+            let mut out = Vec::new();
+            super::write_width(&report, true, width, &mut out).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(value["schema"], "tidemark.lvm.v1");
+            assert_eq!(
+                value["data"]["tracked"][0]["current"]["vg"],
+                "v".repeat(200)
+            );
+            assert!(value["data"].get("mounts").is_none());
+        }
+    }
 }

@@ -22,7 +22,9 @@ fn config(dir: &tempfile::TempDir) -> std::path::PathBuf {
     p
 }
 fn cli(path: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_tidemark"))
+    Command::new("timeout")
+        .arg("20s")
+        .arg(env!("CARGO_BIN_EXE_tidemark"))
         .arg("-c")
         .arg(path)
         .args(args)
@@ -58,8 +60,21 @@ fn fake(
 ) -> std::thread::JoinHandle<()> {
     let socket = p.parent().unwrap().join("api.sock");
     let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
     std::thread::spawn(move || {
-        let (s, _) = listener.accept().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let s = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(error) => panic!("fake daemon accept deadline: {error}"),
+            }
+        };
         s.set_read_timeout(Some(std::time::Duration::from_secs(3)))
             .unwrap();
         let mut s = BufReader::new(s);
@@ -178,6 +193,9 @@ fn live_tables_and_shared_byte_path_machine_output() {
     for (args, replies, expected) in cases {
         let dir = tempfile::tempdir().unwrap();
         let p = config(&dir);
+        if args.first() == Some(&"scan") && !args.contains(&"--cancel") {
+            catalog_entry(&dir, false, "complete");
+        }
         let server = fake(&p, replies);
         let out = cli(&p, &args);
         server.join().unwrap();
@@ -320,4 +338,365 @@ fn explicit_direct_never_connects_to_listening_daemon() {
             "{command} contacted daemon"
         );
     }
+}
+
+fn catalog_entry(dir: &tempfile::TempDir, degraded: bool, status: &str) {
+    let entry = tidemark_store::catalog::ScanEntry {
+        scan_id: "fixture".into(),
+        root: tidemark_core::path::RawPath::new(b"/".to_vec()).unwrap(),
+        mode: tidemark_core::scan::ScanMode::Walk,
+        started_at: 0,
+        finished_at: Some(1),
+        status: status.into(),
+        degraded,
+        file: None,
+        t_disk: None,
+        t_inodes: None,
+        t_dirs: None,
+        errors: None,
+        duration_ms: None,
+    };
+    let catalog = tidemark_store::catalog::Catalog::open(&dir.path().join("state"), true).unwrap();
+    catalog.record_start(&entry).unwrap();
+    catalog.record_finish(&entry).unwrap();
+}
+#[test]
+fn scan_resolves_only_its_catalog_outcome() {
+    if !socket_available() {
+        return;
+    }
+    for (degraded, status, expected) in [
+        (false, "complete", 0),
+        (true, "complete", 3),
+        (false, "partial", 3),
+        (false, "missing", 3),
+    ] {
+        for slot in ["completed", "later_running", "later_complete", "absent"] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = config(&dir);
+            if status != "missing" {
+                catalog_entry(&dir, degraded, status);
+            }
+            let running = if slot == "later_running" {
+                serde_json::json!({"scan_id":"later","root":"/","mode":"walk","phase":"walk","dirs":0,"entries":0,"started_at":0,"rate":0.0})
+            } else {
+                serde_json::Value::Null
+            };
+            let latest = if slot == "later_complete" {
+                "later"
+            } else {
+                "fixture"
+            };
+            let statuses = if slot == "absent" {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([{"root":"/","running":running,"last_complete":{"scan_id":latest,"finished_at":1,"mode":"walk","duration_ms":0},"next_due":null}])
+            };
+            let server = fake(
+                &p,
+                vec![
+                    ("scan.start", serde_json::json!({"scan_id":"fixture"})),
+                    ("scan.status", statuses),
+                ],
+            );
+            let out = cli(
+                &p,
+                if degraded && status == "complete" {
+                    &["--json", "scan", "/"]
+                } else {
+                    &["scan", "/"]
+                },
+            );
+            server.join().unwrap();
+            if status == "complete" {
+                if degraded {
+                    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                    assert_eq!(doc["data"]["last_complete"]["scan_id"], "fixture");
+                } else {
+                    assert!(String::from_utf8_lossy(&out.stdout).contains("scan fixture completed"));
+                }
+            }
+            assert_eq!(
+                out.status.code(),
+                Some(expected),
+                "{slot} {status}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}
+#[test]
+fn scan_invalid_endpoint_never_writes_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = config(&dir);
+    std::fs::write(dir.path().join("api.sock"), b"not a socket").unwrap();
+    let config = std::fs::read_to_string(&p)
+        .unwrap()
+        .replace("api.sock'", "api.sock/child'");
+    std::fs::write(&p, config).unwrap();
+    let out = cli(&p, &["scan", "/"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(!dir.path().join("state").exists());
+}
+#[test]
+fn cells_and_prose_fit_injected_widths_without_splitting_escapes() {
+    let path = format!("/begin/{}/last", "a".repeat(200));
+    let escaped = tidemark_core::path::display_lossy_bytes(b"/bad\xff\n/last");
+    for width in [80, 100, 200] {
+        let table = tidemark_cli::render::table::aligned_width(
+            &[
+                vec!["PATH".into(), "VALUE".into()],
+                vec![path.clone(), escaped.clone()],
+            ],
+            width,
+        );
+        assert!(table.lines().all(|line| line.chars().count() <= width));
+        assert!(table.contains("/begin/") && table.contains("/last") && table.contains("..."));
+        let text = tidemark_cli::render::table::wrap(
+            &format!("{path} {escaped} full in ~2h (1h trend)"),
+            width,
+        );
+        assert!(text.lines().all(|line| line.chars().count() <= width));
+        assert!(text.contains(&escaped));
+        assert!(!text.contains("tre\nnd"));
+    }
+}
+
+#[test]
+fn scan_full_backlog_expires_without_direct_state_writes() {
+    if !socket_available() {
+        return;
+    }
+    use rustix::net::{
+        connect, socket_with, AddressFamily, SocketAddrUnix, SocketFlags, SocketType,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let p = config(&dir);
+    let socket = dir.path().join("api.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    let address = SocketAddrUnix::new(&socket).unwrap();
+    let mut pending = Vec::new();
+    let mut full = false;
+    for _ in 0..256 {
+        let fd = socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+        match connect(&fd, &address) {
+            Ok(()) => pending.push(fd),
+            Err(rustix::io::Errno::AGAIN) => {
+                full = true;
+                break;
+            }
+            Err(error) => panic!("backlog fill failed: {error}"),
+        }
+    }
+    assert!(full, "did not fill bounded listener backlog");
+    let out = cli(&p, &["scan", "/"]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
+    assert!(!dir.path().join("state").exists());
+}
+
+fn example_now() -> tidemark_core::live::NowReport {
+    serde_json::from_value(serde_json::json!({
+        "generated_at":1791845576,"host":"fixture","alerts_firing":[],"scans":[{"root":"/data","running":null,"next_due":null,"last_complete":{"scan_id":"a","finished_at":1791845576,"mode":"walk","duration_ms":5}}],"degraded":[],
+        "mounts":[{"mount":"/data","size":1000000000,"used":50000000,"avail":950000000,"rate_15m":2362647.27,"rate_1h":500.0,"ttf_secs":189,"lvm":null,"hot_dirs_5m":[{"path":"/data/hot","events":3,"files":2,"bytes_delta":50000000,"top_unit":"writer.service","lossy":false},{"path_b64":"L2JhZP8=","events":1,"files":1,"bytes_delta":1,"top_unit":null,"lossy":false}],"writers_5m":[{"path":"other.service","events":3,"files":2,"bytes_delta":100,"top_unit":"other.service","lossy":false}],"phantom":{"mount":"/data","total_bytes":0,"files":0,"holders":[],"limited":false},"open_writers_top":[],"watch_mode":"fd/mount","lossy_minutes_15m":0}]
+    })).unwrap()
+}
+#[test]
+fn now_uses_report_rates_hot_directories_units_and_utc() {
+    let report = example_now();
+    for width in [80, 100, 200] {
+        let text = tidemark_cli::render::now::render_text(&report, width);
+        assert!(text.lines().all(|line| line.chars().count() <= width));
+        assert!(text.contains("2026-10-12 22:52:56Z"));
+        assert!(text.contains("writers (5m) other.service +100 B"));
+        assert_eq!(text.matches("other.service").count(), 1);
+        assert!(text.contains("7.92 GiB/h (15m)"), "{text}");
+        assert!(text.contains("full in ~3m 9s (1h trend)"), "{text}");
+        assert!(text.contains("hot dirs (5m) /data/hot") && text.contains("writer.service"));
+        assert!(
+            text.contains("/bad\\xFF") && text.contains("1 files  ?"),
+            "{text}"
+        );
+    }
+    let mut out = Vec::new();
+    tidemark_cli::render::json("tidemark.now.v1", &report, &mut out).unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(doc["data"]["mounts"][0]["rate_15m"], 2362647.27);
+    assert_eq!(doc["data"]["mounts"][0]["ttf_secs"], 189);
+    assert_eq!(doc["data"]["generated_at"], 1791845576);
+}
+#[test]
+fn status_schedules_are_human_readable_and_fit_widths() {
+    let context = tidemark_cli::Context {
+        config: tidemark_core::config::Config::default(),
+        config_path: "/fixture".into(),
+        json: false,
+        color: false,
+    };
+    let report: tidemark_core::api::StatusResult = serde_json::from_value(serde_json::json!({"version":"fixture","uptime_s":1,"components":[{"name":"api","state":"ok","detail":"a".repeat(200)}],"watch_modes":[],"last_errors":[["api",1791845576,"bad\nmessage"]]})).unwrap();
+    let scans = vec![tidemark_core::live::ScanStatus {
+        root: "/data".into(),
+        running: None,
+        next_due: Some(1791845576),
+        last_complete: None,
+    }];
+    for width in [80, 100, 200] {
+        let mut out = Vec::new();
+        tidemark_cli::render::status::write_width(
+            &report, &scans, &context, false, width, &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.lines().all(|line| line.chars().count() <= width));
+        assert!(
+            text.contains("/data  no  2026-10-12 22:52:56Z  -"),
+            "{text}"
+        );
+        assert!(text.contains("bad\\x0Amessage"), "{text}");
+        assert!(!text.contains("Some(") && !text.contains("None"));
+    }
+    assert_eq!(
+        tidemark_cli::render::size::timestamp(0),
+        "1970-01-01 00:00:00Z"
+    );
+    assert_eq!(
+        tidemark_cli::render::size::timestamp(-1),
+        "1969-12-31 23:59:59Z"
+    );
+}
+#[test]
+fn hot_units_are_visible_without_repeating_unit_group_keys() {
+    let mut rows = example_now().mounts.remove(0).hot_dirs_5m;
+    rows[0].key = b"writer.service".to_vec();
+    for width in [80, 100, 200] {
+        let mut out = Vec::new();
+        tidemark_cli::render::hot::write_grouped(&rows, false, width, true, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("writer.service").count(), 1);
+        assert!(!text.contains("TOP UNIT"));
+        let mut out = Vec::new();
+        tidemark_cli::render::hot::write_width(&rows, false, width, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out)
+                .unwrap()
+                .matches("writer.service")
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn every_live_renderer_fits_long_byte_paths_and_controls() {
+    let mut key = format!("/begin/{}/last", "a".repeat(200)).into_bytes();
+    key.extend_from_slice("世界é".as_bytes());
+    key.extend_from_slice(b"\xff\n");
+    let row = tidemark_core::live::HotEntry {
+        key: key.clone(),
+        events: 1,
+        files: 1,
+        bytes_delta: 1,
+        top_unit: Some("unit\nname".into()),
+        lossy: false,
+    };
+    let phantom: tidemark_core::live::PhantomSummary = serde_json::from_value(serde_json::json!({"mount":"/data","total_bytes":1,"files":1,"limited":false,"holders":[{"pid":1,"comm":"writer","unit":null,"path":"/placeholder","dev":1,"ino":1,"bytes":1}]})).unwrap();
+    let mut phantom = phantom;
+    phantom.holders[0].path = key.clone();
+    let mut writer: tidemark_core::live::OpenWriter = serde_json::from_value(serde_json::json!({"mount":"/data","pid":1,"comm":"writer","unit":null,"path":"/placeholder","dev":1,"ino":1,"size":1,"disk":1,"growth":1,"window_secs":1})).unwrap();
+    writer.path = key.clone();
+    let alerts = vec![tidemark_core::live::AlertSummary {
+        rule: "rule".into(),
+        subject: tidemark_core::path::display_lossy_bytes(&key),
+        since: 0,
+        value: Some(1.0),
+        message: "m".repeat(200),
+    }];
+    let lvm: tidemark_core::api::LvmResult = serde_json::from_value(serde_json::json!({"mounts":[["/data",{"vg":"v".repeat(200),"lv":"lv","lv_size":1,"vg_free":1,"thin_pool":null,"data_pct":null,"meta_pct":null,"sampled_at":0}]],"vgs":[],"sampled_at":0})).unwrap();
+    for width in [40, 80, 100, 200] {
+        let mut outputs = Vec::new();
+        let mut out = Vec::new();
+        tidemark_cli::render::hot::write_width(std::slice::from_ref(&row), false, width, &mut out)
+            .unwrap();
+        outputs.push(out);
+        let mut out = Vec::new();
+        tidemark_cli::render::alerts::active_width(&alerts, false, width, &mut out).unwrap();
+        outputs.push(out);
+        let mut out = Vec::new();
+        tidemark_cli::render::now::phantom_width(
+            std::slice::from_ref(&phantom),
+            false,
+            width,
+            &mut out,
+        )
+        .unwrap();
+        outputs.push(out);
+        let mut out = Vec::new();
+        tidemark_cli::render::now::writers_width(
+            std::slice::from_ref(&writer),
+            false,
+            width,
+            &mut out,
+        )
+        .unwrap();
+        outputs.push(out);
+        let mut out = Vec::new();
+        tidemark_cli::render::now::lvm_width(&lvm, &[], false, width, &mut out).unwrap();
+        outputs.push(out);
+        let mut report = example_now();
+        report.mounts[0].hot_dirs_5m = vec![row.clone()];
+        outputs.push(tidemark_cli::render::now::render_text(&report, width).into_bytes());
+        for out in outputs {
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.lines()
+                    .all(|line| tidemark_cli::render::table::display_width(line) <= width),
+                "{text}"
+            );
+            assert!(text.contains("..."));
+        }
+        let mut out = Vec::new();
+        tidemark_cli::render::hot::write_width(std::slice::from_ref(&row), true, width, &mut out)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let decoded: Vec<tidemark_core::live::HotEntry> =
+            serde_json::from_value(value["data"].clone()).unwrap();
+        assert_eq!(decoded[0].key, key);
+    }
+}
+
+#[test]
+fn scan_permission_error_never_falls_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let p = config(&dir);
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let text = std::fs::read_to_string(&p)
+        .unwrap()
+        .replace("api.sock'", "locked/api.sock'");
+    std::fs::write(&p, text).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let denied = std::fs::symlink_metadata(locked.join("api.sock"))
+        .err()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+    if !denied {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!("permission coverage unavailable: process can traverse mode-000 directory");
+        return;
+    }
+    let out = cli(&p, &["scan", "/"]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(!dir.path().join("state").exists());
 }

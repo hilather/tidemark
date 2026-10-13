@@ -71,22 +71,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     if context.json {
         return crate::render::json("tidemark.writers.v1", rows, &mut out);
     }
-    for r in rows {
-        writeln!(
-            out,
-            "{} {} {} {} {} +{} bytes ({} bytes allocated)",
-            r.mount,
-            r.pid,
-            tidemark_core::path::display_lossy_bytes(r.comm.as_bytes()),
-            tidemark_core::path::display_lossy_bytes(r.unit.as_deref().unwrap_or("?").as_bytes()),
-            tidemark_core::path::display_lossy_bytes(&r.path),
-            r.growth,
-            r.disk
-        )?;
-    }
-    writeln!(
-        out,
-        "Root provides full /proc coverage; other users see the readable subset."
+    crate::render::now::writers(&rows, false, &mut out)?;
+    out.write_all(
+        crate::render::table::wrap(
+            "Root provides full /proc coverage; other users see the readable subset.\n",
+            crate::render::table::terminal_width(),
+        )
+        .as_bytes(),
     )?;
     Ok(())
 }

@@ -30,10 +30,7 @@ pub struct Args {
 /// Execute the command using direct state and snapshot APIs.
 pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     // W6-A3: daemon-first forwarding; direct implementation below is retained.
-    if let Ok(mut client) = crate::client::Client::connect(
-        &context.config.general.socket,
-        std::time::Duration::from_secs(11),
-    ) {
+    if let Some(mut client) = daemon_connection(context)? {
         use tidemark_core::api::*;
         if args.threads.is_some() || !args.exclude.is_empty() || args.keep_partial {
             return Err(crate::CliError::Configuration("daemon scans use configured threads/excludes and discard partial scans; stop the daemon to use direct overrides".into()).into());
@@ -73,16 +70,6 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             },
         )?;
         loop {
-            if interrupt.flag.load(std::sync::atomic::Ordering::Acquire) {
-                let _: ScanCancelResult = super::now::call(
-                    &mut client,
-                    "scan.cancel",
-                    &ScanCancelParams { root: root.clone() },
-                )?;
-                return Err(
-                    crate::CliError::Partial("daemon scan cancellation requested".into()).into(),
-                );
-            }
             let statuses: ScanStatusResult = super::now::call(
                 &mut client,
                 "scan.status",
@@ -90,24 +77,61 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     root: Some(root.clone()),
                 },
             )?;
-            if let Some(status) = statuses.first() {
-                if status.running.is_none() {
-                    if status
-                        .last_complete
-                        .as_ref()
-                        .is_some_and(|s| s.scan_id == started.scan_id)
-                    {
-                        return crate::render::status::scan_complete(
-                            status,
-                            context.json,
-                            &mut std::io::stdout().lock(),
-                        );
-                    }
+            let status = statuses
+                .iter()
+                .find(|s| s.root.as_bytes() == root.as_bytes() || s.root == root.display_lossy());
+            let completed = status.is_some_and(|s| {
+                s.last_complete
+                    .as_ref()
+                    .is_some_and(|last| last.scan_id == started.scan_id)
+            });
+            let ours_running = status.is_some_and(|s| {
+                s.running
+                    .as_ref()
+                    .is_some_and(|running| running.scan_id == started.scan_id)
+            });
+            if completed || !ours_running {
+                let entry = completed_outcome(context, &root, &started.scan_id)?;
+                let degraded = entry.degraded;
+                if let Some(status) = status.filter(|_| completed) {
+                    crate::render::status::scan_complete(
+                        status,
+                        context.json,
+                        &mut std::io::stdout().lock(),
+                    )?;
+                } else {
+                    let status = tidemark_core::live::ScanStatus {
+                        root: root.display_lossy(),
+                        running: None,
+                        next_due: None,
+                        last_complete: Some(tidemark_core::live::LastScan {
+                            scan_id: entry.scan_id,
+                            finished_at: entry.finished_at.unwrap_or(entry.started_at),
+                            mode: match entry.mode {
+                                tidemark_core::scan::ScanMode::Walk => "walk",
+                                tidemark_core::scan::ScanMode::Bulk => "bulk",
+                            }
+                            .into(),
+                            duration_ms: entry.duration_ms.unwrap_or(0),
+                        }),
+                    };
+                    crate::render::status::scan_complete(
+                        &status,
+                        context.json,
+                        &mut std::io::stdout().lock(),
+                    )?;
+                }
+                if degraded {
                     return Err(crate::CliError::Partial(
-                        "daemon scan failed or was cancelled".into(),
+                        "scan completed with errors or partial results".into(),
                     )
                     .into());
                 }
+                return Ok(());
+            }
+            if interrupt.flag.load(std::sync::atomic::Ordering::Acquire) {
+                // The frozen root-only cancellation API cannot atomically target our id.
+                return Err(crate::CliError::Partial("interrupted; daemon scan continues (root-only cancellation cannot safely target this scan id)".into()).into());
             }
             std::thread::park_timeout(std::time::Duration::from_millis(100));
         }
@@ -129,25 +153,14 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         )
         .into());
     }
-    if std::os::unix::net::UnixStream::connect(&context.config.general.socket).is_ok() {
-        return Err(crate::CliError::Precondition(
-            "direct scan requires the daemon to be stopped; daemon forwarding belongs to W6-A"
-                .into(),
-        )
-        .into());
-    }
+    require_absent_daemon(context)?;
     {
         // Recover only in direct mode, under the scan lock, before any recorder
         // or catalog connections are retained.
         let _lock =
             tidemark_scan::orchestrator::ScanLock::acquire(&context.config.general.state_dir)
                 .map_err(scan_error)?;
-        if std::os::unix::net::UnixStream::connect(&context.config.general.socket).is_ok() {
-            return Err(crate::CliError::Precondition(
-                "direct scan requires the daemon to be stopped".into(),
-            )
-            .into());
-        }
+        require_absent_daemon(context)?;
         drop(
             tidemark_scan::orchestrator::open_catalog(&context.config.general.state_dir, true)
                 .map_err(scan_error)?,
@@ -259,5 +272,60 @@ impl tidemark_scan::orchestrator::ScanRecorder for DirectRecorder {
         rows: &[tidemark_core::snapshot::DirRow],
     ) -> Result<(), tidemark_scan::orchestrator::ScanError> {
         tidemark_scan::orchestrator::record_dir_series(&self.state, root, id, ts, rows)
+    }
+}
+
+fn daemon_connection(context: &crate::Context) -> anyhow::Result<Option<crate::client::Client>> {
+    match crate::client::Client::connect(
+        &context.config.general.socket,
+        std::time::Duration::from_secs(11),
+    ) {
+        Ok(client) => Ok(Some(client)),
+        Err(crate::client::ClientError::Unavailable) => Ok(None),
+        Err(error) => {
+            let hint = if matches!(&error, crate::client::ClientError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+            {
+                format!("\n{}", crate::ACCESS_HINT)
+            } else {
+                String::new()
+            };
+            Err(crate::CliError::Unavailable(format!("daemon unavailable: {error}{hint}")).into())
+        }
+    }
+}
+fn require_absent_daemon(context: &crate::Context) -> anyhow::Result<()> {
+    if daemon_connection(context)?.is_some() {
+        return Err(crate::CliError::Precondition(
+            "direct scan requires the daemon to be stopped".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+fn completed_outcome(
+    context: &crate::Context,
+    root: &tidemark_core::path::RawPath,
+    id: &str,
+) -> anyhow::Result<tidemark_store::catalog::ScanEntry> {
+    let outcome = tidemark_store::catalog::Catalog::open(&context.config.general.state_dir, false)
+        .and_then(|catalog| catalog.get(id));
+    match outcome {
+        Ok(Some(entry))
+            if entry.root == *root && entry.finished_at.is_some() && entry.status == "complete" =>
+        {
+            Ok(entry)
+        }
+        Ok(Some(entry))
+            if entry.root == *root && entry.finished_at.is_some() && entry.status == "partial" =>
+        {
+            Err(
+                crate::CliError::Partial("scan completed with errors or partial results".into())
+                    .into(),
+            )
+        }
+        _ => Err(crate::CliError::Partial(format!(
+            "outcome unavailable for daemon scan {id}; no clean completed catalog entry"
+        ))
+        .into()),
     }
 }
