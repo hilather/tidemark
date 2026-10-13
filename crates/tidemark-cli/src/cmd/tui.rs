@@ -12,7 +12,7 @@ pub struct Args {
     pub snapshot: Option<String>,
 }
 
-/// Execute this command (implemented by its later owner).
-pub fn run(_args: &Args, _context: &crate::Context) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!("not implemented yet (W7-A)"))
+/// Execute the read-only interactive snapshot browser.
+pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
+    crate::tui::run(args, context)
 }
