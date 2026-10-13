@@ -77,7 +77,7 @@ CI explicitly skipped cargo-deny because it is not installed; dependency advisor
 - `tests.log`: 896 passed, 0 failed, 14 ignored across 84 harness summaries (including nested helpers).
 - `ci.log`: 896 passed, 0 failed, 14 ignored across 84 harness summaries (including nested helpers).
 
-The only source change after the full standalone workspace test began was rustdoc for the shared LVM helpers; final Clippy and CI covered that final source. No semantic source edits followed the passing tests. `git diff --check` passed. Cleanup, commit and submission evidence is recorded in the external report/artifacts after those operations.
+Final Clippy and CI covered the final source, including the source-scan helper I/O correction, tightened negative assertions and shared LVM helper rustdoc. No source edits followed the passing CI run. `git diff --check` passed. Cleanup, commit and submission evidence is recorded in the external report/artifacts after those operations.
 
 ## Definition of Done evidence
 
