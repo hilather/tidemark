@@ -713,6 +713,9 @@ impl ScanLock {
             "timeseries.db-shm",
             "timeseries.db-journal",
             "timeseries.db.bak-v0",
+            "timeseries.db.bak-v0-wal",
+            "timeseries.db.bak-v0-shm",
+            "timeseries.db.bak-v0-journal",
         ] {
             directory.check_leaf(std::ffi::OsStr::new(name))?;
         }

@@ -157,9 +157,11 @@ impl StateDir {
             if found {
                 match component {
                     Component::Normal(n) => {
-                        if relative.len() >= 4096 { return Err(error(path, "snapshot directory depth exceeds 4096")); }
+                        if relative.len() >= 4096 {
+                            return Err(error(path, "snapshot directory depth exceeds 4096"));
+                        }
                         relative.push(n);
-                    },
+                    }
                     _ => return Err(error(path, "unsafe snapshot component")),
                 }
             } else if component.as_os_str() == "snapshots" {

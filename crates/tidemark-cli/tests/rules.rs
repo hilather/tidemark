@@ -42,7 +42,13 @@ fn metadata_command(temp: &Path) -> Command {
     fs::remove_file(&probe).unwrap();
     let c = command(temp);
     if rustix::process::geteuid().is_root() && bypass {
-        fs::set_permissions(temp, fs::Permissions::from_mode(0o1777)).unwrap();
+        rustix::fs::chown(
+            temp,
+            Some(rustix::process::Uid::from_raw(65534)),
+            Some(rustix::process::Gid::from_raw(65534)),
+        )
+        .unwrap();
+        fs::set_permissions(temp, fs::Permissions::from_mode(0o700)).unwrap();
         let binary = copied_binary(temp);
         let mut dropped = Command::new(binary);
         dropped.args(c.get_args()).gid(65534).uid(65534);

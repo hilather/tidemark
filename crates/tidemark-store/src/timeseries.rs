@@ -37,7 +37,15 @@ pub(crate) fn open_connection(path: &Path, rw: bool) -> Result<Connection, Store
     let directory = crate::state_dir::StateDir::open(&parent, rw)?;
     let check = || -> Result<(), StoreError> {
         directory.check_leaf(name)?;
-        for suffix in ["-wal", "-shm", "-journal", ".bak-v0"] {
+        for suffix in [
+            "-wal",
+            "-shm",
+            "-journal",
+            ".bak-v0",
+            ".bak-v0-wal",
+            ".bak-v0-shm",
+            ".bak-v0-journal",
+        ] {
             let mut companion = name.to_os_string();
             companion.push(suffix);
             directory.check_leaf(&companion)?;

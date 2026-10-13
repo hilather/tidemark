@@ -41,6 +41,9 @@ fn catalog_and_series_refuse_every_hostile_database_leaf() {
         "timeseries.db-shm",
         "timeseries.db-journal",
         "timeseries.db.bak-v0",
+        "timeseries.db.bak-v0-wal",
+        "timeseries.db.bak-v0-shm",
+        "timeseries.db.bak-v0-journal",
     ] {
         for kind in ["symlink", "hardlink", "fifo", "mode"] {
             let state = test_support::private_tempdir().unwrap();

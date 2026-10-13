@@ -377,6 +377,9 @@ pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError> {
         "timeseries.db-shm",
         "timeseries.db-journal",
         "timeseries.db.bak-v0",
+        "timeseries.db.bak-v0-wal",
+        "timeseries.db.bak-v0-shm",
+        "timeseries.db.bak-v0-journal",
     ] {
         verified.check_leaf(std::ffi::OsStr::new(name))?;
     }
@@ -391,6 +394,9 @@ fn recover_catalog_owned(state_dir: &Path) -> Result<Catalog, StoreError> {
         "timeseries.db-shm",
         "timeseries.db-journal",
         "timeseries.db.bak-v0",
+        "timeseries.db.bak-v0-wal",
+        "timeseries.db.bak-v0-shm",
+        "timeseries.db.bak-v0-journal",
     ] {
         verified.check_leaf(std::ffi::OsStr::new(name))?;
     }

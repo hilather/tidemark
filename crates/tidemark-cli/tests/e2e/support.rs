@@ -24,7 +24,6 @@ impl Harness {
     /// Prepare private storage and detect whether root needs to drop DAC privileges.
     pub(super) fn new() -> Self {
         let temp = ::test_support::private_tempdir().unwrap();
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
         let state = temp.path().join("state");
         let config = direct_config(
             temp.path(),
@@ -38,6 +37,14 @@ impl Harness {
         let drop_uid = rustix::process::geteuid().is_root() && std::fs::read_dir(&probe).is_ok();
         std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir(probe).unwrap();
+        if drop_uid {
+            rustix::fs::chown(
+                temp.path(),
+                Some(rustix::process::Uid::from_raw(65534)),
+                Some(rustix::process::Gid::from_raw(65534)),
+            )
+            .unwrap();
+        }
         Self {
             temp,
             state,

@@ -1764,3 +1764,54 @@ fn w7a2_link_pages_preserve_null_duplicates_and_byte_names() {
         .link_instances_page(u64::MAX, None, false, 1)
         .is_err());
 }
+
+#[test]
+fn writer_refuses_hostile_snapshot_leaves_and_directories_without_changes() {
+    use std::os::unix::fs::symlink;
+    for suffix in [".db", ".db.tmp"] {
+        for kind in ["symlink", "fifo", "hardlink", "mode"] {
+            let state = test_support::private_tempdir().unwrap();
+            let victim_dir = test_support::private_tempdir().unwrap();
+            let victim = victim_dir.path().join("victim");
+            test_support::private_write(&victim, b"sentinel").unwrap();
+            let m = meta();
+            let name = format!("{}{suffix}", m.scan_id);
+            let leaf = state.path().join(&name);
+            match kind {
+                "symlink" => symlink(&victim, &leaf).unwrap(),
+                "fifo" => rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    &leaf,
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                    0,
+                )
+                .unwrap(),
+                "hardlink" => std::fs::hard_link(&victim, &leaf).unwrap(),
+                "mode" => {
+                    test_support::private_write(&leaf, b"unsafe").unwrap();
+                    std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o620))
+                        .unwrap();
+                }
+                _ => panic!("unknown fixture"),
+            }
+            assert!(
+                SnapshotWriter::create(state.path(), &m).is_err(),
+                "{suffix} {kind}"
+            );
+            assert_eq!(std::fs::read(&victim).unwrap(), b"sentinel");
+            assert_eq!(
+                std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(std::fs::metadata(&victim).unwrap().len(), 8);
+            assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 1);
+        }
+    }
+    let state = test_support::private_tempdir().unwrap();
+    let outside = test_support::private_tempdir().unwrap();
+    symlink(outside.path(), state.path().join("snapshots")).unwrap();
+    assert!(SnapshotWriter::create(&state.path().join("snapshots/root"), &meta()).is_err());
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 1);
+}

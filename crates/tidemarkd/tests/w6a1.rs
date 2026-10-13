@@ -840,7 +840,7 @@ fn corrupt_catalog_is_preserved_before_recovery() {
     )
     .unwrap();
     let bad = b"deliberately invalid sqlite header";
-    std::fs::write(cfg.general.state_dir.join("timeseries.db"), bad).unwrap();
+    test_support::private_write(cfg.general.state_dir.join("timeseries.db"), bad).unwrap();
     let state = LiveState::new(&cfg, 1);
     let stop = Shutdown::default();
     let h = {

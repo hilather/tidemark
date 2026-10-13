@@ -537,7 +537,7 @@ pub fn run(workspace: &Path, args: impl Iterator<Item = OsString>) -> Result<()>
     if o.caches.iter().any(|c| c == "cold") {
         cold_preflight(o.force)?;
     }
-    fs::create_dir_all(&o.out)?;
+    private_state_dir(&o.out)?;
     o.out = fs::canonicalize(&o.out)?;
     if o.out.starts_with(&o.root) {
         bail!("--out must be outside measured root");
@@ -563,7 +563,7 @@ pub fn run(workspace: &Path, args: impl Iterator<Item = OsString>) -> Result<()>
     let run_dir = o
         .out
         .join(format!("{stem}-{seconds}-{}", std::process::id()));
-    fs::create_dir(&run_dir)?;
+    private_state_dir(&run_dir)?;
     let config = private_config(&run_dir)?;
     if o.watcher || o.modes.iter().any(|m| m != "du") {
         o.tidemark = Some(match &o.tidemark {
@@ -714,6 +714,14 @@ fn watcher_experiment(
     ])
 }
 
+fn private_state_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,12 +785,4 @@ mod tests {
                 .contains(&"close_write".into())
         );
     }
-}
-
-fn private_state_dir(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
 }
