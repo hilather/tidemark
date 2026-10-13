@@ -6,11 +6,11 @@ expression: first
 │20260101T000000Z-00000000 Walk age 99s degraded=false                                                                                                         │
 │/fixture                                                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌Main | Size (page) | filter  | Name Share SIZE RECLAIM SHARED FILES NEWEST Δ──────────────────────────────────────────────────────────────────────────────────┐
+┌Main | Size | filter  | Name Share SIZE RECLAIM SHARED FILES NEWEST Δ─────────────────────────────────────────────────────────────────────────────────────────┐
 │> 00000001/H                                                                                     #     4.00 KiB 2.00 KiB 2.00 KiB      1        100 -         │
 │  00000002/H                                                                                     #     4.00 KiB 2.00 KiB 2.00 KiB      1        100 -         │
 │  00000003/H                                                                                     #     4.00 KiB 2.00 KiB 2.00 KiB      1        100 -         │
-│  [own files]  charged 0 B files 1 (directory inode + LCA charges)                                                                                            │
+│  [own files]                                                                                              0 B       -       -      1          - -            │
 │                                                                                                                                                              │
 │                                                                                                                                                              │
 │                                                                                                                                                              │

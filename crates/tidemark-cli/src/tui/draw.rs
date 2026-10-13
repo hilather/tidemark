@@ -25,7 +25,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
     let meta = b.snapshot.meta();
     let header = format!(
         "{} {:?} age {}s degraded={}\n{}",
-        meta.scan_id,
+        super::escape(meta.scan_id.to_string().as_bytes()),
         meta.mode,
         b.now.saturating_sub(meta.finished_at).max(0),
         meta.degraded,
@@ -33,8 +33,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
     );
     frame.render_widget(Paragraph::new(header).block(Block::bordered()), chunks[0]);
     let title = format!(
-        "{:?} | {:?} (page) | filter {}",
-        b.state.pane, b.state.sort, b.state.filter
+        "{:?} | {:?} | filter {}",
+        b.state.pane,
+        b.state.sort,
+        super::escape(b.state.filter.as_bytes())
     );
     let items: Vec<ListItem<'_>> = match b.state.pane {
         Pane::Main => {
@@ -70,17 +72,21 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
             let own_share = (u128::from(b.dir.own_charged) * 5 / u128::from(b.dir.t_charged.max(1)))
                 .min(5) as usize;
             lines.push(ListItem::new(format!(
-                "[own files] {} charged {} files {} (directory inode + LCA charges)",
+                "{:<name_width$} {:5} {:>7} {:>7} {:>7} {:>6} {:>10} -",
+                "[own files]",
                 "#".repeat(own_share),
                 size::bytes(b.dir.own_charged),
-                b.dir.own_files
+                "-",
+                "-",
+                b.dir.own_files,
+                "-"
             )));
             lines
         }
         Pane::Picker => b
             .snapshots
             .iter()
-            .map(|(id, _, _)| ListItem::new(id.clone()))
+            .map(|(id, _, _)| ListItem::new(super::escape(id.as_bytes())))
             .collect(),
         _ => b
             .text
@@ -92,6 +98,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
                 ))
             })
             .collect(),
+    };
+    let title = if b.pages.live.is_some() {
+        format!("{title} | live (Δ snapshot)")
+    } else {
+        title
     };
     let title = if b.state.pane == Pane::Main {
         format!("{title} | Name Share SIZE RECLAIM SHARED FILES NEWEST Δ")
