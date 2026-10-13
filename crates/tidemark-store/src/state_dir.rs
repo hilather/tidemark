@@ -154,10 +154,20 @@ impl StateDir {
     /// Paths beneath `snapshots` validate every child of the enclosing state root.
     /// Standalone snapshot directories retain the same private-directory policy.
     pub fn snapshot_dir(path: &Path, create: bool) -> io::Result<Self> {
+        let boundary = path
+            .components()
+            .enumerate()
+            .fold(None, |last, (index, component)| {
+                if component.as_os_str() == "snapshots" {
+                    Some(index)
+                } else {
+                    last
+                }
+            });
         let mut base = PathBuf::new();
         let mut relative = Vec::new();
         let mut found = false;
-        for component in path.components() {
+        for (index, component) in path.components().enumerate() {
             if found {
                 match component {
                     Component::Normal(n) => {
@@ -168,7 +178,7 @@ impl StateDir {
                     }
                     _ => return Err(error(path, "unsafe snapshot component")),
                 }
-            } else if component.as_os_str() == "snapshots" {
+            } else if Some(index) == boundary {
                 found = true;
                 relative.push(component.as_os_str());
             } else {
@@ -305,6 +315,21 @@ mod tests {
         assert!(StateDir::open(&temp.path().join("alias"), true).is_err());
         assert!(StateDir::open(&temp.path().join("alias/nested"), true).is_err());
     }
+    #[test]
+    fn snapshot_ancestor_names_do_not_change_state_boundary() {
+        let temp = ::test_support::private_tempdir().unwrap();
+        let ancestor = temp.path().join("snapshots");
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = ancestor.join("state");
+        StateDir::open(&state, true).unwrap();
+        StateDir::snapshot_dir(&state.join("snapshots/root"), true).unwrap();
+        assert_eq!(
+            std::fs::metadata(&ancestor).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
     #[test]
     fn hostile_leaves_are_unchanged() {
         let temp = tempfile::Builder::new()
