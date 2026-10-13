@@ -3,7 +3,7 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
 /// Aggregate path/key payload ceiling for one watcher, independent of count caps.
-pub(super) const PATH_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const PATH_BYTES: usize = super::WATCH_MEMORY_BYTES;
 #[derive(Default)]
 struct Account {
     payload: usize,

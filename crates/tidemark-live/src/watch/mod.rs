@@ -272,6 +272,10 @@ pub struct Watcher {
 // Acknowledgements are FIFO and scoped to the current loss. Eviction is conservative.
 const LOSS_ACK_CAP: usize = 1024;
 const DIRTY_CAP: usize = 200_000;
+// Shared path/key capacity and conservative container ceiling; no configuration key.
+const WATCH_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+// A retained fallback root must fit the kernel pathname ceiling and emergency reserve.
+const WATCH_ROOT_BYTES: usize = 4096;
 // Sparse B-tree nodes and their allocation headers, beyond pathname capacity.
 const DIRTY_NODE_BYTES: usize = 128;
 // Weak handles only; old views may not hold unbounded retired pathname payloads.
@@ -391,8 +395,18 @@ impl Watcher {
         mount: RawPath,
         events: impl IntoIterator<Item = (i64, [Vec<u8>; 3], i64, Option<String>, (u64, u64))>,
     ) -> io::Result<Self> {
+        if mount.as_bytes().len() > WATCH_ROOT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "watch root exceeds 4096 bytes",
+            ));
+        }
+        // Drop backing-capacity slack left by the caller's path normalization.
+        let retained_mount = mount.clone();
+        drop(mount);
+        let mount = retained_mount;
         let mut rings = rings::Rings::new();
-        rings.configure(budget::Budget::new(), mount.as_bytes());
+        rings.configure(budget::Budget::new(), mount.as_bytes())?;
         let mut events = events.into_iter().peekable();
         rings.advance(events.peek().map_or_else(now, |event| event.0));
         let mut total = 0u64;
@@ -477,9 +491,13 @@ impl Watcher {
     }
     /// Check the host namespace, negotiate reporting, and spawn one worker.
     pub fn start(
-        cfg: WatcherOptions,
+        mut cfg: WatcherOptions,
         attribution: Arc<AttributionCache>,
     ) -> Result<Watcher, WatchError> {
+        cfg.mount = cfg.mount.clone();
+        for prefix in &mut cfg.exclude_prefixes {
+            *prefix = prefix.clone();
+        }
         if !namespace_ok()? {
             return Err(WatchError::Namespace);
         }
@@ -569,7 +587,7 @@ impl Watcher {
         state
             .lock()
             .rings
-            .configure(budget::Budget::new(), cfg.mount.as_bytes());
+            .configure(budget::Budget::new(), cfg.mount.as_bytes())?;
         state.lock().rings.advance(now());
         let filesystem_mount = if mode == WatchMode::FdFilesystem {
             Some(descriptor_mount_id(mount_fd.as_fd())?)
@@ -1393,6 +1411,17 @@ impl std::fmt::Display for WatchMode {
 mod tests {
     use super::*;
     #[test]
+    fn injected_fallback_root_must_fit_the_emergency_reserve() {
+        let path = raw(&format!("/{}", "x".repeat(WATCH_ROOT_BYTES)));
+        assert_eq!(
+            Watcher::from_injected_events(path, [])
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    #[test]
     fn injected_long_keys_cross_default_budget_with_exact_root_totals() {
         let events = (0..6000).map(|n| {
             let mut key = format!("/mount/{n}/").into_bytes();
@@ -1469,7 +1498,8 @@ mod tests {
             .state
             .lock()
             .rings
-            .configure(budget::Budget::with_limit(1024), b"/data");
+            .configure(budget::Budget::with_limit(1024), b"/data")
+            .unwrap();
         let parent = raw(&format!("/data/{}", "x".repeat(700)));
         {
             let mut state = watcher.state.lock();

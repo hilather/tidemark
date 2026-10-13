@@ -225,16 +225,19 @@ impl Rings {
     pub fn budget(&self) -> &Budget {
         &self.budget
     }
-    pub fn configure(&mut self, budget: Budget, root: &[u8]) {
-        self.buckets.clear();
-        self.budget.release(self.root.capacity());
-        self.budget = budget;
-        self.root = Vec::new();
-        if let Some(bytes) = copy(root) {
-            if self.budget.reserve_root(bytes.capacity()) {
-                self.root = bytes;
-            }
+    pub fn configure(&mut self, budget: Budget, root: &[u8]) -> std::io::Result<()> {
+        let bytes = copy(root).ok_or_else(|| std::io::Error::from(rustix::io::Errno::NOMEM))?;
+        if !budget.reserve_root(bytes.capacity()) {
+            return Err(rustix::io::Errno::NOMEM.into());
         }
+        self.buckets.clear();
+        let old = std::mem::take(&mut self.root);
+        let old_bytes = old.capacity();
+        drop(old);
+        self.budget.release(old_bytes);
+        self.budget = budget;
+        self.root = bytes;
+        Ok(())
     }
     pub fn clear_retained(&mut self) {
         self.buckets.clear();
@@ -902,7 +905,7 @@ mod tests {
     fn byte_budget_falls_back_to_root_and_releases_completed_maps() {
         let mut r = Rings::new();
         let budget = Budget::with_limit(64 * 1024);
-        r.configure(budget.clone(), b"/mount");
+        r.configure(budget.clone(), b"/mount").unwrap();
         for minute in 0..70 {
             for n in 0..8 {
                 let mut key = vec![b'x'; 1500];
