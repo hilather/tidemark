@@ -9,7 +9,7 @@ They never use systemd, the packaged daemon, its socket, or its state directory.
 | --- | --- | --- |
 | `01-state-full.sh` | Free-space guard refusal, `state_space` alert, admitted writer interrupted by ENOSPC, no temporary or incomplete publication | 1–5 min; scan deadlines 300 s |
 | `02-snapshot-crash.sh` | Twelve fixed kill delays after observing a writer, complete metadata on every published snapshot, startup removes temporaries, subsequent scan succeeds | 2–10 min; 300 s to observe each writer, 900 s recovery |
-| `03-fanotify-overflow.sh` | Four live 100,000-write no-loss bursts (including low fd limit); separate SIGSTOP pass with twice the kernel queue limit, lossy current-minute hot data, missing events, status and two-minute quiet recovery | 3–10 min; live writer 180 s, forced writer 180 s, loss evidence 60 s, quiet recovery 120 s |
+| `03-fanotify-overflow.sh` | Four live 100,000-close-write no-loss bursts over 20,000 reused files (including low fd limit); separate distinct-cap and SIGSTOP queue-overflow passes; resumed writes and optional history expiry | 3–10 min fast, up to 17 min extra slow; live writer 180 s, forced writer 180 s, loss evidence 60 s, transport recovery 120 s after SIGCONT |
 | `04-compaction-crash.sh` | SIGKILL during uncommitted compaction WAL spill, database integrity, restart produces independent last-value oracle, second hourly compaction leaves it identical | SKIP by default; slow mode about 4 h, each hourly phase bounded by 3800 s |
 | `05-directory-races.sh` | Background subtree deletion produces recorded races, complete valid snapshot, no panic | 1–5 min; scan 900 s |
 | `06-huge-directory.sh` | 50,000 entries by default or 1,000,000 with scale marker; direct scan PID peak RSS <= configured 1280 MiB; exact completed file count | 1–5 min normal, 5–20 min scale; fixture 600 s, scan 900 s |
@@ -116,6 +116,29 @@ unmount for up to 180 seconds, with bounded attempts and two-second pauses; on
 exhaustion it reports the mount, available holder diagnostics and daemon process
 state. Script 03 resumes the daemon on every trapped exit before shared cleanup.
 A queue limit above 100,000 fails explicitly because twice that limit exceeds
-the 200,000-write cap; no kernel limits are changed. The two-minute `ok` check
-may expose a product issue: current watcher service health considers the full
-15-minute lossy history (see `docs/handoff/GUEST-fix.md`).
+the 200,000-write cap; no kernel limits are changed. Readiness prints the negotiated `fd_mount`, `fd_filesystem`, `dfid_name_mount`
+or `dfid_name_filesystem` mode. The public `failed` mode is recognized and printed,
+but never accepted as a ready transport.
+
+Script 03 reuses the same 20,000 paths across the clean trials so even back-to-back
+bursts cannot exhaust the shared 200,000 scope/key/file identity table. Each clean
+pass requires exactly 100,000 events, zero additional queue overflows, zero lossy
+minutes and healthy status without truncation reasons. A fresh daemon isolates the
+100,000-distinct-file pass, begun near a minute boundary; it requires exact events,
+zero queue overflows, lossy history and the public component reason
+`truncated: distinct-file cap reached in the minute` with
+`(events complete, per-file counts capped)`. Crossing the minute boundary fails
+explicitly rather than claiming the cap was exercised. That reason is the public
+truncation evidence; JSON now exposes lossy counts, not a separate truncated field.
+
+A further restart isolates forced queue overflow from aggregation truncation.
+Within 120 seconds of SIGCONT, 100 new close-writes must add exactly 100 events
+without another overflow. Status may remain degraded only with the queue-overflow
+reason. Fast mode prints an explicit SKIP for the long recovery check. With
+`TIDEMARK_FAULT_SLOW=1`, status is polled until the affected minute leaves the
+fifteen-minute history (bounded by 17 minutes after SIGCONT); only then must the
+component be `ok`, with no further overflow. Run this phase in each disposable guest:
+
+```sh
+sudo env "PATH=$PATH" TIDEMARK_DEPLOY_TEST_VM=1 TIDEMARK_FAULT_KEEP=1 TIDEMARK_FAULT_SLOW=1 bash tests/fault/03-fanotify-overflow.sh
+```

@@ -64,7 +64,14 @@ elif mode == 'overflow':
     assert values and sum(values) > float(rest[0]), values
     print('\n'.join(line for line in p.read_text().splitlines() if line.startswith('tidemark_watch_overflows_total{')))
     print(f'overflow_total={sum(values)} baseline={rest[0]}')
-elif mode in ('watch-counters', 'burst', 'forced-overflow'):
+elif mode == 'watch-mode':
+    modes = dict(json.loads(p.read_text())['data']['watch_modes'])
+    found = modes.get(rest[0])
+    supported = ('fd_mount', 'fd_filesystem', 'dfid_name_mount', 'dfid_name_filesystem', 'failed')
+    assert found in supported, modes
+    print(f'watch_mode={found}', flush=True)
+    assert found != 'failed', modes
+elif mode in ('watch-counters', 'burst', 'distinct-cap', 'resumed', 'forced-overflow'):
     import re
     text = p.read_text()
     def counter(name):
@@ -83,9 +90,12 @@ elif mode in ('watch-counters', 'burst', 'forced-overflow'):
         overflow_delta = overflows - before['overflows']
         mounts = json.loads(pathlib.Path(rest[2]).read_text())['data']['mounts']
         mount = next(m for m in mounts if m['mount'] == rest[3])
-        if mode == 'burst':
-            assert overflow_delta == 0 and delta >= expected, (delta, overflow_delta, expected)
-            assert mount['lossy_minutes_15m'] == 0, mount
+        if mode in ('burst', 'distinct-cap', 'resumed'):
+            assert overflow_delta == 0 and delta == expected, (delta, overflow_delta, expected)
+            if mode == 'burst':
+                assert mount['lossy_minutes_15m'] == 0, mount
+            elif mode == 'distinct-cap':
+                assert mount['lossy_minutes_15m'] > 0, mount
         else:
             assert overflow_delta > 0 and 0 <= delta < expected, (delta, overflow_delta, expected)
             assert mount['lossy_minutes_15m'] > 0, mount
@@ -100,10 +110,21 @@ elif mode in ('watch-counters', 'burst', 'forced-overflow'):
                 # Empty success cannot establish current-minute loss.
                 assert rows and all(row['lossy'] for row in rows), hot
         print(f'events_delta={delta} writes={expected} overflow_delta={overflow_delta}')
-elif mode == 'watch-ok':
+elif mode in ('watch-ok', 'watch-cap', 'watch-resumed', 'watch-clean'):
     components = json.loads(p.read_text())['data']['components']
     row = next(c for c in components if c['name'] == 'watcher:' + rest[0])
-    assert row['state'] == 'ok', row
+    if mode in ('watch-ok', 'watch-clean'):
+        assert row['state'] == 'ok', row
+        assert 'truncated:' not in row['detail'] and 'lost events:' not in row['detail'], row
+    elif mode == 'watch-cap':
+        assert row['state'] == 'degraded', row
+        assert 'truncated: distinct-file cap reached in the minute' in row['detail'], row
+        assert '(events complete, per-file counts capped)' in row['detail'], row
+        assert 'lost events:' not in row['detail'], row
+    else:
+        assert row['state'] in ('ok', 'degraded'), row
+        if row['state'] == 'degraded':
+            assert 'lost events: queue overflow in the minute' in row['detail'], row
     print(json.dumps(row, sort_keys=True))
 elif mode == 'integrity':
     with sqlite3.connect(f'file:{p}?mode=ro', uri=True) as db:

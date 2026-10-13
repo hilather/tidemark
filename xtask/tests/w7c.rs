@@ -225,3 +225,85 @@ fn shellcheck_advisories_survive_passing_harness_and_warnings_fail() {
         }
     }
 }
+
+#[test]
+fn watcher_helpers_pin_modes_counts_caps_and_recovery_phases() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(r#"
+import json, pathlib, subprocess, sys, tempfile
+helper = sys.argv[1]
+with tempfile.TemporaryDirectory() as directory:
+    base = pathlib.Path(directory)
+    def save(name, data):
+        path = base / name
+        path.write_text(json.dumps(data))
+        return str(path)
+    def run(mode, *args, good=True):
+        result = subprocess.run([sys.executable, helper, mode, *args], capture_output=True, text=True)
+        assert (result.returncode == 0) == good, (mode, args, result.stdout, result.stderr)
+        return result.stdout
+    for mode in ('fd_mount', 'fd_filesystem', 'dfid_name_mount', 'dfid_name_filesystem', 'failed', 'unknown'):
+        status = save('status', {'data': {'watch_modes': [['/mount', mode]]}})
+        text = run('watch-mode', status, '/mount', good=mode not in ('failed', 'unknown'))
+        if mode != 'unknown':
+            assert 'watch_mode=' + mode in text
+    before = save('before', {'events': 1000, 'overflows': 2})
+    metrics = base / 'metrics'
+    def counters(events=1100, overflows=2):
+        metrics.write_text('tidemark_watch_events_total{mount="/mount"} %s\ntidemark_watch_overflows_total{mount="/mount"} %s\n' % (events, overflows))
+    def now(loss):
+        return save('now', {'data': {'mounts': [{'mount': '/mount', 'lossy_minutes_15m': loss}]}})
+    def health(state, detail):
+        return save('health', {'data': {'components': [{'name': 'watcher:/mount', 'state': state, 'detail': detail}]}})
+    counters()
+    run('burst', str(metrics), before, '100', now(0), '/mount')
+    run('burst', str(metrics), before, '100', now(1), '/mount', good=False)
+    counters(1101)
+    run('burst', str(metrics), before, '100', now(0), '/mount', good=False)
+    counters(1099)
+    run('resumed', str(metrics), before, '100', now(1), '/mount', good=False)
+    counters(overflows=3)
+    run('resumed', str(metrics), before, '100', now(1), '/mount', good=False)
+    counters()
+    run('resumed', str(metrics), before, '100', now(1), '/mount')
+    overflow = 'lost events: queue overflow in the minute 12:00 UTC'
+    run('watch-resumed', health('degraded', overflow), '/mount')
+    run('watch-ok', health('degraded', overflow), '/mount', good=False)
+    run('watch-resumed', health('error', overflow), '/mount', good=False)
+    run('watch-resumed', health('degraded', 'lost events: read error'), '/mount', good=False)
+    run('watch-ok', health('ok', 'mode=fd/filesystem'), '/mount')
+    run('watch-ok', health('ok', overflow), '/mount', good=False)
+    cap = 'truncated: distinct-file cap reached in the minute 12:00 UTC (events complete, per-file counts capped)'
+    run('distinct-cap', str(metrics), before, '100', now(1), '/mount')
+    run('distinct-cap', str(metrics), before, '100', now(0), '/mount', good=False)
+    run('watch-cap', health('degraded', cap), '/mount')
+    run('watch-cap', health('degraded', cap + '; ' + overflow), '/mount', good=False)
+    run('watch-cap', health('degraded', 'truncated: current-key cap reached'), '/mount', good=False)
+    run('watch-clean', health('ok', cap), '/mount', good=False)
+"#)
+        .arg(root.join("tests/fault/check.py"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let script = std::fs::read_to_string(root.join("tests/fault/03-fanotify-overflow.sh")).unwrap();
+    assert!(script.contains("local distinct=20000"));
+    assert!(script.contains("n % int(sys.argv[2])"));
+    assert!(script.contains("burst distinct-cap distinct-cap"));
+    assert!(script.contains("resumed_at=$SECONDS"));
+    assert!(script.contains("deadline=$((resumed_at + 120))"));
+    assert!(script.contains("check.py resumed"));
+    assert!(script.contains("check.py watch-resumed"));
+    let slow = script
+        .find("if [[ ${TIDEMARK_FAULT_SLOW:-0} == 1 ]]")
+        .unwrap();
+    assert!(script[slow..].contains("check.py watch-ok"));
+    assert!(script[slow..].contains("SKIP: long fifteen-minute history recovery"));
+    assert!(!script[..slow].contains("check.py watch-ok"));
+}
