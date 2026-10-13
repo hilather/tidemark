@@ -27,6 +27,9 @@ script is added. The detailed existing-coverage table is in
 
 The guest needs Bash, python3 (with SQLite), util-linux (`mount`, `umount`,
 `losetup`, `findmnt`), xfsprogs (`mkfs.xfs`), and coreutils (`timeout`, `truncate`) and util-linux `setsid`.
+The shared harness checks for `mkfs.xfs` before creating resources and reports
+how to install the missing dependency. Other executed commands come from the
+minimal guest tool set; the Python helpers use only the standard library.
 It needs loop devices, root capabilities for mounts/fanotify, the host mount
 namespace (the same as PID 1), and at least 10 GiB free backing storage under
 `/tmp`. Each script uses an 8 GiB sparse image; the full-state script really
@@ -82,7 +85,8 @@ cargo test --offline -p xtask --test w7c
 ```
 
 The test runs `bash -n` on every entrypoint, checks VM/root guards and trap
-ownership, and runs `shellcheck -x` at its default severity when installed.
+ownership, rejects unsupported command words (`rg`, `jq`, `fd`, `bc`) in shell
+and Python helpers recursively, and runs `shellcheck -x` at its default severity when installed.
 `common.bash` is sourced and checked through the entrypoints, rather than being
 executed as a seventh script by the runner. `check.py` validates public JSON,
 SQLite integrity and publication metadata; the public cumulative overflow

@@ -23,7 +23,7 @@ if cli_json scan "$root" > "$work/scan.json" 2> "$work/scan.err"; then
 else
     rc=$?
 fi
-if [[ $rc == 1 || $rc == 5 ]] && rg -q NoSpace "$work/scan.err"; then
+if [[ $rc == 1 || $rc == 5 ]] && grep -Fq NoSpace "$work/scan.err"; then
     pass "space guard refuses below mandatory floor: exit=$rc stderr=$(cat "$work/scan.err")"
 else
     fail "daemon scan refusal: exit=$rc expected=1-or-5 stderr=$(cat "$work/scan.err") required=NoSpace"
