@@ -270,7 +270,7 @@ fn scanner_measured_empty() {
     scanner.scan_once(1).unwrap();
     publish(
         &s,
-        Publication::Procscan(Arc::new(parking_lot::Mutex::new(scanner))),
+        Publication::Procscan(Arc::new(scanner.report().unwrap())),
     );
     assert_eq!(s.view().phantom_bytes("/fixture"), Some(0));
     assert_eq!(
@@ -385,7 +385,8 @@ fn full_channel_sampling_is_nonblocking() {
             .iter()
             .any(|c| c.name == "sampler" && c.state == "degraded")
     });
-    assert!(s.view().fs_samples().is_some());
+    let sample = s.view().fs_samples().unwrap().remove(0);
+    assert!(s.view_at(sample.ts).fs_sample(&sample.mount).is_some());
     stop.store(true, Ordering::Release);
     h.join().unwrap().unwrap();
     drop(rx);
@@ -753,7 +754,7 @@ fn phantom_measurement_uses_allocated_byte_oracle() {
     let state = LiveState::default();
     publish(
         &state,
-        Publication::Procscan(Arc::new(parking_lot::Mutex::new(scanner))),
+        Publication::Procscan(Arc::new(scanner.report().unwrap())),
     );
     assert!(
         state
@@ -1265,4 +1266,213 @@ fn configured_roots_reserve_capacity_against_inactive_manual_history() {
     let scans = state.view().scans().unwrap();
     assert_eq!(scans.len(), 128);
     assert!(scans.iter().all(|s| s.root.starts_with("/configured/")));
+}
+
+#[test]
+fn late_sampler_pass_cannot_resurrect_removed_mount() {
+    let mut config = Config::default();
+    config.sampler.mounts = vec!["/fixture".into()];
+    let state = LiveState::new(&config, 0);
+    let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    let worker_state = state.clone();
+    let worker = std::thread::spawn(move || {
+        let (_, generation) = worker_state.config();
+        ready_tx.send(()).unwrap();
+        resume_rx.recv().unwrap();
+        worker_state
+            .publish(
+                Publication::FsAttempt {
+                    generation,
+                    mount: "/fixture".into(),
+                    sample: Some(sample(10, 95)),
+                },
+                health(),
+            )
+            .unwrap();
+        worker_state
+            .publish(
+                Publication::FsAttempt {
+                    generation,
+                    mount: "/fixture".into(),
+                    sample: None,
+                },
+                health(),
+            )
+            .unwrap();
+    });
+    ready_rx.recv().unwrap();
+    config.sampler.mounts = vec!["/new".into()];
+    state.replace_config(config).unwrap();
+    resume_tx.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(state.view_at(10).fs_samples().is_none());
+    // Even a current-generation pass may publish only current mounts.
+    let (_, generation) = state.config();
+    state
+        .publish(
+            Publication::FsAttempt {
+                generation,
+                mount: "/fixture".into(),
+                sample: Some(sample(11, 95)),
+            },
+            health(),
+        )
+        .unwrap();
+    assert!(state.view_at(11).fs_samples().is_none());
+}
+
+#[test]
+fn internal_alert_has_reserved_publication_slot() {
+    use tidemark_core::config::{AlertKind, AlertRule, AlertThreshold};
+    use tidemark_live::alerts::{AlertDiagnostic, AlertEngine, AlertInputs, MAX_ALERT_SUBJECTS};
+    let mut config = Config::default();
+    config.alerts.rule = vec![AlertRule {
+        name: "growth".into(),
+        kind: AlertKind::DirGrowth,
+        root: Some("/fixture".into()),
+        depth: Some(2),
+        above: Some(AlertThreshold::Number(1.)),
+        for_: Duration::ZERO,
+        ..Default::default()
+    }];
+    let state = LiveState::new(&config, 0);
+    let rows = (0..MAX_ALERT_SUBJECTS)
+        .map(|i| {
+            (
+                RawPath::new(format!("/fixture/{i}").into_bytes()).unwrap(),
+                10,
+            )
+        })
+        .collect();
+    publish(&state, Publication::DirGrowth(("/fixture".into(), 2, rows)));
+    let mut engine = AlertEngine::new(&config.alerts.rule, config.alerts.renotify).unwrap();
+    let events = engine.evaluate(
+        0,
+        &AlertInputs {
+            source: &state.view_at(0),
+            state_space_refused: true,
+        },
+    );
+    assert_eq!(events.len(), MAX_ALERT_SUBJECTS + 1);
+    publish(
+        &state,
+        Publication::Alerts((engine.active(), engine.diagnostics().to_vec())),
+    );
+    assert_eq!(
+        state.view_at(0).active_alerts().unwrap().len(),
+        MAX_ALERT_SUBJECTS + 1
+    );
+    let diagnostics = vec![
+        AlertDiagnostic {
+            rule: "missing".into(),
+            reason: "unavailable".into()
+        };
+        MAX_ALERT_SUBJECTS + 1
+    ];
+    assert!(state
+        .publish(Publication::Alerts((vec![], diagnostics)), health())
+        .is_err());
+    let mut extra = engine.active();
+    extra.push(extra.iter().find(|a| a.rule == "growth").unwrap().clone());
+    assert!(state
+        .publish(Publication::Alerts((extra, vec![])), health())
+        .is_err());
+}
+
+#[test]
+fn process_publication_is_independent_of_collector_and_clears_on_invalidation() {
+    use tidemark_live::procscan::{ProcScanner, ProcScannerOptions};
+    let mut config = Config::default();
+    config.watch.mounts = vec!["/fixture".into()];
+    let state = LiveState::new(&config, 0);
+    let mut scanner = ProcScanner::new(
+        ProcScannerOptions {
+            mounts: vec![(RawPath::new(b"/fixture".to_vec()).unwrap(), u64::MAX)],
+            open_writers: true,
+            exclude_prefixes: vec![],
+        },
+        Arc::new(tidemark_fs::attribution::AttributionCache::new(
+            Duration::ZERO,
+            0,
+        )),
+    );
+    scanner.scan_once(1).unwrap();
+    let report = Arc::new(scanner.report().unwrap());
+    publish(&state, Publication::Procscan(report.clone()));
+    let scanner = Arc::new(parking_lot::Mutex::new(scanner));
+    let guard = scanner.lock();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let reader_state = state.clone();
+    let reader = std::thread::spawn(move || {
+        tx.send((
+            reader_state
+                .view_at(1)
+                .phantom(&PhantomParams { mount: None }),
+            reader_state.view_at(1).writers(&WritersParams {
+                mount: None,
+                window: Duration::from_millis(1500),
+            }),
+        ))
+        .unwrap();
+    });
+    let read = rx.recv_timeout(Duration::from_millis(50));
+    drop(guard);
+    reader.join().unwrap();
+    let (phantom, writers) = read.expect("reader must not lock the mutable collector");
+    assert_eq!(phantom.unwrap()[0].total_bytes, 0);
+    assert!(writers.unwrap().is_empty());
+    state
+        .publish(
+            Publication::ProcscanAttempt {
+                generation: 0,
+                report: None,
+            },
+            component("procscan", "error", "failed pass"),
+        )
+        .unwrap();
+    assert!(state
+        .view_at(2)
+        .phantom(&PhantomParams { mount: None })
+        .is_none());
+    assert!(state
+        .view_at(2)
+        .writers(&WritersParams {
+            mount: None,
+            window: Duration::from_secs(300)
+        })
+        .is_none());
+    publish(&state, Publication::Procscan(report.clone()));
+    config.procscan.open_writers = !config.procscan.open_writers;
+    state.replace_config(config.clone()).unwrap();
+    assert!(state
+        .view_at(2)
+        .phantom(&PhantomParams { mount: None })
+        .is_none());
+    state
+        .publish(
+            Publication::ProcscanAttempt {
+                generation: 0,
+                report: Some(report.clone()),
+            },
+            health(),
+        )
+        .unwrap();
+    assert!(state
+        .view_at(2)
+        .phantom(&PhantomParams { mount: None })
+        .is_none());
+    state
+        .publish(
+            Publication::ProcscanAttempt {
+                generation: 1,
+                report: Some(report),
+            },
+            health(),
+        )
+        .unwrap();
+    config.procscan.enabled = false;
+    state.replace_config(config).unwrap();
+    let now = state.view_at(2).now(&NowParams { mount: None }, 2).unwrap();
+    assert!(now.degraded.iter().any(|s| s == "phantom: not measured"));
 }

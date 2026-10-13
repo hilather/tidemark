@@ -123,6 +123,16 @@ fn start_with(
                 let mounts = match mount_source() {
                     Ok(mounts) => mounts,
                     Err(error) => {
+                        for path in &config.sampler.mounts {
+                            state.publish(
+                                Publication::FsAttempt {
+                                    generation,
+                                    mount: path.to_string_lossy().into_owned(),
+                                    sample: None,
+                                },
+                                crate::component("sampler", "degraded", error.to_string()),
+                            )?;
+                        }
                         state.publish_component(crate::component(
                             "sampler",
                             "degraded",
@@ -148,6 +158,7 @@ fn start_with(
                 crate::mounts::log(&changes, "sampler");
                 for change in &changes {
                     last_sample.remove(&change.path);
+                    state.reset_fs_mount(generation, &change.path.to_string_lossy())?;
                 }
                 if !changes.is_empty() {
                     next_sample = std::time::Instant::now();
@@ -181,7 +192,11 @@ fn start_with(
                     match sample_checked(path, now, identities.get(path).copied().flatten()) {
                         Ok(s) => {
                             state.publish(
-                                Publication::Fs(s.clone()),
+                                Publication::FsAttempt {
+                                    generation,
+                                    mount: s.mount.clone(),
+                                    sample: Some(s.clone()),
+                                },
                                 if errors.is_empty() {
                                     crate::component("sampler", "ok", "statvfs sampled")
                                 } else {
@@ -195,7 +210,17 @@ fn start_with(
                                 rows.push(s);
                             }
                         }
-                        Err(e) => errors.push(e.to_string()),
+                        Err(e) => {
+                            state.publish(
+                                Publication::FsAttempt {
+                                    generation,
+                                    mount: path.to_string_lossy().into_owned(),
+                                    sample: None,
+                                },
+                                crate::component("sampler", "degraded", e.to_string()),
+                            )?;
+                            errors.push(e.to_string());
+                        }
                     }
                 }
                 if due {
@@ -309,6 +334,7 @@ mod tests {
         bytes.lock().clear();
         now.store(102, Ordering::Release);
         wait(&degraded);
+        assert!(state.view_at(102).fs_samples().is_none());
         assert!(rx.try_recv().is_err());
         stop.store(true, Ordering::Release);
         worker.join().unwrap().unwrap();
