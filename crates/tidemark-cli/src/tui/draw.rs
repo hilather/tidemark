@@ -17,9 +17,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
         return;
     }
     let chunks = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(4),
     ])
     .split(area);
     let meta = b.snapshot.meta();

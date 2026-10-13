@@ -7,7 +7,6 @@ use tidemark_core::{
     path::RawPath,
     scan::{ScanMode, SnapshotStatus},
     snapshot::{DirRow, SnapshotMeta},
-    time::ScanId,
 };
 pub fn row(id: u32, parent: Option<u32>, path: &[u8], disk: u64) -> DirRow {
     let path = RawPath::new(path.to_vec()).unwrap();
@@ -55,7 +54,7 @@ pub fn meta(root: RawPath, now: i64) -> SnapshotMeta {
     SnapshotMeta {
         schema_version: 1,
         tool_version: "test".into(),
-        scan_id: ScanId::new(now).unwrap(),
+        scan_id: serde_json::from_str("\"20260101T000000Z-00000000\"").unwrap(),
         root_display: root.display_lossy(),
         root,
         mode: ScanMode::Walk,

@@ -37,20 +37,40 @@ impl Browser {
             if row.parent_id != Some(self.dir.id) {
                 return Err(anyhow::anyhow!("invalid child preorder range"));
             }
-            let delta = self
-                .old
-                .as_ref()
-                .map(|old| {
-                    old.dir_by_path(&row.path).map(|previous| {
-                        i128::from(row.t_disk) - i128::from(previous.map(|r| r.t_disk).unwrap_or(0))
-                    })
-                })
-                .transpose()?;
-            self.rows.push((row, delta));
+            self.rows.push((row, None));
         }
         self.state.next = (cursor <= self.dir.subtree_end).then_some(cursor);
+        if self.state.sort == state::Sort::Growth {
+            self.deltas(PAGE, true)?;
+        }
         self.state.order(&mut self.rows);
         self.state.selected = 0;
+        Ok(())
+    }
+    fn deltas(&mut self, height: usize, all: bool) -> anyhow::Result<()> {
+        let Some(old) = &self.old else {
+            return Ok(());
+        };
+        let start = if all {
+            0
+        } else {
+            self.state.selected.saturating_sub(height)
+        };
+        let limit = if all { PAGE } else { height.saturating_mul(2) };
+        for (row, delta) in self
+            .rows
+            .iter_mut()
+            .filter(|(row, _)| row.path.display_lossy().contains(&self.state.filter))
+            .skip(start)
+            .take(limit)
+        {
+            if delta.is_none() {
+                *delta = Some(
+                    i128::from(row.t_disk)
+                        - i128::from(old.dir_by_path(&row.path)?.map(|r| r.t_disk).unwrap_or(0)),
+                );
+            }
+        }
         Ok(())
     }
     fn visible(&self) -> Vec<&(DirRow, Option<i128>)> {
@@ -221,6 +241,12 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     loop {
+        if browser.state.pane == Pane::Main {
+            browser.deltas(
+                usize::from(terminal.size()?.height),
+                browser.state.sort == state::Sort::Growth,
+            )?;
+        }
         terminal.draw(|frame| draw::draw(frame, &browser))?;
         if guard.cancelled() {
             break;
@@ -256,27 +282,14 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
                 KeyCode::Home => browser.state.selected = 0,
                 KeyCode::End => browser.state.selected = browser.count().saturating_sub(1),
                 KeyCode::PageDown if browser.state.pane == Pane::Main => {
-                    if let Some(next) = browser.state.next {
-                        browser.state.page_start = next;
+                    if browser.state.next_page() {
                         browser.load()?;
                     }
                 }
                 KeyCode::PageUp if browser.state.pane == Pane::Main => {
-                    // Rewalk only preorder boundaries; bounded memory, no stack of pages.
-                    let target = browser.state.page_start;
-                    let mut cursor = browser.dir.id.saturating_add(1);
-                    let mut previous = cursor;
-                    while cursor < target {
-                        previous = cursor;
-                        for _ in 0..PAGE {
-                            if cursor >= target {
-                                break;
-                            }
-                            cursor = browser.snapshot.dir(cursor)?.subtree_end.saturating_add(1);
-                        }
+                    if browser.state.previous_page() {
+                        browser.load()?;
                     }
-                    browser.state.page_start = previous;
-                    browser.load()?;
                 }
                 KeyCode::PageDown => browser.state.move_by(15, browser.count()),
                 KeyCode::PageUp => browser.state.move_by(-15, browser.count()),
@@ -291,6 +304,9 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
                 }
                 KeyCode::Char('s') => {
                     browser.state.sort = browser.state.sort.next();
+                    if browser.state.sort == state::Sort::Growth {
+                        browser.deltas(PAGE, true)?;
+                    }
                     browser.state.order(&mut browser.rows);
                 }
                 KeyCode::Char('i') => browser.pane(Pane::Info)?,

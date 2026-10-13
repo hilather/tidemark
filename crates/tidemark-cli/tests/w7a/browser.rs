@@ -14,6 +14,7 @@ fn browser(count: u32) -> (tempfile::TempDir, Browser) {
     let temp = tempfile::tempdir().unwrap();
     let mut rows = vec![fixture::row(0, None, b"/fixture", u64::from(count) * 4096)];
     rows[0].subtree_end = count;
+    rows[0].own_charged = 0;
     for id in 1..=count {
         rows.push(fixture::row(
             id,
@@ -106,9 +107,10 @@ fn too_small() {
 fn hostile_names_in_data_panes() {
     let temp = tempfile::tempdir().unwrap();
     let name = RawName::new([b"\x1b\n\xff".as_slice(), &[b'x'; 300]].concat()).unwrap();
-    let path = RawPath::new(b"/fixture".to_vec()).unwrap().join(&name);
+    let root = RawPath::new(b"/fixture".to_vec()).unwrap().join(&name);
+    let path = root.join(&name);
     let mut rows = vec![
-        fixture::row(0, None, b"/fixture", 8192),
+        fixture::row(0, None, root.as_bytes(), 8192),
         fixture::row(1, Some(0), path.as_bytes(), 4096),
     ];
     rows[0].subtree_end = 1;
@@ -161,7 +163,14 @@ fn hostile_names_in_data_panes() {
         now: 1_000_100,
     };
     b.load().unwrap();
-    for pane in [Pane::Main, Pane::Info, Pane::Files, Pane::Links] {
+    for pane in [
+        Pane::Main,
+        Pane::Info,
+        Pane::Files,
+        Pane::Links,
+        Pane::Help,
+        Pane::Picker,
+    ] {
         if pane == Pane::Info {
             b.navigate(b.snapshot.dir(1).unwrap()).unwrap();
         } else if b.dir.id != 0 {
@@ -171,9 +180,7 @@ fn hostile_names_in_data_panes() {
         let output = render(&b, 160, 48);
         assert!(!output.contains('\x1b'));
         assert!(!output.contains('\u{fffd}'));
-        if pane != Pane::Links {
-            assert!(output.contains("\\x1B\\x0A\\xFF"));
-        }
+        assert!(output.contains("\\x1B\\x0A\\xFF"));
     }
     b.pane(Pane::Links).unwrap();
     b.enter().unwrap();
@@ -228,4 +235,71 @@ fn million_directory_navigation() {
         };
         b.state.page_start = next;
     }
+}
+
+#[test]
+fn preorder_pages_skip_nested_subtrees_and_support_back() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut rows = vec![
+        fixture::row(0, None, b"/fixture", 10),
+        fixture::row(1, Some(0), b"/fixture/a", 5),
+        fixture::row(2, Some(1), b"/fixture/a/nested", 2),
+        fixture::row(3, Some(0), b"/fixture/b", 5),
+    ];
+    rows[0].subtree_end = 3;
+    rows[1].subtree_end = 2;
+    let file = fixture::snapshot(temp.path(), &rows, 1_000_000);
+    let snapshot = Snapshot::open(&file).unwrap();
+    let mut b = Browser {
+        dir: snapshot.root().unwrap(),
+        snapshot,
+        old: None,
+        state: State::new(1),
+        rows: vec![],
+        text: String::new(),
+        links: vec![],
+        snapshots: vec![],
+        message: String::new(),
+        now: 1_000_100,
+    };
+    b.load().unwrap();
+    assert_eq!(
+        b.rows.iter().map(|r| r.0.id).collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    let (_temp, mut b) = browser(2500);
+    assert!(b.state.next_page());
+    b.load().unwrap();
+    assert_eq!(b.state.page_start, 1001);
+    assert!(b.state.next_page());
+    b.load().unwrap();
+    assert_eq!(b.state.page_start, 2001);
+    assert!(!b.state.next_page());
+    assert!(b.state.previous_page());
+    b.load().unwrap();
+    assert_eq!(b.state.page_start, 1001);
+    assert!(b.state.previous_page());
+    b.load().unwrap();
+    assert_eq!(b.state.page_start, 1);
+    assert!(!b.state.previous_page());
+}
+#[test]
+fn delta_lookups_and_growth_sort_are_snapshot_relative() {
+    let (_temp, mut b) = browser(3);
+    let old_temp = tempfile::tempdir().unwrap();
+    let mut rows = vec![
+        fixture::row(0, None, b"/fixture", 100),
+        fixture::row(1, Some(0), b"/fixture/00000001", 8000),
+        fixture::row(2, Some(0), b"/fixture/00000002", 100),
+    ];
+    rows[0].subtree_end = 2;
+    let file = fixture::snapshot(old_temp.path(), &rows, 900_000);
+    b.old = Some(Snapshot::open(&file).unwrap());
+    b.deltas(24, false).unwrap();
+    assert_eq!(b.rows[0].1, Some(-3904));
+    assert_eq!(b.rows[1].1, Some(3996));
+    assert_eq!(b.rows[2].1, Some(4096));
+    b.state.sort = state::Sort::Growth;
+    b.state.order(&mut b.rows);
+    assert_eq!(b.rows[0].0.id, 3);
 }
