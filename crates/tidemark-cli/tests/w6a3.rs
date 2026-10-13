@@ -399,8 +399,23 @@ fn scan_resolves_only_its_catalog_outcome() {
                     ("scan.status", statuses),
                 ],
             );
-            let out = cli(&p, &["scan", "/"]);
+            let out = cli(
+                &p,
+                if degraded && status == "complete" {
+                    &["--json", "scan", "/"]
+                } else {
+                    &["scan", "/"]
+                },
+            );
             server.join().unwrap();
+            if status == "complete" {
+                if degraded {
+                    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                    assert_eq!(doc["data"]["last_complete"]["scan_id"], "fixture");
+                } else {
+                    assert!(String::from_utf8_lossy(&out.stdout).contains("scan fixture completed"));
+                }
+            }
             assert_eq!(
                 out.status.code(),
                 Some(expected),
@@ -494,7 +509,7 @@ fn scan_full_backlog_expires_without_direct_state_writes() {
 fn example_now() -> tidemark_core::live::NowReport {
     serde_json::from_value(serde_json::json!({
         "generated_at":1791845576,"host":"fixture","alerts_firing":[],"scans":[{"root":"/data","running":null,"next_due":null,"last_complete":{"scan_id":"a","finished_at":1791845576,"mode":"walk","duration_ms":5}}],"degraded":[],
-        "mounts":[{"mount":"/data","size":1000000000,"used":50000000,"avail":950000000,"rate_15m":2362647.27,"rate_1h":500.0,"ttf_secs":189,"lvm":null,"hot_dirs_5m":[{"path":"/data/hot","events":3,"files":2,"bytes_delta":50000000,"top_unit":"writer.service","lossy":false},{"path_b64":"L2JhZP8=","events":1,"files":1,"bytes_delta":1,"top_unit":null,"lossy":false}],"writers_5m":[],"phantom":{"mount":"/data","total_bytes":0,"files":0,"holders":[],"limited":false},"open_writers_top":[],"watch_mode":"fd/mount","lossy_minutes_15m":0}]
+        "mounts":[{"mount":"/data","size":1000000000,"used":50000000,"avail":950000000,"rate_15m":2362647.27,"rate_1h":500.0,"ttf_secs":189,"lvm":null,"hot_dirs_5m":[{"path":"/data/hot","events":3,"files":2,"bytes_delta":50000000,"top_unit":"writer.service","lossy":false},{"path_b64":"L2JhZP8=","events":1,"files":1,"bytes_delta":1,"top_unit":null,"lossy":false}],"writers_5m":[{"path":"other.service","events":3,"files":2,"bytes_delta":100,"top_unit":"other.service","lossy":false}],"phantom":{"mount":"/data","total_bytes":0,"files":0,"holders":[],"limited":false},"open_writers_top":[],"watch_mode":"fd/mount","lossy_minutes_15m":0}]
     })).unwrap()
 }
 #[test]
@@ -504,6 +519,8 @@ fn now_uses_report_rates_hot_directories_units_and_utc() {
         let text = tidemark_cli::render::now::render_text(&report, width);
         assert!(text.lines().all(|line| line.chars().count() <= width));
         assert!(text.contains("2026-10-12 22:52:56Z"));
+        assert!(text.contains("writers (5m) other.service +100 B"));
+        assert_eq!(text.matches("other.service").count(), 1);
         assert!(text.contains("7.92 GiB/h (15m)"), "{text}");
         assert!(text.contains("full in ~3m 9s (1h trend)"), "{text}");
         assert!(text.contains("hot dirs (5m) /data/hot") && text.contains("writer.service"));

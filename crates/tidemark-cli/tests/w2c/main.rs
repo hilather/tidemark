@@ -175,6 +175,7 @@ fn top_json_schema_and_paths() {
     assert!(doc["data"][0]["path_b64"].is_string());
     assert!(doc["data"][0].get("path").is_none());
     assert_eq!(doc["data"][0]["delta"], -4);
+    assert_eq!(doc["data"][0]["newest_mtime"], 100);
 }
 #[test]
 fn outcome_json_schema_and_text() {

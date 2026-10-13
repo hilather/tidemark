@@ -125,7 +125,7 @@ pub fn directories(
         ];
         if wide {
             cells.extend([
-                r.row.newest_mtime.to_string(),
+                crate::render::size::timestamp(r.row.newest_mtime),
                 r.row.t_inodes.to_string(),
                 super::size::bytes(r.row.t_apparent),
             ]);

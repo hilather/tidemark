@@ -92,6 +92,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             });
             if completed || !ours_running {
                 let entry = completed_outcome(context, &root, &started.scan_id)?;
+                let degraded = entry.degraded;
                 if let Some(status) = status.filter(|_| completed) {
                     crate::render::status::scan_complete(
                         status,
@@ -119,6 +120,12 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                         context.json,
                         &mut std::io::stdout().lock(),
                     )?;
+                }
+                if degraded {
+                    return Err(crate::CliError::Partial(
+                        "scan completed with errors or partial results".into(),
+                    )
+                    .into());
                 }
                 return Ok(());
             }
@@ -320,14 +327,13 @@ fn completed_outcome(
         .and_then(|catalog| catalog.get(id));
     match outcome {
         Ok(Some(entry))
-            if entry.root == *root
-                && entry.finished_at.is_some()
-                && entry.status == "complete"
-                && !entry.degraded =>
+            if entry.root == *root && entry.finished_at.is_some() && entry.status == "complete" =>
         {
             Ok(entry)
         }
-        Ok(Some(entry)) if entry.root == *root && (entry.degraded || entry.status == "partial") => {
+        Ok(Some(entry))
+            if entry.root == *root && entry.finished_at.is_some() && entry.status == "partial" =>
+        {
             Err(
                 crate::CliError::Partial("scan completed with errors or partial results".into())
                     .into(),

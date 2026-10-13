@@ -254,21 +254,31 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
                     .unwrap_or_default()
             ),
         });
-        for (title, list) in [
-            ("hot dirs (5m)", &m.hot_dirs_5m),
-            ("writers (5m)", &m.writers_5m),
-        ] {
-            for e in list {
-                lines.push(format!(
-                    "  {} {}  {}  {} files  {}{}",
-                    title,
-                    bytes_display(&e.key),
-                    signed_bytes(e.bytes_delta),
-                    e.files,
-                    escape(e.top_unit.as_deref().unwrap_or("?")),
-                    if e.lossy { " [lossy]" } else { "" }
-                ));
-            }
+        for entry in &m.hot_dirs_5m {
+            lines.push(format!(
+                "  hot dirs (5m) {}  {}  {} files  {}{}",
+                bytes_display(&entry.key),
+                signed_bytes(entry.bytes_delta),
+                entry.files,
+                escape(entry.top_unit.as_deref().unwrap_or("?")),
+                if entry.lossy { " [lossy]" } else { "" }
+            ));
+        }
+        if !m.writers_5m.is_empty() {
+            let writers = m
+                .writers_5m
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{} {}{}",
+                        bytes_display(&entry.key),
+                        signed_bytes(entry.bytes_delta),
+                        if entry.lossy { " [lossy]" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            lines.push(format!("  writers (5m) {writers}"));
         }
         if missing("phantom") {
             lines.push("  deleted-but-open not measured".into());
