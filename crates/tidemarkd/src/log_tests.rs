@@ -39,6 +39,24 @@ fn every_operator_message_formats_with_values_and_without_debug_fields() {
     let millis = 3;
     let path = "/fixture";
     tracing::subscriber::with_default(subscriber, || {
+        let watcher_source = include_str!("../../tidemark-live/src/watch/mod.rs");
+        assert!(watcher_source.contains("watcher started: mount {}, mode {mode}"));
+        assert!(watcher_source.contains("fanotify poll failed: {error}"));
+        assert!(watcher_source.contains("fanotify read failed: {error}"));
+        let mount = tidemark_core::path::RawPath::new(b"/fixture".to_vec()).unwrap();
+        tracing::info!(
+            "watcher started: mount {}, mode {mode}",
+            mount.display_lossy()
+        );
+        tracing::warn!("fanotify poll failed: {error}");
+        tracing::warn!("fanotify read failed: {error}");
+        assert!(String::from_utf8_lossy(&bytes.lock())
+            .contains("watcher started: mount /fixture, mode walk"));
+        assert!(String::from_utf8_lossy(&bytes.lock())
+            .contains("fanotify poll failed: fixture failure"));
+        assert!(String::from_utf8_lossy(&bytes.lock())
+            .contains("fanotify read failed: fixture failure"));
+
         crate::log_descriptor_limit(rustix::process::Rlimit {
             current: Some(65536),
             maximum: Some(65536),

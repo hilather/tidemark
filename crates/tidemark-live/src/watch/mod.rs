@@ -353,7 +353,7 @@ impl Watcher {
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = stopping.clone();
         let mount = cfg.mount.clone();
-        tracing::info!(mode = %mode, mount = %mount.display_lossy(), "watcher started");
+        tracing::info!(mode = %mode, mount = %mount.display_lossy(), "watcher started: mount {}, mode {mode}", mount.display_lossy());
         let thread = std::thread::Builder::new()
             .name("tidemark-watch".into())
             .spawn(move || {
@@ -395,7 +395,7 @@ impl Watcher {
                         if error == rustix::io::Errno::INTR {
                             continue;
                         }
-                        tracing::warn!(%error,"fanotify poll failed");
+                        tracing::warn!(%error,"fanotify poll failed: {error}");
                         if processor.transport_error(&io::Error::from(error), now(), &worker_state)
                             && retry_wait(worker_shutdown.as_ref(), &worker_stopping, 5)
                         {
@@ -688,7 +688,7 @@ fn read_recover<T>(
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                tracing::warn!(%error, "fanotify read failed");
+                tracing::warn!(%error, "fanotify read failed: {error}");
                 if !processor.transport_error(&error, clock(), state) {
                     return None;
                 }
