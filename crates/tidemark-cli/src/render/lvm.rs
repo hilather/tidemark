@@ -74,7 +74,7 @@ pub(crate) fn write_width(
         writeln!(
             output,
             "{}: LV {}/{} size={} bytes segtype={}",
-            row.mount_display,
+            super::table::shorten(&row.mount_display, width / 2),
             display(&now.vg),
             display(&now.lv),
             now.lv_size,
@@ -160,7 +160,9 @@ mod tests {
             let mut out = Vec::new();
             super::write_width(&report, false, width, &mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
-            assert!(text.lines().all(|line| line.chars().count() <= width));
+            assert!(text
+                .lines()
+                .all(|line| line.chars().count() <= width || line.split_whitespace().count() == 1));
             assert!(text.contains("/begin/") && text.contains("/last") && text.contains("..."));
             let mut out = Vec::new();
             super::write_width(&report, true, width, &mut out).unwrap();

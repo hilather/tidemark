@@ -36,11 +36,16 @@ pub fn write_width(
     let destination = out;
     let mut buffer = Vec::new();
     let out = &mut buffer;
-    writeln!(
-        out,
-        "tidemarkd {} · uptime {}s",
-        display(report.version.as_bytes()),
-        report.uptime_s
+    out.write_all(
+        crate::render::table::wrap(
+            &format!(
+                "tidemarkd {} · uptime {}s",
+                display(report.version.as_bytes()),
+                report.uptime_s
+            ),
+            width,
+        )
+        .as_bytes(),
     )?;
     let mut rows: Vec<_> = report.components.iter().collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -52,56 +57,74 @@ pub fn write_width(
             display(r.detail.as_bytes()),
         ]);
     }
-    out.write_all(crate::render::table::aligned_width(&table, width).as_bytes())?;
+    out.write_all(crate::render::table::aligned_wrapped(&table, width, &[0]).as_bytes())?;
     let mut modes = report.watch_modes.clone();
     modes.sort();
     for (mount, mode) in modes {
-        writeln!(
-            out,
-            "watch {}: {}",
-            display(mount.as_bytes()),
-            display(mode.as_bytes())
+        out.write_all(
+            crate::render::table::wrap_prefixed(
+                "watch ",
+                &format!(
+                    "{}: {}",
+                    crate::render::table::shorten(&display(mount.as_bytes()), width / 2),
+                    display(mode.as_bytes())
+                ),
+                width,
+            )
+            .as_bytes(),
         )?;
     }
     let mut errors = report.last_errors.clone();
     errors.sort();
     for (name, ts, message) in errors {
-        writeln!(
-            out,
-            "last error {} at {}: {}",
-            display(name.as_bytes()),
-            crate::render::size::timestamp(ts),
-            display(message.as_bytes())
-        )?;
+        let message = display(message.as_bytes());
+        let word_width = message
+            .split_whitespace()
+            .map(crate::render::table::display_width)
+            .filter(|n| *n <= width)
+            .max()
+            .unwrap_or(1);
+        let prefix = format!(
+            "last error {} at {}: ",
+            crate::render::table::shorten(
+                &display(name.as_bytes()),
+                width.saturating_sub(37 + word_width)
+            ),
+            crate::render::size::timestamp(ts)
+        );
+        out.write_all(crate::render::table::wrap_prefixed(&prefix, &message, width).as_bytes())?;
     }
-    writeln!(out, "ROOT  RUNNING  NEXT RUN  LAST COMPLETE")?;
+    let mut table = vec![["ROOT", "RUNNING", "NEXT RUN", "LAST COMPLETE"]
+        .map(str::to_owned)
+        .to_vec()];
     let mut scans: Vec<_> = scans.iter().collect();
     scans.sort_by(|a, b| a.root.cmp(&b.root));
     for s in scans {
-        writeln!(
-            out,
-            "{}  {}  {}  {}",
+        table.push(vec![
             display(s.root.as_bytes()),
-            if s.running.is_some() { "yes" } else { "no" },
+            if s.running.is_some() {
+                "yes".into()
+            } else {
+                "no".into()
+            },
             s.next_due
                 .map(crate::render::size::timestamp)
                 .unwrap_or_else(|| "-".into()),
             s.last_complete
                 .as_ref()
                 .map(|s| crate::render::size::timestamp(s.finished_at))
-                .unwrap_or_else(|| "-".into())
-        )?;
+                .unwrap_or_else(|| "-".into()),
+        ]);
     }
+    out.write_all(crate::render::table::aligned_wrapped(&table, width, &[0]).as_bytes())?;
     if show_config {
-        writeln!(
-            out,
-            "CLI effective config (daemon config may differ after reload):"
-        )?;
-        serde_json::to_writer_pretty(&mut *out, &context.config)?;
-        writeln!(out)?;
+        let config = format!(
+            "CLI effective config (daemon config may differ after reload):\n{}",
+            serde_json::to_string_pretty(&context.config)?
+        );
+        out.write_all(crate::render::table::wrap(&config, width).as_bytes())?;
     }
-    destination
-        .write_all(crate::render::table::wrap(&String::from_utf8(buffer)?, width).as_bytes())?;
+    destination.write_all(&buffer)?;
     Ok(())
 }
 

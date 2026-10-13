@@ -55,6 +55,9 @@ pub fn write_grouped(
             row.remove(4);
         }
     }
-    out.write_all(crate::render::table::aligned_width(&table, width).as_bytes())?;
+    out.write_all(
+        crate::render::table::aligned_wrapped(&table, width, if by_unit { &[0] } else { &[0, 4] })
+            .as_bytes(),
+    )?;
     Ok(())
 }

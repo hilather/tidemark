@@ -41,7 +41,7 @@ pub fn phantom_width(
         writeln!(
             out,
             "{}: {} bytes in {} deleted open files",
-            tidemark_core::path::display_lossy_bytes(r.mount.as_bytes()),
+            crate::render::table::shorten(&escape(&r.mount), width / 2),
             r.total_bytes,
             r.files
         )?;
@@ -53,10 +53,8 @@ pub fn phantom_width(
                 "  {} {} {} {} {} bytes",
                 h.pid,
                 tidemark_core::path::display_lossy_bytes(h.comm.as_bytes()),
-                tidemark_core::path::display_lossy_bytes(
-                    h.unit.as_deref().unwrap_or("?").as_bytes()
-                ),
-                tidemark_core::path::display_lossy_bytes(&h.path),
+                crate::render::table::shorten(&escape(h.unit.as_deref().unwrap_or("?")), width / 2),
+                crate::render::table::shorten(&bytes_display(&h.path), width / 2),
                 h.bytes
             )?;
         }
@@ -84,10 +82,11 @@ pub fn writers_width(
     if json {
         return crate::render::json("tidemark.writers.v1", rows, out);
     }
-    let destination = out;
-    let mut buffer = Vec::new();
-    let out = &mut buffer;
-    writeln!(out, "MOUNT  PID  COMMAND  UNIT  PATH  GROWTH  DISK")?;
+    let mut table = vec![
+        ["MOUNT", "PID", "COMMAND", "UNIT", "PATH", "GROWTH", "DISK"]
+            .map(str::to_owned)
+            .to_vec(),
+    ];
     let mut rows: Vec<_> = rows.iter().collect();
     rows.sort_by(|a, b| {
         b.growth
@@ -95,20 +94,17 @@ pub fn writers_width(
             .then((&a.path, a.pid).cmp(&(&b.path, b.pid)))
     });
     for r in rows {
-        writeln!(
-            out,
-            "{} {} {} {} {} +{} bytes ({} bytes allocated)",
-            tidemark_core::path::display_lossy_bytes(r.mount.as_bytes()),
-            r.pid,
-            tidemark_core::path::display_lossy_bytes(r.comm.as_bytes()),
-            tidemark_core::path::display_lossy_bytes(r.unit.as_deref().unwrap_or("?").as_bytes()),
-            tidemark_core::path::display_lossy_bytes(&r.path),
-            r.growth,
-            r.disk
-        )?;
+        table.push(vec![
+            escape(&r.mount),
+            r.pid.to_string(),
+            escape(&r.comm),
+            escape(r.unit.as_deref().unwrap_or("?")),
+            bytes_display(&r.path),
+            format!("+{} bytes", r.growth),
+            format!("{} bytes allocated", r.disk),
+        ]);
     }
-    destination
-        .write_all(crate::render::table::wrap(&String::from_utf8(buffer)?, width).as_bytes())?;
+    out.write_all(crate::render::table::aligned_wrapped(&table, width, &[0, 3, 4]).as_bytes())?;
     Ok(())
 }
 /// Render only frozen LVM fields and separately read 24-hour trends.
@@ -136,50 +132,50 @@ pub fn lvm_width(
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
     if json {
-        return crate::render::json("tidemark.lvm.v1", report, out);
+        return crate::render::json("tidemark.lvm.daemon.v1", report, out);
     }
-    let destination = out;
-    let mut buffer = Vec::new();
-    let out = &mut buffer;
-    writeln!(out, "View from daemon; segment types and other volumes are shown only when the daemon is not running.")?;
-    writeln!(
-        out,
-        "MOUNT  VG/LV  SIZE  VG FREE  THIN POOL  DATA %  META %  DATA pp/day  META pp/day"
-    )?;
+    out.write_all(crate::render::table::wrap("View from daemon; segment types and other volumes are shown only when the daemon is not running.",width).as_bytes())?;
+    let mut table = vec![[
+        "MOUNT",
+        "VG/LV",
+        "SIZE",
+        "VG FREE",
+        "THIN POOL",
+        "DATA %",
+        "META %",
+        "DATA pp/day",
+        "META pp/day",
+    ]
+    .map(str::to_owned)
+    .to_vec()];
     let mut rows: Vec<_> = report.mounts.iter().collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     for (m, r) in rows {
         let trend = trends.iter().find(|t| &t.0 == m);
-        writeln!(
-            out,
-            "{}  {}/{}  {}  {}  {}  {:?}  {:?}  {:?}  {:?}",
-            tidemark_core::path::display_lossy_bytes(m.as_bytes()),
-            tidemark_core::path::display_lossy_bytes(r.vg.as_bytes()),
-            tidemark_core::path::display_lossy_bytes(r.lv.as_bytes()),
-            r.lv_size,
-            r.vg_free,
-            tidemark_core::path::display_lossy_bytes(
-                r.thin_pool.as_deref().unwrap_or("?").as_bytes()
-            ),
-            r.data_pct,
-            r.meta_pct,
-            trend.and_then(|t| t.1),
-            trend.and_then(|t| t.2)
-        )?;
+        table.push(vec![
+            escape(m),
+            format!("{}/{}", escape(&r.vg), escape(&r.lv)),
+            r.lv_size.to_string(),
+            r.vg_free.to_string(),
+            escape(r.thin_pool.as_deref().unwrap_or("?")),
+            format!("{:?}", r.data_pct),
+            format!("{:?}", r.meta_pct),
+            format!("{:?}", trend.and_then(|t| t.1)),
+            format!("{:?}", trend.and_then(|t| t.2)),
+        ]);
     }
+    out.write_all(crate::render::table::aligned_wrapped(&table, width, &[0]).as_bytes())?;
     let mut vgs: Vec<_> = report.vgs.iter().collect();
     vgs.sort_by(|a, b| a.vg.cmp(&b.vg));
     for vg in vgs {
-        writeln!(
-            out,
-            "VG {}: {} bytes, {} free",
-            tidemark_core::path::display_lossy_bytes(vg.vg.as_bytes()),
-            vg.size,
-            vg.free
+        out.write_all(
+            crate::render::table::wrap(
+                &format!("VG {}: {} bytes, {} free", escape(&vg.vg), vg.size, vg.free),
+                width,
+            )
+            .as_bytes(),
         )?;
     }
-    destination
-        .write_all(crate::render::table::wrap(&String::from_utf8(buffer)?, width).as_bytes())?;
     Ok(())
 }
 
@@ -195,6 +191,8 @@ pub fn fallback(command: &str) -> anyhow::Result<()> {
 /// Render the report at an injected width without changing machine quantities.
 pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
     use tidemark_core::units::{fmt_bytes, fmt_rate};
+    let path = |s: &str| crate::render::table::shorten(&escape(s), width / 2);
+    let bytes_display = |b: &[u8]| crate::render::table::shorten(&bytes_display(b), width / 2);
     let mut lines = vec![format!(
         "tidemark now - {} - {}",
         escape(&r.host),
@@ -221,7 +219,7 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
         };
         lines.push(format!(
             "{} used {} / {} ({})  {} (15m)  {}",
-            escape(&m.mount),
+            path(&m.mount),
             fmt_bytes(m.used),
             fmt_bytes(m.size),
             pct,
@@ -260,7 +258,7 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
                 bytes_display(&entry.key),
                 signed_bytes(entry.bytes_delta),
                 entry.files,
-                escape(entry.top_unit.as_deref().unwrap_or("?")),
+                path(entry.top_unit.as_deref().unwrap_or("?")),
                 if entry.lossy { " [lossy]" } else { "" }
             ));
         }
@@ -294,7 +292,7 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
                 "    {} (pid {}, {}) {} {}",
                 escape(&h.comm),
                 h.pid,
-                escape(h.unit.as_deref().unwrap_or("?")),
+                path(h.unit.as_deref().unwrap_or("?")),
                 bytes_display(&h.path),
                 fmt_bytes(h.bytes)
             ));
@@ -313,7 +311,7 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
     for s in &r.scans {
         lines.push(format!(
             "last scan {} {}",
-            escape(&s.root),
+            path(&s.root),
             s.last_complete
                 .as_ref()
                 .map(|l| format!(
@@ -334,18 +332,27 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
             ));
         }
     }
+    let mut text = crate::render::table::wrap(&lines.join("\n"), width);
     for a in &r.alerts_firing {
-        lines.push(format!(
-            "ALERT {} {}: {}",
+        let prefix = format!(
+            "ALERT {} {}: ",
             escape(&a.rule),
-            escape(&a.subject),
-            escape(&a.message)
+            crate::render::table::shorten(&escape(&a.subject), width / 3)
+        );
+        text.push_str(&crate::render::table::wrap_prefixed(
+            &prefix,
+            &escape(&a.message),
+            width,
         ));
     }
     for d in &r.degraded {
-        lines.push(format!("degraded: {}", escape(d)));
+        text.push_str(&crate::render::table::wrap_prefixed(
+            "degraded: ",
+            &escape(d),
+            width,
+        ));
     }
-    crate::render::table::wrap(&lines.join("\n"), width)
+    text
 }
 fn escape(s: &str) -> String {
     tidemark_core::path::display_lossy_bytes(s.as_bytes())
