@@ -46,116 +46,235 @@ pub fn start(
     shutdown: Shutdown,
 ) -> Result<ServiceHandle, DaemonError> {
     crate::state::validate_bounds(&config)?;
-    std::thread::Builder::new().name("watcher".into()).spawn(move || {
-        let mut previous: Option<tidemark_core::config::WatchConfig> = None;
-        let mut identities = BTreeMap::new();
-        let mut minutes: BTreeMap<String, MinuteHistory> = BTreeMap::new();
-        let mut previous_rules = Vec::new();
-        let mut watchers: BTreeMap<String, Arc<Watcher>> = BTreeMap::new();
-        let attribution = Arc::new(tidemark_fs::attribution::AttributionCache::new(Duration::from_secs(60), 10_000));
-        let result = (|| {
-            while !shutdown.load(Ordering::Acquire) {
-                let (config, generation) = state.config();
-                if previous.as_ref() != Some(&config.watch) {
-                    for mount in watchers.keys() { state.remove_watcher(mount); }
-                    if let Some(old) = &previous {
-                        for path in &old.mounts { state.remove_component(&format!("watcher:{}", path.to_string_lossy())); }
-                    }
-                    minutes.clear();
-                    watchers.clear();
-                    crate::watch_fd_budget(if config.watch.enabled { config.watch.mounts.len() } else { 0 });
-                    identities.retain(|path, _| config.watch.mounts.contains(path));
-                    previous = Some(config.watch.clone());
-                }
-                if !config.watch.enabled {
-                    state.publish_component(crate::component("watcher", "disabled", "disabled by config"))?;
-                } else {
-                    let Some(mounts) = read_mount_table(&state, crate::mounts::read, &mut watchers, &mut minutes)? else {
-                        crate::wait_service(&state, generation, &shutdown, Duration::from_secs(1));
-                        continue;
-                    };
-                    let changes = crate::mounts::reconcile_live(&config.watch.mounts, &mut identities, &mounts)?;
-
-                    // Release old marks before any replacement starts.
-                    for change in &changes {
-                        let mount = RawPath::from_path(&change.path).map_err(|e| DaemonError::Config(e.to_string()))?.display_lossy();
-                        state.remove_watcher(&mount);
-                        watchers.remove(&mount);
-                        minutes.remove(&mount);
-                    }
-                    let namespace = tidemark_live::watch::namespace_ok();
-                    if matches!(&namespace, Err(error) if crate::resource_pressure(error)) {
-                        state.publish_component(crate::component("watcher", "degraded", format!("namespace check: {namespace:?}")))?;
-                        crate::wait_service(&state, generation, &shutdown, Duration::from_secs(1));
-                        continue;
-                    }
-                    if !matches!(namespace, Ok(true)) {
-                        for mount in watchers.keys() { state.remove_watcher(mount); }
-                        watchers.clear();
+    std::thread::Builder::new()
+        .name("watcher".into())
+        .spawn(move || {
+            let mut previous: Option<tidemark_core::config::WatchConfig> = None;
+            let mut identities = BTreeMap::new();
+            let mut minutes: BTreeMap<String, MinuteHistory> = BTreeMap::new();
+            let mut previous_rules = Vec::new();
+            let mut watchers: BTreeMap<String, Arc<Watcher>> = BTreeMap::new();
+            let attribution = Arc::new(tidemark_fs::attribution::AttributionCache::new(
+                Duration::from_secs(60),
+                10_000,
+            ));
+            let result = (|| {
+                while !shutdown.load(Ordering::Acquire) {
+                    let (config, generation) = state.config();
+                    if previous.as_ref() != Some(&config.watch) {
+                        for mount in watchers.keys() {
+                            state.remove_watcher(mount);
+                        }
+                        if let Some(old) = &previous {
+                            for path in &old.mounts {
+                                state.remove_component(&format!(
+                                    "watcher:{}",
+                                    path.to_string_lossy()
+                                ));
+                            }
+                        }
                         minutes.clear();
-                        state.publish_component(crate::component("watcher", "error", format!("host mount namespace check failed: {namespace:?}")))?;
+                        watchers.clear();
+                        crate::watch_fd_budget(if config.watch.enabled {
+                            config.watch.mounts.len()
+                        } else {
+                            0
+                        });
+                        identities.retain(|path, _| config.watch.mounts.contains(path));
+                        previous = Some(config.watch.clone());
                     }
-                    for path in &config.watch.mounts {
-                        if shutdown.load(Ordering::Acquire) { break; }
-                        let mount = RawPath::from_path(path).map_err(|e| DaemonError::Config(e.to_string()))?.display_lossy();
-                        let name = format!("watcher:{mount}");
-                        if identities.get(path) == Some(&None) {
-                            state.publish_component(crate::component(&name, "degraded", "not mounted"))?;
+                    if !config.watch.enabled {
+                        state.publish_component(crate::component(
+                            "watcher",
+                            "disabled",
+                            "disabled by config",
+                        ))?;
+                    } else {
+                        let Some(mounts) = read_mount_table(
+                            &state,
+                            crate::mounts::read,
+                            &mut watchers,
+                            &mut minutes,
+                        )?
+                        else {
+                            crate::wait_service(
+                                &state,
+                                generation,
+                                &shutdown,
+                                Duration::from_secs(1),
+                            );
+                            continue;
+                        };
+                        let changes = crate::mounts::reconcile_live(
+                            &config.watch.mounts,
+                            &mut identities,
+                            &mounts,
+                        )?;
+
+                        // Release old marks before any replacement starts.
+                        for change in &changes {
+                            let mount = RawPath::from_path(&change.path)
+                                .map_err(|e| DaemonError::Config(e.to_string()))?
+                                .display_lossy();
+                            state.remove_watcher(&mount);
+                            watchers.remove(&mount);
+                            minutes.remove(&mount);
+                        }
+                        let namespace = tidemark_live::watch::namespace_ok();
+                        if matches!(&namespace, Err(error) if crate::resource_pressure(error)) {
+                            state.publish_component(crate::component(
+                                "watcher",
+                                "degraded",
+                                format!("namespace check: {namespace:?}"),
+                            ))?;
+                            crate::wait_service(
+                                &state,
+                                generation,
+                                &shutdown,
+                                Duration::from_secs(1),
+                            );
                             continue;
                         }
-                        if !matches!(namespace, Ok(true)) || watchers.contains_key(&mount) { continue; }
-                        match Watcher::start(options(&config, path)?, attribution.clone()) {
-                            Ok(w) => {
-                                if let Err(error) = verify_identity(identities.get(path).copied().flatten(), || w.mount_identity()) {
-                                    drop(w);
-                                    state.publish_component(crate::component(&name, "error", error.to_string()))?;
-                                    continue;
-                                }
-                                let w = Arc::new(w);
-                                state.publish(Publication::Watcher((mount.clone(), w.clone())), crate::component(&name, "ok", "watcher started"))?;
-                                minutes.insert(mount.clone(), MinuteHistory::default());
-                                watchers.insert(mount, w);
+                        if !matches!(namespace, Ok(true)) {
+                            for mount in watchers.keys() {
+                                state.remove_watcher(mount);
                             }
-                            Err(e) => { state.publish_component(crate::component(&name, "error", e.to_string()))?; }
+                            watchers.clear();
+                            minutes.clear();
+                            state.publish_component(crate::component(
+                                "watcher",
+                                "error",
+                                format!("host mount namespace check failed: {namespace:?}"),
+                            ))?;
+                        }
+                        for path in &config.watch.mounts {
+                            if shutdown.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let mount = RawPath::from_path(path)
+                                .map_err(|e| DaemonError::Config(e.to_string()))?
+                                .display_lossy();
+                            let name = format!("watcher:{mount}");
+                            if identities.get(path) == Some(&None) {
+                                state.publish_component(crate::component(
+                                    &name,
+                                    "degraded",
+                                    "not mounted",
+                                ))?;
+                                continue;
+                            }
+                            if !matches!(namespace, Ok(true)) || watchers.contains_key(&mount) {
+                                continue;
+                            }
+                            match Watcher::start(options(&config, path)?, attribution.clone()) {
+                                Ok(w) => {
+                                    if let Err(error) = verify_identity(
+                                        identities.get(path).copied().flatten(),
+                                        || w.mount_identity(),
+                                    ) {
+                                        drop(w);
+                                        state.publish_component(crate::component(
+                                            &name,
+                                            "error",
+                                            error.to_string(),
+                                        ))?;
+                                        continue;
+                                    }
+                                    let w = Arc::new(w);
+                                    state.publish(
+                                        Publication::Watcher((mount.clone(), w.clone())),
+                                        crate::component(&name, "ok", "watcher started"),
+                                    )?;
+                                    minutes.insert(mount.clone(), MinuteHistory::default());
+                                    watchers.insert(mount, w);
+                                }
+                                Err(e) => {
+                                    state.publish_component(crate::component(
+                                        &name,
+                                        "error",
+                                        e.to_string(),
+                                    ))?;
+                                }
+                            }
+                        }
+                        if config.watch.mounts.is_empty() {
+                            state.publish_component(crate::component(
+                                "watcher",
+                                "disabled",
+                                "no watch mounts",
+                            ))?;
                         }
                     }
-                    if config.watch.mounts.is_empty() {
-                        state.publish_component(crate::component("watcher", "disabled", "no watch mounts"))?;
+                    for (mount, w) in &watchers {
+                        let history = minutes.entry(mount.clone()).or_default();
+                        let mut published = 0;
+                        let mut rows = Vec::new();
+                        for mut minute in w.drain_minutes(1000) {
+                            rows.append(&mut minute.persisted);
+                            history.push(minute);
+                            published = history.publish(mount, &config, &state)?;
+                        }
+                        if previous_rules != config.alerts.rule {
+                            published = history.publish(mount, &config, &state)?;
+                        }
+                        if published == 0 && !history.0.is_empty() {
+                            published = requested_windows(&config, mount).len();
+                        }
+                        let mut dropped = false;
+                        // Persist top 50 for each minute/scope, retaining the collector's rank.
+                        let rows = persistence_rows(rows);
+                        for rows in rows.chunks(super::tswriter::MAX_BATCH_ROWS) {
+                            dropped |= writer
+                                .try_send(super::tswriter::Message::Hot(rows.to_vec()))
+                                .is_err();
+                        }
+                        state.publish_component(watcher_component(mount, w, dropped, published))?;
                     }
+                    previous_rules = config.alerts.rule.clone();
+                    crate::wait_service(&state, generation, &shutdown, Duration::from_secs(1));
                 }
-                for (mount, w) in &watchers {
-                    let history = minutes.entry(mount.clone()).or_default();
-                    let mut published = 0;
-                    let mut rows = Vec::new();
-                    for mut minute in w.drain_minutes(1000) {
-                        rows.append(&mut minute.persisted);
-                        history.push(minute);
-                        published = history.publish(mount, &config, &state)?;
-                    }
-                    if previous_rules != config.alerts.rule {
-                        published = history.publish(mount, &config, &state)?;
-                    }
-                    if published == 0 && !history.0.is_empty() { published = requested_windows(&config, mount).len(); }
-                    let mut dropped = false;
-                    // Persist top 50 for each minute/scope, retaining the collector's rank.
-                    let rows = persistence_rows(rows);
-                    for rows in rows.chunks(super::tswriter::MAX_BATCH_ROWS) { dropped |= writer.try_send(super::tswriter::Message::Hot(rows.to_vec())).is_err(); }
-                    let stats = w.stats();
-                    let health = if stats.mode == WatchMode::Failed { "failed" } else if stats.recovering || dropped || stats.lossy_minutes_15m > 0 { "degraded" } else { "ok" };
-                    state.publish_component(crate::component(&format!("watcher:{mount}"), health, format!("mode={} recovering={} overflows_total={} read_errors={} persistence_dropped={dropped}; windows: {published} published", stats.mode, stats.recovering, stats.overflows_total, stats.read_errors)))?;
-                }
-                previous_rules = config.alerts.rule.clone();
-                crate::wait_service(&state, generation, &shutdown, Duration::from_secs(1));
+                Ok(())
+            })();
+            // Also release on publication failures: the last Arc drop joins the worker.
+            for mount in watchers.keys() {
+                state.remove_watcher(mount);
             }
+            watchers.clear();
+            result?;
+            state.publish_component(crate::component(
+                "watcher",
+                "stopped",
+                "all watcher handles released",
+            ))?;
             Ok(())
-        })();
-        // Also release on publication failures: the last Arc drop joins the worker.
-        for mount in watchers.keys() { state.remove_watcher(mount); }
-        watchers.clear();
-        result?;
-        state.publish_component(crate::component("watcher", "stopped", "all watcher handles released"))?;
-        Ok(())
-    }).map_err(|source| DaemonError::Io { context: "spawn watcher".into(), source })
+        })
+        .map_err(|source| DaemonError::Io {
+            context: "spawn watcher".into(),
+            source,
+        })
+}
+
+fn watcher_component(
+    mount: &str,
+    watcher: &Watcher,
+    dropped: bool,
+    published: usize,
+) -> tidemark_core::api::ComponentState {
+    let stats = watcher.stats();
+    let health = if stats.mode == WatchMode::Failed {
+        "failed"
+    } else if stats.recovering || dropped || stats.lossy_minutes_15m > 0 {
+        "degraded"
+    } else {
+        "ok"
+    };
+    let mut detail = format!("mode={} recovering={} overflows_total={} read_errors={} persistence_dropped={dropped}; windows: {published} published", stats.mode, stats.recovering, stats.overflows_total, stats.read_errors);
+    let reasons = watcher.health_detail();
+    if !reasons.is_empty() {
+        detail.push_str("; ");
+        detail.push_str(&reasons);
+    }
+    crate::component(&format!("watcher:{mount}"), health, detail)
 }
 
 // Retain only facts: persistence rows are removed before insertion.
@@ -384,6 +503,45 @@ fn persistence_rows(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn distinct_cap_detail_and_alert_window_remain_unavailable() {
+        let at = crate::unix_now().div_euclid(60) * 60;
+        let events = std::iter::once((at - 120, [vec![], vec![], vec![]], 0, None, (1, 0))).chain(
+            (1..=100_000).map(|n| {
+                (
+                    at - 60,
+                    [b"d".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                    1,
+                    None,
+                    (1, n),
+                )
+            }),
+        );
+        let watcher =
+            Watcher::from_injected_events(RawPath::new(b"/fixture".to_vec()).unwrap(), events)
+                .unwrap();
+        let mut history = MinuteHistory::default();
+        for minute in watcher.drain_minutes(1000) {
+            history.push(minute);
+        }
+        let (hot, overflows) = history.facts(history.0.len());
+        assert!(history
+            .0
+            .iter()
+            .any(|minute| minute.truncated && minute.lossy));
+        assert!(hot.is_none());
+        assert_eq!(overflows, Some(0));
+        let component = watcher_component("/fixture", &watcher, false, 1);
+        assert_eq!(component.state, "degraded");
+        assert!(component
+            .detail
+            .contains("truncated: distinct-file cap reached in the minute"));
+        assert!(component
+            .detail
+            .contains("events complete, per-file counts capped"));
+        assert!(!component.detail.contains("lost events:"));
+    }
+
     use super::*;
     fn minute(at: i64, bytes: i64) -> CompletedMinute {
         CompletedMinute {

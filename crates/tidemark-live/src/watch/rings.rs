@@ -48,6 +48,12 @@ struct Bucket {
     drained: bool,
     truncated: bool,
     drain_truncated: bool,
+    distinct_capped: bool,
+    current_capped: bool,
+    completed_capped: bool,
+    read_error: bool,
+    descriptor_pressure: bool,
+    transport_loss: bool,
     overflow_start: u64,
     overflow_end: u64,
     seen: HashSet<(usize, Vec<u8>, (u64, u64))>,
@@ -100,6 +106,7 @@ impl Rings {
                 if rows.len() > COMPLETED_CAP {
                     last.lossy = true;
                     last.truncated = true;
+                    last.completed_capped = true;
                     self.dropped += (rows.len() - COMPLETED_CAP) as u64;
                 }
                 *map = rows
@@ -128,6 +135,12 @@ impl Rings {
                 drained: self.rows_drained_until.is_some_and(|end| at <= end),
                 truncated: false,
                 drain_truncated: false,
+                distinct_capped: false,
+                current_capped: false,
+                completed_capped: false,
+                read_error: false,
+                descriptor_pressure: false,
+                transport_loss: self.rollback_until.is_some_and(|end| at <= end),
                 overflow_start: self.overflow_total,
                 overflow_end: self.overflow_total,
                 seen: HashSet::new(),
@@ -152,13 +165,22 @@ impl Rings {
         for bucket in &mut self.buckets {
             if bucket.minute >= start {
                 bucket.lossy = true;
+                bucket.transport_loss = true;
             }
+        }
+    }
+    pub fn read_failure(&mut self, now: i64, descriptor_pressure: bool) {
+        self.overflow(now);
+        if let Some(b) = self.buckets.back_mut() {
+            b.descriptor_pressure |= descriptor_pressure;
+            b.read_error |= !descriptor_pressure;
         }
     }
     pub fn overflow(&mut self, now: i64) {
         self.advance(now);
         if let Some(b) = self.buckets.back_mut() {
             b.lossy = true;
+            b.transport_loss = true;
         }
     }
     pub fn add(
@@ -178,6 +200,8 @@ impl Rings {
                 bucket.seen.insert((index, key.clone(), identity))
             } else {
                 bucket.lossy = true;
+                bucket.truncated = true;
+                bucket.distinct_capped = true;
                 false
             };
             if !map.contains_key(&key) && map.len() >= CURRENT_CAP {
@@ -191,6 +215,7 @@ impl Rings {
                 bucket.units[index].retain(|key, _| map.contains_key(key));
                 bucket.lossy = true;
                 bucket.truncated = true;
+                bucket.current_capped = true;
             }
             let row = if map.contains_key(&key) {
                 map.get_mut(&key)
@@ -271,6 +296,60 @@ impl Rings {
             }
         }
         ranked(&sum).into_iter().take(limit).collect()
+    }
+    pub fn detail(&self, now: i64) -> String {
+        let cutoff = now.div_euclid(60) * 60 - 14 * 60;
+        // One latest occurrence per cause bounds status text independently of
+        // the number of affected minutes and configured watchers.
+        let mut reported = [false; 8];
+        let mut reasons = Vec::with_capacity(reported.len());
+        for b in self
+            .buckets
+            .iter()
+            .rev()
+            .filter(|b| b.minute >= cutoff && b.minute <= now)
+        {
+            let causes = [
+                (b.distinct_capped, "truncated: distinct-file cap reached"),
+                (b.current_capped, "truncated: current-key cap reached"),
+                (b.completed_capped, "truncated: completed-key cap reached"),
+                (b.drain_truncated, "truncated: requested-output cap reached"),
+                (b.read_error, "lost events: read error"),
+                (b.descriptor_pressure, "lost events: descriptor pressure"),
+                (
+                    b.overflow_end > b.overflow_start,
+                    "lost events: queue overflow",
+                ),
+                (
+                    b.transport_loss
+                        && !b.read_error
+                        && !b.descriptor_pressure
+                        && b.overflow_end == b.overflow_start,
+                    "lost events: transport recovery or history gap",
+                ),
+            ];
+            for (index, (occurred, reason)) in causes.into_iter().enumerate() {
+                if !occurred || reported[index] {
+                    continue;
+                }
+                reported[index] = true;
+                let minute = format!(
+                    "{:02}:{:02} UTC (timestamp {})",
+                    b.minute.div_euclid(3600).rem_euclid(24),
+                    b.minute.div_euclid(60).rem_euclid(60),
+                    b.minute
+                );
+                let qualifier = if index == 0 && !b.transport_loss {
+                    " (events complete, per-file counts capped)"
+                } else if index == 0 {
+                    " (per-file counts capped)"
+                } else {
+                    ""
+                };
+                reasons.push(format!("{reason} in the minute {minute}{qualifier}"));
+            }
+        }
+        reasons.join("; ")
     }
     pub fn lossy(&self, now: i64) -> u32 {
         self.buckets
@@ -369,6 +448,38 @@ mod tests {
             b"unit".to_vec(),
             b"comm".to_vec(),
         ]
+    }
+    #[test]
+    fn diagnostics_distinguish_caps_from_each_transport_loss() {
+        let mut r = Rings::new();
+        r.advance(0);
+        r.read_failure(60, true);
+        r.read_failure(61, false);
+        r.queue_overflow(62);
+        let bucket = r.buckets.back_mut().unwrap();
+        bucket.truncated = true;
+        bucket.distinct_capped = true;
+        let detail = r.detail(62);
+        assert!(!detail.contains("events complete"));
+        for reason in [
+            "truncated: distinct-file cap",
+            "lost events: queue overflow",
+            "lost events: read error",
+            "lost events: descriptor pressure",
+            "00:01 UTC (timestamp 60)",
+        ] {
+            assert!(detail.contains(reason), "{detail}");
+        }
+    }
+    #[test]
+    fn diagnostics_retain_only_latest_occurrence_per_cause() {
+        let mut r = Rings::new();
+        for at in 0..15 {
+            r.read_failure(at * 60, true);
+        }
+        let detail = r.detail(14 * 60);
+        assert_eq!(detail.matches("descriptor pressure").count(), 1);
+        assert!(detail.contains("00:14 UTC (timestamp 840)"));
     }
     #[test]
     fn completed_empty_minutes_and_overflow_boundaries() {

@@ -174,7 +174,7 @@ pub struct CompletedMinute {
     pub overflow_total_at_end: u64,
     /// Any loss from overflow, recovery, caps, rollback, or a preceding retention gap.
     pub lossy: bool,
-    /// A per-minute list was cut by its storage or requested output cap.
+    /// A per-minute list or distinct-file count was capped by storage or requested output.
     pub truncated: bool,
     /// Ranked directory rows, bounded by the existing completed-minute cap and top_k.
     pub dirs: Vec<HotEntry>,
@@ -353,7 +353,7 @@ impl Watcher {
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = stopping.clone();
         let mount = cfg.mount.clone();
-        tracing::info!(mode = %mode, mount = %mount.display_lossy(), "watcher started");
+        tracing::info!(mode = %mode, mount = %mount.display_lossy(), "watcher started: mount {}, mode {mode}", mount.display_lossy());
         let thread = std::thread::Builder::new()
             .name("tidemark-watch".into())
             .spawn(move || {
@@ -395,7 +395,7 @@ impl Watcher {
                         if error == rustix::io::Errno::INTR {
                             continue;
                         }
-                        tracing::warn!(%error,"fanotify poll failed");
+                        tracing::warn!(%error,"fanotify poll failed: {error}");
                         if processor.transport_error(&io::Error::from(error), now(), &worker_state)
                             && retry_wait(worker_shutdown.as_ref(), &worker_stopping, 5)
                         {
@@ -442,6 +442,7 @@ impl Watcher {
                         processor.loss(now(), &worker_state);
                         let mut state = worker_state.lock();
                         state.read_errors = state.read_errors.saturating_add(1);
+                        state.rings.read_failure(now(), true);
                     }
                     for event in events {
                         if worker_stopping.load(Ordering::Relaxed) {
@@ -594,6 +595,13 @@ impl Watcher {
         }
         paths
     }
+    /// Explain caps and loss in the retained fifteen-minute history.
+    /// Reports at most eight causes, each with its latest affected UTC minute.
+    /// Truncation diagnostics do not change legacy lossy flags or alert availability.
+    pub fn health_detail(&self) -> String {
+        let state = self.state.lock();
+        state.rings.detail(now())
+    }
     /// Read counters and the loss indicator for the latest fifteen minute buckets.
     pub fn stats(&self) -> WatchStats {
         let mut state = self.state.lock();
@@ -680,7 +688,7 @@ fn read_recover<T>(
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                tracing::warn!(%error, "fanotify read failed");
+                tracing::warn!(%error, "fanotify read failed: {error}");
                 if !processor.transport_error(&error, clock(), state) {
                     return None;
                 }
@@ -743,6 +751,13 @@ impl Processor<'_> {
             .any(|errno| errno.raw_os_error() == code)
         }) || error.kind() == io::ErrorKind::WouldBlock;
         let mut state = state.lock();
+        state.rings.read_failure(
+            at,
+            error.raw_os_error().is_some_and(|code| {
+                code == rustix::io::Errno::MFILE.raw_os_error()
+                    || code == rustix::io::Errno::NFILE.raw_os_error()
+            }),
+        );
         state.read_errors = state.read_errors.saturating_add(1);
         state.recovering = retry;
         state.failed = !retry;
@@ -970,6 +985,31 @@ mod tests {
             }
             assert_eq!(reads, 5000usize.div_ceil(batch));
         }
+    }
+    #[test]
+    fn distinct_file_cap_marks_truncation_and_preserves_event_totals() {
+        let at = now().div_euclid(60) * 60;
+        let events = std::iter::once((at - 60, [vec![], vec![], vec![]], 0, None, (1, 0))).chain(
+            (1..=100_000).map(|n| {
+                (
+                    at,
+                    [b"d".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                    1,
+                    None,
+                    (1, n),
+                )
+            }),
+        );
+        let watcher = Watcher::from_injected_events(raw("/fixture"), events).unwrap();
+        assert!(watcher
+            .health_detail()
+            .contains("truncated: distinct-file cap reached in the minute"));
+        let minutes = watcher.drain_minutes_at(at + 60, 1000);
+        let minute = minutes.last().unwrap();
+        assert!(minute.truncated && minute.lossy);
+        assert_eq!(minute.overflow_total_at_end, 0);
+        assert_eq!(minute.dirs[0].events, 100_000);
+        assert_eq!(minute.dirs[0].files, 66_667);
     }
     #[test]
     fn injected_watcher_minutes_and_shared_persistence() {

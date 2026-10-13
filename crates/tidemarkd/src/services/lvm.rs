@@ -60,7 +60,7 @@ where
                     state.publish_component(crate::component(
                         "lvm",
                         "disabled",
-                        "configuration",
+                        "not configured: lvm disabled by config",
                     ))?;
                     crate::wait_service(&state, generation, &shutdown, config.lvm.interval);
                     continue;
@@ -147,6 +147,37 @@ mod tests {
             assert!(Instant::now() < end);
             std::thread::yield_now();
         }
+    }
+    #[test]
+    fn disabled_lvm_reports_why_without_collecting() {
+        let mut config = Config::default();
+        config.lvm.enabled = false;
+        let state = LiveState::new(&config, 0);
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let shutdown = Shutdown::default();
+        let handle = start_worker(
+            state.clone(),
+            tx,
+            shutdown.clone(),
+            |_, _| panic!("disabled LVM must not collect"),
+            || panic!("disabled LVM must not read mountinfo"),
+        )
+        .unwrap();
+        wait(|| {
+            state
+                .view_at(0)
+                .status(0)
+                .unwrap()
+                .components
+                .iter()
+                .any(|c| {
+                    c.name == "lvm"
+                        && c.state == "disabled"
+                        && c.detail == "not configured: lvm disabled by config"
+                })
+        });
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap().unwrap();
     }
     #[test]
     fn retry_sequence_custom_intervals_and_success_reset() {

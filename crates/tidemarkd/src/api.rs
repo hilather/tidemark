@@ -195,6 +195,11 @@ fn params<T: serde::de::DeserializeOwned>(r: &Request) -> Result<T, DaemonError>
 fn value<T: serde::Serialize>(v: T) -> Result<serde_json::Value, DaemonError> {
     serde_json::to_value(v).map_err(|e| DaemonError::Internal(e.to_string()))
 }
+pub(crate) fn log_request(uid: u32, pid: i32, method: &str, ok: bool, elapsed: Duration) {
+    let outcome = if ok { "ok" } else { "failed" };
+    let millis = elapsed.as_millis();
+    tracing::info!(uid, pid, method = %method, ok, millis = %millis, "API request: {method} from uid {uid} pid {pid}, {outcome} in {millis} ms");
+}
 fn available<T>(v: Option<T>) -> Result<T, DaemonError> {
     v.ok_or_else(|| DaemonError::Unavailable("measurement unavailable".into()))
 }
@@ -262,7 +267,10 @@ pub(crate) fn dispatch_controlled(
             "hot" => value(available(view.hot(&params(request)?))?),
             "lvm" => value(available(view.lvm_report(&params(request)?))?),
             "phantom" => value(available(view.phantom(&params(request)?))?),
-            "writers" => value(available(view.writers(&params(request)?))?),
+            "writers" => value(
+                view.writers(&params(request)?)
+                    .ok_or_else(|| DaemonError::Unavailable(view.process_unavailable_detail()))?,
+            ),
             "alerts.active" => {
                 let p: AlertsActiveParams = params(request)?;
                 let mut rows = available(view.active_alerts())?;
@@ -454,7 +462,8 @@ fn connection(
                 }
                 Err(_) => return,
             };
-            tracing::info!(uid, pid, method = %request.method, "API request");
+            let request_started = Instant::now();
+            let method = request.method.clone();
             let scan_start = request.method == "scan.start";
             let id = request.id.clone();
             let ctx = context.clone();
@@ -478,13 +487,17 @@ fn connection(
                 });
             let _handler = match spawned {
                 Ok(handle) => Handler(Some(handle)),
-                Err(_) => return,
+                Err(_) => {
+                    log_request(uid, pid, &method, false, request_started.elapsed());
+                    return;
+                }
             };
             let deadline = cancellation.deadline;
             let mut timed_out = false;
             let response = loop {
                 if shutdown.load(Ordering::Acquire) {
                     cancellation.cancel();
+                    log_request(uid, pid, &method, false, request_started.elapsed());
                     return;
                 }
                 if Instant::now() >= deadline {
@@ -507,6 +520,7 @@ fn connection(
                     Err(_) => break error(&id, ApiErrorCode::Internal, "handler disconnected"),
                 }
             };
+            log_request(uid, pid, &method, response.ok, request_started.elapsed());
             if send(&mut stream, &response, &shutdown, timeout).is_err() {
                 return;
             }
@@ -735,7 +749,7 @@ impl Drop for SocketPath {
         let _keep_locked = &self.lock;
         if let Some(identity) = self.identity {
             if let Err(error) = self.unlink(identity) {
-                tracing::warn!(%error, "API socket cleanup failed");
+                tracing::warn!(%error, "API socket cleanup failed: {error}");
             }
         }
         if let Ok(stat) = rustix::fs::statat(
@@ -749,7 +763,7 @@ impl Drop for SocketPath {
                     &self.lock_name,
                     rustix::fs::AtFlags::empty(),
                 ) {
-                    tracing::warn!(%error, "API lock cleanup failed");
+                    tracing::warn!(%error, "API lock cleanup failed: {error}");
                 }
             }
         }
@@ -823,7 +837,7 @@ pub fn start_with_peer_timeout(
                     || listener.accept(),
                     |error, log| {
                         if log {
-                            tracing::warn!(%error, "API accept degraded; retrying");
+                            tracing::warn!(%error, "API accept degraded; retrying: {error}");
                         }
                         let _ = context.state.publish_component(crate::component(
                             "api",
@@ -947,6 +961,46 @@ mod fuzz_seams;
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn writers_unavailable_names_the_process_scan_and_failure() {
+        let mut config = tidemark_core::config::Config::default();
+        config.procscan.enabled = true;
+        let state = crate::state::LiveState::new(&config, 0);
+        let context = Context {
+            state: state.clone(),
+            scans: crate::scheduler::ScanControl::default(),
+            reload: Arc::new(|| unreachable!("writers does not reload")),
+        };
+        let request = Request {
+            v: 1,
+            id: "writers-test".into(),
+            method: "writers".into(),
+            params: serde_json::json!({"window": "5m"}),
+        };
+        let response = dispatch(&request, 0, &context, 0).unwrap();
+        assert_eq!(
+            response.error.unwrap().message,
+            "unavailable: process scan has not completed yet"
+        );
+        state.publish(crate::state::Publication::ProcscanAttempt { generation: 0, report: None }, crate::component("procscan", "degraded", "process inventory over its memory budget: 34000 descriptors, 134217000 bytes retained")).unwrap();
+        let response = dispatch(&request, 0, &context, 1).unwrap();
+        assert_eq!(response.error.unwrap().message, "unavailable: process inventory over its memory budget: 34000 descriptors, 134217000 bytes retained");
+        state
+            .publish_component(crate::component("procscan", "error", "permission denied"))
+            .unwrap();
+        let response = dispatch(&request, 0, &context, 1).unwrap();
+        assert_eq!(
+            response.error.unwrap().message,
+            "unavailable: process scan failed: permission denied"
+        );
+        config.procscan.enabled = false;
+        state.replace_config(config).unwrap();
+        let response = dispatch(&request, 0, &context, 1).unwrap();
+        assert_eq!(
+            response.error.unwrap().message,
+            "unavailable: process scan not configured: disabled by config"
+        );
+    }
     const FRAME_SEED: &[u8] = include_bytes!("../../../fuzz/corpus/api_frame/sample");
     fn exercise_frame(bytes: &[u8]) {
         let mut input = bytes;
@@ -1247,7 +1301,10 @@ mod tests {
                 flag.store(true, Ordering::Release);
                 Err(DaemonError::Shutdown)
             }));
-            let (mut stream, stop, handle) = pair(reload, Duration::from_millis(100));
+            // Allow the client to be scheduled under workspace load before the
+            // idle deadline closes the pair. The three-second reader limit
+            // still fails if the callback does not observe its real deadline.
+            let (mut stream, stop, handle) = pair(reload, Duration::from_secs(1));
             stream
                 .get_mut()
                 .write_all(b"{\"v\":1,\"id\":\"x\",\"method\":\"config.reload\",\"params\":{}}\n")

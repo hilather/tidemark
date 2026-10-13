@@ -118,7 +118,7 @@ pub fn build(inputs: &FirstbootInputs, now: i64) -> FirstbootReport {
             .ok_or_else(|| io::Error::other("btime absent or invalid"))
     })()
     .unwrap_or_else(|error| {
-        tracing::warn!(%error, "boot timestamp unavailable");
+        tracing::warn!(%error, "boot timestamp unavailable: {error}");
         0
     });
     build_with_boot(inputs, now, booted_at)
@@ -164,7 +164,7 @@ pub fn write(state_dir: &Path, r: &FirstbootReport) -> io::Result<()> {
         &bytes,
         rustix::process::geteuid().is_root(),
     )?;
-    tracing::info!(healthy = r.healthy, version = %r.version, config_sha256 = %r.config_sha256, "Tidemark first-boot report published");
+    tracing::info!(healthy = r.healthy, version = %r.version, config_sha256 = %r.config_sha256, "Tidemark first-boot report published: healthy {}, version {}, config sha256 {}", r.healthy, r.version, r.config_sha256);
     Ok(())
 }
 #[path = "../../tidemark-cli/src/deploy/files.rs"]
