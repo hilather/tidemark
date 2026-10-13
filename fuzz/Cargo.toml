@@ -1,0 +1,110 @@
+# Owned by: W7-C3-fuzz
+[package]
+name = "tidemark-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+[package.metadata]
+cargo-fuzz = true
+[workspace]
+[dependencies]
+libfuzzer-sys = "0.4"
+tidemark-fs = { path = "../crates/tidemark-fs" }
+tidemark-core = { path = "../crates/tidemark-core" }
+tidemark-cli = { path = "../crates/tidemark-cli" }
+tidemarkd = { path = "../crates/tidemarkd" }
+tidemark-store = { path = "../crates/tidemark-store" }
+serde_json = "1"
+tempfile = "3"
+rusqlite = { version = "0.38", features = ["bundled"] }
+
+[[bin]]
+name = "mountinfo"
+path = "fuzz_targets/mountinfo.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "disk_stat"
+path = "fuzz_targets/disk_stat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cgroup_unit"
+path = "fuzz_targets/cgroup_unit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fdinfo_flags"
+path = "fuzz_targets/fdinfo_flags.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stat_starttime"
+path = "fuzz_targets/stat_starttime.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lvs"
+path = "fuzz_targets/lvs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vgs"
+path = "fuzz_targets/vgs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_request"
+path = "fuzz_targets/api_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_response"
+path = "fuzz_targets/api_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "staged"
+path = "fuzz_targets/staged.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firstboot"
+path = "fuzz_targets/firstboot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "catalog_path"
+path = "fuzz_targets/catalog_path.rs"
+test = false
+doc = false
+bench = false
