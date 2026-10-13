@@ -123,11 +123,16 @@ fn start_with(
                 let mounts = match mount_source() {
                     Ok(mounts) => mounts,
                     Err(error) => {
-                        state.publish_component(crate::component(
-                            "sampler",
-                            "degraded",
-                            error.to_string(),
-                        ))?;
+                        for path in &config.sampler.mounts {
+                            state.publish(
+                                Publication::FsAttempt {
+                                    generation,
+                                    mount: path.to_string_lossy().into_owned(),
+                                    sample: None,
+                                },
+                                crate::component("sampler", "degraded", error.to_string()),
+                            )?;
+                        }
                         crate::wait_service(
                             &state,
                             generation,
@@ -148,6 +153,7 @@ fn start_with(
                 crate::mounts::log(&changes, "sampler");
                 for change in &changes {
                     last_sample.remove(&change.path);
+                    state.reset_fs_mount(generation, &change.path.to_string_lossy());
                 }
                 if !changes.is_empty() {
                     next_sample = std::time::Instant::now();
@@ -181,7 +187,11 @@ fn start_with(
                     match sample_checked(path, now, identities.get(path).copied().flatten()) {
                         Ok(s) => {
                             state.publish(
-                                Publication::Fs(s.clone()),
+                                Publication::FsAttempt {
+                                    generation,
+                                    mount: s.mount.clone(),
+                                    sample: Some(s.clone()),
+                                },
                                 if errors.is_empty() {
                                     crate::component("sampler", "ok", "statvfs sampled")
                                 } else {
@@ -195,7 +205,17 @@ fn start_with(
                                 rows.push(s);
                             }
                         }
-                        Err(e) => errors.push(e.to_string()),
+                        Err(e) => {
+                            state.publish(
+                                Publication::FsAttempt {
+                                    generation,
+                                    mount: path.to_string_lossy().into_owned(),
+                                    sample: None,
+                                },
+                                crate::component("sampler", "degraded", e.to_string()),
+                            )?;
+                            errors.push(e.to_string());
+                        }
                     }
                 }
                 if due {

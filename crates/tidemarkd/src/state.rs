@@ -33,6 +33,8 @@ struct Inner {
     started: i64,
     hash: Option<String>,
     fs: BTreeMap<String, VecDeque<FsSample>>,
+    fs_available: BTreeMap<String, bool>,
+    lvm_available: bool,
     lvm: Option<LvmResult>,
     watchers: BTreeMap<String, Arc<tidemark_live::watch::Watcher>>,
     procscan: Option<Arc<parking_lot::Mutex<tidemark_live::procscan::ProcScanner>>>,
@@ -65,6 +67,22 @@ impl Default for LiveState {
 pub enum Publication {
     /// Publish fs measurements.
     Fs(FsSample),
+    /// Generation-bound collector attempt; failure retains display history.
+    FsAttempt {
+        /// Configuration observed before collection.
+        generation: u64,
+        /// Configured mount whose collector attempted measurement.
+        mount: String,
+        /// Successful sample, or unavailable after failure.
+        sample: Option<FsSample>,
+    },
+    /// Generation-bound LVM attempt; failure retains display history.
+    LvmAttempt {
+        /// Configuration observed before collection.
+        generation: u64,
+        /// Successful report, or unavailable after failure.
+        report: Option<LvmResult>,
+    },
     /// Publish lvm measurements.
     Lvm(LvmResult),
     /// Publish watcher measurements.
@@ -117,6 +135,8 @@ impl LiveState {
             started: started_at,
             hash: None,
             fs: BTreeMap::new(),
+            fs_available: BTreeMap::new(),
+            lvm_available: false,
             lvm: None,
             watchers: BTreeMap::new(),
             procscan: None,
@@ -242,10 +262,35 @@ impl LiveState {
                 .iter()
                 .any(|p| p.to_string_lossy() == m.as_str())
         });
+        d.fs_available.retain(|m, _| {
+            config
+                .sampler
+                .mounts
+                .iter()
+                .any(|p| p.to_string_lossy() == m.as_str())
+        });
+        if d.config.lvm != config.lvm || d.config.sampler.mounts != config.sampler.mounts {
+            d.lvm_available = false;
+        }
         d.windows.clear();
         d.config = Arc::new(config);
         d.generation = d.generation.saturating_add(1);
         Ok(())
+    }
+    /// Clear a mount's current samples on a presence/identity transition.
+    /// Obsolete passes cannot change the current generation's measurements.
+    pub fn reset_fs_mount(&self, generation: u64, mount: &str) {
+        let mut d = self.0.write();
+        if generation == d.generation
+            && d.config
+                .sampler
+                .mounts
+                .iter()
+                .any(|p| p.to_string_lossy() == mount)
+        {
+            d.fs.remove(mount);
+            d.fs_available.remove(mount);
+        }
     }
     /// Retain a verified state directory for descriptor-anchored SQLite paths.
     pub fn bind_storage(&self, fd: std::os::fd::OwnedFd) {
@@ -269,9 +314,58 @@ impl LiveState {
     ) -> Result<(), crate::DaemonError> {
         let mut d = self.0.write();
         check_key(&d.components, &component.name, MAX_SUBJECTS)?;
+        let result = match result {
+            Publication::FsAttempt {
+                generation,
+                mount,
+                sample,
+            } => {
+                if generation != d.generation
+                    || !d
+                        .config
+                        .sampler
+                        .mounts
+                        .iter()
+                        .any(|p| p.to_string_lossy() == mount)
+                {
+                    return Ok(());
+                }
+                check_key(&d.fs_available, &mount, MAX_SUBJECTS)?;
+                if let Some(sample) = sample {
+                    if sample.mount != mount {
+                        return Err(crate::DaemonError::Invalid(
+                            "sample mount does not match attempt".into(),
+                        ));
+                    }
+                    Publication::Fs(sample)
+                } else {
+                    d.fs_available.insert(mount, false);
+                    health(&mut d, component);
+                    return Ok(());
+                }
+            }
+            Publication::LvmAttempt { generation, report } => {
+                if generation != d.generation {
+                    return Ok(());
+                }
+                if let Some(report) = report {
+                    Publication::Lvm(report)
+                } else {
+                    d.lvm_available = false;
+                    health(&mut d, component);
+                    return Ok(());
+                }
+            }
+            other => other,
+        };
         match result {
+            Publication::FsAttempt { .. } | Publication::LvmAttempt { .. } => {
+                unreachable!("attempts normalized above")
+            }
             Publication::Fs(s) => {
                 check_key(&d.fs, &s.mount, MAX_SUBJECTS)?;
+                check_key(&d.fs_available, &s.mount, MAX_SUBJECTS)?;
+                d.fs_available.insert(s.mount.clone(), true);
                 let r = d.fs.entry(s.mount.clone()).or_default();
                 if r.back().is_some_and(|last| s.ts < last.ts) {
                     r.clear();
@@ -290,6 +384,7 @@ impl LiveState {
                 check_len(r.vgs.len(), MAX_INVENTORY)?;
                 r.mounts.sort_by(|a, b| a.0.cmp(&b.0));
                 r.vgs.sort_by(|a, b| a.vg.cmp(&b.vg));
+                d.lvm_available = true;
                 d.lvm = Some(r);
             }
             Publication::Watcher((mount, w)) => {
@@ -814,6 +909,13 @@ impl<T> TransposeOption<T> for Option<Option<T>> {
 }
 impl AlertSource for LiveStateView {
     fn fs_sample(&self, mount: &str) -> Option<FsSample> {
+        if self.data.fs_available.get(mount) != Some(&true) {
+            return None;
+        }
+        let sample = self.data.fs.get(mount)?.back()?;
+        if !fresh(sample.ts, self.now, self.data.config.sampler.interval) {
+            return None;
+        }
         self.data
             .fs
             .get(mount)?
@@ -823,7 +925,7 @@ impl AlertSource for LiveStateView {
             .cloned()
     }
     fn fs_rate(&self, mount: &str, window: Duration) -> Option<f64> {
-        if window.is_zero() {
+        if window.is_zero() || self.fs_sample(mount).is_none() {
             return None;
         }
         let start = i128::from(self.now) * 1_000_000_000
@@ -862,6 +964,16 @@ impl AlertSource for LiveStateView {
         .map(|r| r.total_bytes)
     }
     fn lvm(&self) -> Option<Vec<LvmNow>> {
+        if !self.data.lvm_available
+            || !self.data.config.lvm.enabled
+            || !fresh(
+                self.data.lvm.as_ref()?.sampled_at,
+                self.now,
+                self.data.config.lvm.interval,
+            )
+        {
+            return None;
+        }
         Some(
             self.data
                 .lvm
@@ -910,4 +1022,11 @@ fn watch_mode(mode: tidemark_live::watch::WatchMode) -> &'static str {
         WatchMode::DfidNameFilesystem => "dfid_name_filesystem",
         WatchMode::Failed => "failed",
     }
+}
+
+fn fresh(at: i64, now: i64, interval: Duration) -> bool {
+    let age = i128::from(now) - i128::from(at);
+    age >= 0
+        && age * 1_000_000_000
+            <= (interval.as_nanos().saturating_mul(3).min(i128::MAX as u128) as i128)
 }

@@ -81,19 +81,22 @@ where
                     let samples = tidemark_fs::lvm::to_samples(&report, &tracked);
                     state
                         .publish(
-                            Publication::Lvm(LvmResult {
-                                mounts: tracked
-                                    .iter()
-                                    .map(|m| {
-                                        (
-                                            m.mount.as_path().to_string_lossy().into_owned(),
-                                            tidemark_fs::lvm::lvm_now(&report, m),
-                                        )
-                                    })
-                                    .collect(),
-                                vgs: report.vgs,
-                                sampled_at: report.sampled_at,
-                            }),
+                            Publication::LvmAttempt {
+                                generation,
+                                report: Some(LvmResult {
+                                    mounts: tracked
+                                        .iter()
+                                        .map(|m| {
+                                            (
+                                                m.mount.as_path().to_string_lossy().into_owned(),
+                                                tidemark_fs::lvm::lvm_now(&report, m),
+                                            )
+                                        })
+                                        .collect(),
+                                    vgs: report.vgs,
+                                    sampled_at: report.sampled_at,
+                                }),
+                            },
                             crate::component("lvm", "ok", "report collected"),
                         )
                         .map_err(|e| e.to_string())?;
@@ -114,7 +117,13 @@ where
                 let delay = match result {
                     Ok(()) => collection_delay(true, &mut failures, config.lvm.interval),
                     Err(error) => {
-                        state.publish_component(crate::component("lvm", "error", error))?;
+                        state.publish(
+                            Publication::LvmAttempt {
+                                generation,
+                                report: None,
+                            },
+                            crate::component("lvm", "error", error),
+                        )?;
                         collection_delay(false, &mut failures, config.lvm.interval)
                     }
                 };

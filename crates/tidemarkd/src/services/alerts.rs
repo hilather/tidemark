@@ -264,6 +264,136 @@ mod tests {
         }
     }
     #[test]
+    fn collector_failure_expiry_and_recovery_through_enabled_source() {
+        let mut cfg = Config::default();
+        cfg.sampler.mounts = vec!["/data".into(), "/other".into()];
+        cfg.sampler.interval = Duration::from_secs(10);
+        cfg.lvm.interval = Duration::from_secs(10);
+        cfg.alerts.rule = vec![AlertRule {
+            name: "usage".into(),
+            mount: Some("/data".into()),
+            above: Some(AlertThreshold::Number(50.)),
+            for_: Duration::from_secs(10),
+            ..Default::default()
+        }];
+        let state = LiveState::new(&cfg, 0);
+        let publish_sample = |mount: &str, ts| {
+            state
+                .publish(
+                    Publication::FsAttempt {
+                        generation: 0,
+                        mount: mount.into(),
+                        sample: Some(FsSample {
+                            ts,
+                            mount: mount.into(),
+                            size: 100,
+                            used: 95,
+                            avail: 5,
+                            inodes: 1,
+                            inodes_used: 0,
+                        }),
+                    },
+                    crate::component("sampler", "ok", "sample"),
+                )
+                .unwrap()
+        };
+        publish_sample("/data", 0);
+        publish_sample("/other", 0);
+        let mut engine = AlertEngine::new(&cfg.alerts.rule, Duration::from_secs(20)).unwrap();
+        let evaluate = |engine: &mut AlertEngine, now| {
+            let view = state.view_at(now);
+            engine.evaluate(
+                now,
+                &AlertInputs {
+                    source: &EnabledSource {
+                        source: &view,
+                        config: &cfg,
+                        procscan_ok: false,
+                    },
+                    state_space_refused: false,
+                },
+            )
+        };
+        assert!(evaluate(&mut engine, 0).is_empty());
+        state
+            .publish(
+                Publication::FsAttempt {
+                    generation: 0,
+                    mount: "/data".into(),
+                    sample: None,
+                },
+                crate::component("sampler", "degraded", "collection failed"),
+            )
+            .unwrap();
+        assert!(evaluate(&mut engine, 10).is_empty());
+        assert!(evaluate(&mut engine, 30).is_empty());
+        assert_eq!(state.view_at(30).fs_samples().unwrap().len(), 2);
+        assert!(state.view_at(30).fs_sample("/other").is_some());
+        assert!(state.view_at(31).fs_sample("/other").is_none());
+        assert!(state.view_at(86400).fs_sample("/data").is_none());
+        publish_sample("/data", 40);
+        // Persistence and another mount's error do not invalidate this sample.
+        state
+            .publish(
+                Publication::FsAttempt {
+                    generation: 0,
+                    mount: "/other".into(),
+                    sample: None,
+                },
+                crate::component("sampler", "degraded", "other mount failed"),
+            )
+            .unwrap();
+        state
+            .publish_component(crate::component("sampler", "degraded", "writer congested"))
+            .unwrap();
+        assert!(evaluate(&mut engine, 40).is_empty());
+        assert_eq!(evaluate(&mut engine, 50)[0].state, AlertState::Firing);
+        assert!(evaluate(&mut engine, 71).is_empty());
+        state
+            .publish(
+                Publication::LvmAttempt {
+                    generation: 0,
+                    report: Some(tidemark_core::api::LvmResult {
+                        mounts: vec![],
+                        vgs: vec![],
+                        sampled_at: 100,
+                    }),
+                },
+                crate::component("lvm", "ok", "report"),
+            )
+            .unwrap();
+        assert_eq!(state.view_at(130).lvm(), Some(vec![]));
+        assert!(state.view_at(131).lvm().is_none());
+        state
+            .publish(
+                Publication::LvmAttempt {
+                    generation: 0,
+                    report: None,
+                },
+                crate::component("lvm", "error", "failed"),
+            )
+            .unwrap();
+        assert!(state.view_at(100).lvm().is_none());
+        assert!(state
+            .view_at(100)
+            .lvm_report(&tidemark_core::api::LvmParams { mount: None })
+            .is_some());
+        state
+            .publish(
+                Publication::LvmAttempt {
+                    generation: 0,
+                    report: Some(tidemark_core::api::LvmResult {
+                        mounts: vec![],
+                        vgs: vec![],
+                        sampled_at: 140,
+                    }),
+                },
+                crate::component("lvm", "ok", "recovered"),
+            )
+            .unwrap();
+        assert_eq!(state.view_at(140).lvm(), Some(vec![]));
+    }
+    #[test]
     fn transitions_delivery_persistence_and_unavailable_pause() {
         let mut cfg = Config::default();
         cfg.alerts.rule = vec![AlertRule {
