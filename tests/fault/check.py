@@ -64,7 +64,7 @@ elif mode == 'overflow':
     assert values and sum(values) > float(rest[0]), values
     print('\n'.join(line for line in p.read_text().splitlines() if line.startswith('tidemark_watch_overflows_total{')))
     print(f'overflow_total={sum(values)} baseline={rest[0]}')
-elif mode in ('watch-counters', 'burst'):
+elif mode in ('watch-counters', 'burst', 'forced-overflow'):
     import re
     text = p.read_text()
     def counter(name):
@@ -81,12 +81,30 @@ elif mode in ('watch-counters', 'burst'):
         expected = int(rest[1])
         delta = events - before['events']
         overflow_delta = overflows - before['overflows']
-        assert overflow_delta > 0 or delta >= expected, (delta, overflow_delta, expected)
-        if delta < expected:
-            mounts = json.loads(pathlib.Path(rest[2]).read_text())['data']['mounts']
-            assert any(m['mount'] == rest[3] and m['lossy_minutes_15m'] > 0
-                       for m in mounts), mounts
+        mounts = json.loads(pathlib.Path(rest[2]).read_text())['data']['mounts']
+        mount = next(m for m in mounts if m['mount'] == rest[3])
+        if mode == 'burst':
+            assert overflow_delta == 0 and delta >= expected, (delta, overflow_delta, expected)
+            assert mount['lossy_minutes_15m'] == 0, mount
+        else:
+            assert overflow_delta > 0 and 0 <= delta < expected, (delta, overflow_delta, expected)
+            assert mount['lossy_minutes_15m'] > 0, mount
+            hot_rc = int(pathlib.Path(rest[5]).read_text())
+            if hot_rc == 4:
+                print('hot window unavailable (CLI exit 4)')
+            else:
+                assert hot_rc == 0, hot_rc
+                hot = json.loads(pathlib.Path(rest[4]).read_text())
+                assert hot['schema'] == 'tidemark.hot.v1', hot
+                rows = hot['data']
+                # Empty success cannot establish current-minute loss.
+                assert rows and all(row['lossy'] for row in rows), hot
         print(f'events_delta={delta} writes={expected} overflow_delta={overflow_delta}')
+elif mode == 'watch-ok':
+    components = json.loads(p.read_text())['data']['components']
+    row = next(c for c in components if c['name'] == 'watcher:' + rest[0])
+    assert row['state'] == 'ok', row
+    print(json.dumps(row, sort_keys=True))
 elif mode == 'integrity':
     with sqlite3.connect(f'file:{p}?mode=ro', uri=True) as db:
         assert db.execute('PRAGMA integrity_check').fetchone() == ('ok',)

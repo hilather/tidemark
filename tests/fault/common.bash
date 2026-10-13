@@ -1,5 +1,7 @@
 # Owned by: W7-C2-fault. Shared disposable-guest harness (not a runner entrypoint).
 # shellcheck shell=bash
+# Compare and display byte-ordered paths consistently in every guest locale.
+export LC_ALL=C
 setup() {
     # xfsprogs is additional to the minimal guest tools; fail before resources.
     command -v mkfs.xfs >/dev/null 2>&1 || {
@@ -145,8 +147,38 @@ scan_background() {
 fixture() { run_helper 600 python3 "$repo/tests/fault/check.py" fixture "$root" "$1"; }
 no_tmp() { run_helper 120 python3 "$repo/tests/fault/check.py" no-tmp "$state"; }
 snapshots() { run_helper 120 python3 "$repo/tests/fault/check.py" snapshots "$state"; }
+# A slow XFS unmount may outlive one attempt after a large write burst.
+unmount_fixture() {
+    local deadline=$((SECONDS + 180)) remaining attempt_seconds
+    while findmnt -n --mountpoint "$work/fs" >/dev/null; do
+        remaining=$((deadline - SECONDS))
+        (( remaining > 0 )) || break
+        attempt_seconds=$((remaining - 1))
+        if (( attempt_seconds <= 0 )); then sleep "$remaining"; break; fi
+        (( attempt_seconds <= 30 )) || attempt_seconds=30
+        if timeout --foreground --kill-after=1 "$attempt_seconds" umount "$work/fs"; then
+            return 0
+        fi
+        remaining=$((deadline - SECONDS))
+        (( remaining > 0 )) || break
+        if (( remaining < 2 )); then sleep "$remaining"; else sleep 2; fi
+    done
+    findmnt -n --mountpoint "$work/fs" >/dev/null || return 0
+    echo 'FAIL: cleanup: unmount (180-second retry budget exhausted)' >&2
+    timeout --foreground --kill-after=1 5 findmnt --mountpoint "$work/fs" >&2 || true
+    if command -v fuser >/dev/null 2>&1; then
+        timeout --foreground --kill-after=1 5 fuser -vm "$work/fs" >&2 || true
+    elif command -v lsof >/dev/null 2>&1; then
+        timeout --foreground --kill-after=1 5 lsof "$work/fs" >&2 || true
+    fi
+    if [[ -n ${daemon_pid:-} ]]; then
+        echo "Daemon process state (pid=$daemon_pid; absent row means exited):" >&2
+        timeout --foreground --kill-after=1 5 ps -o pid,ppid,stat,wchan:32,args -p "$daemon_pid" >&2 || true
+    fi
+    return 1
+}
 cleanup() {
-    local rc=$? child deadline
+    local rc=${1:-$?} child deadline
     trap - EXIT INT TERM
     set +e
     # Each tracked child is a setsid group leader. Signal the whole group,
@@ -178,7 +210,7 @@ cleanup() {
         if [[ -z $loop ]]; then
             loop=$(timeout --foreground 10 findmnt -n -o SOURCE --mountpoint "$work/fs")
         fi
-        if ! timeout --foreground 30 umount "$work/fs"; then echo 'FAIL: cleanup: unmount' >&2; rc=1; fi
+        if ! unmount_fixture; then rc=1; fi
     fi
     if [[ -n $loop && $(timeout --foreground 10 losetup --list --noheadings --output BACK-FILE "$loop" 2>/dev/null) == "$work/image" ]]; then
         if ! timeout --foreground 10 losetup -d "$loop"; then echo 'FAIL: cleanup: detach loop' >&2; rc=1; fi
