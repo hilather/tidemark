@@ -225,6 +225,91 @@ pub mod mask {
     pub const ONDIR: u64 = 0x40000000;
 }
 
+/// Non-owning metadata from one event, with offsets into the original buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord {
+    /// Total length, including trailing information and padding.
+    pub event_len: u32,
+    /// Kernel metadata version (currently 3).
+    pub version: u8,
+    /// Length of the metadata header.
+    pub metadata_len: u16,
+    /// Notification mask.
+    pub mask: u64,
+    /// Descriptor number only; this record never owns or closes it.
+    pub raw_fd: i32,
+    /// Originating process ID.
+    pub pid: i32,
+    /// Trailing information byte range within the input buffer.
+    pub information: std::ops::Range<usize>,
+}
+
+/// Decode kernel event bytes without syscalls, descriptor ownership or allocation.
+/// Each record consumes at least 24 bytes; the first malformed record yields an
+/// InvalidData error and ends iteration. Event lengths must be 8-byte aligned.
+/// Information records are validated for FID-mode notifications, as in EventIter.
+#[doc(hidden)]
+pub fn parse_event_buffer(buffer: &[u8]) -> EventRecords<'_> {
+    EventRecords { buffer, offset: 0 }
+}
+
+/// Allocation-free iterator returned by [`parse_event_buffer`].
+pub struct EventRecords<'a> {
+    buffer: &'a [u8],
+    offset: usize,
+}
+impl Iterator for EventRecords<'_> {
+    type Item = io::Result<EventRecord>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset == self.buffer.len() {
+            return None;
+        }
+        let b = &self.buffer[self.offset..];
+        let result = parse_record(b, self.offset);
+        match &result {
+            Ok(record) => self.offset += record.event_len as usize,
+            Err(_) => self.offset = self.buffer.len(),
+        }
+        Some(result)
+    }
+}
+impl std::iter::FusedIterator for EventRecords<'_> {}
+
+fn parse_record(b: &[u8], offset: usize) -> io::Result<EventRecord> {
+    if b.len() < 24 {
+        return Err(invalid("truncated metadata"));
+    }
+    let event_len = u32_at(b, 0);
+    let len = event_len as usize;
+    let metadata_len = u16::from_ne_bytes([b[6], b[7]]);
+    let meta = usize::from(metadata_len);
+    if b[4] != 3
+        || len < 24
+        || len > b.len()
+        || len % 8 != 0
+        || meta < 24
+        || meta > len
+        || meta % 8 != 0
+    {
+        return Err(invalid("invalid fanotify metadata"));
+    }
+    let mask = u64::from_ne_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+    let raw_fd = u32_at(b, 16) as i32;
+    if raw_fd < 0 && mask & 0x4000 == 0 {
+        // This also bounds every variable-length information record before decoding.
+        decode_information(b, meta, len)?;
+    }
+    Ok(EventRecord {
+        event_len,
+        version: b[4],
+        metadata_len,
+        mask,
+        raw_fd,
+        pid: u32_at(b, 20) as i32,
+        information: offset + meta..offset + len,
+    })
+}
+
 /// Bounds-checked event iterator; dropping it closes descriptors in unread records.
 pub struct EventIter<'b> {
     buffer: &'b [u8],
@@ -235,7 +320,20 @@ impl Iterator for EventIter<'_> {
         if self.buffer.is_empty() {
             return None;
         }
-        let result = decode(self.buffer);
+        // SAFETY: EventIter is constructed only from a kernel read (or tests
+        // transferring unique descriptors). Take ownership once, including on
+        // validation failure, so malformed kernel records retain cleanup behavior.
+        let fd = if self.buffer.len() >= 24 {
+            let raw_fd = u32_at(self.buffer, 16) as i32;
+            if raw_fd >= 0 {
+                Some(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let result = decode(self.buffer, fd);
         match result {
             Ok((event, len)) => {
                 self.buffer = &self.buffer[len..];
@@ -272,31 +370,44 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 // linux/fanotify.h byte offsets: metadata event_len=0, vers=4, metadata_len=6,
 // mask=8, fd=16, pid=20 (24 bytes). Info header type=0, len=2 (4 bytes);
 // FID fsid=4, file_handle bytes=12, handle_type=16, handle=20.
-fn decode(b: &[u8]) -> io::Result<(RawEvent, usize)> {
-    if b.len() < 24 {
-        return Err(invalid("truncated metadata"));
-    }
-    let len = u32_at(b, 0) as usize;
-    let raw_fd = u32_at(b, 16) as i32;
-    // SAFETY: only buffers returned by fanotify read reach this private decoder in production;
-    // each descriptor is transferred once and closed even when validation fails.
-    let fd = if raw_fd >= 0 {
-        Some(unsafe { OwnedFd::from_raw_fd(raw_fd) })
-    } else {
-        None
-    };
-    let metadata_len = u16::from_ne_bytes([b[6], b[7]]) as usize;
-    if b[4] != 3 || len < 24 || len > b.len() || metadata_len < 24 || metadata_len > len {
-        return Err(invalid("invalid fanotify metadata"));
-    }
-    let mask = u64::from_ne_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
-    let pid = u32_at(b, 20) as i32;
-    if mask & 0x4000 != 0 {
+fn decode(b: &[u8], fd: Option<OwnedFd>) -> io::Result<(RawEvent, usize)> {
+    let record = parse_event_buffer(b)
+        .next()
+        .ok_or_else(|| invalid("empty buffer"))??;
+    let len = record.event_len as usize;
+    if record.mask & 0x4000 != 0 {
         return Ok((RawEvent::Overflow, len));
     }
     if let Some(fd) = fd {
-        return Ok((RawEvent::Fd { mask, pid, fd }, len));
+        return Ok((
+            RawEvent::Fd {
+                mask: record.mask,
+                pid: record.pid,
+                fd,
+            },
+            len,
+        ));
     }
+    let info = decode_information(b, usize::from(record.metadata_len), len)?;
+    Ok((
+        RawEvent::Fid {
+            mask: record.mask,
+            pid: record.pid,
+            fsid: info.fsid,
+            handle_type: info.handle_type,
+            handle: info.handle.to_vec(),
+            name: info.name.map(<[u8]>::to_vec),
+        },
+        len,
+    ))
+}
+struct FidInfo<'a> {
+    fsid: [i32; 2],
+    handle_type: i32,
+    handle: &'a [u8],
+    name: Option<&'a [u8]>,
+}
+fn decode_information(b: &[u8], metadata_len: usize, len: usize) -> io::Result<FidInfo<'_>> {
     let mut at = metadata_len;
     let mut event = None;
     let mut priority = 0;
@@ -323,7 +434,7 @@ fn decode(b: &[u8]) -> io::Result<(RawEvent, usize)> {
                     .iter()
                     .position(|v| *v == 0)
                     .ok_or_else(|| invalid("unterminated name"))?;
-                Some(tail[..end].to_vec())
+                Some(&tail[..end])
             } else {
                 None
             };
@@ -334,21 +445,17 @@ fn decode(b: &[u8]) -> io::Result<(RawEvent, usize)> {
             };
             if candidate_priority > priority {
                 priority = candidate_priority;
-                event = Some(RawEvent::Fid {
-                    mask,
-                    pid,
+                event = Some(FidInfo {
                     fsid: [u32_at(r, 4) as i32, u32_at(r, 8) as i32],
                     handle_type: u32_at(r, 16) as i32,
-                    handle: r[20..20 + bytes].to_vec(),
+                    handle: &r[20..20 + bytes],
                     name,
                 });
             }
         }
         at += record_len;
     }
-    event
-        .map(|e| (e, len))
-        .ok_or_else(|| invalid("missing FID record"))
+    event.ok_or_else(|| invalid("missing FID record"))
 }
 
 #[cfg(test)]
@@ -386,6 +493,7 @@ mod tests {
         if named {
             record.extend(b"raw\xff\0");
         }
+        record.resize(record.len().next_multiple_of(8), 0);
         let len = record.len() as u16;
         record[2..4].copy_from_slice(&len.to_ne_bytes());
         let mut bytes = metadata(mask::CREATE, -1, 24 + u32::from(len));
@@ -434,7 +542,7 @@ mod tests {
         b[36..40].copy_from_slice(&u32::MAX.to_ne_bytes());
         assert!(EventIter { buffer: &b }.next().unwrap().is_err());
         let mut b = fid(true);
-        *b.last_mut().unwrap() = 1;
+        b[47..].fill(1);
         assert!(EventIter { buffer: &b }.next().unwrap().is_err());
         for len in [0, 23, u32::MAX] {
             let b = metadata(0x4000, -1, len);
