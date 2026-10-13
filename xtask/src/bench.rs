@@ -573,6 +573,7 @@ pub fn run(workspace: &Path, args: impl Iterator<Item = OsString>) -> Result<()>
             None => ensure_binary(workspace)?,
         });
     }
+    crate::gen_fixture::flush_fixture(&root)?;
     let leaf = leaves(&o.root)?;
     let mut disks = Disks {
         leaves: leaf.clone(),

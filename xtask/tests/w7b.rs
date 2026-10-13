@@ -152,6 +152,9 @@ fn mutation_is_confined() {
     let text = String::from_utf8(out.stdout).unwrap();
     let v: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
     assert!(v["mutation_operations"].as_u64().unwrap() >= 150);
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(".tidemark-fixture.json")).unwrap()).unwrap();
+    assert_eq!(summary["state"], "before_mutation");
     assert!(root.join("mutations").is_dir());
     assert_eq!(fs::read(t.path().join("sentinel")).unwrap(), b"unchanged");
     assert_eq!(fs::read_dir(t.path()).unwrap().count(), 2);
@@ -235,6 +238,17 @@ fn summary_matches_du_and_inode_target() {
         + summary["symlinks"].as_u64().unwrap()
         + summary["control_files"].as_u64().unwrap();
     assert_eq!(total, 500);
+    assert_eq!(summary["state"], "before_mutation");
+    assert!(Command::new("sync")
+        .arg("-f")
+        .arg(t.path())
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(
+        summary["apparent_bytes"],
+        test_support::oracle::du_apparent_normalized(t.path()).unwrap()
+    );
     let du = Command::new("du")
         .args(["-sx", "--block-size=1", "--"])
         .arg(t.path())
