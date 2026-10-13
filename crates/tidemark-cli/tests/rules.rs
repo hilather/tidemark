@@ -4,6 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "support/config.rs"]
 mod config_support;
+#[path = "e2e/identity.rs"]
+mod identity;
 use serde_json::Value;
 use std::{
     fs,
@@ -12,13 +14,17 @@ use std::{
     process::Command,
 };
 
+fn test_binary() -> std::ffi::OsString {
+    std::env::var_os("TIDEMARK_TEST_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_tidemark").into())
+}
 fn command(temp: &Path) -> Command {
     let config = config_support::direct_config(
         temp,
         "[scan]\nthreads=1\n[throttle]\nmin_ops_per_sec=50000\nmax_ops_per_sec=50000\n",
     );
     fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
-    let mut c = Command::new(env!("CARGO_BIN_EXE_tidemark"));
+    let mut c = Command::new(test_binary());
     c.arg("--config")
         .arg(config)
         .arg("--state-dir")
@@ -28,7 +34,7 @@ fn command(temp: &Path) -> Command {
 }
 fn copied_binary(temp: &Path) -> std::path::PathBuf {
     let binary = temp.join("tidemark");
-    fs::copy(env!("CARGO_BIN_EXE_tidemark"), &binary).unwrap();
+    fs::copy(test_binary(), &binary).unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
     binary
 }
@@ -82,6 +88,9 @@ fn atimes(paths: &[std::path::PathBuf]) -> Vec<(i64, i64)> {
 }
 #[test]
 fn regular_contents_are_never_read() {
+    if identity::delegate("regular_contents_are_never_read") {
+        return;
+    }
     let t = ::test_support::private_tempdir().unwrap();
     let root = t.path().join("root");
     fs::create_dir(&root).unwrap();

@@ -17,6 +17,14 @@ wait_for_status() {
         sleep 1
     done
 }
+hot_has_path() {
+    tidemark hot --window 5m --json | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)
+assert doc["schema"] == "tidemark.hot.v1"
+sys.exit(0 if any(row.get("path") == sys.argv[1] for row in doc["data"]) else 1)
+' "$1"
+}
 if [[ $phase == verify ]]; then
     export TIDEMARK_DEPLOY_VM_PHASE=verify TIDEMARK_DEPLOY_VM_CONFIG=$config
     cargo test --offline -p tidemark-cli --features privileged --test w4b w4b::privileged::deploy_stage_reboot_verify -- --exact --nocapture
@@ -37,7 +45,7 @@ if [[ $phase == verify ]]; then
     # shellcheck disable=SC2016 # $1 is expanded by the inner sh, using its directory argument.
     systemd-run --wait --unit=tidemark-install-reboot-writer /bin/sh -c 'dd if=/dev/zero of="$1/payload" bs=1M count=8 && sleep 5' sh "$TIDEMARK_INSTALL_MOUNT/tidemark-install-reboot"
     deadline=$((SECONDS + 60))
-    until tidemark hot --window 5m | grep -F "$TIDEMARK_INSTALL_MOUNT/tidemark-install-reboot"; do
+    until hot_has_path "$TIDEMARK_INSTALL_MOUNT/tidemark-install-reboot"; do
         (( SECONDS < deadline )) || { journalctl -u tidemarkd; exit 1; }
         sleep 1
     done
@@ -137,7 +145,7 @@ mkdir -p "$TIDEMARK_INSTALL_MOUNT/tidemark-install-namespace"
 systemd-run --wait --unit=tidemark-install-writer /bin/dd if=/dev/zero of="$TIDEMARK_INSTALL_MOUNT/tidemark-install-namespace/payload" bs=1M count=50
 sync
 deadline=$((SECONDS + 150))
-until tidemark hot --window 5m | grep -F 'tidemark-install-namespace'; do
+until hot_has_path "$TIDEMARK_INSTALL_MOUNT/tidemark-install-namespace"; do
     (( SECONDS < deadline )) || { journalctl -u tidemarkd; exit 1; }
     sleep 1
 done

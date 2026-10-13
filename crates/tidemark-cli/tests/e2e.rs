@@ -8,3 +8,6 @@ mod scan_lifecycle;
 mod scan_reports;
 #[path = "e2e/support.rs"]
 mod support;
+
+#[path = "e2e/identity.rs"]
+mod identity;

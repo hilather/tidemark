@@ -105,7 +105,13 @@ resume_cleanup() {
 }
 trap resume_cleanup EXIT
 # Reject a guest whose queue cannot be overfilled within the agreed write cap.
-read -r queue_limit < /proc/sys/fs/fanotify/max_queued_events
+if [[ -e /proc/sys/fs/fanotify/max_queued_events ]]; then
+    read -r queue_limit < /proc/sys/fs/fanotify/max_queued_events
+    echo "fanotify queue limit: $queue_limit (kernel sysctl)"
+else
+    queue_limit=16384
+    echo "fanotify queue limit: $queue_limit (EL8 fixed default; sysctl absent)"
+fi
 [[ $queue_limit =~ ^[0-9]+$ ]] || { fail 'invalid fanotify queue limit'; exit 1; }
 writes=$((queue_limit * 2))
 (( queue_limit > 0 && writes <= 200000 )) || { fail "queue limit $queue_limit cannot be doubled within 200000 writes"; exit 1; }
