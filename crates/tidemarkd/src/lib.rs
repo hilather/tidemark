@@ -395,6 +395,51 @@ mod tests {
         child.wait().unwrap();
     }
     #[test]
+    fn startup_pressure_types_retry_at_lock_and_store_seams() {
+        use tidemark_scan::orchestrator::ScanError;
+        for code in [24, 12] {
+            for seam in 0..4 {
+                let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
+                let shutdown = Shutdown::default();
+                let mut attempts = 0;
+                let result = retry_start("catalog", &state, &shutdown, || {
+                    attempts += 1;
+                    if attempts == 1 {
+                        let io = std::io::Error::from_raw_os_error(code);
+                        let error = match seam {
+                            0 => startup_scan_error(ScanError::Io(io)),
+                            1 => startup_scan_error(ScanError::Store(
+                                tidemark_store::StoreError::Io(io),
+                            )),
+                            2 => startup_lease_error(io),
+                            _ => startup_scan_error(ScanError::Sys(
+                                rustix::io::Errno::from_raw_os_error(code),
+                            )),
+                        };
+                        assert!(daemon_pressure(&error));
+                        Err(error)
+                    } else {
+                        Ok(42)
+                    }
+                })
+                .unwrap();
+                assert_eq!(result, 42);
+                assert_eq!(attempts, 2);
+            }
+        }
+        let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
+        let mut attempts = 0;
+        let result = retry_start::<()>("catalog", &state, &Shutdown::default(), || {
+            attempts += 1;
+            Err(startup_scan_error(ScanError::Busy))
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("state directory in use"));
+        assert_eq!(attempts, 1);
+    }
+    #[test]
     fn requested_shutdown_preserves_first_startup_attempt() {
         let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -1375,12 +1420,27 @@ fn startup_catalog(
 }
 
 fn startup_lease_error(source: std::io::Error) -> DaemonError {
-    DaemonError::Store(source.to_string())
+    if source.kind() == std::io::ErrorKind::WouldBlock {
+        DaemonError::Store(source.to_string())
+    } else {
+        DaemonError::Io {
+            context: "writer lease".into(),
+            source,
+        }
+    }
 }
 
 fn startup_scan_error(error: tidemark_scan::orchestrator::ScanError) -> DaemonError {
     use tidemark_scan::orchestrator::ScanError;
     match error {
+        ScanError::Io(source) => DaemonError::Io {
+            context: "startup scan ownership".into(),
+            source,
+        },
+        ScanError::Sys(source) => DaemonError::Io {
+            context: "startup scan ownership".into(),
+            source: source.into(),
+        },
         ScanError::Store(error) => startup_store_error(error),
         ScanError::Busy => {
             DaemonError::Store("state directory in use by another tidemark process".into())
