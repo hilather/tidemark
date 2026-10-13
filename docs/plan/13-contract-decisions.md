@@ -1201,3 +1201,43 @@ Sources: `docs/handoff/RECHECK-life.md`, `docs/handoff/RECHECK-state.md`, `docs/
 Unauthorized or failed SO_PEERCRED lookup closes before parsing, with zero response bytes. The forbidden code remains in the frozen dispatch type but is not a transport response to unauthorized peers. Frame collection, handler execution and response writing each have their own absolute ten-second budget. A timed-out handler retains its worker/slot until joined; transport timeout cannot prove an admitted scan or committed reload did not happen. Supersedes R3-14 and ADR-018’s forbidden-response wording.
 
 Sources: `docs/handoff/EDGE-api.md`, `docs/handoff/RECHECK-edge.md`.
+
+### R5-21 — Verified state and metrics trust boundary
+
+**Decision: accepted; open gates explicitly retained.**
+
+Storage opens verified no-follow directory capabilities and checks SQLite main files, WAL/SHM/journal/backup leaves, snapshots and scan.lock before use. Unsafe ancestry, owners, types, links or modes are refused, never repaired. STATE-trust-A2 supersedes part A’s confidentiality-mode rejection at the storage layer (R5-24); daemon/deployment remain private. Deployment markers never waive ownership. Metrics collector ancestry uses the shared trust rule. Process inventory is capped at 128 MiB per pass, including retained path/descriptor data; exceeding it fails the entire pass, never truncates into misleading completeness. See ../security.md for threat model and audit-based limits.
+
+Sources: `docs/handoff/STATE-trust-A.md`, `docs/handoff/STATE-trust-A2.md`, `docs/handoff/STATE-trust-B.md`, `docs/handoff/AUDIT-procfs-budget.md`.
+
+### R5-22 — Removed HTTP remnants and stale statuses
+
+**Decision: accepted; open gates explicitly retained.**
+
+ADR-020 supersedes endpoint/webhook deliverables everywhere in v1. R3-1 lifecycle completion, R4-7 exact windows, R4-9 mount state and R4-16 finding status must be read with R5-2/8/9/19/21. Historical review evidence remains historical; implementation closure is not a guest gate.
+
+Sources: `docs/handoff/CODE-drop-http.md`, `docs/handoff/RECHECK-life.md`, `docs/handoff/RECHECK-state.md`, `docs/handoff/RECHECK-edge.md`.
+
+### R5-23 — Owner decisions: symlink access time and required deny
+
+**Decision: accepted; open gates explicitly retained.**
+
+Owner decision 2026-10-13: reading symbolic-link text in tidemark symlinks may update that link’s access time according to mount atime policy; this is a documented limit of the read-only promise. --check-targets stops at the selected mount boundary and never reads external chain links. Owner decision F05 makes the deny job required, retaining BSL-1.0. These replace the second audit’s pending F04/F05 dispositions.
+
+Sources: `docs/handoff/SYMLINK-atime.md`, `docs/handoff/CI-deny-required.md`.
+
+### R5-24 — Later hardening precision
+
+**Decision: accepted; open gates explicitly retained.**
+
+Storage integrity requires euid-owned directories/leaves, no group/world write and one link for regular leaves; readable-by-others storage warns once rather than refusing. Ancestors require root/euid ownership or read-only mount; namespace overflow uid is root-like only for ancestors/sticky children in a noninitial user namespace. Sticky writable children propagate the constraint; no read-only exemption excuses their ownership/write rules. Daemon/deploy state retains mode & 077 == 0 and markers never waive ownership. Rates need five minutes and at least three samples in the fit window. The watcher shares 200,000 scope/key/file tuples across three scopes, allowing 66,667 distinct files/minute; the cap marks truncated/lossy while events continue. Status names cap/minute and distinguishes queue overflow, read errors and descriptor pressure. Unit families are AF_UNIX; guest scripts fix locale/retry unmount/force overflow; cargo xtask ci uses --no-fail-fast. Safe fuzz seams are parse_event_buffer(&[u8]) -> EventRecords, hidden parse_mount_id(&str) -> io::Result<u64>, and read_frame(&mut impl Read, &mut FrameDecoder) -> Result<Request, FrameError>, with no fd ownership in pure parsing. CLI errors retain operation/path/full cause/exit code; hostile controls escape, sizes are human units/right aligned, human enums lowercase and JSON unchanged.
+
+Sources: `docs/handoff/STATE-trust-A2.md`, `docs/handoff/STATE-trust-B.md`, `docs/handoff/DAEMON-polish.md`, `docs/handoff/GATE-fix.md`, `docs/handoff/GUEST-fix.md`, `docs/handoff/FUZZ-seams.md`, `docs/handoff/CLI-polish.md`.
+
+### R5-25 — Symbolic-link wording and boundary semantics
+
+**Decision: accepted; open gates explicitly retained.**
+
+No scan and no other command reads the text of symbolic links it finds. Resolving an administrator-supplied command-line path through canonicalize follows links in that path as ordinary tools do. symlinks --check-targets performs gated component-by-component no-follow resolution, with at most 40 expansions, and stops before metadata/link text beyond the selected mount (including same-device bind mounts). OtherFs means unchecked outside-boundary, not known existence/dangling/loop. This replaces W3-B’s following-stat description.
+
+Sources: `docs/handoff/SYMLINK-atime.md`.
