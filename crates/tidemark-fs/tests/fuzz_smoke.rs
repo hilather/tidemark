@@ -23,7 +23,10 @@ fn mutated(seed: &[u8], cut: usize, byte: u8, mode: u8) -> Vec<u8> {
             }
         }
         2 => out.extend_from_slice(seed),
-        3 => out.extend(std::iter::repeat_n(byte, cut % 4096)),
+        3 => {
+            let i = cut % (out.len() + 1);
+            out.splice(i..i, std::iter::repeat_n(byte, cut % 4096));
+        }
         _ => {
             let i = cut % (out.len() + 1);
             out.splice(i..i, [0, 255, byte]);
@@ -71,6 +74,7 @@ fn large_and_deep_inputs_finish_within_two_seconds_each() {
     let mut deep = vec![b'['; 512];
     deep.extend(std::iter::repeat_n(b']', 512));
     cases.push(deep);
+    cases.push(format!("deep = {}0{}", "[".repeat(512), "]".repeat(512)).into_bytes());
     for seed in SEEDS {
         cases.push(seed.repeat((1024 * 1024 / seed.len()).max(1)));
     }
@@ -84,4 +88,14 @@ fn large_and_deep_inputs_finish_within_two_seconds_each() {
             start.elapsed()
         );
     }
+}
+#[test]
+fn documented_size_limits_refuse_without_parsing() {
+    let bytes = vec![b' '; 16 * 1024 * 1024 + 1];
+    let start = Instant::now();
+    assert!(tidemark_fs::mount::parse_mountinfo(&bytes).is_err());
+    assert!(tidemark_fs::lvm::parse_lvs_json(&bytes).is_err());
+    assert!(tidemark_fs::lvm::parse_vgs_json(&bytes).is_err());
+    assert!(tidemark_fs::blockdev::parse_disk_stat(&" ".repeat(65537)).is_none());
+    assert!(start.elapsed() < Duration::from_secs(2));
 }
