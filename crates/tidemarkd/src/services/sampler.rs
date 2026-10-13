@@ -225,10 +225,20 @@ fn start_with_sample(
                                     mount: s.mount.clone(),
                                     sample: Some(s.clone()),
                                 },
-                                if errors.is_empty() {
+                                if errors.is_empty() && measurement_errors.is_empty() {
                                     crate::component("sampler", "ok", "statvfs sampled")
                                 } else {
-                                    crate::component("sampler", "degraded", errors.join("; "))
+                                    // A later successful mount must not erase an earlier failure.
+                                    crate::component(
+                                        "sampler",
+                                        "degraded",
+                                        errors
+                                            .iter()
+                                            .chain(&measurement_errors)
+                                            .map(String::as_str)
+                                            .collect::<Vec<_>>()
+                                            .join("; "),
+                                    )
                                 },
                             )?;
                             // Measure every configured interval, but queue each whole-second
