@@ -117,12 +117,7 @@ impl rusqlite::types::ToSql for SqlPath<'_> {
 impl Catalog {
     /// Open the source-of-truth catalog, optionally applying sample migrations.
     pub fn open(state_dir: &Path, rw: bool) -> Result<Self, StoreError> {
-        if rw {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(state_dir)?;
-        }
+        crate::state_dir::StateDir::open(state_dir, rw)?;
         Ok(Self {
             conn: crate::timeseries::open_connection(&state_dir.join("timeseries.db"), rw)?,
             state_dir: state_dir.to_owned(),
