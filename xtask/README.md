@@ -8,10 +8,14 @@ The GitHub `deny` job installs cached cargo-deny 0.20.2 and checks the locked
 dependency graph on pushes to `main`, pull requests, manual dispatch, and weekly
 for new advisories. It logs the tool version, runs advisories, bans, licenses and
 sources separately, and marks the job failed if any category fails while keeping
-all category logs available. Its initial findings are non-blocking; make the job
-required once those findings are resolved. Use `cargo xtask ci --require-deny` (or
-`tools/ci.sh --require-deny`) to fail when cargo-deny is missing; without the flag,
-the existing warning and skip behavior remains.
+all category logs available. The job is required: a red `deny` job blocks the
+workflow and means a dependency category or tool setup failed. Read the failing
+category step's log (or the setup step's log for a tool failure). An advisory
+needs a dependency upgrade or a documented, dated exception in `deny.toml` under
+`[advisories] ignore`, with the reason. A licence finding needs the owner's
+decision. On a machine without cargo-deny, `cargo xtask ci` still skips the check
+with a warning. Use `cargo xtask ci --require-deny` (or
+`tools/ci.sh --require-deny`) to make its absence an error.
 
 `tools/ci.sh` runs the same checks from the repository root. Set
 `RUST_TOOLCHAIN_BIN` to the directory containing the pinned Cargo and Rust tools
