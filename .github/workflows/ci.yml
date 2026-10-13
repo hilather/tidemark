@@ -27,13 +27,35 @@ jobs:
         id: deny-cache
         with:
           path: ~/.cargo/bin/cargo-deny
-          key: cargo-deny-${{ runner.os }}-0.18.4
+          key: cargo-deny-${{ runner.os }}-0.20.2
       - name: Install pinned cargo-deny
         if: steps.deny-cache.outputs.cache-hit != 'true'
-        run: cargo install cargo-deny --locked --version 0.18.4
+        run: cargo install cargo-deny --locked --version 0.20.2
       - run: cargo fetch --locked
       - run: cargo deny --version
-      - run: cargo deny check
+      - name: Check advisories
+        id: advisories
+        if: always()
+        continue-on-error: true
+        run: cargo deny check advisories
+      - name: Check bans
+        id: bans
+        if: always()
+        continue-on-error: true
+        run: cargo deny check bans
+      - name: Check licenses
+        id: licenses
+        if: always()
+        continue-on-error: true
+        run: cargo deny check licenses
+      - name: Check sources
+        id: sources
+        if: always()
+        continue-on-error: true
+        run: cargo deny check sources
+      - name: Fail if any dependency category failed
+        if: ${{ always() && (steps.advisories.outcome == 'failure' || steps.bans.outcome == 'failure' || steps.licenses.outcome == 'failure' || steps.sources.outcome == 'failure') }}
+        run: exit 1
   ci:
     runs-on: ubuntu-24.04
     timeout-minutes: 45

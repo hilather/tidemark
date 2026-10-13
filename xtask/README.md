@@ -4,10 +4,12 @@ Run `cargo xtask ci` to validate owner tags and read-only symbols, check formatt
 run Clippy and unprivileged tests, and run cargo-deny when installed. Missing
 cargo-deny produces a warning. The checks do not rewrite tracked files.
 
-The GitHub `deny` job installs cached cargo-deny 0.18.4 and checks the locked
+The GitHub `deny` job installs cached cargo-deny 0.20.2 and checks the locked
 dependency graph on pushes to `main`, pull requests, manual dispatch, and weekly
-for new advisories. Its initial findings are non-blocking; make the job required
-once those findings are resolved. Use `cargo xtask ci --require-deny` (or
+for new advisories. It logs the tool version, runs advisories, bans, licenses and
+sources separately, and marks the job failed if any category fails while keeping
+all category logs available. Its initial findings are non-blocking; make the job
+required once those findings are resolved. Use `cargo xtask ci --require-deny` (or
 `tools/ci.sh --require-deny`) to fail when cargo-deny is missing; without the flag,
 the existing warning and skip behavior remains.
 
