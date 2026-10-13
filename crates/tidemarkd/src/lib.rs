@@ -398,7 +398,7 @@ mod tests {
     fn startup_pressure_types_retry_at_lock_and_store_seams() {
         use tidemark_scan::orchestrator::ScanError;
         for code in [24, 12] {
-            for seam in 0..4 {
+            for seam in 0..7 {
                 let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
                 let shutdown = Shutdown::default();
                 let mut attempts = 0;
@@ -406,7 +406,16 @@ mod tests {
                     attempts += 1;
                     if attempts == 1 {
                         let io = std::io::Error::from_raw_os_error(code);
-                        let error = match seam {
+                        let io = if seam >= 4 {
+                            // StateDir retains ErrorKind but not errno in its path context.
+                            std::io::Error::new(
+                                io.kind(),
+                                format!("state directory /fixture: {io}"),
+                            )
+                        } else {
+                            io
+                        };
+                        let error = match seam % 4 {
                             0 => startup_scan_error(ScanError::Io(io)),
                             1 => startup_scan_error(ScanError::Store(
                                 tidemark_store::StoreError::Io(io),
@@ -438,6 +447,60 @@ mod tests {
             .to_string()
             .contains("state directory in use"));
         assert_eq!(attempts, 1);
+    }
+    #[test]
+    fn startup_retries_real_descriptor_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(tidemark_store::catalog::Catalog::open(dir.path(), true).unwrap());
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::startup_emfile_child"])
+            .env("TIDEMARK_STARTUP_EMFILE", dir.path())
+            .status()
+            .unwrap();
+        assert!(child.success());
+    }
+    #[test]
+    fn startup_emfile_child() {
+        let Some(path) = std::env::var_os("TIDEMARK_STARTUP_EMFILE") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        rustix::process::setrlimit(
+            rustix::process::Resource::Nofile,
+            rustix::process::Rlimit {
+                current: Some(64),
+                maximum: limit.maximum,
+            },
+        )
+        .unwrap();
+        let mut held = Vec::with_capacity(64);
+        for _ in 0..64 {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => held.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(24));
+                    break;
+                }
+            }
+        }
+        let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
+        let mut attempts = 0;
+        let catalog = retry_start("catalog", &state, &Shutdown::default(), || {
+            attempts += 1;
+            let result = startup_catalog(&path, 100, Duration::ZERO);
+            if attempts == 1 {
+                let error = result.err().unwrap();
+                assert!(daemon_pressure(&error), "{error}");
+                held.clear();
+                Err(error)
+            } else {
+                result
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert!(catalog.list(None).unwrap().is_empty());
     }
     #[test]
     fn startup_initializes_empty_database_without_self_conflicting_lease() {
@@ -864,7 +927,12 @@ fn retry_start<T>(
 
 // Resource pressure must be contained by the component owning the retry loop.
 pub(crate) fn resource_pressure(error: &std::io::Error) -> bool {
+    // The pinned toolchain maps EMFILE/ENFILE to a distinct kind whose variant
+    // name is still unstable. Compare typed kinds through the stable errno API.
+    let descriptor_kind =
+        std::io::Error::from_raw_os_error(rustix::io::Errno::MFILE.raw_os_error()).kind();
     error.kind() == std::io::ErrorKind::OutOfMemory
+        || error.kind() == descriptor_kind
         || error.raw_os_error().is_some_and(|code| {
             [
                 rustix::io::Errno::MFILE,
@@ -1417,8 +1485,12 @@ fn startup_catalog(
         let catalog = tidemark_store::catalog::Catalog::open_after_recovery(storage, files)
             .map_err(startup_store_error)?;
         // Cleanup requires scan exclusion after normal writer ownership is retained.
-        if let Ok(_lock) = tidemark_scan::orchestrator::ScanLock::acquire(storage) {
-            tidemark_store::catalog::cleanup_abandoned_scans(storage, now);
+        match tidemark_scan::orchestrator::ScanLock::acquire(storage) {
+            Ok(_lock) => tidemark_store::catalog::cleanup_abandoned_scans(storage, now),
+            Err(tidemark_scan::orchestrator::ScanError::Busy) => {
+                tracing::info!("startup scan cleanup skipped: host scan lock is held");
+            }
+            Err(error) => return Err(startup_scan_error(error)),
         }
         return Ok(catalog);
     }
