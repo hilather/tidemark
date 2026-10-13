@@ -1241,3 +1241,27 @@ Sources: `docs/handoff/STATE-trust-A2.md`, `docs/handoff/STATE-trust-B.md`, `doc
 No scan and no other command reads the text of symbolic links it finds. Resolving an administrator-supplied command-line path through canonicalize follows links in that path as ordinary tools do. symlinks --check-targets performs gated component-by-component no-follow resolution, with at most 40 expansions, and stops before metadata/link text beyond the selected mount (including same-device bind mounts). OtherFs means unchecked outside-boundary, not known existence/dangling/loop. This replaces W3-B’s following-stat description.
 
 Sources: `docs/handoff/SYMLINK-atime.md`.
+
+### R5-26 — Filesystem-wide fd watcher marks
+
+**Decision: accepted; open gates explicitly retained.**
+
+Fd mode independently probes filesystem marks: prefer fd/filesystem on supported Rocky 8.10, otherwise fd/mount on Rocky 8.8 or mark failure. Filesystem marks see writes through all mounts/private namespaces. Foreign events are mapped by bounded file handles against the retained watched mount; failure or outside-subtree paths retains totals/unit/command counts and attributes directory activity to watched root. unmapped_events is reported when nonzero; hard-link name attribution is best effort. fd/mount warns that other namespace/bind writes are unseen. Status/firstboot mode is fd_filesystem; foreground/detail display is fd/filesystem. ADR-013’s revisit is completed, but host namespace guard and service restrictions remain. OPEN RISK: database units using PrivateTmp=/ProtectSystem= can be invisible on 8.8; full watcher cost and packaged restricted-unit guest acceptance remain pending.
+
+Sources: `docs/handoff/WATCH-fsmark.md`.
+
+### R5-27 — Open core and guest decisions
+
+**Status: open risks; no behavior change decided.**
+
+OPEN for owner/core sign-off: HotEntryWire non-path keys serialize as byte-number arrays (for example user-1000), while paths use path/path_b64; no CLI-only serializer change is authorized. OPEN: whether reaching aggregation caps should make the watcher component degraded. Guest acceptance is still pending for trust policy with a real second user, filesystem marks under packaged restrictions, and symbolic-link mount-boundary/atime preservation.
+
+Sources: `docs/handoff/CLI-polish.md`, `docs/handoff/DAEMON-polish.md`, `docs/handoff/STATE-trust-A2.md`, `docs/handoff/WATCH-fsmark.md`, `docs/handoff/SYMLINK-atime.md`.
+
+### R5-28 — Operator-facing additions
+
+**Decision: accepted; open gates explicitly retained.**
+
+The operator guide describes watcher visibility/mode in tidemark status, symbolic-link access-time limits, custom --state-dir trust/private-mode requirements and man tidemark, with a pointer to ../security.md. Operational instructions must distinguish measured capability, implemented fallback and pending guest acceptance.
+
+Sources: `docs/handoff/W7-D1.md`, `docs/handoff/W7-D2.md`, `docs/handoff/STATE-trust-A2.md`, `docs/handoff/STATE-trust-B.md`, `docs/handoff/SYMLINK-atime.md`, `docs/handoff/WATCH-fsmark.md`.
