@@ -848,35 +848,29 @@ impl Processor<'_> {
                 if pid == self.own_pid {
                     return;
                 }
+                let event_mount = self
+                    .filesystem_mount
+                    .and_then(|_| self.event_handle.identify(fd.as_fd()).ok());
+                let reopened = if self
+                    .filesystem_mount
+                    .is_some_and(|watched| event_mount.is_some_and(|id| id != watched))
+                {
+                    self.event_handle.reopen(mount_fd).ok()
+                } else {
+                    None
+                };
+                let path_fd = reopened.as_ref().map_or(fd.as_fd(), |host| host.as_fd());
                 fdmode::resolve_event_with_fallback(
                     fd.as_fd(),
+                    path_fd,
                     self.filesystem_mount.map(|_| &self.cfg.mount),
                 )
                 .map(|(mut p, s, created)| {
                     if let Some(watched) = self.filesystem_mount {
-                        let event_mount = self.event_handle.identify(fd.as_fd()).ok();
-                        let reopened = if event_mount.is_some_and(|id| id != watched) {
-                            self.event_handle
-                                .reopen(mount_fd)
-                                .ok()
-                                .and_then(|host| fdmode::descriptor_path(host.as_fd()).ok())
-                                .and_then(|path| RawPath::from_path(&path).ok())
-                        } else {
-                            None
-                        };
-                        if fdmode::mapped_path(
-                            event_mount,
-                            watched,
-                            &p,
-                            reopened.as_ref(),
-                            &self.cfg.mount,
-                        )
-                        .is_some()
+                        let host_path = reopened.as_ref().map(|_| &p);
+                        if fdmode::mapped_path(event_mount, watched, &p, host_path, &self.cfg.mount)
+                            .is_none()
                         {
-                            if let Some(host) = reopened {
-                                p = host;
-                            }
-                        } else {
                             p = self.unmapped_path(state);
                         }
                     }

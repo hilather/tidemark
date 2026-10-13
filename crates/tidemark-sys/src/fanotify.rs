@@ -179,10 +179,12 @@ pub enum RawEvent {
 #[derive(Default)]
 pub struct EventHandle {
     storage: [u64; 17],
+    identified: bool,
 }
 impl EventHandle {
     /// Obtain the event descriptor's handle and originating mount id without reading content.
     pub fn identify(&mut self, fd: BorrowedFd<'_>) -> io::Result<u64> {
+        self.identified = false;
         self.storage.fill(0);
         let ptr = self.storage.as_mut_ptr().cast::<libc::file_handle>();
         let mut mount_id = 0;
@@ -201,10 +203,19 @@ impl EventHandle {
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
-        u64::try_from(mount_id).map_err(io::Error::other)
+        // SAFETY: the header is within the initialized aligned storage.
+        if unsafe { (*ptr).handle_bytes } > 128 {
+            return Err(invalid("file handle exceeds kernel maximum"));
+        }
+        let mount_id = u64::try_from(mount_id).map_err(io::Error::other)?;
+        self.identified = true;
+        Ok(mount_id)
     }
     /// Reopen the identified inode in the watched mount for metadata-only path resolution.
     pub fn reopen(&mut self, mount: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+        if !self.identified {
+            return Err(invalid("no successfully identified event handle"));
+        }
         let ptr = self.storage.as_mut_ptr().cast::<libc::file_handle>();
         // SAFETY: identify initialized the bounded aligned handle; no contents are read.
         let mut fd = unsafe {

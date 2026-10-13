@@ -109,9 +109,10 @@ fn event_stat(s: rustix::fs::Statx) -> io::Result<(EventStat, i64)> {
 }
 pub(super) fn resolve_event_with_fallback(
     fd: BorrowedFd<'_>,
+    path_fd: BorrowedFd<'_>,
     fallback: Option<&RawPath>,
 ) -> io::Result<(RawPath, EventStat, i64)> {
-    resolve_with_fallback(fd, fallback, || {
+    resolve_with_fallback(path_fd, fallback, || {
         rustix::fs::statx(
             fd,
             "",
