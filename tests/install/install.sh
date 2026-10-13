@@ -1,5 +1,7 @@
 #!/bin/bash
 # Owned by: W6-C. Disposable VM only; install/upgrade/erase and two-phase reboot gate.
+# TIDEMARK_INSTALL_UPGRADE_RPM must be built with:
+# cargo xtask rpm --native --version 0.1.1 --upgrade-fixture
 set -euo pipefail
 [[ ${TIDEMARK_DEPLOY_TEST_VM:-} == 1 ]] || { echo 'Requires disposable VM marker TIDEMARK_DEPLOY_TEST_VM=1' >&2; exit 1; }
 cd "$(dirname "$0")/../.."
@@ -40,7 +42,7 @@ if [[ $phase == verify ]]; then
 fi
 [[ $phase == install ]] || { echo 'phase must be install or verify' >&2; exit 1; }
 : "${TIDEMARK_INSTALL_RPM:?Supply absolute 0.1.0 RPM path}"
-: "${TIDEMARK_INSTALL_UPGRADE_RPM:?Supply absolute rebuilt 0.1.1 RPM path}"
+: "${TIDEMARK_INSTALL_UPGRADE_RPM:?Supply absolute 0.1.1 RPM path built with --upgrade-fixture}"
 : "${TIDEMARK_INSTALL_MOUNT:?Supply persistent disposable loop-XFS mount (survives reboot)}"
 [[ $(findmnt -n -o FSTYPE --target "$TIDEMARK_INSTALL_MOUNT") == xfs ]]
 [[ $(findmnt -n -o TARGET --target "$TIDEMARK_INSTALL_MOUNT") == "$TIDEMARK_INSTALL_MOUNT" ]]
@@ -48,6 +50,20 @@ fi
 [[ $TIDEMARK_INSTALL_MOUNT =~ ^/[a-zA-Z0-9_/-]+$ && $TIDEMARK_INSTALL_MOUNT != / ]]
 [[ $(rpm -qp --qf '%{VERSION}' "$TIDEMARK_INSTALL_RPM") == 0.1.0 ]]
 [[ $(rpm -qp --qf '%{VERSION}' "$TIDEMARK_INSTALL_UPGRADE_RPM") == 0.1.1 ]]
+# Reject an ordinary upgrade package before installing anything. Extract only
+# the configuration asset into a private temporary directory.
+upgrade_extract=$(mktemp -d)
+trap 'rm -rf -- "$upgrade_extract"' EXIT
+if ! rpm2cpio "$TIDEMARK_INSTALL_UPGRADE_RPM" | (cd "$upgrade_extract" && cpio -id --quiet './etc/tidemark/tidemark.toml'); then
+    echo 'Cannot inspect upgrade RPM configuration (requires rpm2cpio and cpio)' >&2
+    exit 1
+fi
+if ! grep -Fxq '# upgrade fixture 0.1.1' "$upgrade_extract/etc/tidemark/tidemark.toml"; then
+    echo 'Upgrade RPM must carry the marker: build with --native --version 0.1.1 --upgrade-fixture' >&2
+    exit 1
+fi
+rm -rf -- "$upgrade_extract"
+trap - EXIT
 if rpm -q tidemark >/dev/null 2>&1; then
     echo 'Requires a fresh VM without tidemark installed' >&2
     exit 1
@@ -123,6 +139,11 @@ until tidemark hot --window 5m | grep -F 'tidemark-install-namespace'; do
     sleep 1
 done
 # 7. Audit query errors are failures, not an empty success.
+if [[ ${TIDEMARK_INSTALL_ALLOW_PERMISSIVE:-0} == 1 ]]; then
+    echo 'SELinux acceptance is NOT tested in this run (TIDEMARK_INSTALL_ALLOW_PERMISSIVE=1)'
+else
+    [[ $(getenforce) == Enforcing ]] || { echo 'SELinux must be Enforcing for acceptance' >&2; exit 1; }
+fi
 systemctl is-active --quiet auditd
 set +e
 ausearch -m AVC -ts recent -c tidemarkd > /tmp/tidemark-install-avc.log 2>&1
@@ -148,6 +169,10 @@ systemctl is-active --quiet tidemarkd
 after_pid=$(systemctl show tidemarkd -p MainPID --value)
 [[ $after_pid =~ ^[0-9]+$ && $after_pid != 0 && $after_pid != "$before_pid" ]]
 wait_for_status
+cmp /etc/tidemark/tidemark.toml /var/lib/tidemark-install/edited.toml
+[[ -f /etc/tidemark/tidemark.toml.rpmnew ]]
+[[ $(stat -c '%a:%U:%G' /etc/tidemark/tidemark.toml.rpmnew) == 600:root:root ]]
+grep -Fxq '# upgrade fixture 0.1.1' /etc/tidemark/tidemark.toml.rpmnew
 systemctl stop tidemarkd
 dnf reinstall -y "$TIDEMARK_INSTALL_UPGRADE_RPM"
 [[ $(systemctl show tidemarkd -p ActiveState --value) == inactive ]]
@@ -157,6 +182,9 @@ wait_for_status
 cmp /etc/tidemark/tidemark.toml /var/lib/tidemark-install/edited.toml
 [[ $(stat -c '%a:%U:%G' /etc/tidemark/tidemark.toml) == 600:root:root ]]
 # 9. Erase stops/disables service and retains state bytes.
+systemctl enable tidemarkd
+systemctl is-enabled --quiet tidemarkd
+systemctl is-active --quiet tidemarkd
 printf 'retain\n' > /var/lib/tidemark/install-retain
 rpm -e tidemark
 if systemctl is-active --quiet tidemarkd; then
@@ -167,6 +195,7 @@ if systemctl is-enabled --quiet tidemarkd; then
     echo 'tidemarkd unexpectedly enabled' >&2
     exit 1
 fi
+[[ ! -e /etc/systemd/system/multi-user.target.wants/tidemarkd.service && ! -L /etc/systemd/system/multi-user.target.wants/tidemarkd.service ]]
 [[ $(cat /var/lib/tidemark/install-retain) == retain ]]
 cmp /etc/tidemark/tidemark.toml.rpmsave /var/lib/tidemark-install/edited.toml
 [[ $(stat -c '%a' /etc/tidemark/tidemark.toml.rpmsave) == 600 ]]

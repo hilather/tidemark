@@ -32,7 +32,16 @@ Only config/state/runtime are private (0600/0700 root:root); binaries are 0755
 and public unit/docs/completion files 0644 root:root. No account is created.
 An upgrade restarts a running daemon and leaves a stopped daemon stopped, without changing enablement.
 
-On a fresh disposable Rocky 8.8 or 8.10 VM with auditd, python3, loop-XFS fixture,
+For the install gate, `TIDEMARK_INSTALL_UPGRADE_RPM` must be built with
+`cargo xtask rpm --native --version 0.1.1 --upgrade-fixture`. This native-only,
+0.1.1-only option uses `tests/install/rpm-upgrade.toml` and a default config
+with the added comment `# upgrade fixture 0.1.1`; xtask tests reject drift from
+the production metadata and config. The harness rejects packages without the
+marker before installing, then requires the conflicting default in `.rpmnew`
+(0600 root:root) while the edited live config survives. Ordinary 0.1.1 builds
+remain available without the option. Do not distribute the fixture as a release.
+
+On a fresh disposable Rocky 8.8 or 8.10 VM with auditd, python3, rpm2cpio, cpio, loop-XFS fixture,
 Cargo cache and built RPMs, run `cargo xtask vm-test --host VM --filter install`
 with `--env TIDEMARK_DEPLOY_TEST_VM=1`, and absolute VM paths via
 `TIDEMARK_INSTALL_RPM`, `TIDEMARK_INSTALL_UPGRADE_RPM`, `TIDEMARK_INSTALL_MOUNT`.
@@ -41,7 +50,11 @@ reboot; this test never edits fstab. The install phase runs steps 1–9 and the
 existing W4-B stage test. Reboot externally, then invoke the same suite/filter
 with `--env TIDEMARK_INSTALL_PHASE=verify` and the VM marker. That phase runs
 W4-B's boot-time/hash/core-health/API assertions and `deploy verify --wait 5m`.
-Archive `/var/lib/tidemark-install/security.txt` and the harness logs.
+SELinux must be Enforcing; `TIDEMARK_INSTALL_ALLOW_PERMISSIVE=1` explicitly
+marks SELinux acceptance as NOT tested while continuing the other checks.
+Before erase the harness enables and checks the active service, then requires
+erase to stop it and remove its enablement link. Archive
+`/var/lib/tidemark-install/security.txt` and the harness logs.
 
 ## CI
 

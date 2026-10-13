@@ -287,7 +287,7 @@ fn native_options_and_command_order() {
         assert!(parse(&args).is_err(), "{args:?}");
     }
     for online in [false, true] {
-        let commands = rpm::native_commands("0.1.1", online).unwrap();
+        let commands = rpm::native_commands("0.1.1", online, false).unwrap();
         assert_eq!(commands.len(), 3);
         assert_eq!(commands[0].program, "cargo");
         assert_eq!(commands[0].args[0], "build");
@@ -305,7 +305,7 @@ fn native_options_and_command_order() {
         assert_eq!(commands[2].program, "cargo");
         assert_eq!(commands[2].args, rpm::generate_rpm_args("0.1.1").unwrap());
     }
-    assert!(rpm::native_commands("bad", false).is_err());
+    assert!(rpm::native_commands("bad", false, false).is_err());
 }
 
 #[test]
@@ -351,4 +351,52 @@ fn workflow_and_new_shell_syntax() {
             .unwrap()
             .success());
     }
+}
+
+#[test]
+fn upgrade_fixture_options_and_drift() {
+    let parse = |args: &[&str]| rpm::parse_args(args.iter().map(|s| (*s).to_owned()));
+    let options = parse(&["--native", "--version", "0.1.1", "--upgrade-fixture"]).unwrap();
+    assert!(options.native && options.upgrade_fixture);
+    for args in [
+        vec!["--upgrade-fixture"],
+        vec!["--version", "0.1.1", "--upgrade-fixture"],
+        vec!["--native", "--upgrade-fixture"],
+        vec!["--native", "--version", "0.1.0", "--upgrade-fixture"],
+        vec![
+            "--native",
+            "--version",
+            "0.1.1",
+            "--upgrade-fixture",
+            "--upgrade-fixture",
+        ],
+        vec!["--container", "--version", "0.1.1", "--upgrade-fixture"],
+    ] {
+        assert!(parse(&args).is_err(), "{args:?}");
+    }
+    assert!(rpm::native_commands("0.1.0", false, true).is_err());
+    for online in [false, true] {
+        let ordinary = rpm::native_commands("0.1.1", online, false).unwrap();
+        let mut fixture = rpm::native_commands("0.1.1", online, true).unwrap();
+        assert_eq!(fixture[2].args[4], "tests/install/rpm-upgrade.toml");
+        fixture[2].args[4] = "packaging/rpm/rpm.toml".into();
+        assert_eq!(fixture, ordinary);
+    }
+    let metadata = read("packaging/rpm/rpm.toml");
+    let source = "source = \"packaging/config/tidemark.toml\"";
+    assert_eq!(metadata.matches(source).count(), 1);
+    assert_eq!(
+        read("tests/install/rpm-upgrade.toml"),
+        metadata.replace(
+            source,
+            "source = \"tests/install/upgrade-config/tidemark.toml\""
+        )
+    );
+    assert_eq!(
+        read("tests/install/upgrade-config/tidemark.toml"),
+        format!(
+            "{}# upgrade fixture 0.1.1\n",
+            read("packaging/config/tidemark.toml")
+        )
+    );
 }
