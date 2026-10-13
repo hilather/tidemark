@@ -181,7 +181,7 @@ fn alert_source_unavailable_empty_and_measured() {
         &s,
         Publication::WatchWindow {
             mount: "/fixture".into(),
-            window: Duration::from_secs(90),
+            window: Duration::from_secs(120),
             measured_at: 100,
             hot: Some(vec![]),
             overflows: Some(0),
@@ -192,17 +192,17 @@ fn alert_source_unavailable_empty_and_measured() {
     assert_eq!(v.dir_growth("/fixture", 2), Some(vec![]));
     assert_eq!(v.active_alerts(), Some(vec![]));
     assert_eq!(
-        v.hot_dirs("/fixture", Duration::from_secs(90)),
+        v.hot_dirs("/fixture", Duration::from_secs(120)),
         Some(vec![])
     );
     assert_eq!(
-        v.watch_overflows("/fixture", Duration::from_secs(90)),
+        v.watch_overflows("/fixture", Duration::from_secs(120)),
         Some(0)
     );
     assert!(v.hot_dirs("/fixture", Duration::from_secs(60)).is_none());
     assert!(s
-        .view_at(101)
-        .watch_overflows("/fixture", Duration::from_secs(90))
+        .view_at(191)
+        .watch_overflows("/fixture", Duration::from_secs(120))
         .is_none());
     let hot = HotEntry {
         key: b"/fixture/a".to_vec(),
@@ -216,19 +216,20 @@ fn alert_source_unavailable_empty_and_measured() {
         &s,
         Publication::WatchWindow {
             mount: "/fixture".into(),
-            window: Duration::from_secs(90),
+            window: Duration::from_secs(120),
             measured_at: 100,
             hot: Some(vec![hot.clone()]),
             overflows: Some(7),
         },
     );
     assert_eq!(
-        s.view_at(100).hot_dirs("/fixture", Duration::from_secs(90)),
+        s.view_at(100)
+            .hot_dirs("/fixture", Duration::from_secs(120)),
         Some(vec![hot])
     );
     assert_eq!(
         s.view_at(100)
-            .watch_overflows("/fixture", Duration::from_secs(90)),
+            .watch_overflows("/fixture", Duration::from_secs(120)),
         Some(7)
     );
     let lv = LvmNow {

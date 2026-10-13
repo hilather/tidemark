@@ -1,4 +1,4 @@
-//! Owned by: W6-A2b
+//! Owned by: W6-watch-windows
 //! Periodic alert evaluation, bounded persistence and delivery.
 
 use crate::{
@@ -24,18 +24,25 @@ pub fn start(
         .name("alerts".into())
         .spawn(move || {
             let mut previous = None;
-            let mut engine = None;
+            let mut engine: Option<AlertEngine> = None;
             let mut previous_failures = (std::collections::BTreeMap::new(), 0);
             let mut sinks: Vec<Box<dyn Deliver>> = vec![Box::new(JournalDeliver)];
             while !shutdown.load(Ordering::Acquire) {
                 let (config, generation) = state.config();
                 if previous.as_ref() != Some(&config.alerts) {
-                    engine = Some(
-                        AlertEngine::new(&config.alerts.rule, config.alerts.renotify)
-                            .map_err(|e| DaemonError::Config(e.to_string()))?,
-                    );
+                    if let Some(engine) = engine.as_mut() {
+                        engine
+                            .reconfigure(&config.alerts.rule, config.alerts.renotify)
+                            .map_err(|e| DaemonError::Config(e.to_string()))?;
+                    } else {
+                        engine = Some(
+                            AlertEngine::new(&config.alerts.rule, config.alerts.renotify)
+                                .map_err(|e| DaemonError::Config(e.to_string()))?,
+                        );
+                    }
                     previous = Some(config.alerts.clone());
                 }
+                let revision = state.alert_revision();
                 if let Some(engine) = engine.as_mut() {
                     tick_current(
                         engine,
@@ -46,7 +53,7 @@ pub fn start(
                         &mut previous_failures,
                     )?;
                 }
-                crate::wait_service(&state, generation, &shutdown, Duration::from_secs(30));
+                wait_inputs(&state, generation, revision, &shutdown);
             }
             state.publish_component(crate::component("alerts", "stopped", "shutdown"))?;
             Ok(())
@@ -116,7 +123,7 @@ fn tick_current(
             state_space_refused: view.state_space_refused().unwrap_or(false),
         },
     ));
-    tick_evaluated(engine, state, writer, sinks, events)?;
+    tick_evaluated(engine, now, state, writer, sinks, events)?;
     Ok(())
 }
 
@@ -130,11 +137,12 @@ fn tick(
     sinks: &mut [Box<dyn Deliver>],
 ) -> Result<(), DaemonError> {
     let events = engine.evaluate(now, inputs);
-    tick_evaluated(engine, state, writer, sinks, events)
+    tick_evaluated(engine, now, state, writer, sinks, events)
 }
 
 fn tick_evaluated(
     engine: &AlertEngine,
+    now: i64,
     state: &LiveState,
     writer: &super::tswriter::Sender,
     sinks: &mut [Box<dyn Deliver>],
@@ -156,37 +164,29 @@ fn tick_evaluated(
         }
     }
     let mut diagnostics = engine.diagnostics().to_vec();
-    for diagnostic in &mut diagnostics {
-        if let Some(rule) = config
-            .alerts
-            .rule
-            .iter()
-            .find(|r| r.name == diagnostic.rule)
-        {
-            if matches!(
-                rule.kind,
-                tidemark_core::config::AlertKind::HotDirGrowth
-                    | tidemark_core::config::AlertKind::WatchLossy
-            ) {
-                let window = rule
-                    .window
-                    .as_deref()
-                    .and_then(|w| humantime::parse_duration(w).ok());
-                diagnostic.reason = if !window.is_some_and(minute_window) {
-                    "watcher windows require whole minutes from 1 through 60".into()
-                } else {
-                    "exact completed-minute observation unavailable: collector lacks empty-minute/loss records and boundary overflow counters".into()
-                };
-            }
-        }
-    }
+    let view = state.view_at(now);
+    decorate_diagnostics(&mut diagnostics, &config, &view);
+    diagnostics.sort_by(|a, b| a.rule.cmp(&b.rule));
+    let faults: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| !d.reason.starts_with("warming up"))
+        .collect();
     let health = if !errors.is_empty() {
         crate::component("alerts", "degraded", errors.join("; "))
-    } else if !diagnostics.is_empty() {
+    } else if !faults.is_empty() {
         crate::component(
             "alerts",
             "degraded",
-            "rules not evaluable; see alert diagnostics",
+            format!(
+                "{} rules not evaluable: {}",
+                faults.len(),
+                faults
+                    .iter()
+                    .take(3)
+                    .map(|d| d.rule.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         )
     } else {
         crate::component("alerts", "ok", "rules evaluated")
@@ -194,7 +194,71 @@ fn tick_evaluated(
     state.publish(Publication::Alerts((engine.active(), diagnostics)), health)
 }
 
-fn minute_window(window: Duration) -> bool {
+fn wait_inputs(state: &LiveState, generation: u64, revision: u64, shutdown: &Shutdown) {
+    let start = std::time::Instant::now();
+    while !shutdown.load(Ordering::Acquire)
+        && state.config().1 == generation
+        && state.alert_revision() == revision
+        && start.elapsed() < Duration::from_secs(30)
+    {
+        std::thread::park_timeout(Duration::from_millis(50));
+    }
+}
+fn decorate_diagnostics(
+    diagnostics: &mut [tidemark_live::alerts::AlertDiagnostic],
+    config: &Config,
+    view: &crate::state::LiveStateView,
+) {
+    for diagnostic in diagnostics {
+        let Some(rule) = config
+            .alerts
+            .rule
+            .iter()
+            .find(|r| r.name == diagnostic.rule)
+        else {
+            continue;
+        };
+        if rule.kind == tidemark_core::config::AlertKind::TimeToFull
+            && diagnostic.reason == "window rate unavailable or nonfinite"
+            && rule.mount.as_ref().is_some_and(|mount| {
+                rule.window
+                    .as_deref()
+                    .and_then(|w| humantime::parse_duration(w).ok())
+                    .is_some_and(|window| view.rate_warming_up(&mount.to_string_lossy(), window))
+            })
+        {
+            diagnostic.reason = "warming up: collecting filesystem rate samples".into();
+        }
+        if !matches!(
+            diagnostic.reason.as_str(),
+            "hot directory window unavailable" | "overflow window unavailable"
+        ) {
+            continue;
+        }
+        if !matches!(
+            rule.kind,
+            tidemark_core::config::AlertKind::HotDirGrowth
+                | tidemark_core::config::AlertKind::WatchLossy
+        ) {
+            continue;
+        }
+        let window = rule
+            .window
+            .as_deref()
+            .and_then(|w| humantime::parse_duration(w).ok());
+        diagnostic.reason = if !window.is_some_and(minute_window) {
+            "watcher windows require whole minutes from 1 through 60".into()
+        } else if rule.mount.as_ref().is_some_and(|mount| {
+            view.watch_warming_up(&mount.to_string_lossy(), window.unwrap_or_default())
+        }) {
+            "warming up: waiting for completed whole minutes".into()
+        } else {
+            "exact completed-minute observation unavailable: missing, stale, lossy or truncated window".into()
+        };
+    }
+}
+
+pub(crate) fn minute_window(window: Duration) -> bool {
     window.subsec_nanos() == 0
         && (60..=3600).contains(&window.as_secs())
         && window.as_secs().is_multiple_of(60)
@@ -270,6 +334,191 @@ mod tests {
         path::RawPath,
     };
     use tidemark_live::alerts::{AlertSource, ScanAge};
+    #[test]
+    fn warming_health_fault_names_and_now_diagnostics() {
+        use tidemark_core::config::AlertKind;
+        let mut cfg = Config::default();
+        cfg.alerts.rule = vec![AlertRule {
+            name: "hot".into(),
+            kind: AlertKind::HotDirGrowth,
+            mount: Some("/data".into()),
+            path: Some("/data/*".into()),
+            window: Some("1m".into()),
+            above: Some(AlertThreshold::Number(1.)),
+            ..Default::default()
+        }];
+        let state = LiveState::new(&cfg, 0);
+        state
+            .publish(
+                Publication::Watcher((
+                    "/data".into(),
+                    Arc::new(
+                        tidemark_live::watch::Watcher::from_injected_events(
+                            RawPath::from_path(std::path::Path::new("/data")).unwrap(),
+                            [],
+                        )
+                        .unwrap(),
+                    ),
+                )),
+                crate::component("watcher:/data", "ok", "fixture"),
+            )
+            .unwrap();
+        let mut engine = AlertEngine::new(&cfg.alerts.rule, cfg.alerts.renotify).unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let mut failures = Default::default();
+        let mut sinks = [];
+        tick_current(&mut engine, 30, &state, &tx, &mut sinks, &mut failures).unwrap();
+        let view = state.view_at(30);
+        assert_eq!(
+            view.status(30)
+                .unwrap()
+                .components
+                .iter()
+                .find(|c| c.name == "alerts")
+                .unwrap()
+                .state,
+            "ok"
+        );
+        assert!(view.alert_diagnostics().unwrap()[0]
+            .reason
+            .starts_with("warming up"));
+        assert!(view
+            .now(&tidemark_core::api::NowParams { mount: None }, 30)
+            .unwrap()
+            .degraded
+            .iter()
+            .any(|d| d.starts_with("alert hot: warming up")));
+        tick_current(&mut engine, 121, &state, &tx, &mut sinks, &mut failures).unwrap();
+        let view = state.view_at(121);
+        let health = view
+            .status(121)
+            .unwrap()
+            .components
+            .into_iter()
+            .find(|c| c.name == "alerts")
+            .unwrap();
+        assert_eq!(health.state, "degraded");
+        assert_eq!(health.detail, "1 rules not evaluable: hot");
+        assert!(view
+            .now(&tidemark_core::api::NowParams { mount: None }, 121)
+            .unwrap()
+            .degraded
+            .iter()
+            .any(|d| d.starts_with("alert hot: not evaluable:")));
+        state
+            .publish(
+                Publication::WatchWindow {
+                    mount: "/data".into(),
+                    window: Duration::from_secs(60),
+                    measured_at: 120,
+                    hot: Some(vec![]),
+                    overflows: Some(0),
+                },
+                crate::component("watcher:/data", "ok", "fixture"),
+            )
+            .unwrap();
+        tick_current(&mut engine, 150, &state, &tx, &mut sinks, &mut failures).unwrap();
+        assert!(state.view_at(150).alert_diagnostics().unwrap().is_empty());
+        assert_eq!(
+            state
+                .view_at(150)
+                .status(150)
+                .unwrap()
+                .components
+                .iter()
+                .find(|c| c.name == "alerts")
+                .unwrap()
+                .state,
+            "ok"
+        );
+        cfg.alerts.rule = (0..4)
+            .map(|i| AlertRule {
+                name: format!("missing{i}"),
+                mount: Some("/missing".into()),
+                above: Some(AlertThreshold::Number(50.)),
+                ..Default::default()
+            })
+            .collect();
+        state.replace_config(cfg.clone()).unwrap();
+        engine
+            .reconfigure(&cfg.alerts.rule, cfg.alerts.renotify)
+            .unwrap();
+        tick_current(&mut engine, 150, &state, &tx, &mut sinks, &mut failures).unwrap();
+        assert_eq!(
+            state
+                .view_at(150)
+                .status(150)
+                .unwrap()
+                .components
+                .iter()
+                .find(|c| c.name == "alerts")
+                .unwrap()
+                .detail,
+            "4 rules not evaluable: missing0, missing1, missing2"
+        );
+        assert_eq!(
+            state
+                .view_at(150)
+                .now(&tidemark_core::api::NowParams { mount: None }, 150)
+                .unwrap()
+                .degraded
+                .iter()
+                .filter(|d| d.starts_with("alert missing"))
+                .count(),
+            4
+        );
+    }
+    #[test]
+    fn rate_window_warmup_requires_a_healthy_sample_and_expires() {
+        let mut cfg = Config::default();
+        cfg.alerts.rule = vec![AlertRule {
+            name: "full".into(),
+            kind: tidemark_core::config::AlertKind::TimeToFull,
+            mount: Some("/data".into()),
+            below: Some("1h".into()),
+            window: Some("1h".into()),
+            ..Default::default()
+        }];
+        let state = LiveState::new(&cfg, 0);
+        let mut engine = AlertEngine::new(&cfg.alerts.rule, cfg.alerts.renotify).unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let mut failures = Default::default();
+        let sample = |ts| {
+            state
+                .publish(
+                    Publication::Fs(FsSample {
+                        ts,
+                        mount: "/data".into(),
+                        size: 100,
+                        used: 50,
+                        avail: 50,
+                        inodes: 1,
+                        inodes_used: 0,
+                    }),
+                    crate::component("sampler", "ok", "fixture"),
+                )
+                .unwrap()
+        };
+        sample(0);
+        tick_current(&mut engine, 30, &state, &tx, &mut [], &mut failures).unwrap();
+        assert!(state.view_at(30).alert_diagnostics().unwrap()[0]
+            .reason
+            .starts_with("warming up"));
+        tick_current(&mut engine, 91, &state, &tx, &mut [], &mut failures).unwrap();
+        assert_eq!(
+            state.view_at(91).alert_diagnostics().unwrap()[0].reason,
+            "filesystem sample unavailable"
+        );
+        sample(3601);
+        tick_current(&mut engine, 3601, &state, &tx, &mut [], &mut failures).unwrap();
+        assert!(!state.view_at(3601).alert_diagnostics().unwrap()[0]
+            .reason
+            .starts_with("warming up"));
+        sample(3751);
+        sample(3901);
+        tick_current(&mut engine, 3901, &state, &tx, &mut [], &mut failures).unwrap();
+        assert!(state.view_at(3901).alert_diagnostics().unwrap().is_empty());
+    }
     struct Source(Option<u64>);
     impl AlertSource for Source {
         fn fs_sample(&self, mount: &str) -> Option<FsSample> {
