@@ -64,6 +64,29 @@ elif mode == 'overflow':
     assert values and sum(values) > float(rest[0]), values
     print('\n'.join(line for line in p.read_text().splitlines() if line.startswith('tidemark_watch_overflows_total{')))
     print(f'overflow_total={sum(values)} baseline={rest[0]}')
+elif mode in ('watch-counters', 'burst'):
+    import re
+    text = p.read_text()
+    def counter(name):
+        values = [float(v) for v in re.findall(
+            r'^' + name + r'\{[^\n]*\}\s+(\S+)', text, re.M)]
+        assert values, (name, text)
+        return sum(values)
+    events = counter('tidemark_watch_events_total')
+    overflows = counter('tidemark_watch_overflows_total')
+    if mode == 'watch-counters':
+        print(json.dumps(dict(events=events, overflows=overflows)))
+    else:
+        before = json.loads(pathlib.Path(rest[0]).read_text())
+        expected = int(rest[1])
+        delta = events - before['events']
+        overflow_delta = overflows - before['overflows']
+        assert overflow_delta > 0 or delta >= expected, (delta, overflow_delta, expected)
+        if delta < expected:
+            mounts = json.loads(pathlib.Path(rest[2]).read_text())['data']['mounts']
+            assert any(m['mount'] == rest[3] and m['lossy_minutes_15m'] > 0
+                       for m in mounts), mounts
+        print(f'events_delta={delta} writes={expected} overflow_delta={overflow_delta}')
 elif mode == 'integrity':
     with sqlite3.connect(f'file:{p}?mode=ro', uri=True) as db:
         assert db.execute('PRAGMA integrity_check').fetchone() == ('ok',)

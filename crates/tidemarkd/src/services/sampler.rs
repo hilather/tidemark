@@ -123,6 +123,11 @@ fn start_with(
                 let mounts = match mount_source() {
                     Ok(mounts) => mounts,
                     Err(error) => {
+                        if matches!(&error, DaemonError::Io { source, .. } if crate::resource_pressure(source)) {
+                            state.publish_component(crate::component("sampler", "degraded", error.to_string()))?;
+                            crate::wait_service(&state, generation, &shutdown, config.sampler.interval.min(std::time::Duration::from_secs(10)));
+                            continue;
+                        }
                         for path in &config.sampler.mounts {
                             state.publish(
                                 Publication::FsAttempt {
@@ -210,6 +215,10 @@ fn start_with(
                             }
                         }
                         Err(e) => {
+                            if matches!(&e, DaemonError::Io { source, .. } if crate::resource_pressure(source)) {
+                                errors.push(e.to_string());
+                                continue;
+                            }
                             state.publish(
                                 Publication::FsAttempt {
                                     generation,

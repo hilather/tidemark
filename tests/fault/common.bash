@@ -101,7 +101,11 @@ run_helper() {
 cli_json() { run_helper 20 "$cli" -c "$config" --json "$@"; }
 start_daemon() {
     local started=$SECONDS
-    setsid "$daemon" --config "$config" >> "$work/daemon.log" 2>&1 &
+    if [[ -n ${1:-} ]]; then
+        setsid bash -c 'ulimit -n "$1"; exec "$2" --config "$3"' tidemark-low-fd "$1" "$daemon" "$config" >> "$work/daemon.log" 2>&1 &
+    else
+        setsid "$daemon" --config "$config" >> "$work/daemon.log" 2>&1 &
+    fi
     daemon_pid=$!
     children+=("$daemon_pid")
     local deadline=$((SECONDS + 60))

@@ -859,6 +859,46 @@ fn launch(
         })
 }
 
+fn launch_recover(
+    command: Command,
+    shared: Arc<Shared>,
+    writer: tswriter::Sender,
+) -> Result<Option<Job>, DaemonError> {
+    let reply = command.reply.clone();
+    match launch(command, shared.clone(), writer) {
+        Ok(handle) => Ok(Some(Job {
+            handle: Some(handle),
+            shared,
+        })),
+        Err(error @ DaemonError::Io { .. }) if matches!(&error, DaemonError::Io { source, .. } if crate::resource_pressure(source)) =>
+        {
+            *shared.active.lock() = None;
+            shared.state.release_scan();
+            shared.state.publish_component(component(
+                "scheduler",
+                "degraded",
+                error.to_string(),
+            ))?;
+            let _ = reply.try_send(Err(error));
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn scheduling_catalog(
+    state: &LiveState,
+    open: impl FnOnce() -> Result<Catalog, tidemark_store::StoreError>,
+) -> Result<Option<Catalog>, DaemonError> {
+    match open() {
+        Ok(catalog) => Ok(Some(catalog)),
+        Err(error) if crate::store_pressure(&error) => {
+            state.publish_component(component("scheduler", "degraded", error.to_string()))?;
+            Ok(None)
+        }
+        Err(error) => Err(DaemonError::Store(error.to_string())),
+    }
+}
 #[cfg(test)]
 fn report_firstboot(state: &LiveState, now: i64) -> Result<bool, DaemonError> {
     let elapsed = state
@@ -1020,14 +1060,21 @@ fn start_inner(
 // even when the first due scan will occupy the host slot for a long time.
 fn initialize_schedules(state: &LiveState, now: i64) -> Result<(), DaemonError> {
     let (config, generation) = state.config();
-    let catalog = Catalog::open(&state.storage_path(), false)
-        .map_err(|e| DaemonError::Store(e.to_string()))?;
+    let Some(catalog) = scheduling_catalog(state, || Catalog::open(&state.storage_path(), false))?
+    else {
+        return Ok(());
+    };
     for root in &config.roots {
         let raw =
             RawPath::from_path(&root.path).map_err(|e| DaemonError::Invalid(e.to_string()))?;
-        let last = catalog
-            .latest(&raw)
-            .map_err(|e| DaemonError::Store(e.to_string()))?;
+        let last = match catalog.latest(&raw) {
+            Ok(last) => last,
+            Err(error) if crate::store_pressure(&error) => {
+                state.publish_component(component("scheduler", "degraded", error.to_string()))?;
+                return Ok(());
+            }
+            Err(error) => return Err(DaemonError::Store(error.to_string())),
+        };
         let next_due = next_run(
             &parse_schedule(&root.schedule)?,
             root.window
@@ -1159,6 +1206,13 @@ fn scheduler(
             if let Some(j) = job.take() {
                 match j.join()? {
                     Ok(()) | Err(DaemonError::Scan(_)) => {}
+                    Err(DaemonError::Io { source, .. }) if crate::resource_pressure(&source) => {
+                        shared.state.publish_component(component(
+                            "scheduler",
+                            "degraded",
+                            source.to_string(),
+                        ))?;
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -1195,10 +1249,7 @@ fn scheduler(
                         .try_send(Err(DaemonError::Scan("Busy".into())));
                     *shared.active.lock() = None;
                 } else {
-                    job = Some(Job {
-                        handle: Some(launch(command, shared.clone(), writer.clone())?),
-                        shared: shared.clone(),
-                    });
+                    job = launch_recover(command, shared.clone(), writer.clone())?;
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -1229,14 +1280,27 @@ fn scheduler(
             &shared.failures,
             "waiting for scheduled scan",
         ))?;
-        let catalog = Catalog::open(&shared.state.storage_path(), false)
-            .map_err(|e| DaemonError::Store(e.to_string()))?;
+        let Some(catalog) = scheduling_catalog(&shared.state, || {
+            Catalog::open(&shared.state.storage_path(), false)
+        })?
+        else {
+            continue;
+        };
         for root in &config.roots {
             let raw =
                 RawPath::from_path(&root.path).map_err(|e| DaemonError::Invalid(e.to_string()))?;
-            let last = catalog
-                .latest(&raw)
-                .map_err(|e| DaemonError::Store(e.to_string()))?;
+            let last = match catalog.latest(&raw) {
+                Ok(last) => last,
+                Err(error) if crate::store_pressure(&error) => {
+                    shared.state.publish_component(component(
+                        "scheduler",
+                        "degraded",
+                        error.to_string(),
+                    ))?;
+                    break;
+                }
+                Err(error) => return Err(DaemonError::Store(error.to_string())),
+            };
             let last_finished = last.as_ref().and_then(|e| e.finished_at);
             let last_id = last.as_ref().map(|e| e.scan_id.as_str());
             let completion = completions.entry(raw.clone()).or_insert_with(|| {
@@ -1327,23 +1391,20 @@ fn scheduler(
                 });
                 drop(active);
                 let (tx, _) = bounded(1);
-                job = Some(Job {
-                    handle: Some(launch(
-                        Command {
-                            params: ScanStartParams {
-                                root: raw,
-                                mode: None,
-                                throttle: None,
-                            },
-                            scheduled: true,
-                            reply: tx,
-                            cancel,
+                job = launch_recover(
+                    Command {
+                        params: ScanStartParams {
+                            root: raw,
+                            mode: None,
+                            throttle: None,
                         },
-                        shared.clone(),
-                        writer.clone(),
-                    )?),
-                    shared: shared.clone(),
-                });
+                        scheduled: true,
+                        reply: tx,
+                        cancel,
+                    },
+                    shared.clone(),
+                    writer.clone(),
+                )?;
                 break;
             }
         }
@@ -1357,6 +1418,13 @@ fn scheduler(
         );
         match job.join()? {
             Ok(()) | Err(DaemonError::Scan(_)) => {}
+            Err(DaemonError::Io { source, .. }) if crate::resource_pressure(&source) => {
+                shared.state.publish_component(component(
+                    "scheduler",
+                    "degraded",
+                    source.to_string(),
+                ))?;
+            }
             Err(e) => return Err(e),
         }
     }
@@ -1406,6 +1474,28 @@ mod tests {
             clock: Arc::new(crate::unix_now),
             failures: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         }
+    }
+    #[test]
+    fn catalog_descriptor_pressure_keeps_scheduler_pass_alive() {
+        let state = LiveState::new(&Config::default(), 0);
+        let result = scheduling_catalog(&state, || {
+            Err(tidemark_store::StoreError::Io(
+                std::io::Error::from_raw_os_error(24),
+            ))
+        })
+        .unwrap();
+        assert!(result.is_none());
+        let status = state.view().status(0).unwrap();
+        assert!(status
+            .components
+            .iter()
+            .any(|c| c.name == "scheduler" && c.state == "degraded" && c.detail.contains("24")));
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            scheduling_catalog(&state, || Catalog::open(dir.path(), true))
+                .unwrap()
+                .is_some()
+        );
     }
     #[test]
     fn retry_sequence_uses_injected_time_and_caps_at_one_hour() {

@@ -19,6 +19,77 @@ use tidemark_core::{
 use tidemark_fs::attribution::AttributionCache;
 use tidemark_sys::fanotify::{mask, Fanotify, InitMode, RawEvent};
 
+const FD_EVENT_BYTES: usize = 24;
+const MAX_FD_BATCH: usize = 256;
+static FD_BATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(MAX_FD_BATCH);
+
+/// Set the process-wide fd-mode read budget, including already running watchers.
+/// The transport holds between 16 and 256 descriptors per mount per read.
+pub fn set_fd_batch(events: usize) {
+    FD_BATCH.store(events.clamp(16, MAX_FD_BATCH), Ordering::Release);
+}
+
+fn fd_buffer_len() -> usize {
+    fd_read_len(FD_BATCH.load(Ordering::Acquire))
+}
+fn fd_read_len(batch: usize) -> usize {
+    batch.clamp(16, MAX_FD_BATCH) * FD_EVENT_BYTES
+}
+fn read_batch<T>(
+    buffer: &mut [u8],
+    length: usize,
+    read: impl FnOnce(&mut [u8]) -> io::Result<T>,
+) -> io::Result<T> {
+    read(&mut buffer[..length])
+}
+
+fn descriptor_limit_reached() -> bool {
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+    descriptor_limit_with(limit, count_descriptors)
+}
+fn count_descriptors(limit: u64) -> io::Result<u64> {
+    use rustix::fs::{Mode, OFlags, RawDir};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let fd = match rustix::fs::open("/proc/self/fd", flags | OFlags::NOATIME, Mode::empty()) {
+        Err(rustix::io::Errno::PERM) => rustix::fs::open("/proc/self/fd", flags, Mode::empty()),
+        result => result,
+    }?;
+    let mut buffer = [std::mem::MaybeUninit::<u8>::uninit(); 8192];
+    let mut entries = RawDir::new(&fd, &mut buffer);
+    let mut count = 0u64;
+    while count < limit {
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        let entry = entry?;
+        if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn descriptor_limit_with(limit: Option<u64>, count: impl FnOnce(u64) -> io::Result<u64>) -> bool {
+    let Some(limit) = limit else {
+        return false;
+    };
+    // The procfs directory descriptor is included, conservatively detecting
+    // the last remaining slot. Its open fails if no slot remains at all.
+    match count(limit) {
+        Ok(count) => count >= limit,
+        Err(error) => error.raw_os_error().is_some_and(|code| {
+            [
+                rustix::io::Errno::MFILE,
+                rustix::io::Errno::NFILE,
+                rustix::io::Errno::NOMEM,
+                rustix::io::Errno::NOBUFS,
+            ]
+            .iter()
+            .any(|errno| code == errno.raw_os_error())
+        }),
+    }
+}
+
 /// Settings for one mount-scoped watcher.
 pub struct WatcherOptions {
     /// Contract field.
@@ -286,7 +357,15 @@ impl Watcher {
         let thread = std::thread::Builder::new()
             .name("tidemark-watch".into())
             .spawn(move || {
-                let mut buffer = vec![0; 65536];
+                let fd_mode = mode == WatchMode::FdMount;
+                let mut buffer = vec![
+                    0;
+                    if fd_mode {
+                        MAX_FD_BATCH * FD_EVENT_BYTES
+                    } else {
+                        65536
+                    }
+                ];
                 let mut processor = Processor {
                     own_pid: std::process::id() as i32,
                     cfg: &cfg,
@@ -342,9 +421,14 @@ impl Watcher {
                     }
                     let Some(events) = read_recover(
                         || {
-                            group
-                                .read(&mut buffer)
-                                .map(|events| events.collect::<Vec<_>>())
+                            let len = if fd_mode {
+                                fd_buffer_len()
+                            } else {
+                                buffer.len()
+                            };
+                            read_batch(&mut buffer, len, |bytes| {
+                                group.read(bytes).map(|events| events.collect::<Vec<_>>())
+                            })
                         },
                         &mut processor,
                         &worker_state,
@@ -354,6 +438,11 @@ impl Watcher {
                     ) else {
                         break;
                     };
+                    if fd_mode && descriptor_limit_reached() {
+                        processor.loss(now(), &worker_state);
+                        let mut state = worker_state.lock();
+                        state.read_errors = state.read_errors.saturating_add(1);
+                    }
                     for event in events {
                         if worker_stopping.load(Ordering::Relaxed) {
                             break;
@@ -567,7 +656,7 @@ fn select_group<T>(
         None => fd().map(|group| (group, WatchMode::FdMount)),
     }
 }
-// A read is bounded by the 64 KiB transport buffer, including this collected batch.
+// Reads are bounded by the mode-specific transport buffer, including collected batches.
 fn read_recover<T>(
     mut read: impl FnMut() -> io::Result<T>,
     processor: &mut Processor<'_>,
@@ -845,6 +934,41 @@ impl std::fmt::Display for WatchMode {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn descriptor_limit_counts_and_unreadable_pressure_are_lossy() {
+        assert_eq!(count_descriptors(1).unwrap(), 1);
+        assert!(count_descriptors(65536).unwrap() > 0);
+        assert!(descriptor_limit_with(Some(64), |_| Ok(64)));
+        assert!(!descriptor_limit_with(Some(64), |_| Ok(63)));
+        assert!(!descriptor_limit_with(None, |_| panic!("unlimited")));
+        for errno in [24, 23, 12, 105] {
+            assert!(descriptor_limit_with(Some(64), |_| Err(
+                io::Error::from_raw_os_error(errno)
+            )));
+        }
+        assert!(!descriptor_limit_with(Some(64), |_| Err(
+            io::Error::from_raw_os_error(2)
+        )));
+    }
+    #[test]
+    fn fd_reader_drains_five_thousand_in_bounded_batches() {
+        for batch in [256, 32, 16] {
+            let mut remaining = 5000;
+            let mut buffer = vec![0; 65536];
+            let mut reads = 0;
+            while remaining > 0 {
+                let count = read_batch(&mut buffer, fd_read_len(batch), |bytes| {
+                    let count = remaining.min(bytes.len() / FD_EVENT_BYTES);
+                    assert!(count <= batch);
+                    Ok(count)
+                })
+                .unwrap();
+                remaining -= count;
+                reads += 1;
+            }
+            assert_eq!(reads, 5000usize.div_ceil(batch));
+        }
+    }
     #[test]
     fn injected_watcher_minutes_and_shared_persistence() {
         for legacy_first in [false, true] {

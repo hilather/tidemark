@@ -63,23 +63,16 @@ pub fn start(
                     }
                     minutes.clear();
                     watchers.clear();
+                    crate::watch_fd_budget(if config.watch.enabled { config.watch.mounts.len() } else { 0 });
                     identities.retain(|path, _| config.watch.mounts.contains(path));
                     previous = Some(config.watch.clone());
                 }
                 if !config.watch.enabled {
                     state.publish_component(crate::component("watcher", "disabled", "disabled by config"))?;
                 } else {
-                    let mounts = match crate::mounts::read() {
-                        Ok(mounts) => mounts,
-                        Err(error) => {
-                            // An unreadable table cannot authorize retaining a mark.
-                            for mount in watchers.keys() { state.remove_watcher(mount); }
-                            watchers.clear();
-                            minutes.clear();
-                            state.publish_component(crate::component("watcher", "degraded", error.to_string()))?;
-                            crate::wait_service(&state, generation, &shutdown, Duration::from_secs(1));
-                            continue;
-                        }
+                    let Some(mounts) = read_mount_table(&state, crate::mounts::read, &mut watchers, &mut minutes)? else {
+                        crate::wait_service(&state, generation, &shutdown, Duration::from_secs(1));
+                        continue;
                     };
                     let changes = crate::mounts::reconcile_live(&config.watch.mounts, &mut identities, &mounts)?;
 
@@ -91,6 +84,11 @@ pub fn start(
                         minutes.remove(&mount);
                     }
                     let namespace = tidemark_live::watch::namespace_ok();
+                    if matches!(&namespace, Err(error) if crate::resource_pressure(error)) {
+                        state.publish_component(crate::component("watcher", "degraded", format!("namespace check: {namespace:?}")))?;
+                        crate::wait_service(&state, generation, &shutdown, Duration::from_secs(1));
+                        continue;
+                    }
                     if !matches!(namespace, Ok(true)) {
                         for mount in watchers.keys() { state.remove_watcher(mount); }
                         watchers.clear();
@@ -306,6 +304,29 @@ fn requested_windows(config: &Config, mount: &str) -> BTreeSet<usize> {
         .collect()
 }
 
+fn read_mount_table(
+    state: &LiveState,
+    read: impl FnOnce() -> Result<Vec<tidemark_fs::mount::MountInfo>, DaemonError>,
+    watchers: &mut BTreeMap<String, Arc<Watcher>>,
+    minutes: &mut BTreeMap<String, MinuteHistory>,
+) -> Result<Option<Vec<tidemark_fs::mount::MountInfo>>, DaemonError> {
+    match read() {
+        Ok(mounts) => Ok(Some(mounts)),
+        Err(error) => {
+            if !matches!(&error, DaemonError::Io { source, .. } if crate::resource_pressure(source))
+            {
+                for mount in watchers.keys() {
+                    state.remove_watcher(mount);
+                }
+                watchers.clear();
+                minutes.clear();
+            }
+            state.publish_component(crate::component("watcher", "degraded", error.to_string()))?;
+            Ok(None)
+        }
+    }
+}
+
 fn verify_identity(
     expected: Option<crate::mounts::Identity>,
     actual: impl FnOnce() -> std::io::Result<(u64, u32, u32)>,
@@ -375,6 +396,39 @@ mod tests {
             resolve_for: Duration::ZERO,
             ..Default::default()
         }
+    }
+    #[test]
+    fn mountinfo_emfile_retains_watcher_and_minute_history() {
+        let state = LiveState::new(&Config::default(), 0);
+        let watcher = Arc::new(
+            Watcher::from_injected_events(RawPath::new(b"/fixture".to_vec()).unwrap(), []).unwrap(),
+        );
+        let mut watchers = BTreeMap::from([("/fixture".into(), watcher.clone())]);
+        let mut minutes = BTreeMap::from([("/fixture".into(), MinuteHistory::default())]);
+        let read = || {
+            Err(DaemonError::Io {
+                context: "mountinfo".into(),
+                source: std::io::Error::from_raw_os_error(24),
+            })
+        };
+        assert!(read_mount_table(&state, read, &mut watchers, &mut minutes)
+            .unwrap()
+            .is_none());
+        assert!(Arc::ptr_eq(&watchers["/fixture"], &watcher));
+        assert!(minutes.contains_key("/fixture"));
+        assert!(state
+            .view()
+            .status(0)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "watcher" && c.state == "degraded"));
+        assert!(
+            read_mount_table(&state, || Ok(vec![]), &mut watchers, &mut minutes)
+                .unwrap()
+                .is_some()
+        );
+        assert!(watchers.contains_key("/fixture"));
     }
     #[test]
     fn exact_consecutive_minutes_loss_gaps_overflows_and_cap() {

@@ -141,6 +141,116 @@ pub fn main_entry() -> std::process::ExitCode {
 mod tests {
     use super::*;
     #[test]
+    fn requested_shutdown_preserves_first_startup_attempt() {
+        let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut calls = 0;
+        assert_eq!(
+            retry_start("catalog", &state, &shutdown, || {
+                calls += 1;
+                Ok(42)
+            })
+            .unwrap(),
+            42
+        );
+        assert_eq!(calls, 1);
+        assert!(matches!(
+            retry_start::<()>("catalog", &state, &shutdown, || Err(DaemonError::Io {
+                context: "open".into(),
+                source: std::io::Error::from_raw_os_error(24)
+            })),
+            Err(DaemonError::Shutdown)
+        ));
+    }
+    #[test]
+    fn resource_exit_does_not_fail_lifecycle_join() {
+        let handle = std::thread::spawn(|| {
+            Err(DaemonError::Io {
+                context: "final pass".into(),
+                source: std::io::Error::from_raw_os_error(24),
+            })
+        });
+        assert!(join_until(
+            "sampler",
+            handle,
+            std::time::Instant::now() + std::time::Duration::from_secs(5)
+        )
+        .is_ok());
+    }
+    #[test]
+    fn sqlite_extended_pressure_codes_exclude_corruption() {
+        for code in [7, 10, 14, 10 | (3 << 8), 14 | (2 << 8)] {
+            assert!(sqlite_pressure_code(code));
+        }
+        for code in [0, 11, 26, 19, 8] {
+            assert!(!sqlite_pressure_code(code));
+        }
+    }
+    #[test]
+    fn service_start_resource_pressure_retries_without_shutdown() {
+        let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
+        let shutdown = Shutdown::default();
+        let mut calls = 0;
+        let result = retry_start("sampler", &state, &shutdown, || {
+            calls += 1;
+            if calls <= 2 {
+                Err(DaemonError::Io {
+                    context: "spawn".into(),
+                    source: std::io::Error::from_raw_os_error(12),
+                })
+            } else {
+                Ok(42)
+            }
+        })
+        .unwrap();
+        assert_eq!((calls, result), (3, 42));
+        assert!(!shutdown.load(std::sync::atomic::Ordering::Acquire));
+        assert!(state
+            .view()
+            .status(0)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "sampler" && c.state == "degraded"));
+    }
+    #[test]
+    fn per_mount_descriptor_budget_reserves_headroom() {
+        assert_eq!(fd_budget(Some(1024), 2), 256);
+        assert_eq!(fd_budget(Some(1024), 4), 128);
+        assert_eq!(fd_budget(Some(640), 4), 32);
+        assert_eq!(fd_budget(Some(64), 1), 16);
+        assert_eq!(fd_budget(None, 100), 256);
+        assert_eq!(fd_budget(Some(64), 0), 256);
+    }
+    #[test]
+    fn descriptor_limit_raise_equal_and_refused() {
+        use rustix::process::Rlimit;
+        use std::cell::Cell;
+        let limit = Cell::new(Rlimit {
+            current: Some(64),
+            maximum: Some(1024),
+        });
+        let calls = Cell::new(0);
+        let raised = raise_fd_limit(
+            || limit.get(),
+            |next| {
+                calls.set(calls.get() + 1);
+                limit.set(next);
+                Ok(())
+            },
+        );
+        assert_eq!(raised.current, Some(1024));
+        assert_eq!(calls.get(), 1);
+        raise_fd_limit(|| limit.get(), |_| panic!("equal limits must not be set"));
+        limit.set(Rlimit {
+            current: Some(64),
+            maximum: Some(1024),
+        });
+        let refused = raise_fd_limit(|| limit.get(), |_| Err(rustix::io::Errno::PERM));
+        assert_eq!(refused.current, Some(64));
+    }
+
+    #[test]
     fn operational_intervals_have_inclusive_366_day_cap() {
         let max = std::time::Duration::from_secs(366 * 86400);
         let setters: [fn(&mut tidemark_core::config::Config, std::time::Duration); 7] = [
@@ -345,6 +455,125 @@ pub enum DaemonError {
     #[error("internal: {0}")]
     Internal(String),
 }
+fn raise_fd_limit(
+    get: impl Fn() -> rustix::process::Rlimit,
+    set: impl Fn(rustix::process::Rlimit) -> Result<(), rustix::io::Errno>,
+) -> rustix::process::Rlimit {
+    let limit = get();
+    if limit.current != limit.maximum {
+        if let Err(error) = set(rustix::process::Rlimit {
+            current: limit.maximum,
+            ..limit
+        }) {
+            tracing::warn!(%error, "could not raise descriptor soft limit");
+        }
+    }
+    get()
+}
+
+fn fd_budget(limit: Option<u64>, mounts: usize) -> usize {
+    limit.map_or(256, |limit| {
+        if mounts == 0 {
+            256
+        } else {
+            (limit.saturating_sub(512) / mounts as u64).clamp(16, 256) as usize
+        }
+    })
+}
+
+pub(crate) fn watch_fd_budget(mounts: usize) {
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+    let needed = (mounts as u64).saturating_mul(256).saturating_add(512);
+    let batch = fd_budget(limit, mounts);
+    tidemark_live::watch::set_fd_batch(batch);
+    if limit.is_some_and(|limit| limit < needed) {
+        tracing::warn!(
+            ?limit,
+            needed,
+            mounts,
+            batch,
+            "descriptor budget reduced; minimum batch may exceed available reserve"
+        );
+    }
+}
+
+fn daemon_pressure(error: &DaemonError) -> bool {
+    matches!(error, DaemonError::Io { source, .. } if resource_pressure(source))
+        || matches!(error, DaemonError::Unavailable(detail) if detail.starts_with("resource pressure:"))
+}
+fn startup_store_error(error: tidemark_store::StoreError) -> DaemonError {
+    if store_pressure(&error) {
+        DaemonError::Unavailable(format!("resource pressure: {error}"))
+    } else {
+        DaemonError::Store(error.to_string())
+    }
+}
+fn retry_start<T>(
+    name: &str,
+    state: &state::LiveState,
+    shutdown: &Shutdown,
+    mut start: impl FnMut() -> Result<T, DaemonError>,
+) -> Result<T, DaemonError> {
+    use std::{
+        sync::atomic::Ordering,
+        time::{Duration, Instant},
+    };
+    let mut failures = 0u32;
+    let mut last_log: Option<Instant> = None;
+    loop {
+        match start() {
+            Err(error) if daemon_pressure(&error) => {
+                // Preserve the initial startup attempt: recovery tests and callers
+                // may request shutdown before entry but still require catalog repair.
+                if shutdown.load(Ordering::Acquire) {
+                    return Err(DaemonError::Shutdown);
+                }
+                state.publish_component(component(name, "degraded", error.to_string()))?;
+                if last_log.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+                    tracing::warn!(component=name, %error, "startup resource pressure; retrying");
+                    last_log = Some(Instant::now());
+                }
+                let end = Instant::now() + Duration::from_millis(50u64 << failures.min(4));
+                failures = failures.saturating_add(1);
+                while !shutdown.load(Ordering::Acquire) && Instant::now() < end {
+                    std::thread::park_timeout(Duration::from_millis(20));
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+// Resource pressure must be contained by the component owning the retry loop.
+pub(crate) fn resource_pressure(error: &std::io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        [
+            rustix::io::Errno::MFILE,
+            rustix::io::Errno::NFILE,
+            rustix::io::Errno::NOMEM,
+            rustix::io::Errno::NOBUFS,
+        ]
+        .iter()
+        .any(|errno| errno.raw_os_error() == code)
+    })
+}
+
+fn sqlite_pressure_code(code: i32) -> bool {
+    matches!(code & 0xff, 7 | 10 | 14)
+}
+
+pub(crate) fn store_pressure(error: &tidemark_store::StoreError) -> bool {
+    match error {
+        tidemark_store::StoreError::Io(error) => resource_pressure(error),
+        // SQLite preserves its extended result code, but not the underlying errno.
+        // CANTOPEN, NOMEM and IOERR are retried by read-only scheduling passes.
+        tidemark_store::StoreError::Sql(error) => error
+            .sqlite_error()
+            .is_some_and(|error| sqlite_pressure_code(error.extended_code)),
+        _ => false,
+    }
+}
+
 /// Shared shutdown flag; lifecycle owner broadcasts by setting it true.
 pub type Shutdown = std::sync::Arc<std::sync::atomic::AtomicBool>;
 /// Service thread joined during bounded shutdown. Shape proposed by W6-prep; the owning task may refine it inside its own file.
@@ -403,14 +632,21 @@ pub fn run_controlled(
         time::{Duration, Instant},
     };
     validate_config(&config)?;
-    let (loaded, hash) = load_config(&options.config_path)?;
+    let limit = raise_fd_limit(
+        || rustix::process::getrlimit(rustix::process::Resource::Nofile),
+        |limit| rustix::process::setrlimit(rustix::process::Resource::Nofile, limit),
+    );
+    tracing::info!(soft=?limit.current, hard=?limit.maximum, "effective descriptor limit");
+    let (loaded, hash) = retry_start("config", &state, &shutdown, || {
+        load_config(&options.config_path)
+    })?;
     if loaded != config {
         return Err(DaemonError::Config(
             "supplied configuration differs from loaded bytes".into(),
         ));
     }
     // Validate all unsafe paths before creating any artifact; retain the directory handle.
-    let fd = prepare_state(&config)?;
+    let fd = retry_start("daemon", &state, &shutdown, || prepare_state(&config))?;
     protect_config(&mut config)?;
     state.replace_config(config.clone())?;
     state.bind_storage(fd);
@@ -423,13 +659,19 @@ pub fn run_controlled(
     )?;
     // Both storage opens perform header preflight before SQLite. Recovery is corruption-only.
     let storage = state.storage_path();
-    let catalog = match tidemark_store::catalog::Catalog::open(&storage, true) {
+    let catalog = match retry_start("catalog", &state, &shutdown, || {
+        match tidemark_store::catalog::Catalog::open(&storage, true) {
+            Err(error) if store_pressure(&error) => Err(startup_store_error(error)),
+            result => Ok(result),
+        }
+    })? {
         Ok(c) => c,
         Err(error) if corrupt(&error) => {
-            let c = tidemark_store::catalog::recover_catalog(&storage)
-                .map_err(|e| DaemonError::Store(e.to_string()))?;
+            let c = retry_start("catalog", &state, &shutdown, || {
+                tidemark_store::catalog::recover_catalog(&storage).map_err(startup_store_error)
+            })?;
             for path in c.recovery_files() {
-                tracing::warn!(path=%path.display(),"preserved corrupt catalog artifact");
+                tracing::warn!(path=%path.display(), "preserved corrupt catalog artifact");
             }
             c
         }
@@ -446,9 +688,9 @@ pub fn run_controlled(
     for root in &config.roots {
         let raw = tidemark_core::path::RawPath::from_path(&root.path)
             .map_err(|e| DaemonError::Config(e.to_string()))?;
-        let entry = catalog
-            .latest(&raw)
-            .map_err(|e| DaemonError::Store(e.to_string()))?;
+        let entry = retry_start("catalog", &state, &shutdown, || {
+            catalog.latest(&raw).map_err(startup_store_error)
+        })?;
         let last_complete = entry.and_then(|e| {
             Some(tidemark_core::live::LastScan {
                 scan_id: e.scan_id,
@@ -468,12 +710,17 @@ pub fn run_controlled(
         )?;
     }
     drop(catalog);
-    let ts = tidemark_store::timeseries::TimeSeries::open(&storage.join("timeseries.db"), true)
-        .map_err(|e| DaemonError::Store(e.to_string()))?;
+    let ts = retry_start("tswriter", &state, &shutdown, || {
+        tidemark_store::timeseries::TimeSeries::open(&storage.join("timeseries.db"), true)
+            .map_err(startup_store_error)
+    })?;
     drop(ts);
     if config.watch.enabled {
         match tidemark_live::watch::namespace_ok() {
             Ok(true) => {}
+            Err(error) if resource_pressure(&error) => {
+                state.publish_component(component("watcher", "degraded", error.to_string()))?;
+            }
             result => {
                 let reason =
                     format!("host mount namespace unavailable: {result:?}; watcher disabled");
@@ -501,77 +748,87 @@ pub fn run_controlled(
     }
     let config = Arc::new(config);
     let writer_shutdown = Shutdown::default();
-    let (writer, writer_handle) = services::tswriter::start_supervised(
-        config.clone(),
-        state.clone(),
-        writer_shutdown.clone(),
-    )?;
+    let (writer, writer_handle) = retry_start("tswriter", &state, &shutdown, || {
+        services::tswriter::start_supervised(config.clone(), state.clone(), writer_shutdown.clone())
+    })?;
     // Any startup error stops already-started services before returning.
     let mut handles = Vec::new();
     let recorder_deadline = Arc::new(parking_lot::Mutex::new(None));
     let started = (|| -> Result<_, DaemonError> {
         add_service(
             "sampler",
-            services::sampler::start(
-                config.clone(),
-                state.clone(),
-                writer.clone(),
-                shutdown.clone(),
-            ),
+            retry_start("sampler", &state, &shutdown, || {
+                services::sampler::start(
+                    config.clone(),
+                    state.clone(),
+                    writer.clone(),
+                    shutdown.clone(),
+                )
+            }),
             &state,
             &mut handles,
         )?;
         add_service(
             "lvm",
-            services::lvm::start(
-                config.clone(),
-                state.clone(),
-                writer.clone(),
-                shutdown.clone(),
-            ),
+            retry_start("lvm", &state, &shutdown, || {
+                services::lvm::start(
+                    config.clone(),
+                    state.clone(),
+                    writer.clone(),
+                    shutdown.clone(),
+                )
+            }),
             &state,
             &mut handles,
         )?;
         add_service(
             "watcher",
-            services::watcher::start(
-                config.clone(),
-                state.clone(),
-                writer.clone(),
-                shutdown.clone(),
-            ),
+            retry_start("watcher", &state, &shutdown, || {
+                services::watcher::start(
+                    config.clone(),
+                    state.clone(),
+                    writer.clone(),
+                    shutdown.clone(),
+                )
+            }),
             &state,
             &mut handles,
         )?;
         add_service(
             "procscan",
-            services::procscan::start(
-                config.clone(),
-                state.clone(),
-                writer.clone(),
-                shutdown.clone(),
-            ),
+            retry_start("procscan", &state, &shutdown, || {
+                services::procscan::start(
+                    config.clone(),
+                    state.clone(),
+                    writer.clone(),
+                    shutdown.clone(),
+                )
+            }),
             &state,
             &mut handles,
         )?;
         add_service(
             "alerts",
-            services::alerts::start(
+            retry_start("alerts", &state, &shutdown, || {
+                services::alerts::start(
+                    config.clone(),
+                    state.clone(),
+                    writer.clone(),
+                    shutdown.clone(),
+                )
+            }),
+            &state,
+            &mut handles,
+        )?;
+        let scans = match retry_start("scheduler", &state, &shutdown, || {
+            scheduler::start_with_deadline(
                 config.clone(),
                 state.clone(),
                 writer.clone(),
                 shutdown.clone(),
-            ),
-            &state,
-            &mut handles,
-        )?;
-        let scans = match scheduler::start_with_deadline(
-            config.clone(),
-            state.clone(),
-            writer.clone(),
-            shutdown.clone(),
-            recorder_deadline.clone(),
-        ) {
+                recorder_deadline.clone(),
+            )
+        }) {
             Ok((scans, h)) => {
                 handles.push(("scheduler", h));
                 scans
@@ -588,7 +845,9 @@ pub fn run_controlled(
         };
         add_service(
             "metrics",
-            metrics::start(config.clone(), state.clone(), shutdown.clone()),
+            retry_start("metrics", &state, &shutdown, || {
+                metrics::start(config.clone(), state.clone(), shutdown.clone())
+            }),
             &state,
             &mut handles,
         )?;
@@ -600,7 +859,17 @@ pub fn run_controlled(
         };
         add_service(
             "api",
-            api::start(config.clone(), context, shutdown.clone()),
+            retry_start("api", &state, &shutdown, || {
+                api::start(
+                    config.clone(),
+                    api::Context {
+                        state: context.state.clone(),
+                        scans: context.scans.clone(),
+                        reload: context.reload.clone(),
+                    },
+                    shutdown.clone(),
+                )
+            }),
             &state,
             &mut handles,
         )?;
@@ -756,6 +1025,12 @@ fn join_until(
         return Err(DaemonError::Internal(format!(
             "{name} did not stop before shutdown deadline"
         )));
+    }
+    if let Err(error) = &result {
+        if daemon_pressure(error) {
+            tracing::warn!(component=name, %error, "service degraded at shutdown");
+            return Ok(());
+        }
     }
     result
 }

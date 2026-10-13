@@ -79,6 +79,9 @@ pub fn start(
                     state.publish(Publication::ProcscanAttempt { generation, report: None }, crate::component("procscan", "degraded", "reconfigured; awaiting completed scan"))?;
                     match scanner(&config) {
                         Ok(s) => collector = Some(s),
+                        Err(e) if matches!(&e, DaemonError::Io { source, .. } if crate::resource_pressure(source)) => {
+                            state.publish_component(crate::component("procscan", "degraded", e.to_string()))?;
+                        }
                         Err(e) => { state.publish(Publication::ProcscanAttempt { generation, report: None }, crate::component("procscan", "error", e.to_string()))?; }
                     }
                 }
@@ -90,6 +93,9 @@ pub fn start(
                             for rows in phantom.chunks(super::tswriter::MAX_BATCH_ROWS) { dropped |= writer.try_send(super::tswriter::Message::Phantom(rows.to_vec())).is_err(); }
                             for rows in writers.chunks(super::tswriter::MAX_BATCH_ROWS) { dropped |= writer.try_send(super::tswriter::Message::Writers(rows.to_vec())).is_err(); }
                             state.publish(Publication::ProcscanAttempt { generation, report: s.report().map(Arc::new) }, crate::component("procscan", if dropped || result.writers_full { "degraded" } else { "ok" }, format!("fds_seen={} writers_full={} writer_evictions={} persistence_dropped={dropped}", result.fds_seen, result.writers_full, result.writer_evictions)))?;
+                        }
+                        Err(e) if crate::resource_pressure(&e) => {
+                            state.publish_component(crate::component("procscan", "degraded", e.to_string()))?;
                         }
                         Err(e) => { state.publish(Publication::ProcscanAttempt { generation, report: None }, crate::component("procscan", "error", e.to_string()))?; }
                     }
