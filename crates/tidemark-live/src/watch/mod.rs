@@ -515,7 +515,7 @@ impl Watcher {
                 _ => return Err(WatchError::Unsupported),
             }
         }
-        let mount_fd = Arc::new(
+        let mut mount_fd = Arc::new(
             rustix::fs::open(
                 cfg.mount.as_path(),
                 rustix::fs::OFlags::PATH
@@ -558,6 +558,28 @@ impl Watcher {
         })?;
         if mode == WatchMode::FdMount {
             mode = fd_mode_selected;
+        }
+        if mode == WatchMode::FdFilesystem {
+            let identity = descriptor_identity(mount_fd.as_fd())?;
+            let flags = mount_open_flags(mode);
+            let replacement =
+                match rustix::fs::open(cfg.mount.as_path(), flags, rustix::fs::Mode::empty()) {
+                    Err(rustix::io::Errno::PERM) => rustix::fs::open(
+                        cfg.mount.as_path(),
+                        flags & !rustix::fs::OFlags::NOATIME,
+                        rustix::fs::Mode::empty(),
+                    ),
+                    result => result,
+                }
+                .map_err(io::Error::from)?;
+            if descriptor_identity(replacement.as_fd())? != identity {
+                return Err(io::Error::other(
+                    "watched mount changed while opening handle mount descriptor",
+                )
+                .into());
+            }
+            // The mark already targets this verified mount. Retain only the real open.
+            mount_fd = Arc::new(replacement);
         }
         let shutdown = Arc::new(
             rustix::event::eventfd(
@@ -1045,6 +1067,18 @@ pub fn parse_mount_id(text: &str) -> io::Result<u64> {
                 "missing or invalid fdinfo mount id",
             )
         })
+}
+fn mount_open_flags(mode: WatchMode) -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
+    let base = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    if mode == WatchMode::FdFilesystem {
+        base | OFlags::RDONLY | OFlags::NOATIME
+    } else {
+        base | OFlags::PATH
+    }
+}
+fn descriptor_identity(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<(u64, u64)> {
+    Ok((descriptor_mount_id(fd)?, rustix::fs::fstat(fd)?.st_dev))
 }
 fn descriptor_mount_id(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<u64> {
     use std::io::Read;
