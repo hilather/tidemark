@@ -658,13 +658,16 @@ pub(crate) fn state_guard(path: &Path, cfg: Option<&Config>) -> io::Result<()> {
         }),
     )?;
     files::validate_state(&path.join("deploy"), std::iter::empty::<&Path>())?;
-    let (state, _) = files::state_handles(path, false)?;
+    let (state, deploy) = files::state_handles(path, false)?;
     if let Some(bytes) = files::optional_at(state.as_ref(), MARKER)? {
         let marker: Marker = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         if marker.format != "tidemark-state-v1" || marker.state_dir.as_path() != path {
             return Err(io::Error::other("state marker path mismatch"));
         }
     }
+    // Preserve the bounded-record admission contract before verify/service work.
+    files::optional_at(deploy.as_ref(), "staged.json")?;
+    files::optional_at(deploy.as_ref(), "firstboot.json")?;
     Ok(())
 }
 #[derive(Serialize, Deserialize)]

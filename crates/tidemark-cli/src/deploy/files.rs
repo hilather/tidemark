@@ -498,11 +498,16 @@ fn check_content(state: &OwnedFd, deploy: Option<&OwnedFd>, path: &Path) -> io::
     }
     if let Some(deploy) = deploy {
         for name in ["staged.json", "firstboot.json"] {
-            check_leaf_at(
+            // Preserve admission's record-size bound without parsing record contents.
+            match read_state_at(
                 deploy,
                 std::ffi::OsStr::new(name),
                 &path.join("deploy").join(name),
-            )?;
+            ) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
     }
     Ok(())
@@ -570,7 +575,12 @@ pub(crate) fn read_state_at(
         .take(1024 * 1024 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > 1024 * 1024 {
-        return Err(io::Error::other("deployment file exceeds 1 MiB"));
+        return Err(leaf_error(
+            parent,
+            name,
+            path,
+            io::Error::other("deployment file exceeds 1 MiB"),
+        ));
     }
     Ok(bytes)
 }
