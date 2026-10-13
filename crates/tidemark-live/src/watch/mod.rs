@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use std::{
     collections::{BTreeSet, VecDeque},
     io,
-    os::fd::{AsFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, OwnedFd},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -86,6 +86,31 @@ pub struct WatchEvent {
     /// Best-effort process attribution.
     pub attribution: Attribution,
 }
+/// One completed wall-clock minute of one watcher, emitted once in timestamp order.
+///
+/// The first eligible minute is the first full minute after watcher startup. Empty
+/// minutes are included. Only the retained 60-bucket history is available: missing
+/// timestamps identify a gap and the first returned minute after it is lossy.
+/// Clock rollback marks affected minutes lossy without repeating a timestamp.
+/// Overflow totals never decrease and adjacent minute boundaries share one total.
+#[derive(Clone, Debug)]
+pub struct CompletedMinute {
+    /// Minute start in epoch seconds, a multiple of 60.
+    pub started_at: i64,
+    /// Cumulative queue overflows at the start boundary.
+    pub overflow_total_at_start: u64,
+    /// Cumulative queue overflows at the end boundary.
+    pub overflow_total_at_end: u64,
+    /// Any loss from overflow, recovery, caps, rollback, or a preceding retention gap.
+    pub lossy: bool,
+    /// A per-minute list was cut by its storage or requested output cap.
+    pub truncated: bool,
+    /// Ranked directory rows, bounded by the existing completed-minute cap and top_k.
+    pub dirs: Vec<HotEntry>,
+    /// Persistence rows the legacy drain would return, sharing its drain cursor.
+    /// Empty if those rows have already been handed out by that drain.
+    pub persisted: Vec<HotMinute>,
+}
 /// Owns a bounded background watcher and joins it on stop or drop.
 pub struct Watcher {
     mode: WatchMode,
@@ -94,6 +119,7 @@ pub struct Watcher {
     stopping: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     mount: RawPath,
+    mount_fd: Option<Arc<OwnedFd>>,
 }
 // Acknowledgements are FIFO and scoped to the current loss. Eviction is conservative.
 const LOSS_ACK_CAP: usize = 1024;
@@ -122,6 +148,9 @@ impl State {
             self.mark_loss();
             self.rings.overflow(at);
         }
+        if self.failed || self.recovering {
+            self.rings.recovery(at);
+        }
         self.last_at = Some(at);
     }
 }
@@ -132,12 +161,15 @@ fn now() -> i64 {
 impl Watcher {
     /// Build a kernel-free watcher from attributed metadata events for integration tests.
     /// Events are `(timestamp, directory/unit/command keys, signed delta, unit, identity)`.
+    /// The first event timestamp establishes startup; an empty source starts now.
     #[doc(hidden)]
     pub fn from_injected_events(
         mount: RawPath,
         events: impl IntoIterator<Item = (i64, [Vec<u8>; 3], i64, Option<String>, (u64, u64))>,
     ) -> io::Result<Self> {
         let mut rings = rings::Rings::new();
+        let mut events = events.into_iter().peekable();
+        rings.advance(events.peek().map_or_else(now, |event| event.0));
         for (at, keys, delta, unit, identity) in events {
             rings.add(at, keys, delta, unit, identity);
         }
@@ -164,6 +196,7 @@ impl Watcher {
             stopping: Arc::new(AtomicBool::new(false)),
             thread: None,
             mount,
+            mount_fd: None,
         })
     }
     /// Check the host namespace, negotiate reporting, and spawn one worker.
@@ -183,6 +216,18 @@ impl Watcher {
                 _ => return Err(WatchError::Unsupported),
             }
         }
+        let mount_fd = Arc::new(
+            rustix::fs::open(
+                cfg.mount.as_path(),
+                rustix::fs::OFlags::PATH
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        );
+        let mark_path = mount_mark_path(&mount_fd);
         let mut selected = None;
         if caps.report_dfid_name {
             if let Ok(group) = Fanotify::init(InitMode::DfidName) {
@@ -192,10 +237,9 @@ impl Watcher {
                     | mask::MOVED_FROM
                     | mask::MOVED_TO
                     | mask::ONDIR;
-                if caps.mark_filesystem && group.mark_filesystem(cfg.mount.as_path(), rich).is_ok()
-                {
+                if caps.mark_filesystem && group.mark_filesystem(&mark_path, rich).is_ok() {
                     selected = Some((group, WatchMode::DfidNameFilesystem));
-                } else if group.mark_mount(cfg.mount.as_path(), rich).is_ok() {
+                } else if group.mark_mount(&mark_path, rich).is_ok() {
                     selected = Some((group, WatchMode::DfidNameMount));
                 }
             }
@@ -206,19 +250,10 @@ impl Watcher {
             }
             let group = Fanotify::init(InitMode::FdMode).map_err(|_| WatchError::Unsupported)?;
             group
-                .mark_mount(cfg.mount.as_path(), event_mask)
+                .mark_mount(&mark_path, event_mask)
                 .map_err(|_| WatchError::Unsupported)?;
             Ok(group)
         })?;
-        let mount_fd = rustix::fs::open(
-            cfg.mount.as_path(),
-            rustix::fs::OFlags::PATH
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )
-        .map_err(io::Error::from)?;
         let shutdown = Arc::new(
             rustix::event::eventfd(
                 0,
@@ -240,6 +275,8 @@ impl Watcher {
             stream: None,
             dropped_events: 0,
         }));
+        state.lock().rings.advance(now());
+        let worker_mount_fd = mount_fd.clone();
         let worker_state = state.clone();
         let worker_shutdown = shutdown.clone();
         let stopping = Arc::new(AtomicBool::new(false));
@@ -254,7 +291,7 @@ impl Watcher {
                     own_pid: std::process::id() as i32,
                     cfg: &cfg,
                     attribution: &attribution,
-                    mount_fd: mount_fd.as_fd(),
+                    mount_fd: worker_mount_fd.as_fd(),
                     sizes: fdmode::Sizes::new(cfg.lru_entries, now()),
                     paths: fidmode::PathSizes::new(cfg.lru_entries),
                     handles: fidmode::HandlePaths::new(100_000),
@@ -295,7 +332,7 @@ impl Watcher {
                         let at = now();
                         state.observe_time(at);
                         if state.recovering {
-                            state.rings.overflow(at);
+                            state.rings.recovery(at);
                         } else {
                             state.rings.advance(at);
                         }
@@ -337,6 +374,7 @@ impl Watcher {
             stopping,
             thread: Some(thread),
             mount,
+            mount_fd: Some(mount_fd),
         })
     }
     /// Return the reporting mode selected by successful marks.
@@ -356,11 +394,66 @@ impl Watcher {
         state.rings.hot(at, window_min, scope, limit)
     }
     /// Return each retained completed minute once, with at most top_k rows per scope.
+    /// Persistence rows share a drain cursor with [`Self::drain_minutes`]: each row
+    /// is handed out once, through whichever method drains its minute first.
     pub fn drain_completed_minutes(&self, top_k: usize) -> Vec<HotMinute> {
+        self.drain_completed_minutes_at(now(), top_k)
+    }
+    fn drain_completed_minutes_at(&self, at: i64, top_k: usize) -> Vec<HotMinute> {
         let mut state = self.state.lock();
-        let at = now();
         state.observe_time(at);
         state.rings.drain(at, &self.mount.display_lossy(), top_k)
+    }
+    /// Drain completed minutes oldest first, including empty healthy minutes.
+    ///
+    /// Starts with the first full minute after startup; retained history is bounded
+    /// to 60 buckets. A retention gap is visible in timestamps and marks the next
+    /// emitted minute lossy. Rollback never repeats an emitted timestamp. Adjacent
+    /// boundaries have equal cumulative queue-overflow totals, which never decrease.
+    /// Recovery, overflow, rollback and cut lists make hot data unavailable (lossy).
+    /// Persistence rows share a cursor with [`Self::drain_completed_minutes`]; a row
+    /// is handed out once through whichever method drains its minute first. The
+    /// minute facts and directory rows remain available after the legacy row drain.
+    pub fn drain_minutes(&self, top_k: usize) -> Vec<CompletedMinute> {
+        self.drain_minutes_at(now(), top_k)
+    }
+    fn drain_minutes_at(&self, at: i64, top_k: usize) -> Vec<CompletedMinute> {
+        let mut state = self.state.lock();
+        state.observe_time(at);
+        if state.failed || state.recovering {
+            state.rings.recovery(at);
+        }
+        state
+            .rings
+            .drain_minutes(at, &self.mount.display_lossy(), top_k)
+    }
+    /// Identity of the retained descriptor used to mark the mount: mount ID,
+    /// device major and device minor. Uses EL8-compatible procfs fdinfo and fstat.
+    /// Injected-event watchers return [`io::ErrorKind::Unsupported`].
+    pub fn mount_identity(&self) -> io::Result<(u64, u32, u32)> {
+        use std::io::Read;
+        let fd = self.mount_fd.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "injected watcher has no mount descriptor",
+            )
+        })?;
+        let stat = rustix::fs::fstat(fd.as_fd())?;
+        let file = std::fs::File::open(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))?;
+        let mut text = String::new();
+        file.take(16_385).read_to_string(&mut text)?;
+        if text.len() > 16_384 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized mount fdinfo",
+            ));
+        }
+        let id = parse_mount_id(&text)?;
+        Ok((
+            id,
+            rustix::fs::major(stat.st_dev),
+            rustix::fs::minor(stat.st_dev),
+        ))
     }
     /// Enable the optional 1,000-event foreground buffer. Daemon watchers do not allocate it.
     pub fn enable_events(&self) {
@@ -418,7 +511,7 @@ impl Watcher {
         let at = now();
         state.observe_time(at);
         if state.failed || state.recovering {
-            state.rings.overflow(at);
+            state.rings.recovery(at);
         } else {
             state.rings.advance(at);
         }
@@ -449,6 +542,22 @@ impl Watcher {
         }
     }
 }
+fn mount_mark_path(fd: &impl AsRawFd) -> std::path::PathBuf {
+    // The mark helper uses FAN_MARK_DONT_FOLLOW. A final `.` names the
+    // retained directory itself, rather than the procfs descriptor symlink.
+    std::path::PathBuf::from(format!("/proc/self/fd/{}/.", fd.as_raw_fd()))
+}
+fn parse_mount_id(text: &str) -> io::Result<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .and_then(|id| id.trim().parse().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing or invalid fdinfo mount id",
+            )
+        })
+}
 fn select_group<T>(
     rich: Option<(T, WatchMode)>,
     fd: impl FnOnce() -> Result<T, WatchError>,
@@ -473,7 +582,7 @@ fn read_recover<T>(
             Ok(events) => {
                 let mut state = state.lock();
                 if state.recovering {
-                    state.rings.overflow(clock());
+                    state.rings.recovery(clock());
                 }
                 state.recovering = false;
                 return Some(events);
@@ -559,7 +668,7 @@ impl Processor<'_> {
             self.loss(at, state);
             let mut state = state.lock();
             state.overflows = state.overflows.saturating_add(1);
-            state.rings.overflow(at);
+            state.rings.queue_overflow(at);
             return;
         }
         let resolved = match event {
@@ -736,6 +845,148 @@ impl std::fmt::Display for WatchMode {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn injected_watcher_minutes_and_shared_persistence() {
+        for legacy_first in [false, true] {
+            let watcher = Watcher::from_injected_events(
+                raw("/fixture"),
+                [
+                    (
+                        17,
+                        [b"d".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                        1,
+                        Some("u".into()),
+                        (1, 1),
+                    ),
+                    (
+                        60,
+                        [b"d".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                        2,
+                        Some("u".into()),
+                        (1, 1),
+                    ),
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                watcher.mount_identity().unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+            if legacy_first {
+                assert_eq!(watcher.drain_completed_minutes_at(180, 1000).len(), 6);
+            }
+            let minutes = watcher.drain_minutes_at(180, 1000);
+            assert_eq!(minutes.len(), 2);
+            assert_eq!(minutes[0].started_at, 60);
+            assert_eq!(minutes[0].dirs[0].bytes_delta, 2);
+            assert_eq!(minutes[0].dirs[0].top_unit.as_deref(), Some("u"));
+            assert_eq!(minutes[0].persisted.len(), if legacy_first { 0 } else { 3 });
+            assert!(minutes[1].dirs.is_empty() && minutes[1].persisted.is_empty());
+            assert!(!minutes[1].lossy);
+            assert!(watcher.drain_minutes_at(180, 1000).is_empty());
+            // The legacy drain also owns startup's partial-minute rows.
+            assert_eq!(
+                watcher.drain_completed_minutes_at(180, 1000).len(),
+                if legacy_first { 0 } else { 3 }
+            );
+        }
+    }
+    #[test]
+    fn injected_watcher_overflow_and_recovery_facts() {
+        let watcher = Watcher::from_injected_events(
+            raw("/fixture"),
+            [(17, [vec![], vec![], vec![]], 0, None, (1, 1))],
+        )
+        .unwrap();
+        let mut state = watcher.state.lock();
+        state.rings.queue_overflow(130);
+        state.overflows = 1;
+        state.recovering = true;
+        drop(state);
+        let minutes = watcher.drain_minutes_at(240, 1000);
+        assert_eq!(
+            minutes
+                .iter()
+                .map(|m| (m.overflow_total_at_start, m.overflow_total_at_end))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (0, 1), (1, 1)]
+        );
+        assert!(minutes[1].lossy);
+        assert!(minutes[2].lossy);
+        // Ordinary queries must not make recovery intervals look healthy.
+        {
+            let mut state = watcher.state.lock();
+            state.observe_time(360);
+            state.rings.advance(360);
+        }
+        let recovering = watcher.drain_minutes_at(420, 1000);
+        assert!(recovering.iter().all(|m| m.lossy));
+        watcher.state.lock().recovering = false;
+    }
+    #[test]
+    fn retained_mount_descriptor_survives_path_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("mount");
+        std::fs::create_dir(&original).unwrap();
+        let fd = Arc::new(
+            rustix::fs::open(
+                &original,
+                rustix::fs::OFlags::PATH
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap(),
+        );
+        let mut watcher = Watcher::from_injected_events(raw("/fixture"), []).unwrap();
+        watcher.mount_fd = Some(fd.clone());
+        let identity = watcher.mount_identity().unwrap();
+        let mounts = tidemark_fs::mount::read_mountinfo().unwrap();
+        let raw_path = RawPath::from_path(&original).unwrap();
+        let mount = mounts
+            .iter()
+            .filter(|m| raw_path.starts_with(&m.mount_point))
+            .max_by_key(|m| m.mount_point.as_bytes().len())
+            .unwrap();
+        assert_eq!(identity, (u64::from(mount.id), mount.major, mount.minor));
+        std::fs::rename(&original, temp.path().join("moved")).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        let retained = rustix::fs::fstat(fd.as_fd()).unwrap();
+        // FAN_MARK_DONT_FOLLOW must resolve the final component to the retained
+        // directory, even after replacement of the originally configured path.
+        let target = rustix::fs::statat(
+            rustix::fs::CWD,
+            mount_mark_path(&fd),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        let replacement = rustix::fs::stat(&original).unwrap();
+        assert_eq!(
+            (target.st_dev, target.st_ino),
+            (retained.st_dev, retained.st_ino)
+        );
+        assert_ne!(target.st_ino, replacement.st_ino);
+        assert_eq!(watcher.mount_identity().unwrap(), identity);
+    }
+    #[test]
+    fn fdinfo_mount_id_parser() {
+        assert_eq!(
+            parse_mount_id("pos:\t0\nflags:\t010000000\nmnt_id:\t123\n").unwrap(),
+            123
+        );
+        for text in [
+            "",
+            "mnt_id: garbage",
+            "mnt_id: -1",
+            "mnt_id: 18446744073709551616",
+        ] {
+            assert_eq!(
+                parse_mount_id(text).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
     fn empty_state() -> Mutex<State> {
         Mutex::new(State {
             rings: rings::Rings::new(),
@@ -762,6 +1013,7 @@ mod tests {
             stopping: Arc::new(AtomicBool::new(false)),
             thread: None,
             mount: raw("/data"),
+            mount_fd: None,
         }
     }
     fn raw(path: &str) -> RawPath {
@@ -1093,6 +1345,7 @@ mod tests {
             stopping: Arc::new(stopping),
             thread: None,
             mount: cfg.mount.clone(),
+            mount_fd: None,
         };
         assert_eq!(watcher.mode(), WatchMode::Failed);
         let drained = watcher.drain_events(3);
