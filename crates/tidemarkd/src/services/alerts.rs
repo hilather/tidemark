@@ -523,6 +523,75 @@ mod tests {
         tick_current(&mut engine, 3901, &state, &tx, &mut [], &mut failures).unwrap();
         assert!(state.view_at(3901).alert_diagnostics().unwrap().is_empty());
     }
+    #[test]
+    fn one_minute_and_late_remount_rates_warm_for_five_minutes_of_current_identity() {
+        for window in ["1m", "1h"] {
+            let mut cfg = Config::default();
+            cfg.sampler.mounts = vec!["/data".into()];
+            cfg.alerts.rule = vec![AlertRule {
+                name: "full".into(),
+                kind: tidemark_core::config::AlertKind::TimeToFull,
+                mount: Some("/data".into()),
+                below: Some("1h".into()),
+                window: Some(window.into()),
+                ..Default::default()
+            }];
+            let state = LiveState::new(&cfg, 0);
+            let mut engine = AlertEngine::new(&cfg.alerts.rule, cfg.alerts.renotify).unwrap();
+            let (tx, _rx) = crossbeam_channel::bounded(64);
+            let mut failures = Default::default();
+            for base in [0, 36_000] {
+                if base > 0 {
+                    state.reset_fs_mount(state.config().1, "/data").unwrap();
+                }
+                for elapsed in (0..=300).step_by(30) {
+                    let ts = base + elapsed;
+                    state
+                        .publish(
+                            Publication::Fs(FsSample {
+                                ts,
+                                mount: "/data".into(),
+                                size: 10_000,
+                                used: 100 + elapsed as u64,
+                                avail: 9_900 - elapsed as u64,
+                                inodes: 1,
+                                inodes_used: 0,
+                            }),
+                            crate::component("sampler:/data", "ok", "fixture"),
+                        )
+                        .unwrap();
+                    tick_current(&mut engine, ts, &state, &tx, &mut [], &mut failures).unwrap();
+                    let view = state.view_at(ts);
+                    let diagnostics = view.alert_diagnostics().unwrap();
+                    if elapsed < 300 {
+                        assert_eq!(diagnostics.len(), 1);
+                        assert!(
+                            diagnostics[0].reason.starts_with("warming up"),
+                            "{base} {elapsed} {window}: {diagnostics:?}"
+                        );
+                    } else {
+                        assert!(diagnostics.is_empty());
+                    }
+                    assert_eq!(
+                        view.status(ts)
+                            .unwrap()
+                            .components
+                            .iter()
+                            .find(|c| c.name == "alerts")
+                            .unwrap()
+                            .state,
+                        "ok"
+                    );
+                }
+                let stale = base + 391;
+                tick_current(&mut engine, stale, &state, &tx, &mut [], &mut failures).unwrap();
+                assert_eq!(
+                    state.view_at(stale).alert_diagnostics().unwrap()[0].reason,
+                    "filesystem sample unavailable"
+                );
+            }
+        }
+    }
     struct Source(Option<u64>);
     impl AlertSource for Source {
         fn fs_sample(&self, mount: &str) -> Option<FsSample> {

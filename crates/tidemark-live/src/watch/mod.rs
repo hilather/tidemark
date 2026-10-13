@@ -184,23 +184,117 @@ pub struct CompletedMinute {
     /// Empty if those rows have already been handed out by that drain.
     pub persisted: Vec<HotMinute>,
 }
+/// Immutable window rows while a watcher is running; shutdown reclaims their payload.
+/// Old views keep a small handle and return no rows after the watcher retires.
+#[doc(hidden)]
+pub struct WatcherRows {
+    data: Mutex<Option<WindowRowsData>>,
+}
+struct WindowRowsData {
+    rows: Vec<HotEntry>,
+    budget: budget::Budget,
+    _keys: budget::Reservation,
+    _nodes: budget::Reservation,
+}
+impl WatcherRows {
+    fn retain(rows: Vec<HotEntry>, budget: budget::Budget) -> Option<Arc<Self>> {
+        let bytes = rows
+            .iter()
+            .map(|r| r.key.capacity() + r.top_unit.as_ref().map_or(0, String::capacity))
+            .sum();
+        let keys = budget::Reservation::normal(&budget, bytes)?;
+        let nodes = budget::Reservation::nodes(
+            &budget,
+            rows.capacity() * (std::mem::size_of::<HotEntry>() + 128) + 256,
+        )?;
+        Some(Arc::new(Self {
+            data: Mutex::new(Some(WindowRowsData {
+                rows,
+                budget,
+                _keys: keys,
+                _nodes: nodes,
+            })),
+        }))
+    }
+    /// Admit fixture windows that are published without a running watcher.
+    #[doc(hidden)]
+    pub fn from_unwatched_rows(rows: Vec<HotEntry>) -> Option<Arc<Self>> {
+        Self::retain(rows, budget::Budget::new())
+    }
+    /// Copy a bounded window with fallible scratch admission; retired handles return None.
+    pub fn copy_rows(&self) -> Option<Vec<HotEntry>> {
+        let data = self.data.lock();
+        let data = data.as_ref()?;
+        let bytes = data
+            .rows
+            .iter()
+            .map(|r| r.key.len() + r.top_unit.as_ref().map_or(0, String::len))
+            .sum();
+        let _keys = budget::Reservation::new(&data.budget, bytes)?;
+        let _nodes = budget::Reservation::nodes(
+            &data.budget,
+            data.rows.len() * (std::mem::size_of::<HotEntry>() + 128) + 128,
+        )?;
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(data.rows.len()).ok()?;
+        for r in &data.rows {
+            rows.push(HotEntry {
+                key: budget::copy(&r.key)?,
+                events: r.events,
+                files: r.files,
+                bytes_delta: r.bytes_delta,
+                top_unit: match r.top_unit.as_deref() {
+                    Some(unit) => Some(budget::copy_string(unit)?),
+                    None => None,
+                },
+                lossy: r.lossy,
+            });
+        }
+        Some(rows)
+    }
+    fn reclaim(&self) {
+        self.data.lock().take();
+    }
+}
+/// Capacity reservation shared by watcher history and immutable daemon windows.
+/// Dropping the reservation releases its charge without retaining kernel resources.
+#[doc(hidden)]
+pub struct WatcherKeyReservation {
+    _lease: budget::Reservation,
+}
 /// Owns a bounded background watcher and joins it on stop or drop.
 pub struct Watcher {
     mode: WatchMode,
     state: Arc<Mutex<State>>,
-    shutdown: Arc<OwnedFd>,
+    shutdown: Mutex<Option<Arc<OwnedFd>>>,
     stopping: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
     mount: RawPath,
-    mount_fd: Option<Arc<OwnedFd>>,
+    mount_fd: Mutex<Option<Arc<OwnedFd>>>,
 }
 // Acknowledgements are FIFO and scoped to the current loss. Eviction is conservative.
 const LOSS_ACK_CAP: usize = 1024;
+const DIRTY_CAP: usize = 200_000;
+// Shared path/key capacity and conservative container ceiling; no configuration key.
+const WATCH_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+// A retained fallback root must fit the kernel pathname ceiling and emergency reserve.
+const WATCH_ROOT_BYTES: usize = 4096;
+// Sparse B-tree nodes and their allocation headers, beyond pathname capacity.
+const DIRTY_NODE_BYTES: usize = 128;
+// Weak handles only; old views may not hold unbounded retired pathname payloads.
+const WINDOW_HANDLE_CAP: usize = 1024;
+const WINDOW_HANDLE_BYTES: usize = WINDOW_HANDLE_CAP * 32;
 struct State {
     rings: rings::Rings,
     dirty: BTreeSet<RawPath>,
+    dirty_bytes: usize,
+    dirty_nodes: usize,
+    windows: VecDeque<std::sync::Weak<WatcherRows>>,
+    window_nodes: usize,
     loss_pending: bool,
     loss_taken: VecDeque<RawPath>,
+    loss_taken_bytes: usize,
+    loss_taken_nodes: usize,
     last_at: Option<i64>,
     events: u64,
     overflows: u64,
@@ -208,14 +302,65 @@ struct State {
     recovering: bool,
     read_errors: u64,
     stream: Option<VecDeque<WatchEvent>>,
+    stream_bytes: usize,
+    stream_nodes: usize,
     dropped_events: u64,
     unmapped_events: u64,
 }
 impl State {
     fn mark_loss(&mut self) {
+        // Destroy retained allocations before returning shared credits: the FID
+        // worker can reserve against this budget without taking the state lock.
         self.dirty.clear();
+        self.rings.budget().release(self.dirty_bytes);
+        self.dirty_bytes = 0;
+        self.rings.budget().release_nodes(self.dirty_nodes);
+        self.dirty_nodes = 0;
         self.loss_pending = true;
-        self.loss_taken.clear();
+        self.loss_taken = VecDeque::new();
+        self.rings.budget().release(self.loss_taken_bytes);
+        self.rings.budget().release_nodes(self.loss_taken_nodes);
+        self.loss_taken_bytes = 0;
+        self.loss_taken_nodes = 0;
+    }
+    fn dirty_parent(&mut self, parent: &RawPath, at: i64) {
+        if self.dirty.contains(parent) {
+            return;
+        }
+        let bytes = parent.as_bytes().len();
+        let full = self.dirty.len() >= DIRTY_CAP;
+        let admitted = !full && self.rings.budget().reserve(bytes);
+        let nodes = admitted && self.rings.budget().reserve_nodes(DIRTY_NODE_BYTES, false);
+        if admitted && !nodes {
+            self.rings.budget().release(bytes);
+        }
+        if !nodes {
+            self.mark_loss();
+            self.rings.dirty_loss(at, !full);
+            return;
+        }
+        // RawPath::clone clones the normalized Vec into an exact-length allocation.
+        self.dirty.insert(parent.clone());
+        self.dirty_bytes += bytes;
+        self.dirty_nodes += DIRTY_NODE_BYTES;
+    }
+    fn clear_retained(&mut self) {
+        self.mark_loss();
+        self.loss_pending = false;
+        self.rings.clear_retained();
+        for window in &self.windows {
+            if let Some(window) = window.upgrade() {
+                window.reclaim();
+            }
+        }
+        self.windows = VecDeque::new();
+        self.rings.budget().release_nodes(self.window_nodes);
+        self.window_nodes = 0;
+        self.stream = None;
+        self.rings.budget().release(self.stream_bytes);
+        self.rings.budget().release_nodes(self.stream_nodes);
+        self.stream_bytes = 0;
+        self.stream_nodes = 0;
     }
     fn observe_time(&mut self, at: i64) {
         if self.last_at.is_some_and(|last| at < last) {
@@ -226,6 +371,20 @@ impl State {
             self.rings.recovery(at);
         }
         self.last_at = Some(at);
+    }
+}
+impl Drop for State {
+    fn drop(&mut self) {
+        self.dirty.clear();
+        self.loss_taken.clear();
+        self.windows = VecDeque::new();
+        self.stream = None;
+        self.rings
+            .budget()
+            .release(self.dirty_bytes + self.loss_taken_bytes + self.stream_bytes);
+        self.rings.budget().release_nodes(
+            self.dirty_nodes + self.loss_taken_nodes + self.window_nodes + self.stream_nodes,
+        );
     }
 }
 fn now() -> i64 {
@@ -241,38 +400,88 @@ impl Watcher {
         mount: RawPath,
         events: impl IntoIterator<Item = (i64, [Vec<u8>; 3], i64, Option<String>, (u64, u64))>,
     ) -> io::Result<Self> {
+        if mount.as_bytes().len() > WATCH_ROOT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "watch root exceeds 4096 bytes",
+            ));
+        }
+        // Drop backing-capacity slack left by the caller's path normalization.
+        let retained_mount = mount.clone();
+        drop(mount);
+        let mount = retained_mount;
         let mut rings = rings::Rings::new();
+        rings.configure(budget::Budget::new(), mount.as_bytes())?;
         let mut events = events.into_iter().peekable();
         rings.advance(events.peek().map_or_else(now, |event| event.0));
+        let mut total = 0u64;
         for (at, keys, delta, unit, identity) in events {
             rings.add(at, keys, delta, unit, identity);
+            total = total.saturating_add(1);
         }
         Ok(Self {
             mode: WatchMode::FdMount,
             state: Arc::new(Mutex::new(State {
                 rings,
                 dirty: BTreeSet::new(),
+                dirty_bytes: 0,
+                dirty_nodes: 0,
+                windows: VecDeque::new(),
+                window_nodes: 0,
                 loss_pending: false,
                 loss_taken: VecDeque::new(),
+                loss_taken_bytes: 0,
+                loss_taken_nodes: 0,
                 last_at: None,
-                events: 0,
+                events: total,
                 overflows: 0,
                 failed: false,
                 recovering: false,
                 read_errors: 0,
                 stream: None,
+                stream_bytes: 0,
+                stream_nodes: 0,
                 dropped_events: 0,
                 unmapped_events: 0,
             })),
-            shutdown: Arc::new(rustix::event::eventfd(
+            shutdown: Mutex::new(Some(Arc::new(rustix::event::eventfd(
                 0,
                 rustix::event::EventfdFlags::NONBLOCK,
-            )?),
+            )?))),
             stopping: Arc::new(AtomicBool::new(false)),
-            thread: None,
+            thread: Mutex::new(None),
             mount,
-            mount_fd: None,
+            mount_fd: Mutex::new(None),
         })
+    }
+    /// Fanotify-free lifecycle seam: an eventfd stands in for the owned group.
+    /// Records worker stop and group close in order, using the production shutdown path.
+    #[doc(hidden)]
+    pub fn from_injected_events_with_shutdown_probe(
+        mount: RawPath,
+        descriptor: OwnedFd,
+        observer: impl Fn(&'static str) + Send + 'static,
+    ) -> io::Result<Self> {
+        let watcher = Self::from_injected_events(mount, [])?;
+        *watcher.mount_fd.lock() = Some(Arc::new(descriptor));
+        let shutdown = watcher
+            .shutdown
+            .lock()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| io::Error::other("injected shutdown descriptor absent"))?;
+        let group = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)?;
+        *watcher.thread.lock() = Some(std::thread::spawn(move || {
+            let mut polls = [rustix::event::PollFd::new(
+                shutdown.as_ref(),
+                rustix::event::PollFlags::IN,
+            )];
+            while let Err(rustix::io::Errno::INTR) = rustix::event::poll(&mut polls, None) {}
+            observer("worker stopped");
+            drop(group);
+            observer("group closed");
+        }));
+        Ok(watcher)
     }
     /// Build attributed test events with an explicitly selected reporting mode.
     #[doc(hidden)]
@@ -287,9 +496,13 @@ impl Watcher {
     }
     /// Check the host namespace, negotiate reporting, and spawn one worker.
     pub fn start(
-        cfg: WatcherOptions,
+        mut cfg: WatcherOptions,
         attribution: Arc<AttributionCache>,
     ) -> Result<Watcher, WatchError> {
+        cfg.mount = cfg.mount.clone();
+        for prefix in &mut cfg.exclude_prefixes {
+            *prefix = prefix.clone();
+        }
         if !namespace_ok()? {
             return Err(WatchError::Namespace);
         }
@@ -356,8 +569,14 @@ impl Watcher {
         let state = Arc::new(Mutex::new(State {
             rings: rings::Rings::new(),
             dirty: BTreeSet::new(),
+            dirty_bytes: 0,
+            dirty_nodes: 0,
+            windows: VecDeque::new(),
+            window_nodes: 0,
             loss_pending: false,
             loss_taken: VecDeque::new(),
+            loss_taken_bytes: 0,
+            loss_taken_nodes: 0,
             last_at: None,
             events: 0,
             overflows: 0,
@@ -365,9 +584,15 @@ impl Watcher {
             recovering: false,
             read_errors: 0,
             stream: None,
+            stream_bytes: 0,
+            stream_nodes: 0,
             dropped_events: 0,
             unmapped_events: 0,
         }));
+        state
+            .lock()
+            .rings
+            .configure(budget::Budget::new(), cfg.mount.as_bytes())?;
         state.lock().rings.advance(now());
         let filesystem_mount = if mode == WatchMode::FdFilesystem {
             Some(descriptor_mount_id(mount_fd.as_fd())?)
@@ -409,6 +634,9 @@ impl Watcher {
                     paths: fidmode::PathSizes::new(cfg.lru_entries),
                     handles: fidmode::HandlePaths::new(100_000),
                 };
+                let budget = worker_state.lock().rings.budget().clone();
+                processor.paths.set_budget(budget.clone());
+                processor.handles.set_budget(budget);
                 loop {
                     if worker_stopping.load(Ordering::Relaxed) {
                         break;
@@ -494,11 +722,11 @@ impl Watcher {
         Ok(Self {
             mode,
             state,
-            shutdown,
+            shutdown: Mutex::new(Some(shutdown)),
             stopping,
-            thread: Some(thread),
+            thread: Mutex::new(Some(thread)),
             mount,
-            mount_fd: Some(mount_fd),
+            mount_fd: Mutex::new(Some(mount_fd)),
         })
     }
     /// Return the reporting mode selected by successful marks.
@@ -537,7 +765,7 @@ impl Watcher {
     /// Recovery, overflow, rollback and cut lists make hot data unavailable (lossy).
     /// Persistence rows share a cursor with [`Self::drain_completed_minutes`]; a row
     /// is handed out once through whichever method drains its minute first. The
-    /// minute facts and directory rows remain available after the legacy row drain.
+    /// minute facts remain available after the legacy row drain; its key maps are released.
     pub fn drain_minutes(&self, top_k: usize) -> Vec<CompletedMinute> {
         self.drain_minutes_at(now(), top_k)
     }
@@ -556,7 +784,8 @@ impl Watcher {
     /// Injected-event watchers return [`io::ErrorKind::Unsupported`].
     pub fn mount_identity(&self) -> io::Result<(u64, u32, u32)> {
         use std::io::Read;
-        let fd = self.mount_fd.as_ref().ok_or_else(|| {
+        let mount_fd = self.mount_fd.lock();
+        let fd = mount_fd.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 "injected watcher has no mount descriptor",
@@ -581,18 +810,35 @@ impl Watcher {
     }
     /// Enable the optional 1,000-event foreground buffer. Daemon watchers do not allocate it.
     pub fn enable_events(&self) {
-        self.state
-            .lock()
-            .stream
-            .get_or_insert_with(|| VecDeque::with_capacity(1000));
+        let mut state = self.state.lock();
+        if self.stopping.load(Ordering::Acquire) || state.stream.is_some() {
+            return;
+        }
+        let nodes = 2 * 1000 * std::mem::size_of::<WatchEvent>() + 128;
+        if !state.rings.budget().reserve_nodes(nodes, false) {
+            state.rings.key_memory_loss();
+            return;
+        }
+        let mut stream = VecDeque::new();
+        if stream.try_reserve_exact(1000).is_err() {
+            state.rings.budget().release_nodes(nodes);
+            state.rings.key_memory_loss();
+            return;
+        }
+        state.stream = Some(stream);
+        state.stream_nodes = nodes;
     }
-    /// Remove and return up to `limit` of the oldest buffered events.
+    /// Remove and return up to `limit` of the oldest buffered events, moving their paths.
     pub fn drain_events(&self, limit: usize) -> Vec<WatchEvent> {
         let mut state = self.state.lock();
         let Some(stream) = &mut state.stream else {
             return Vec::new();
         };
-        stream.drain(..limit.min(stream.len())).collect()
+        let events: Vec<_> = stream.drain(..limit.min(stream.len())).collect();
+        let bytes = events.iter().map(event_bytes).sum();
+        state.stream_bytes -= bytes;
+        state.rings.budget().release(bytes);
+        events
     }
     /// Remove dirty entries at or below `under`, returning them in byte order.
     /// Ancestor entries remain retained and also report `under` as dirty. After loss,
@@ -607,20 +853,55 @@ impl Watcher {
         let lost = under.starts_with(&self.mount)
             && state.loss_pending
             && !state.loss_taken.contains(under);
-        if lost {
-            if state.loss_taken.len() == LOSS_ACK_CAP {
-                state.loss_taken.pop_front();
-            }
-            state.loss_taken.push_back(under.clone());
-        }
         let mut paths: Vec<_> = state
             .dirty
-            .iter()
-            .filter(|p| p.starts_with(under))
-            .cloned()
+            .extract_if(.., |p| p.starts_with(under))
             .collect();
-        for path in &paths {
-            state.dirty.remove(path);
+        let removed: usize = paths.iter().map(|p| p.as_bytes().len()).sum();
+        // Tests may seed dirty directly without the admission helper.
+        let removed = removed.min(state.dirty_bytes);
+        let nodes = (paths.len() * DIRTY_NODE_BYTES).min(state.dirty_nodes);
+        state.dirty_nodes -= nodes;
+        state.rings.budget().release_nodes(nodes);
+        state.dirty_bytes -= removed;
+        state.rings.budget().release(removed);
+        let root_copy = if ancestor || lost {
+            budget::Reservation::new(state.rings.budget(), under.as_bytes().len())
+        } else {
+            None
+        };
+        // If a temporary response cannot be admitted, leave the root unacknowledged.
+        // Later takes remain conservative; moved descendants are still returned.
+        if (ancestor || lost) && (root_copy.is_none() || paths.try_reserve(1).is_err()) {
+            state.rings.key_memory_loss();
+            return paths;
+        }
+        if lost {
+            if state.loss_taken.len() == LOSS_ACK_CAP {
+                if let Some(old) = state.loss_taken.pop_front() {
+                    let bytes = old.as_bytes().len();
+                    state.loss_taken_bytes -= bytes;
+                    state.loss_taken_nodes -= 128;
+                    drop(old);
+                    state.rings.budget().release(bytes);
+                    state.rings.budget().release_nodes(128);
+                }
+            }
+            let bytes = under.as_bytes().len();
+            if state.rings.budget().reserve(bytes) {
+                if state.rings.budget().reserve_nodes(128, false) {
+                    if state.loss_taken.try_reserve(1).is_ok() {
+                        state.loss_taken.push_back(under.clone());
+                        state.loss_taken_bytes += bytes;
+                        state.loss_taken_nodes += 128;
+                    } else {
+                        state.rings.budget().release(bytes);
+                        state.rings.budget().release_nodes(128);
+                    }
+                } else {
+                    state.rings.budget().release(bytes);
+                }
+            }
         }
         if ancestor || lost {
             paths.push(under.clone());
@@ -628,6 +909,61 @@ impl Watcher {
             paths.dedup();
         }
         paths
+    }
+    /// Retain immutable daemon window rows in this watcher's aggregate budget.
+    /// Shutdown reclaims the rows even when an old state view keeps the returned handle.
+    #[doc(hidden)]
+    pub fn retain_window_rows(&self, rows: Vec<HotEntry>) -> Option<Arc<WatcherRows>> {
+        let mut state = self.state.lock();
+        if self.stopping.load(Ordering::Acquire) {
+            return None;
+        }
+        state.windows.retain(|w| w.strong_count() > 0);
+        if state.windows.len() == WINDOW_HANDLE_CAP {
+            return None;
+        }
+        if state.window_nodes == 0 {
+            if !state
+                .rings
+                .budget()
+                .reserve_nodes(WINDOW_HANDLE_BYTES, false)
+            {
+                return None;
+            }
+            if state.windows.try_reserve_exact(WINDOW_HANDLE_CAP).is_err() {
+                state.rings.budget().release_nodes(WINDOW_HANDLE_BYTES);
+                return None;
+            }
+            state.window_nodes = WINDOW_HANDLE_BYTES;
+        }
+        let rows = WatcherRows::retain(rows, state.rings.budget().clone())?;
+        state.windows.push_back(Arc::downgrade(&rows));
+        Some(rows)
+    }
+    /// Record truncation when a downstream history/window cannot retain its keys.
+    #[doc(hidden)]
+    pub fn key_memory_budget_exceeded(&self) {
+        self.state.lock().rings.key_memory_loss();
+    }
+    /// Reserve owned path/key capacity for a bounded downstream consumer.
+    #[doc(hidden)]
+    pub fn reserve_key_bytes(&self, bytes: usize) -> Option<WatcherKeyReservation> {
+        budget::Reservation::normal(self.state.lock().rings.budget(), bytes)
+            .map(|lease| WatcherKeyReservation { _lease: lease })
+    }
+    /// Reserve container storage for a bounded downstream consumer.
+    #[doc(hidden)]
+    pub fn reserve_node_bytes(&self, bytes: usize) -> Option<WatcherKeyReservation> {
+        budget::Reservation::nodes(self.state.lock().rings.budget(), bytes)
+            .map(|lease| WatcherKeyReservation { _lease: lease })
+    }
+    /// Conservative owned heap charge, including container credits; excludes numeric size history.
+    pub fn retained_memory_charge(&self) -> usize {
+        self.state.lock().rings.budget().committed()
+    }
+    /// Retained path/key capacities currently admitted against the 64 MiB ceiling.
+    pub fn retained_key_bytes(&self) -> usize {
+        self.state.lock().rings.budget().used()
     }
     /// Explain caps and loss in the retained fifteen-minute history.
     /// Reports at most eight causes, each with its latest affected UTC minute.
@@ -638,8 +974,10 @@ impl Watcher {
     }
     /// Read counters and the loss indicator for the latest fifteen minute buckets.
     pub fn stats(&self) -> WatchStats {
+        self.stats_at(now())
+    }
+    fn stats_at(&self, at: i64) -> WatchStats {
         let mut state = self.state.lock();
-        let at = now();
         state.observe_time(at);
         if state.failed || state.recovering {
             state.rings.recovery(at);
@@ -666,15 +1004,28 @@ impl Watcher {
         self.state.lock().unmapped_events
     }
     /// Wake the worker and join it, closing the group and all event descriptors.
-    pub fn stop(mut self) {
-        self.shutdown_worker();
+    pub fn stop(self) {
+        self.shutdown();
     }
-    fn shutdown_worker(&mut self) {
-        self.stopping.store(true, Ordering::Relaxed);
-        let _ = rustix::io::write(self.shutdown.as_ref(), &1u64.to_ne_bytes());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+    /// Stop and join the worker and release the fanotify group and mount descriptor.
+    /// Idempotent; old views keep measurements without keeping the transport alive.
+    pub fn shutdown(&self) {
+        // Keep this lock through join and descriptor release so every concurrent
+        // shutdown caller observes completed teardown before returning.
+        let mut thread = self.thread.lock();
+        if self.stopping.swap(true, Ordering::AcqRel) {
+            return;
         }
+        let signal = self.shutdown.lock().take();
+        if let Some(signal) = &signal {
+            let _ = rustix::io::write(signal.as_ref(), &1u64.to_ne_bytes());
+        }
+        if let Some(worker) = thread.take() {
+            let _ = worker.join();
+        }
+        drop(signal);
+        self.mount_fd.lock().take();
+        self.state.lock().clear_retained();
     }
 }
 fn mount_mark_path(fd: &impl AsRawFd) -> std::path::PathBuf {
@@ -779,6 +1130,11 @@ pub fn namespace_ok() -> io::Result<bool> {
     Ok(std::fs::read_link("/proc/self/ns/mnt")? == std::fs::read_link("/proc/1/ns/mnt")?)
 }
 
+fn event_bytes(event: &WatchEvent) -> usize {
+    event.path.as_bytes().len()
+        + event.attribution.comm.capacity()
+        + event.attribution.unit.as_ref().map_or(0, String::capacity)
+}
 struct Processor<'a> {
     filesystem_mount: Option<u64>,
     event_handle: tidemark_sys::fanotify::EventHandle,
@@ -953,20 +1309,37 @@ impl Processor<'_> {
         let mut state = state.lock();
         state.observe_time(at);
         state.events = state.events.saturating_add(1);
-        if let Some(stream) = &mut state.stream {
-            let full = stream.len() == 1000;
-            if full {
-                stream.pop_front();
+        if state.stream.is_some() {
+            let budget = state.rings.budget().clone();
+            let mut dropped = 0;
+            if let Some(stream) = &mut state.stream {
+                if stream.len() == 1000 {
+                    if let Some(old) = stream.pop_front() {
+                        let bytes = event_bytes(&old);
+                        drop(old);
+                        state.stream_bytes -= bytes;
+                        budget.release(bytes);
+                    }
+                    dropped += 1;
+                }
             }
-            stream.push_back(WatchEvent {
-                at,
-                path,
-                delta,
-                attribution: who.clone(),
-            });
-            if full {
-                state.dropped_events = state.dropped_events.saturating_add(1);
+            let bytes =
+                path.as_bytes().len() + who.comm.len() + who.unit.as_ref().map_or(0, String::len);
+            if budget.reserve(bytes) {
+                if let Some(stream) = &mut state.stream {
+                    stream.push_back(WatchEvent {
+                        at,
+                        path: path.clone(),
+                        delta,
+                        attribution: who.clone(),
+                    });
+                    state.stream_bytes += bytes;
+                }
+            } else {
+                dropped += 1;
+                state.rings.key_memory_loss();
             }
+            state.dropped_events = state.dropped_events.saturating_add(dropped);
         }
         state.rings.add(
             at,
@@ -979,14 +1352,11 @@ impl Processor<'_> {
             who.unit,
             identity,
         );
-        if state.dirty.len() < 200_000 {
-            state.dirty.insert(parent);
-        } else {
-            state.rings.overflow(at);
-        }
+        state.dirty_parent(&parent, at);
     }
 }
 
+mod budget;
 mod fdmode;
 mod fidmode;
 mod rings;
@@ -1010,7 +1380,7 @@ pub enum WatchError {
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        self.shutdown_worker();
+        self.shutdown();
     }
 }
 fn dir_key(parent: &RawPath, mount: &RawPath, depth: usize) -> RawPath {
@@ -1045,6 +1415,171 @@ impl std::fmt::Display for WatchMode {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn concurrent_shutdown_joins_once_and_reclaims_retained_windows() {
+        let descriptor = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC).unwrap();
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let recorded = steps.clone();
+        let watcher = Arc::new(
+            Watcher::from_injected_events_with_shutdown_probe(
+                raw("/data"),
+                descriptor,
+                move |step| recorded.lock().push(step),
+            )
+            .unwrap(),
+        );
+        let baseline = watcher.retained_key_bytes();
+        let rows = watcher
+            .retain_window_rows(vec![HotEntry {
+                key: vec![b'x'; 4096],
+                events: 1,
+                files: 1,
+                bytes_delta: 7,
+                top_unit: Some("writer".into()),
+                lossy: false,
+            }])
+            .unwrap();
+        assert_eq!(
+            rows.copy_rows().unwrap()[0].top_unit.as_deref(),
+            Some("writer")
+        );
+        let callers: Vec<_> = (0..4)
+            .map(|_| {
+                let watcher = watcher.clone();
+                std::thread::spawn(move || watcher.shutdown())
+            })
+            .collect();
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        assert_eq!(*steps.lock(), vec!["worker stopped", "group closed"]);
+        assert!(watcher.thread.lock().is_none());
+        assert!(watcher.shutdown.lock().is_none());
+        assert!(watcher.mount_fd.lock().is_none());
+        assert!(rows.copy_rows().is_none());
+        assert_eq!(watcher.retained_key_bytes(), baseline);
+        watcher.enable_events();
+        assert!(watcher.state.lock().stream.is_none());
+        watcher.shutdown();
+        assert_eq!(steps.lock().len(), 2);
+    }
+    #[test]
+    fn injected_fallback_root_must_fit_the_emergency_reserve() {
+        let path = raw(&format!("/{}", "x".repeat(WATCH_ROOT_BYTES)));
+        assert_eq!(
+            Watcher::from_injected_events(path, [])
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    #[test]
+    fn injected_long_keys_cross_default_budget_with_exact_root_totals() {
+        let events = (0..6000).map(|n| {
+            let mut key = format!("/mount/{n}/").into_bytes();
+            key.resize(4000, b'x');
+            (
+                0,
+                [key, b"unit".to_vec(), b"comm".to_vec()],
+                7,
+                None,
+                (1, n),
+            )
+        });
+        let watcher = Watcher::from_injected_events(raw("/mount"), events).unwrap();
+        assert_eq!(watcher.stats_at(0).events_total, 6000);
+        assert!(watcher.retained_memory_charge() <= budget::PATH_BYTES);
+        let state = watcher.state.lock();
+        let rows = state.rings.hot(0, 1, HotScope::Dir, usize::MAX);
+        assert_eq!(rows.iter().map(|r| r.events).sum::<u64>(), 6000);
+        assert_eq!(rows.iter().map(|r| r.bytes_delta).sum::<i64>(), 42_000);
+        assert!(rows.iter().any(|r| r.key == b"/mount"));
+        assert!(state
+            .rings
+            .detail(0)
+            .contains("key bytes over the memory budget"));
+    }
+    #[test]
+    fn full_dirty_set_invalidates_root_once_and_recovers_over_sixteen_minutes() {
+        let watcher = Watcher::from_injected_events(
+            raw("/data"),
+            [(
+                0,
+                [b"/data".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                0,
+                None,
+                (1, 0),
+            )],
+        )
+        .unwrap();
+        {
+            let mut state = watcher.state.lock();
+            for n in 0..DIRTY_CAP {
+                state.dirty_parent(&raw(&format!("/data/{n}")), 0);
+            }
+            assert_eq!(state.dirty.len(), DIRTY_CAP);
+            state.dirty_parent(&raw("/data/0"), 60);
+            assert_eq!(state.rings.lossy(60), 0);
+            assert_eq!(state.dirty.len(), DIRTY_CAP);
+            state.dirty_parent(&raw("/data/omitted"), 60);
+            assert!(state.dirty.is_empty());
+            assert_eq!(state.dirty_bytes, 0);
+            assert_eq!(state.rings.lossy(60), 1);
+            assert!(state.rings.detail(60).contains("dirty set full"));
+            assert!(!state.rings.detail(60).contains("transport recovery"));
+        }
+        let root = raw("/data/omitted/subtree");
+        assert_eq!(watcher.take_dirty(&root), vec![root.clone()]);
+        assert!(watcher.take_dirty(&root).is_empty());
+        for minute in 2..=17 {
+            let mut state = watcher.state.lock();
+            state.dirty_parent(&raw("/data/recovered"), minute * 60);
+            state.rings.advance(minute * 60);
+            assert_eq!(state.dirty.len(), 1);
+            if minute >= 16 {
+                assert_eq!(state.rings.lossy(minute * 60), 0);
+            }
+        }
+        let parent = raw("/data/recovered");
+        assert_eq!(watcher.take_dirty(&parent), vec![parent]);
+    }
+    #[test]
+    fn dirty_byte_admission_collapses_to_root_and_recovers() {
+        let watcher = Watcher::from_injected_events(raw("/data"), []).unwrap();
+        watcher
+            .state
+            .lock()
+            .rings
+            .configure(budget::Budget::with_limit(1024), b"/data")
+            .unwrap();
+        let parent = raw(&format!("/data/{}", "x".repeat(700)));
+        {
+            let mut state = watcher.state.lock();
+            state.dirty_parent(&parent, 0);
+            state.dirty_parent(&parent, 0); // existing parent requires no reservation
+            assert_eq!(state.dirty.len(), 1);
+            state.dirty_parent(&raw(&format!("/data/{}", "y".repeat(100))), 60);
+            assert!(state.dirty.is_empty());
+            assert_eq!(state.dirty_bytes, 0);
+            assert!(state
+                .rings
+                .detail(60)
+                .contains("dirty set over its memory budget"));
+        }
+        assert_eq!(
+            watcher.take_dirty(&raw("/data/new-subtree")),
+            vec![raw("/data/new-subtree")]
+        );
+        watcher
+            .state
+            .lock()
+            .dirty_parent(&raw("/data/recovered"), 120);
+        assert_eq!(
+            watcher.take_dirty(&raw("/data/recovered")),
+            vec![raw("/data/recovered")]
+        );
+    }
     #[test]
     fn unmapped_event_keeps_totals_and_root_directory() {
         let temp = tempfile::tempdir().unwrap();
@@ -1201,8 +1736,12 @@ mod tests {
             let minutes = watcher.drain_minutes_at(180, 1000);
             assert_eq!(minutes.len(), 2);
             assert_eq!(minutes[0].started_at, 60);
-            assert_eq!(minutes[0].dirs[0].bytes_delta, 2);
-            assert_eq!(minutes[0].dirs[0].top_unit.as_deref(), Some("u"));
+            if legacy_first {
+                assert!(minutes[0].dirs.is_empty());
+            } else {
+                assert_eq!(minutes[0].dirs[0].bytes_delta, 2);
+                assert_eq!(minutes[0].dirs[0].top_unit.as_deref(), Some("u"));
+            }
             assert_eq!(minutes[0].persisted.len(), if legacy_first { 0 } else { 3 });
             assert!(minutes[1].dirs.is_empty() && minutes[1].persisted.is_empty());
             assert!(!minutes[1].lossy);
@@ -1262,8 +1801,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut watcher = Watcher::from_injected_events(raw("/fixture"), []).unwrap();
-        watcher.mount_fd = Some(fd.clone());
+        let watcher = Watcher::from_injected_events(raw("/fixture"), []).unwrap();
+        *watcher.mount_fd.lock() = Some(fd.clone());
         let identity = watcher.mount_identity().unwrap();
         let mounts = tidemark_fs::mount::read_mountinfo().unwrap();
         let raw_path = RawPath::from_path(&original).unwrap();
@@ -1314,8 +1853,14 @@ mod tests {
         Mutex::new(State {
             rings: rings::Rings::new(),
             dirty: BTreeSet::new(),
+            dirty_bytes: 0,
+            dirty_nodes: 0,
+            windows: VecDeque::new(),
+            window_nodes: 0,
             loss_pending: false,
             loss_taken: VecDeque::new(),
+            loss_taken_bytes: 0,
+            loss_taken_nodes: 0,
             last_at: None,
             events: 0,
             overflows: 0,
@@ -1323,6 +1868,8 @@ mod tests {
             recovering: false,
             read_errors: 0,
             stream: None,
+            stream_bytes: 0,
+            stream_nodes: 0,
             dropped_events: 0,
             unmapped_events: 0,
         })
@@ -1331,13 +1878,13 @@ mod tests {
         Watcher {
             mode: WatchMode::FdMount,
             state: Arc::new(empty_state()),
-            shutdown: Arc::new(
+            shutdown: Mutex::new(Some(Arc::new(
                 rustix::event::eventfd(0, rustix::event::EventfdFlags::NONBLOCK).unwrap(),
-            ),
+            ))),
             stopping: Arc::new(AtomicBool::new(false)),
-            thread: None,
+            thread: Mutex::new(None),
             mount: raw("/data"),
-            mount_fd: None,
+            mount_fd: Mutex::new(None),
         }
     }
     fn raw(path: &str) -> RawPath {
@@ -1669,11 +2216,11 @@ mod tests {
         let watcher = Watcher {
             mode: WatchMode::FdMount,
             state: Arc::new(state),
-            shutdown: Arc::new(shutdown),
+            shutdown: Mutex::new(Some(Arc::new(shutdown))),
             stopping: Arc::new(stopping),
-            thread: None,
+            thread: Mutex::new(None),
             mount: cfg.mount.clone(),
-            mount_fd: None,
+            mount_fd: Mutex::new(None),
         };
         assert_eq!(watcher.mode(), WatchMode::Failed);
         let drained = watcher.drain_events(3);

@@ -62,7 +62,8 @@ pub fn start(
                 while !shutdown.load(Ordering::Acquire) {
                     let (config, generation) = state.config();
                     if previous.as_ref() != Some(&config.watch) {
-                        for mount in watchers.keys() {
+                        for (mount, watcher) in &watchers {
+                            watcher.shutdown();
                             state.remove_watcher(mount);
                         }
                         if let Some(old) = &previous {
@@ -116,9 +117,7 @@ pub fn start(
                             let mount = RawPath::from_path(&change.path)
                                 .map_err(|e| DaemonError::Config(e.to_string()))?
                                 .display_lossy();
-                            state.remove_watcher(&mount);
-                            watchers.remove(&mount);
-                            minutes.remove(&mount);
+                            retire_watcher(&state, &mut watchers, &mut minutes, &mount);
                         }
                         let namespace = tidemark_live::watch::namespace_ok();
                         if matches!(&namespace, Err(error) if crate::resource_pressure(error)) {
@@ -135,8 +134,10 @@ pub fn start(
                             );
                             continue;
                         }
+                        recover_coordinator(&state, &namespace)?;
                         if !matches!(namespace, Ok(true)) {
-                            for mount in watchers.keys() {
+                            for (mount, watcher) in &watchers {
+                                watcher.shutdown();
                                 state.remove_watcher(mount);
                             }
                             watchers.clear();
@@ -185,7 +186,10 @@ pub fn start(
                                         Publication::Watcher((mount.clone(), w.clone())),
                                         crate::component(&name, "ok", "watcher started"),
                                     )?;
-                                    minutes.insert(mount.clone(), MinuteHistory::default());
+                                    minutes.insert(
+                                        mount.clone(),
+                                        MinuteHistory::for_watcher(w.clone()),
+                                    );
                                     watchers.insert(mount, w);
                                 }
                                 Err(e) => {
@@ -197,16 +201,11 @@ pub fn start(
                                 }
                             }
                         }
-                        if config.watch.mounts.is_empty() {
-                            state.publish_component(crate::component(
-                                "watcher",
-                                "disabled",
-                                "no watch mounts",
-                            ))?;
-                        }
                     }
                     for (mount, w) in &watchers {
-                        let history = minutes.entry(mount.clone()).or_default();
+                        let history = minutes
+                            .entry(mount.clone())
+                            .or_insert_with(|| MinuteHistory::for_watcher(w.clone()));
                         let mut published = 0;
                         let mut rows = Vec::new();
                         for mut minute in w.drain_minutes(1000) {
@@ -223,11 +222,7 @@ pub fn start(
                         let mut dropped = false;
                         // Persist top 50 for each minute/scope, retaining the collector's rank.
                         let rows = persistence_rows(rows);
-                        for rows in rows.chunks(super::tswriter::MAX_BATCH_ROWS) {
-                            dropped |= writer
-                                .try_send(super::tswriter::Message::Hot(rows.to_vec()))
-                                .is_err();
-                        }
+                        dropped |= enqueue_persistence(w, &writer, &rows);
                         state.publish_component(watcher_component(mount, w, dropped, published))?;
                     }
                     previous_rules = config.alerts.rule.clone();
@@ -235,8 +230,9 @@ pub fn start(
                 }
                 Ok(())
             })();
-            // Also release on publication failures: the last Arc drop joins the worker.
-            for mount in watchers.keys() {
+            // Also stop on publication failures, independently of retained reader views.
+            for (mount, watcher) in &watchers {
+                watcher.shutdown();
                 state.remove_watcher(mount);
             }
             watchers.clear();
@@ -285,18 +281,72 @@ fn watcher_component(
 
 // Retain only facts: persistence rows are removed before insertion.
 #[derive(Default)]
-struct MinuteHistory(VecDeque<CompletedMinute>);
+struct MinuteHistory(
+    VecDeque<CompletedMinute>,
+    Option<Arc<Watcher>>,
+    VecDeque<(
+        Option<tidemark_live::watch::WatcherKeyReservation>,
+        Option<tidemark_live::watch::WatcherKeyReservation>,
+    )>,
+    usize,
+);
+const HISTORY_BYTES: usize = 8 * 1024 * 1024;
 impl MinuteHistory {
-    fn push(&mut self, minute: CompletedMinute) {
+    fn for_watcher(watcher: Arc<Watcher>) -> Self {
+        Self(VecDeque::new(), Some(watcher), VecDeque::new(), 0)
+    }
+    fn row_bytes(minute: &CompletedMinute) -> usize {
+        minute.dirs.capacity() * std::mem::size_of::<HotEntry>()
+            + minute
+                .dirs
+                .iter()
+                .map(|r| r.key.capacity() + r.top_unit.as_ref().map_or(0, String::capacity))
+                .sum::<usize>()
+    }
+    fn push(&mut self, mut minute: CompletedMinute) {
+        // Persistence ownership leaves this consumer before minute history admission.
+        minute.persisted = Vec::new();
         if self
             .0
             .back()
             .is_some_and(|last| last.started_at >= minute.started_at)
         {
             self.0.clear();
+            self.2.clear();
+            self.3 = 0;
         }
         if self.0.len() == 60 {
-            self.0.pop_front();
+            if let Some(old) = self.0.pop_front() {
+                self.3 -= Self::row_bytes(&old);
+            }
+            self.2.pop_front();
+        }
+        let bytes = Self::row_bytes(&minute);
+        let keys = minute
+            .dirs
+            .iter()
+            .map(|r| r.key.capacity() + r.top_unit.as_ref().map_or(0, String::capacity))
+            .sum();
+        let (payload, nodes) = self.1.as_ref().map_or((None, None), |w| {
+            (
+                w.reserve_key_bytes(keys),
+                w.reserve_node_bytes(bytes - keys),
+            )
+        });
+        let admitted = bytes <= HISTORY_BYTES.saturating_sub(self.3)
+            && (self.1.is_none() || (payload.is_some() && nodes.is_some()));
+        if admitted {
+            self.3 += bytes;
+            self.2.push_back((payload, nodes));
+        } else {
+            drop((payload, nodes));
+            if let Some(w) = &self.1 {
+                w.key_memory_budget_exceeded();
+            }
+            minute.dirs = Vec::new();
+            minute.truncated = true;
+            minute.lossy = true;
+            self.2.push_back((None, None));
         }
         self.0.push_back(minute);
     }
@@ -401,7 +451,47 @@ impl MinuteHistory {
         };
         let windows = requested_windows(config, mount);
         for count in &windows {
-            let (hot, overflows) = self.facts(*count);
+            let keys: usize = self
+                .0
+                .iter()
+                .rev()
+                .take(*count)
+                .flat_map(|m| &m.dirs)
+                .map(|r| r.key.capacity())
+                .sum();
+            let rows: usize = self.0.iter().rev().take(*count).map(|m| m.dirs.len()).sum();
+            let scratch = self.1.as_ref().map(|w| {
+                (
+                    w.reserve_key_bytes(keys.saturating_mul(2)),
+                    w.reserve_node_bytes(rows.saturating_mul(384)),
+                )
+            });
+            let scratch_ok = scratch
+                .as_ref()
+                .is_none_or(|(p, n)| p.is_some() && n.is_some());
+            let (mut hot, overflows) = if scratch_ok {
+                self.facts(*count)
+            } else {
+                let mut facts = MinuteHistory::default();
+                for minute in &self.0 {
+                    facts.0.push_back(CompletedMinute {
+                        started_at: minute.started_at,
+                        overflow_total_at_start: minute.overflow_total_at_start,
+                        overflow_total_at_end: minute.overflow_total_at_end,
+                        lossy: true,
+                        dirs: Vec::new(),
+                        persisted: Vec::new(),
+                        truncated: true,
+                    });
+                }
+                facts.facts(*count)
+            };
+            if !scratch_ok {
+                hot = None;
+                if let Some(w) = &self.1 {
+                    w.key_memory_budget_exceeded();
+                }
+            }
             let warming = self.0.len() < *count
                 && self.0.iter().all(|m| {
                     !m.lossy
@@ -452,6 +542,33 @@ fn requested_windows(config: &Config, mount: &str) -> BTreeSet<usize> {
         .collect()
 }
 
+fn recover_coordinator(
+    state: &LiveState,
+    namespace: &std::io::Result<bool>,
+) -> Result<(), DaemonError> {
+    if matches!(namespace, Ok(true)) {
+        state.publish_component(crate::component(
+            "watcher",
+            "ok",
+            "mount table and host mount namespace checked",
+        ))?;
+    }
+    Ok(())
+}
+
+fn retire_watcher(
+    state: &LiveState,
+    watchers: &mut BTreeMap<String, Arc<Watcher>>,
+    minutes: &mut BTreeMap<String, MinuteHistory>,
+    mount: &str,
+) {
+    if let Some(watcher) = watchers.remove(mount) {
+        watcher.shutdown();
+    }
+    state.remove_watcher(mount);
+    minutes.remove(mount);
+}
+
 fn read_mount_table(
     state: &LiveState,
     read: impl FnOnce() -> Result<Vec<tidemark_fs::mount::MountInfo>, DaemonError>,
@@ -463,7 +580,8 @@ fn read_mount_table(
         Err(error) => {
             if !matches!(&error, DaemonError::Io { source, .. } if crate::resource_pressure(source))
             {
-                for mount in watchers.keys() {
+                for (mount, watcher) in watchers.iter() {
+                    watcher.shutdown();
                     state.remove_watcher(mount);
                 }
                 watchers.clear();
@@ -494,6 +612,51 @@ fn verify_identity(
     Ok(())
 }
 
+// Includes cloned row structures, all three strings/keys and allocation slack.
+// With the existing 64-message writer channel this producer queues <= 4 MiB.
+const PERSISTENCE_MESSAGE_BYTES: usize = 64 * 1024;
+fn enqueue_persistence(
+    watcher: &Watcher,
+    writer: &super::tswriter::Sender,
+    rows: &[tidemark_core::live::HotMinute],
+) -> bool {
+    let mut dropped = false;
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = start;
+        let mut bytes = 0;
+        while end < rows.len() && end - start < super::tswriter::MAX_BATCH_ROWS {
+            let r = &rows[end];
+            let cost = std::mem::size_of::<tidemark_core::live::HotMinute>()
+                + 128
+                + r.key.len()
+                + r.mount.len()
+                + r.scope.len();
+            if cost > PERSISTENCE_MESSAGE_BYTES.saturating_sub(bytes) {
+                break;
+            }
+            bytes += cost;
+            end += 1;
+        }
+        if end == start {
+            dropped = true;
+            start += 1;
+            continue;
+        }
+        // The copy is charged through construction/enqueue. Queue ownership is
+        // separately bounded by the byte limit and the existing channel count cap.
+        if let Some(_copy) = watcher.reserve_key_bytes(bytes) {
+            dropped |= writer
+                .try_send(super::tswriter::Message::Hot(rows[start..end].to_vec()))
+                .is_err();
+        } else {
+            dropped = true;
+        }
+        start = end;
+    }
+    dropped
+}
+
 fn persistence_rows(
     rows: Vec<tidemark_core::live::HotMinute>,
 ) -> Vec<tidemark_core::live::HotMinute> {
@@ -509,6 +672,152 @@ fn persistence_rows(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn history_and_window_views_share_watcher_byte_admission_and_release() {
+        let mut cfg = Config::default();
+        cfg.alerts.rule = vec![rule(AlertKind::HotDirGrowth, "1m")];
+        let watcher = Arc::new(
+            Watcher::from_injected_events(RawPath::new(b"/data".to_vec()).unwrap(), []).unwrap(),
+        );
+        let baseline = watcher.retained_key_bytes();
+        let state = LiveState::new(&cfg, 0);
+        state
+            .publish(
+                Publication::Watcher(("/data".into(), watcher.clone())),
+                crate::component("watcher:/data", "ok", "fixture"),
+            )
+            .unwrap();
+        let mut history = MinuteHistory::for_watcher(watcher.clone());
+        let mut m = minute(60, 7);
+        m.dirs[0].key = vec![b'x'; 4096];
+        history.push(m);
+        let retained = watcher.retained_key_bytes();
+        assert!(retained > baseline);
+        history.publish("/data", &cfg, &state).unwrap();
+        let published = watcher.retained_key_bytes();
+        assert!(published > retained);
+        let old_view = state.view_at(120);
+        assert_eq!(watcher.retained_key_bytes(), published); // immutable window keys are shared
+        drop(history);
+        state.remove_watcher("/data");
+        assert!(watcher.retained_key_bytes() > baseline); // old view owns its window reservation
+        watcher.shutdown();
+        assert_eq!(watcher.retained_key_bytes(), baseline);
+        assert!(tidemark_live::alerts::AlertSource::hot_dirs(
+            &old_view,
+            "/data",
+            Duration::from_secs(60)
+        )
+        .is_none());
+        drop(old_view);
+        assert_eq!(watcher.retained_key_bytes(), baseline);
+    }
+    #[test]
+    fn minute_history_byte_cap_preserves_boundary_facts_and_marks_truncation() {
+        let watcher = Arc::new(
+            Watcher::from_injected_events(RawPath::new(b"/data".to_vec()).unwrap(), []).unwrap(),
+        );
+        let mut history = MinuteHistory::for_watcher(watcher.clone());
+        for n in 0..16 {
+            let mut m = minute(n * 60, 7);
+            m.dirs[0].key = vec![b'x'; 1024 * 1024];
+            history.push(m);
+            assert!(history.3 <= HISTORY_BYTES);
+            assert!(watcher.retained_memory_charge() <= 64 * 1024 * 1024);
+        }
+        assert!(history.0.back().unwrap().truncated);
+        assert_eq!(history.facts(16), (None, Some(0)));
+        let baseline = watcher.retained_key_bytes()
+            - history
+                .0
+                .iter()
+                .flat_map(|m| &m.dirs)
+                .map(|r| r.key.capacity() + r.top_unit.as_ref().map_or(0, String::capacity))
+                .sum::<usize>();
+        drop(history);
+        assert_eq!(watcher.retained_key_bytes(), baseline);
+    }
+    #[test]
+    fn queued_persistence_messages_have_a_byte_bound_with_long_keys() {
+        let watcher =
+            Watcher::from_injected_events(RawPath::new(b"/data".to_vec()).unwrap(), []).unwrap();
+        let rows: Vec<_> = (0..200)
+            .map(|n| tidemark_core::live::HotMinute {
+                mount: "/data".into(),
+                scope: "dir".into(),
+                key: vec![b'x'; 4000],
+                ts: 0,
+                events: 1,
+                files: 1,
+                bytes_delta: n,
+                lossy: false,
+            })
+            .collect();
+        let (tx, rx) = crossbeam_channel::bounded(super::super::tswriter::CHANNEL_CAPACITY);
+        assert!(!enqueue_persistence(&watcher, &tx, &rows));
+        let mut count = 0;
+        for message in rx.try_iter() {
+            let super::super::tswriter::Message::Hot(rows) = message else {
+                panic!("wrong persistence kind");
+            };
+            let bytes = rows.capacity() * std::mem::size_of::<tidemark_core::live::HotMinute>()
+                + rows
+                    .iter()
+                    .map(|r| r.key.capacity() + r.mount.capacity() + r.scope.capacity() + 128)
+                    .sum::<usize>();
+            assert!(bytes <= PERSISTENCE_MESSAGE_BYTES);
+            count += rows.len();
+        }
+        assert_eq!(count, 200);
+    }
+    #[test]
+    fn retained_view_does_not_delay_retirement_before_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let descriptor = rustix::fs::open(
+            temp.path(),
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = order.clone();
+        let watcher = Arc::new(
+            Watcher::from_injected_events_with_shutdown_probe(
+                RawPath::new(b"/fixture".to_vec()).unwrap(),
+                descriptor,
+                move |step| recorded.lock().push(step),
+            )
+            .unwrap(),
+        );
+        let state = LiveState::new(&Config::default(), 0);
+        state
+            .publish(
+                Publication::Watcher(("/fixture".into(), watcher.clone())),
+                crate::component("watcher:/fixture", "ok", "fixture"),
+            )
+            .unwrap();
+        let old_view = state.view_at(0);
+        let mut watchers = BTreeMap::from([("/fixture".into(), watcher.clone())]);
+        let mut minutes = BTreeMap::from([("/fixture".into(), MinuteHistory::default())]);
+        retire_watcher(&state, &mut watchers, &mut minutes, "/fixture");
+        assert_eq!(
+            watcher.mount_identity().unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        // This seam occupies the same ordering position as Watcher::start in a pass.
+        order.lock().push("replacement starts");
+        let replacement =
+            Watcher::from_injected_events(RawPath::new(b"/fixture".to_vec()).unwrap(), []).unwrap();
+        assert_eq!(
+            *order.lock(),
+            vec!["worker stopped", "group closed", "replacement starts"]
+        );
+        assert!(watchers.is_empty() && minutes.is_empty());
+        watcher.shutdown();
+        assert_eq!(order.lock().len(), 3);
+        assert!(old_view.status(0).is_some());
+        drop(replacement);
+    }
     #[test]
     fn filesystem_mode_detail_is_healthy() {
         let watcher = super::Watcher::from_injected_events_in_mode(
@@ -644,6 +953,29 @@ mod tests {
                 .is_some()
         );
         assert!(watchers.contains_key("/fixture"));
+        state
+            .publish_component(crate::component(
+                "watcher:/fixture",
+                "degraded",
+                "retained mount loss",
+            ))
+            .unwrap();
+        recover_coordinator(&state, &Ok(false)).unwrap();
+        assert!(state
+            .view_at(0)
+            .status(0)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "watcher" && c.state == "degraded"));
+        recover_coordinator(&state, &Ok(true)).unwrap();
+        let components = state.view_at(0).status(0).unwrap().components;
+        assert!(components
+            .iter()
+            .any(|c| c.name == "watcher" && c.state == "ok"));
+        assert!(components
+            .iter()
+            .any(|c| c.name == "watcher:/fixture" && c.state == "degraded"));
     }
     #[test]
     fn exact_consecutive_minutes_loss_gaps_overflows_and_cap() {

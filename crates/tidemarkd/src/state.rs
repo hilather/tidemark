@@ -64,7 +64,7 @@ struct Inner {
 struct WindowFacts {
     warming: bool,
     at: i64,
-    hot: Option<Vec<HotEntry>>,
+    hot: Option<Arc<tidemark_live::watch::WatcherRows>>,
     overflows: Option<u64>,
 }
 impl Default for LiveState {
@@ -478,7 +478,7 @@ impl LiveState {
     pub(crate) fn publish_window_health(
         &self,
         result: Publication,
-        component: ComponentState,
+        mut component: ComponentState,
         warming: bool,
         observed_config: Option<&Config>,
     ) -> Result<(), crate::DaemonError> {
@@ -667,6 +667,22 @@ impl LiveState {
                 }
                 let key = (mount, window);
                 check_key(&d.windows, &key, MAX_WINDOWS)?;
+                let hot = hot.and_then(|rows| {
+                    let retained = match d.watchers.get(&key.0) {
+                        Some(w) => w.retain_window_rows(rows),
+                        None => tidemark_live::watch::WatcherRows::from_unwatched_rows(rows),
+                    };
+                    if retained.is_none() {
+                        component.state = "degraded".into();
+                        component
+                            .detail
+                            .push_str("; truncated: key bytes over the memory budget");
+                        if let Some(w) = d.watchers.get(&key.0) {
+                            w.key_memory_budget_exceeded();
+                        }
+                    }
+                    retained
+                });
                 d.windows.insert(
                     key,
                     WindowFacts {
@@ -877,9 +893,8 @@ impl LiveStateView {
                 .is_none_or(|f| f.warming && self.watch_window_at(mount, window).is_some())
     }
     pub(crate) fn rate_warming_up(&self, mount: &str, window: Duration) -> bool {
-        let elapsed = i128::from(self.now) - i128::from(self.data.started);
-        elapsed >= 0
-            && elapsed < i128::from(window.as_secs())
+        !window.is_zero()
+            && !self.rate_ready(mount)
             && self.fs_sample(mount).is_some()
             && self.fs_rate(mount, window).is_none()
     }
@@ -1323,7 +1338,7 @@ impl AlertSource for LiveStateView {
     fn hot_dirs(&self, mount: &str, window: Duration) -> Option<Vec<HotEntry>> {
         let f = self.data.windows.get(&(mount.into(), window))?;
         self.watch_window_at(mount, window)?;
-        f.hot.clone()
+        f.hot.as_ref()?.copy_rows()
     }
     fn watch_overflows(&self, mount: &str, window: Duration) -> Option<u64> {
         let f = self.data.windows.get(&(mount.into(), window))?;
@@ -1516,20 +1531,44 @@ mod presence_lock_tests {
                     )
                     .unwrap();
             });
-            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let entered = entered_rx.recv_timeout(Duration::from_secs(10));
             let (read_tx, read_rx) = crossbeam_channel::bounded(1);
             let reader_state = state.clone();
             let reader = std::thread::spawn(move || {
                 read_tx.send(reader_state.view_at(0).status(0)).unwrap();
             });
-            let read = read_rx.recv_timeout(Duration::from_millis(200));
-            if phase == 2 {
-                state.replace_config(config).unwrap();
-            }
-            release_tx.send(()).unwrap();
-            worker.join().unwrap();
-            reader.join().unwrap();
+            let read = read_rx.recv_timeout(Duration::from_secs(10));
+            let (reload, reload_worker) = if phase == 2 {
+                let reload_state = state.clone();
+                let (reload_tx, reload_rx) = crossbeam_channel::bounded(1);
+                let reload_worker = std::thread::spawn(move || {
+                    let _ = reload_tx.send(reload_state.replace_config(config));
+                });
+                let progress = reload_rx.recv_timeout(Duration::from_secs(10));
+                (Some(progress), Some(reload_worker))
+            } else {
+                (None, None)
+            };
+            // Even a regressed publisher holding the global lock can now finish:
+            // no assertion or synchronous reload can retain its release signal.
+            let release = release_tx.send(());
+            let published = worker.join();
+            let read_joined = reader.join();
+            let reload_joined = reload_worker.map(std::thread::JoinHandle::join);
+            assert!(
+                entered.is_ok(),
+                "publisher did not enter during phase {phase}"
+            );
+            assert!(release.is_ok());
+            assert!(published.is_ok() && read_joined.is_ok());
+            assert!(reload_joined.is_none_or(|result| result.is_ok()));
             assert!(read.is_ok(), "reader blocked during phase {phase}");
+            if phase == 2 {
+                assert!(
+                    matches!(reload, Some(Ok(Ok(())))),
+                    "reload blocked during phase 2"
+                );
+            }
             assert_eq!(state.0.read().presence.is_empty(), phase == 2);
         }
     }

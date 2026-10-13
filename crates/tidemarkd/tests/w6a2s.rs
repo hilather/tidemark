@@ -623,3 +623,48 @@ fn alert_reload_keeps_unchanged_firing_rule_without_duplicate_event() {
     stop.store(true, Ordering::Release);
     worker.join().unwrap().unwrap();
 }
+
+#[test]
+fn retired_watcher_transport_stops_while_an_old_state_view_is_held() {
+    use tidemark_core::path::RawPath;
+    use tidemark_live::watch::Watcher;
+    use tidemarkd::state::Publication;
+    let (_dir, cfg) = config();
+    let state = LiveState::new(&cfg, 0);
+    let descriptor = rustix::fs::open(
+        "/",
+        rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY,
+        rustix::fs::Mode::empty(),
+    )
+    .unwrap();
+    let steps = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let captured = steps.clone();
+    let watched = Arc::new(
+        Watcher::from_injected_events_with_shutdown_probe(
+            RawPath::new(b"/fixture".to_vec()).unwrap(),
+            descriptor,
+            move |step| captured.lock().push(step),
+        )
+        .unwrap(),
+    );
+    state
+        .publish(
+            Publication::Watcher(("/fixture".into(), watched.clone())),
+            tidemarkd::component("watcher:/fixture", "ok", "fixture"),
+        )
+        .unwrap();
+    let old_view = state.view_at(0);
+    let weak = Arc::downgrade(&watched);
+    watched.shutdown();
+    state.remove_watcher("/fixture");
+    assert_eq!(*steps.lock(), vec!["worker stopped", "group closed"]);
+    assert_eq!(
+        watched.mount_identity().unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    drop(watched);
+    assert!(weak.upgrade().is_some());
+    assert!(old_view.status(0).is_some());
+    drop(old_view);
+    assert!(weak.upgrade().is_none());
+}

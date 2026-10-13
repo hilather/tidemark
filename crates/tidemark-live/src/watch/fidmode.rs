@@ -1,5 +1,11 @@
 //! Owned by: W5-A
 //! Resolve kernel file handles without reading file data or following names.
+use super::budget::{Budget, Reservation};
+// Include hash growth overlap, queue capacity slack and allocator headers.
+const PATH_NODE: usize = 256;
+const PATH_QUEUE: usize = 160;
+const HANDLE_NODE: usize = 320;
+const HANDLE_QUEUE: usize = 192;
 use std::{
     io,
     os::fd::{AsFd, BorrowedFd},
@@ -65,6 +71,9 @@ pub(super) struct PathSizes {
     order: std::collections::VecDeque<(RawPath, u64)>,
     sequence: u64,
     cap: usize,
+    budget: Budget,
+    charged: usize,
+    nodes: usize,
 }
 impl PathSizes {
     pub fn new(cap: usize) -> Self {
@@ -73,33 +82,94 @@ impl PathSizes {
             order: Default::default(),
             sequence: 0,
             cap,
+            budget: Budget::new(),
+            charged: 0,
+            nodes: 0,
         }
     }
+    pub fn set_budget(&mut self, budget: Budget) {
+        self.budget = budget;
+    }
     pub fn clear(&mut self) {
-        self.entries.clear();
-        self.order.clear();
+        self.entries = Default::default();
+        self.order = Default::default();
+        self.budget.release(self.charged);
+        self.budget.release_nodes(self.nodes);
+        self.charged = 0;
+        self.nodes = 0;
     }
     pub fn remember(&mut self, path: &RawPath, id: (u64, u64), disk: i64) {
         if self.cap == 0 {
             return;
         }
+        let old = self.entries.contains_key(path);
+        let bytes = path.as_bytes().len() * (1 + usize::from(!old));
+        if !self.budget.reserve(bytes) {
+            return;
+        }
+        let nodes = PATH_QUEUE + usize::from(!old) * PATH_NODE;
+        if !self.budget.reserve_nodes(nodes, false) {
+            self.budget.release(bytes);
+            return;
+        }
+        if self.entries.try_reserve(1).is_err() || self.order.try_reserve(1).is_err() {
+            self.budget.release(bytes);
+            self.budget.release_nodes(nodes);
+            return;
+        }
+        self.nodes += nodes;
+        self.charged += bytes;
         self.sequence = self.sequence.wrapping_add(1);
-        self.entries.insert(path.clone(), (id, disk, self.sequence));
+        if let Some(value) = self.entries.get_mut(path) {
+            *value = (id, disk, self.sequence);
+        } else {
+            self.entries.insert(path.clone(), (id, disk, self.sequence));
+        }
         self.order.push_back((path.clone(), self.sequence));
         if self.order.len() > self.cap.saturating_mul(2) {
-            self.order
-                .retain(|(p, s)| self.entries.get(p).is_some_and(|v| v.2 == *s));
+            let old_len = self.order.len();
+            let mut released = 0;
+            self.order.retain(|(p, s)| {
+                let keep = self.entries.get(p).is_some_and(|v| v.2 == *s);
+                if !keep {
+                    released += p.as_bytes().len();
+                }
+                keep
+            });
+            self.order.shrink_to_fit();
+            let nodes = (old_len - self.order.len()) * PATH_QUEUE;
+            self.nodes -= nodes;
+            self.budget.release_nodes(nodes);
+            self.charged -= released;
+            self.budget.release(released);
         }
         while self.entries.len() > self.cap {
             if let Some((p, s)) = self.order.pop_front() {
+                let mut released = p.as_bytes().len();
+                let mut nodes = PATH_QUEUE;
                 if self.entries.get(&p).is_some_and(|v| v.2 == s) {
                     self.entries.remove(&p);
+                    nodes += PATH_NODE;
+                    released += p.as_bytes().len();
                 }
+                drop(p);
+                self.nodes -= nodes;
+                self.budget.release_nodes(nodes);
+                self.charged -= released;
+                self.budget.release(released);
             }
         }
     }
     pub fn remove(&mut self, path: &RawPath) -> Option<((u64, u64), i64)> {
-        self.entries.remove(path).map(|(id, disk, _)| (id, disk))
+        self.entries.remove(path).map(|(id, disk, _)| {
+            self.entries.shrink_to_fit();
+            self.nodes -= PATH_NODE;
+            self.budget.release_nodes(PATH_NODE);
+            let bytes = path.as_bytes().len();
+            self.charged -= bytes;
+            self.budget.release(bytes);
+            (id, disk)
+        })
     }
 }
 
@@ -109,6 +179,9 @@ pub(super) struct HandlePaths {
     order: std::collections::VecDeque<((i32, Vec<u8>), u64)>,
     sequence: u64,
     cap: usize,
+    budget: Budget,
+    charged: usize,
+    nodes: usize,
 }
 impl HandlePaths {
     pub fn new(cap: usize) -> Self {
@@ -117,14 +190,35 @@ impl HandlePaths {
             order: Default::default(),
             sequence: 0,
             cap,
+            budget: Budget::new(),
+            charged: 0,
+            nodes: 0,
         }
     }
+    pub fn set_budget(&mut self, budget: Budget) {
+        self.budget = budget;
+    }
     pub fn clear(&mut self) {
-        self.entries.clear();
-        self.order.clear();
+        self.entries = Default::default();
+        self.order = Default::default();
+        self.budget.release(self.charged);
+        self.budget.release_nodes(self.nodes);
+        self.charged = 0;
+        self.nodes = 0;
     }
     pub fn get(&mut self, key: &(i32, Vec<u8>)) -> Option<RawPath> {
-        let path = self.entries.get(key)?.0.clone();
+        let cached = &self.entries.get(key)?.0;
+        // Refreshing passes owned scratch to put; admit every temporary path/key
+        // copy before allocation, independently of retained cache credits.
+        let _scratch = Reservation::normal(
+            &self.budget,
+            cached
+                .as_bytes()
+                .len()
+                .saturating_mul(3)
+                .saturating_add(key.1.len().saturating_mul(2)),
+        )?;
+        let path = cached.clone();
         self.put(key.clone(), path.clone());
         Some(path)
     }
@@ -132,26 +226,148 @@ impl HandlePaths {
         if self.cap == 0 {
             return;
         }
+        let Some(_scratch) = Reservation::normal(&self.budget, key.1.len()) else {
+            return;
+        };
+        let Some(handle) = super::budget::copy(&key.1) else {
+            return;
+        };
+        let key = (key.0, handle);
+        // Refresh existing handles without adding duplicate path allocations.
+        let old_bytes = self
+            .entries
+            .get(&key)
+            .map_or(0, |(p, _)| p.as_bytes().len() + key.1.len());
+        let bytes = key.1.len() * 2 + path.as_bytes().len();
+        if !self.budget.reserve(bytes) {
+            return;
+        }
+        let nodes = HANDLE_QUEUE + usize::from(!self.entries.contains_key(&key)) * HANDLE_NODE;
+        if !self.budget.reserve_nodes(nodes, false) {
+            self.budget.release(bytes);
+            return;
+        }
+        if self.entries.try_reserve(1).is_err() || self.order.try_reserve(1).is_err() {
+            self.budget.release(bytes);
+            self.budget.release_nodes(nodes);
+            return;
+        }
+        self.nodes += nodes;
+        self.charged += bytes;
         self.sequence = self.sequence.wrapping_add(1);
-        self.entries.insert(key.clone(), (path, self.sequence));
+        self.entries
+            .insert(key.clone(), (path.clone(), self.sequence));
+        self.charged -= old_bytes;
+        self.budget.release(old_bytes);
         self.order.push_back((key, self.sequence));
         if self.order.len() > self.cap.saturating_mul(2) {
-            self.order
-                .retain(|(k, s)| self.entries.get(k).is_some_and(|v| v.1 == *s));
+            let old_len = self.order.len();
+            let mut released = 0;
+            self.order.retain(|(k, s)| {
+                let keep = self.entries.get(k).is_some_and(|v| v.1 == *s);
+                if !keep {
+                    released += k.1.capacity();
+                }
+                keep
+            });
+            self.order.shrink_to_fit();
+            let nodes = (old_len - self.order.len()) * HANDLE_QUEUE;
+            self.nodes -= nodes;
+            self.budget.release_nodes(nodes);
+            self.charged -= released;
+            self.budget.release(released);
         }
         while self.entries.len() > self.cap {
             if let Some((k, s)) = self.order.pop_front() {
+                let mut released = k.1.capacity();
+                let mut nodes = HANDLE_QUEUE;
                 if self.entries.get(&k).is_some_and(|v| v.1 == s) {
-                    self.entries.remove(&k);
+                    if let Some((p, _)) = self.entries.remove(&k) {
+                        released += k.1.len() + p.as_bytes().len();
+                        nodes += HANDLE_NODE;
+                    }
                 }
+                drop(k);
+                self.nodes -= nodes;
+                self.budget.release_nodes(nodes);
+                self.charged -= released;
+                self.budget.release(released);
             }
         }
+    }
+}
+impl Drop for PathSizes {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+impl Drop for HandlePaths {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn handle_lookup_scratch_is_admitted_before_refresh_copies() {
+        let budget = Budget::with_limit(4096);
+        let mut cache = HandlePaths::new(2);
+        cache.set_budget(budget.clone());
+        let path = RawPath::new(format!("/{}", "x".repeat(100)).into_bytes()).unwrap();
+        cache.put((1, vec![1; 100]), path);
+        let normal_limit = 4096 - 4096 / 64;
+        let pressure = normal_limit - budget.committed();
+        assert!(budget.reserve(pressure));
+        let before = budget.used();
+        assert!(cache.get(&(1, vec![1; 100])).is_none());
+        assert_eq!(budget.used(), before);
+        assert_eq!(cache.order.len(), 1);
+        budget.release(pressure);
+        assert!(cache.get(&(1, vec![1; 100])).is_some());
+        cache.clear();
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn shared_cache_budget_tracks_repeated_entries_eviction_and_clear() {
+        let budget = Budget::with_limit(2048);
+        let mut paths = PathSizes::new(10);
+        let mut handles = HandlePaths::new(10);
+        paths.set_budget(budget.clone());
+        handles.set_budget(budget.clone());
+        for n in 0..100 {
+            let path = RawPath::new(format!("/{}-{n}", "x".repeat(100)).into_bytes()).unwrap();
+            paths.remember(&path, (1, n), 7);
+            handles.put((1, vec![n as u8; 100]), path.clone());
+            let path_bytes = paths
+                .entries
+                .keys()
+                .map(|p| p.as_bytes().len())
+                .sum::<usize>()
+                + paths
+                    .order
+                    .iter()
+                    .map(|(p, _)| p.as_bytes().len())
+                    .sum::<usize>();
+            let handle_bytes = handles
+                .entries
+                .iter()
+                .map(|(k, (p, _))| k.1.capacity() + p.as_bytes().len())
+                .sum::<usize>()
+                + handles
+                    .order
+                    .iter()
+                    .map(|(k, _)| k.1.capacity())
+                    .sum::<usize>();
+            assert_eq!(budget.used(), path_bytes + handle_bytes);
+            assert!(budget.used() <= 2048);
+            paths.remove(&path);
+        }
+        paths.clear();
+        handles.clear();
+        assert_eq!(budget.used(), 0);
+    }
     #[test]
     fn handle_path_lru_and_invalidation() {
         let path = RawPath::new(b"/dir".to_vec()).unwrap();
