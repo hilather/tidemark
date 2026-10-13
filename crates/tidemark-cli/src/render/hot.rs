@@ -43,7 +43,7 @@ pub fn write_grouped(
             tidemark_core::path::display_lossy_bytes(&r.key),
             r.events.to_string(),
             r.files.to_string(),
-            format!("{:+}", r.bytes_delta),
+            crate::render::now::signed_bytes(r.bytes_delta),
             tidemark_core::path::display_lossy_bytes(
                 r.top_unit.as_deref().unwrap_or("?").as_bytes(),
             ),
@@ -56,8 +56,56 @@ pub fn write_grouped(
         }
     }
     out.write_all(
-        crate::render::table::aligned_wrapped(&table, width, if by_unit { &[0] } else { &[0, 4] })
-            .as_bytes(),
+        crate::render::table::aligned_wrapped_right(
+            &table,
+            width,
+            if by_unit { &[0] } else { &[0, 4] },
+            &[1, 2, 3],
+        )
+        .as_bytes(),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn signed_sizes_align_and_json_remains_integer() {
+        let rows: Vec<_> = [8_388_608, -1024, 0, i64::MIN]
+            .into_iter()
+            .enumerate()
+            .map(|(i, bytes_delta)| tidemark_core::live::HotEntry {
+                key: format!("unit-{i}").into_bytes(),
+                events: 1,
+                files: 1,
+                bytes_delta,
+                top_unit: None,
+                lossy: false,
+            })
+            .collect();
+        for width in [80, 100] {
+            let mut out = Vec::new();
+            super::write_width(&rows[..3], false, width, &mut out).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            let ends: Vec<_> = text
+                .lines()
+                .skip(1)
+                .map(|line| {
+                    let size = ["+8.00 MiB", "-1.00 KiB", "+0 B"]
+                        .into_iter()
+                        .find(|s| line.contains(s))
+                        .unwrap();
+                    line.find(size).unwrap() + size.len()
+                })
+                .collect();
+            assert!(ends.iter().all(|end| *end == ends[0]), "{text}");
+            assert!(!text.contains("8388608"));
+        }
+        let mut out = Vec::new();
+        super::write_width(&rows, true, 80, &mut out).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["data"][0]["bytes_delta"], 8_388_608);
+        assert_eq!(json["data"][3]["bytes_delta"], i64::MIN);
+        assert!(super::super::now::signed_bytes(i64::MIN).starts_with('-'));
+    }
 }

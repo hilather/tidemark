@@ -361,7 +361,7 @@ fn bytes_display(b: &[u8]) -> String {
     tidemark_core::path::display_lossy_bytes(b)
 }
 
-fn signed_bytes(bytes: i64) -> String {
+pub(crate) fn signed_bytes(bytes: i64) -> String {
     format!(
         "{}{}",
         if bytes < 0 { "-" } else { "+" },
