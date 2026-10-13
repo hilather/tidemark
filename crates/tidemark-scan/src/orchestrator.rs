@@ -1023,25 +1023,20 @@ impl crate::agg::RowSink for WriterSink<'_> {
 }
 
 fn delete_snapshot(state: &std::path::Path, file: &std::path::Path) -> Result<(), ScanError> {
-    let allowed = std::fs::canonicalize(state.join("snapshots"))?;
-    let parent = std::fs::canonicalize(
-        file.parent()
-            .ok_or_else(|| ScanError::Precondition("snapshot has no parent".into()))?,
-    )?;
-    if !parent.starts_with(allowed) || file.extension() != Some(std::ffi::OsStr::new("db")) {
-        return Err(ScanError::Precondition(
-            "snapshot deletion outside state directory refused".into(),
-        ));
+    let relative = file.strip_prefix(state.join("snapshots")).map_err(|_| ScanError::Precondition("snapshot deletion outside state directory refused".into()))?;
+    let mut components = relative.components();
+    let root = match components.next() { Some(std::path::Component::Normal(n)) => n, _ => return Err(ScanError::Precondition("unsafe snapshot path".into())) };
+    let name = match components.next() { Some(std::path::Component::Normal(n)) => n, _ => return Err(ScanError::Precondition("unsafe snapshot path".into())) };
+    if components.next().is_some() || file.extension() != Some(std::ffi::OsStr::new("db")) {
+        return Err(ScanError::Precondition("unsafe snapshot path".into()));
     }
-    match std::fs::remove_file(file) {
-        Ok(()) => {
-            tracing::info!(path=%file.display(), "pruned snapshot");
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    let directory = tidemark_store::state_dir::StateDir::open(state, false)?
+        .subdir(std::ffi::OsStr::new("snapshots"), false)?.subdir(root, false)?;
+    directory.unlink_leaf(name)?;
+    tracing::info!(path=%file.display(), "pruned snapshot");
+    Ok(())
 }
+
 fn guard_and_prune(
     state: &std::path::Path,
     catalog: &tidemark_store::catalog::Catalog,
