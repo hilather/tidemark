@@ -43,6 +43,8 @@ fn collisions_rejected_by_check_config_and_reload() {
         (real.join("metrics.prom.tmp"), real.join("metrics.prom")),
         (socket.clone(), alias.join("api.sock")),
         (socket.clone(), real.join("child/../api.sock")),
+        (real.join("api.sock/"), real.join("api.sock.lock")),
+        (real.join("metrics.prom.tmp"), real.join("metrics.prom/")),
     ] {
         config(&path, &socket, &textfile, &state_dir);
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_tidemarkd"))

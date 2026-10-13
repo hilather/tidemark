@@ -1181,9 +1181,9 @@ fn validate_output_paths(c: &tidemark_core::config::Config) -> Result<(), Daemon
     use std::os::unix::fs::MetadataExt;
     use std::path::{Component, Path, PathBuf};
     fn suffix(path: &Path, suffix: &str) -> PathBuf {
-        let mut name = path.as_os_str().to_os_string();
+        let mut name = path.file_name().unwrap_or(path.as_os_str()).to_os_string();
         name.push(suffix);
-        name.into()
+        path.with_file_name(name)
     }
     fn normalize(path: &Path) -> PathBuf {
         let mut result = PathBuf::new();
