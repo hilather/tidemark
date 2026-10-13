@@ -904,6 +904,7 @@ pub fn run_controlled(
             );
             tracing::info!("daemon ready");
             let mut firstboot_followup = firstboot::Followup::default();
+            let firstboot_elapsed = monotonic_clock();
             let mut firstboot_due = Instant::now();
             while !shutdown.load(Ordering::Acquire) {
                 if reload_flag.swap(false, Ordering::AcqRel) {
@@ -925,6 +926,7 @@ pub fn run_controlled(
                             &state.config().0.general.state_dir,
                             &inputs,
                             unix_now(),
+                            firstboot_elapsed(),
                         ) {
                             tracing::warn!(%error, "firstboot followup failed");
                         }
