@@ -620,33 +620,40 @@ fn global_candidates_across_roots_and_replacement_uncover_previous_rows() {
 
 #[test]
 fn resolved_workspace_has_no_http_or_tls_packages() {
-    let output = std::process::Command::new("cargo")
-        .args(["metadata", "--offline", "--format-version", "1"])
-        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    for package in metadata["packages"].as_array().unwrap() {
-        let name = package["name"].as_str().unwrap();
-        assert!(
-            ![
-                "ureq",
-                "tiny_http",
-                "rustls",
-                "ring",
-                "hyper",
-                "reqwest",
-                "webpki-roots"
-            ]
-            .contains(&name),
-            "unexpected package {name}"
-        );
+    // Cargo.lock is the complete resolved set, including other platforms. No
+    // registry cache or cargo subprocess is needed to inspect package names.
+    let lock =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock")).unwrap();
+    let mut in_package = false;
+    let mut packages = 0;
+    for line in lock.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_package = line == "[[package]]";
+        } else if in_package {
+            if let Some(name) = line
+                .strip_prefix("name = \"")
+                .and_then(|v| v.strip_suffix('"'))
+            {
+                packages += 1;
+                assert!(
+                    ![
+                        "ureq",
+                        "tiny_http",
+                        "rustls",
+                        "ring",
+                        "hyper",
+                        "reqwest",
+                        "webpki-roots",
+                        "native-tls",
+                        "openssl"
+                    ]
+                    .contains(&name),
+                    "unexpected package {name}"
+                );
+            }
+        }
     }
+    assert!(packages > 0, "Cargo.lock contains no package names");
 }
 
 #[test]
