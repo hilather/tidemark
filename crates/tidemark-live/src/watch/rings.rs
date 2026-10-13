@@ -925,6 +925,36 @@ mod tests {
                 .sum::<usize>()
     }
     #[test]
+    fn emergency_root_headroom_preserves_sixty_undrained_minutes() {
+        let mut r = Rings::new();
+        let mut root = vec![b'r'; super::super::WATCH_ROOT_BYTES];
+        root[0] = b'/';
+        r.configure(Budget::new(), &root).unwrap();
+        for n in 0..300 {
+            let mut key = format!("/{n}/").into_bytes();
+            key.resize(256 * 1024, b'x');
+            r.add(0, [key, b"u".to_vec(), b"c".to_vec()], 7, None, (1, n));
+        }
+        for minute in 1..60 {
+            let key = vec![b'a' + (minute % 26) as u8; 4000];
+            r.add(
+                minute * 60,
+                [key, b"u".to_vec(), b"c".to_vec()],
+                7,
+                None,
+                (2, minute as u64),
+            );
+            let rows = r.hot(minute * 60, 1, HotScope::Dir, usize::MAX);
+            assert_eq!(rows.iter().map(|row| row.events).sum::<u64>(), 1);
+            assert_eq!(rows.iter().map(|row| row.bytes_delta).sum::<i64>(), 7);
+            assert_eq!(r.budget.used(), payload(&r));
+            assert!(r.budget.committed() <= super::super::WATCH_MEMORY_BYTES);
+        }
+        let rows = r.hot(59 * 60, 60, HotScope::Dir, usize::MAX);
+        assert_eq!(rows.iter().map(|row| row.events).sum::<u64>(), 359);
+        assert_eq!(rows.iter().map(|row| row.bytes_delta).sum::<i64>(), 359 * 7);
+    }
+    #[test]
     fn output_admission_bounds_unequal_rows_before_ranking() {
         let mut r = Rings::new();
         r.configure(Budget::new(), b"/mount").unwrap();
