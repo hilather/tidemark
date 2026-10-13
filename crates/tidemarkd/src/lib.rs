@@ -141,6 +141,28 @@ pub fn main_entry() -> std::process::ExitCode {
 mod tests {
     use super::*;
     #[test]
+    fn requested_shutdown_preserves_first_startup_attempt() {
+        let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut calls = 0;
+        assert_eq!(
+            retry_start("catalog", &state, &shutdown, || {
+                calls += 1;
+                Ok(42)
+            })
+            .unwrap(),
+            42
+        );
+        assert_eq!(calls, 1);
+        assert!(matches!(
+            retry_start::<()>("catalog", &state, &shutdown, || Err(DaemonError::Io {
+                context: "open".into(),
+                source: std::io::Error::from_raw_os_error(24)
+            })),
+            Err(DaemonError::Shutdown)
+        ));
+    }
+    #[test]
     fn resource_exit_does_not_fail_lifecycle_join() {
         let handle = std::thread::spawn(|| {
             Err(DaemonError::Io {
@@ -499,11 +521,13 @@ fn retry_start<T>(
     let mut failures = 0u32;
     let mut last_log: Option<Instant> = None;
     loop {
-        if shutdown.load(Ordering::Acquire) {
-            return Err(DaemonError::Shutdown);
-        }
         match start() {
             Err(error) if daemon_pressure(&error) => {
+                // Preserve the initial startup attempt: recovery tests and callers
+                // may request shutdown before entry but still require catalog repair.
+                if shutdown.load(Ordering::Acquire) {
+                    return Err(DaemonError::Shutdown);
+                }
                 state.publish_component(component(name, "degraded", error.to_string()))?;
                 if last_log.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
                     tracing::warn!(component=name, %error, "startup resource pressure; retrying");
