@@ -3,7 +3,9 @@
 
 #![forbid(unsafe_code)]
 
+mod bench;
 mod checks;
+mod gen_fixture;
 mod rpm;
 mod vm_test;
 
@@ -68,7 +70,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("vm-test") => vm_test::run(root, args),
-        Some("gen-fixture" | "bench") => bail!("command is not implemented yet (owner W7-B)"),
+        Some("gen-fixture") => gen_fixture::run(env::args_os().skip(2)),
+        Some("bench") => bench::run(root, env::args_os().skip(2)),
         Some("rpm") => rpm::run(root, args),
         _ => bail!("usage: cargo xtask <ci|vm-test|gen-fixture|bench|rpm>"),
     }

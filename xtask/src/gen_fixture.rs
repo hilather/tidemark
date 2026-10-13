@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::{
         fs::{symlink, MetadataExt, OpenOptionsExt},
         io::AsRawFd,
@@ -123,17 +123,21 @@ pub fn safe_root(path: &Path) -> Result<Dir> {
         bail!("refusing filesystem root /");
     }
     let mounts = mount_points()?;
+    validate_mounts(&canonical, &mounts)?;
+    capability.original = canonical;
+    Ok(capability)
+}
+fn validate_mounts(canonical: &Path, mounts: &[PathBuf]) -> Result<()> {
     if !mounts.iter().any(|m| canonical.starts_with(m)) {
         bail!("cannot resolve root mount parent chain");
     }
     if mounts
         .iter()
-        .any(|m| m.starts_with(&canonical) && m != &canonical)
+        .any(|m| m.starts_with(canonical) && m != canonical)
     {
         bail!("nested mount below fixture root");
     }
-    capability.original = canonical;
-    Ok(capability)
+    Ok(())
 }
 /// Decode mountinfo's byte escapes and reject malformed topology.
 pub fn mount_points() -> Result<Vec<PathBuf>> {
@@ -150,7 +154,7 @@ pub fn mount_points() -> Result<Vec<PathBuf>> {
         while i < field.len() {
             if field[i] == b'\\' {
                 let s = field.get(i + 1..i + 4).context("invalid mount escape")?;
-                if !s.iter().all(|b| (b'0'..=b'7').contains(b)) {
+                if s[0] > b'3' || !s.iter().all(|b| (b'0'..=b'7').contains(b)) {
                     bail!("invalid mount escape");
                 }
                 decoded.push((s[0] - b'0') * 64 + (s[1] - b'0') * 8 + s[2] - b'0');
@@ -220,7 +224,7 @@ fn add_bytes(s: &mut Summary, path: &Path) -> Result<()> {
 fn marker(dir: &Dir) -> Result<Marker> {
     let mut f = OpenOptions::new()
         .read(true)
-        .custom_flags(NOFOLLOW)
+        .custom_flags(NOFOLLOW | 0x800)
         .open(dir.path().join(MARKER))?;
     if !f.metadata()?.is_file() || f.metadata()?.len() > 4096 {
         bail!("invalid fixture marker");
@@ -228,6 +232,14 @@ fn marker(dir: &Dir) -> Result<Marker> {
     let mut data = String::new();
     f.read_to_string(&mut data)?;
     Ok(serde_json::from_str(&data)?)
+}
+/// Read bounded, no-follow fixture identity for the watcher workload.
+pub fn fixture_identity(dir: &Dir) -> Result<(u64, u64, bool)> {
+    let m = marker(dir)?;
+    if m.profile != "reports" || m.count < 32 || m.count > 100_000_000 {
+        bail!("invalid fixture identity");
+    }
+    Ok((m.count, m.seed, m.dense))
 }
 fn clear(dir: &Dir) -> Result<()> {
     // Two passes: validate all directories first, so unexpected subtrees are refused.
@@ -344,14 +356,24 @@ pub fn generate(o: &Options) -> Result<Summary> {
         symlink(target, p.clone())?;
         add_bytes(&mut s, &p)?;
     }
+    // Fixed-size JSON control files make their own size/blocks non-circular.
+    let summary_path = dir.path().join(".tidemark-fixture.json");
+    let mut summary_file = create(&summary_path)?;
+    summary_file.write_all(&[b' '; 4096])?;
+    add_bytes(&mut s, &dir.path().join(MARKER))?;
+    add_bytes(&mut s, &summary_path)?;
     let root_metadata = dir.file.metadata()?;
     s.apparent_bytes += root_metadata.len();
     s.allocated_bytes += root_metadata.blocks() * 512;
     for i in 0..dirs {
         add_bytes(&mut s, &dir.path().join(format!("report-{i:04}")))?;
     }
-    // Control-file byte totals excluded: summary cannot include its own serialized size.
-    serde_json::to_writer_pretty(create(&dir.path().join(".tidemark-fixture.json"))?, &s)?;
+    let encoded = serde_json::to_vec_pretty(&s)?;
+    if encoded.len() > 4096 {
+        bail!("summary exceeds fixed control-file size");
+    }
+    summary_file.seek(SeekFrom::Start(0))?;
+    summary_file.write_all(&encoded)?;
     println!("{}", serde_json::to_string(&s)?);
     if o.rate > 0 {
         mutate(&dir, o.rate, o.duration)?;
@@ -407,7 +429,75 @@ pub fn mutate(dir: &Dir, rate: u64, duration: Option<u64>) -> Result<u64> {
     Ok(ops)
 }
 /// Dispatch the fixture command.
-pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
-    generate(&parse_args(args)?)?;
+pub fn run(args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> {
+    let (args, root, _) = os_args(args)?;
+    let mut options = parse_args(args.into_iter())?;
+    if let Some(root) = root {
+        options.root = root;
+    }
+    generate(&options)?;
     Ok(())
+}
+
+/// Retain raw path bytes while validating text-only flags and numeric values.
+pub fn os_args(
+    args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(Vec<String>, Option<PathBuf>, Option<PathBuf>)> {
+    let mut args = args;
+    let mut text = Vec::new();
+    let mut root = None;
+    let mut out = None;
+    while let Some(arg) = args.next() {
+        let flag = arg.to_str().context("flag/value must be UTF-8")?.to_owned();
+        text.push(flag.clone());
+        if flag == "--root" || flag == "--out" {
+            let path = PathBuf::from(args.next().context("path flag needs a value")?);
+            if flag == "--root" {
+                root = Some(path);
+            } else {
+                out = Some(path);
+            }
+            text.push("raw-path-placeholder".into());
+        }
+    }
+    Ok((text, root, out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn mutation_requires_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = safe_root(root.path()).unwrap();
+        assert!(mutate(&dir, 10, Some(1)).is_err());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn random_reproducible_and_bounded() {
+        let mut a = Random(42);
+        let mut b = Random(42);
+        for _ in 0..1000 {
+            let size = a.size();
+            assert_eq!(size, b.size());
+            assert!((1..=2147483648).contains(&size));
+        }
+    }
+    #[test]
+    fn mount_refusals() {
+        assert!(validate_mounts(Path::new("/tmp/fixture"), &[]).is_err());
+        assert!(validate_mounts(
+            Path::new("/tmp/fixture"),
+            &["/".into(), "/tmp/fixture/nested".into()]
+        )
+        .is_err());
+        assert!(validate_mounts(Path::new("/tmp/fixture"), &["/".into()]).is_ok());
+    }
+    #[test]
+    fn raw_paths_retained() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_vec(b"/tmp/raw-\xff".to_vec());
+        let (_, root, _) = os_args(["--root".into(), raw.clone()].into_iter()).unwrap();
+        assert_eq!(root.unwrap().as_os_str(), raw);
+    }
 }
