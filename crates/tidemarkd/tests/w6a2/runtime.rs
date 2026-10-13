@@ -531,6 +531,7 @@ fn failure_health_survives_idle_other_root_and_reload_until_recovery() {
     removed.roots.clear();
     h.state.replace_config(removed).unwrap();
     wait(|| !degraded());
+    assert!(h.state.view().scans().unwrap().is_empty());
     h.state.replace_config(cfg).unwrap();
     wait(degraded);
     wait(|| {

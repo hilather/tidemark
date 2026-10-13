@@ -5,9 +5,13 @@ use std::{
     process::{Child, Command},
     time::{Duration, Instant},
 };
-fn wait(mut f: impl FnMut() -> bool, deadline: Instant) {
+fn wait(mut f: impl FnMut() -> bool, deadline: Instant, logs: &impl Fn() -> String) {
     while !f() {
-        assert!(Instant::now() < deadline, "VM daemon deadline exceeded");
+        assert!(
+            Instant::now() < deadline,
+            "VM daemon deadline exceeded; stderr: {}",
+            logs()
+        );
         std::thread::yield_now();
     }
 }
@@ -66,22 +70,26 @@ fn daemon_reload_and_shutdown() {
     wait(
         || logs().contains("daemon ready"),
         Instant::now() + Duration::from_secs(15),
+        &logs,
     );
     write_config(&path, 99);
     signal(&child.0, rustix::process::Signal::HUP);
     wait(
         || logs().contains("reloaded=true"),
         Instant::now() + Duration::from_secs(10),
+        &logs,
     );
     std::fs::write(&path, "[sampler]\ninterval='0s'\n").unwrap();
     signal(&child.0, rustix::process::Signal::HUP);
     wait(
         || logs().contains("reloaded=false"),
         Instant::now() + Duration::from_secs(10),
+        &logs,
     );
     wait(
         || logs().contains("scan memory admission estimate"),
         Instant::now() + Duration::from_secs(15),
+        &logs,
     );
     let started = Instant::now();
     signal(&child.0, rustix::process::Signal::TERM);
@@ -92,8 +100,9 @@ fn daemon_reload_and_shutdown() {
             exit.is_some()
         },
         started + Duration::from_secs(10),
+        &logs,
     );
-    assert!(exit.unwrap().success());
+    assert!(exit.unwrap().success(), "stderr: {}", logs());
     let snapshots = dir.path().join("state/snapshots");
     if snapshots.exists() {
         for root in std::fs::read_dir(snapshots).unwrap() {

@@ -178,10 +178,12 @@ mod tests {
         let path = dir.path().join("config.toml");
         let original = b"[sampler]\ninterval='1h'\n";
         std::fs::write(&path, original).unwrap();
-        let captured = std::fs::read(&path).unwrap();
-        // Change the inode contents after capture. Parsing has no path/fd to reread.
-        std::fs::write(&path, b"[sampler]\ninterval='2h'\n").unwrap();
-        let (config, hash) = parse_config_bytes(&captured).unwrap();
+        // Mutate the same inode at the real loader's capture/parse boundary.
+        let (config, hash) = load_config_captured(&path, |captured| {
+            assert_eq!(captured, original);
+            std::fs::write(&path, b"[sampler]\ninterval='2h'\n").unwrap();
+        })
+        .unwrap();
         assert_eq!(
             config.sampler.interval,
             std::time::Duration::from_secs(3600)
@@ -190,6 +192,66 @@ mod tests {
         let (later, later_hash) = load_config(&path).unwrap();
         assert_eq!(later.sampler.interval, std::time::Duration::from_secs(7200));
         assert_ne!(hash, later_hash);
+    }
+    #[test]
+    fn expired_shutdown_deadline_still_joins_worker() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = completed.clone();
+        let (ready, started) = crossbeam_channel::bounded(1);
+        let handle = std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            flag.store(true, Ordering::Release);
+            Ok(())
+        });
+        started.recv().unwrap();
+        assert!(join_until("test", handle, std::time::Instant::now()).is_err());
+        assert!(completed.load(Ordering::Acquire));
+    }
+    #[test]
+    fn pending_scan_reservation_survives_reload_and_stale_schedule_cannot_reappear() {
+        use tidemark_core::{
+            config::{Config, RootConfig},
+            live::ScanStatus,
+        };
+        let config = Config::default();
+        let state = state::LiveState::new(&config, 0);
+        let old_root = config.roots[0].path.to_string_lossy().into_owned();
+        state.reserve_scan(old_root.clone()).unwrap();
+        let before = state.config();
+        let mut next = config;
+        next.roots = (0..128)
+            .map(|n| RootConfig {
+                path: format!("/replacement/{n}").into(),
+                schedule: "off".into(),
+                ..RootConfig::default()
+            })
+            .collect();
+        assert!(state.replace_config(next.clone()).is_err());
+        assert_eq!(state.config(), before);
+        state.release_scan();
+        state.replace_config(next).unwrap();
+        state
+            .publish_scheduled(
+                ScanStatus {
+                    root: old_root,
+                    running: None,
+                    last_complete: None,
+                    next_due: None,
+                },
+                before.1,
+                component("scheduler", "ok", "stale"),
+            )
+            .unwrap();
+        assert_eq!(state.view().scans().unwrap().len(), 128);
+        assert!(!state
+            .reserve_scheduled("/retired".into(), before.1)
+            .unwrap());
+        assert_eq!(state.view().scans().unwrap().len(), 128);
     }
     #[test]
     fn example_and_unknown_key() {
@@ -436,6 +498,7 @@ pub fn run_controlled(
         services::tswriter::start(config.clone(), state.clone(), writer_shutdown.clone())?;
     // Any startup error stops already-started services before returning.
     let mut handles = Vec::new();
+    let recorder_deadline = Arc::new(parking_lot::Mutex::new(None));
     let started = (|| -> Result<_, DaemonError> {
         add_service(
             "sampler",
@@ -492,11 +555,12 @@ pub fn run_controlled(
             &state,
             &mut handles,
         )?;
-        let scans = match scheduler::start(
+        let scans = match scheduler::start_with_deadline(
             config.clone(),
             state.clone(),
             writer.clone(),
             shutdown.clone(),
+            recorder_deadline.clone(),
         ) {
             Ok((scans, h)) => {
                 handles.push(("scheduler", h));
@@ -547,9 +611,10 @@ pub fn run_controlled(
             while !shutdown.load(Ordering::Acquire) {
                 if reload_flag.swap(false, Ordering::AcqRel) {
                     match reload() {
-                        Ok(r) => {
-                            tracing::info!(reloaded=r.reloaded,warnings=?r.warnings,"config reload")
+                        Ok(r) if r.reloaded => {
+                            tracing::info!(reloaded = true, "config reload")
                         }
+                        Ok(_) => {}
                         Err(e) => tracing::error!(error=%e,"config reload rejected"),
                     }
                 }
@@ -566,6 +631,7 @@ pub fn run_controlled(
             }
             let deadline = Instant::now() + Duration::from_secs(9);
             shutdown_deadline = Some(deadline);
+            *recorder_deadline.lock() = Some(deadline);
             scans.begin_shutdown(deadline);
             // API observes shutdown first; cancellation precedes producer joins and writer drain.
             for scan in state
@@ -593,6 +659,7 @@ pub fn run_controlled(
     tracing::info!("daemon stopping");
     shutdown.store(true, Ordering::Release);
     let deadline = shutdown_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(9));
+    *recorder_deadline.lock() = Some(deadline);
     // API first, then scheduler/watchers and the other producers.
     handles.sort_by_key(|(name, _)| match *name {
         "api" => 0,
@@ -792,7 +859,7 @@ pub fn reload_callback(path: std::path::PathBuf, state: state::LiveState) -> api
                 })
             }
             Err(e) => {
-                tracing::error!(error=%e,"keeping previous config");
+                tracing::error!(reloaded=false,error=%e,"keeping previous config");
                 let _ = sd_notify::notify(
                     false,
                     &[sd_notify::NotifyState::Status(
@@ -911,6 +978,12 @@ fn prepare_state(c: &tidemark_core::config::Config) -> Result<std::os::fd::Owned
 fn load_config(
     path: &std::path::Path,
 ) -> Result<(tidemark_core::config::Config, String), DaemonError> {
+    load_config_captured(path, |_| {})
+}
+fn load_config_captured(
+    path: &std::path::Path,
+    after_capture: impl FnOnce(&[u8]),
+) -> Result<(tidemark_core::config::Config, String), DaemonError> {
     use rustix::fs::{self, FileType, Mode, OFlags};
     use std::io::Read;
     let absolute = if path.is_absolute() {
@@ -962,6 +1035,7 @@ fn load_config(
     if bytes.len() > 1024 * 1024 {
         return Err(DaemonError::Config("config exceeds 1 MiB".into()));
     }
+    after_capture(&bytes);
     parse_config_bytes(&bytes)
 }
 fn parse_config_bytes(

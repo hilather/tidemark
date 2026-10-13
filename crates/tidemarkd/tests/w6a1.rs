@@ -1211,3 +1211,34 @@ fn oversized_metrics_interval_is_rejected_before_startup_and_reload() {
     assert!(result.warnings[0].contains("366 days"));
     assert_eq!(state.config(), before);
 }
+
+#[test]
+fn configured_roots_reserve_capacity_against_inactive_manual_history() {
+    let cfg = Config::default();
+    let state = LiveState::new(&cfg, 0);
+    for n in 0..128 {
+        state
+            .publish(
+                Publication::Scan(ScanStatus {
+                    root: format!("/manual/{n}"),
+                    running: None,
+                    last_complete: None,
+                    next_due: None,
+                }),
+                health(),
+            )
+            .unwrap();
+    }
+    let mut next = cfg;
+    next.roots = (0..128)
+        .map(|n| tidemark_core::config::RootConfig {
+            path: format!("/configured/{n}").into(),
+            schedule: "off".into(),
+            ..tidemark_core::config::RootConfig::default()
+        })
+        .collect();
+    state.replace_config(next).unwrap();
+    let scans = state.view().scans().unwrap();
+    assert_eq!(scans.len(), 128);
+    assert!(scans.iter().all(|s| s.root.starts_with("/configured/")));
+}
