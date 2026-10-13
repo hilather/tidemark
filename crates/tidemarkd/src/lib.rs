@@ -34,6 +34,7 @@ pub mod state;
 
 use clap::Parser;
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 /// Daemon invocation options.
 #[derive(Debug, Parser)]
@@ -140,6 +141,43 @@ pub fn main_entry() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_wait_preserves_busy_database_and_sidecars() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let lock = tidemark_scan::orchestrator::ScanLock::acquire(dir.path()).unwrap();
+        let mut originals = Vec::new();
+        for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"corrupt fixture").unwrap();
+            originals.push((path.clone(), std::fs::metadata(&path).unwrap().ino()));
+        }
+        let start = Instant::now();
+        let error = startup_catalog(dir.path(), 100, Duration::from_millis(60))
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("state directory in use by another tidemark process"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        for (path, inode) in originals {
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+            assert_eq!(std::fs::read(path).unwrap(), b"corrupt fixture");
+        }
+        assert!(!dir.path().join("timeseries-recovery-0").exists());
+        drop(lock);
+        let catalog = startup_catalog(dir.path(), 100, Duration::ZERO).unwrap();
+        assert_eq!(catalog.recovery_files().len(), 3);
+    }
+    #[test]
+    fn healthy_catalog_does_not_wait_for_scan_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(tidemark_store::catalog::Catalog::open(dir.path(), true).unwrap());
+        let _lock = tidemark_scan::orchestrator::ScanLock::acquire(dir.path()).unwrap();
+        let start = Instant::now();
+        drop(startup_catalog(dir.path(), 100, Duration::from_secs(30)).unwrap());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
     #[test]
     fn requested_shutdown_preserves_first_startup_attempt() {
         let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
@@ -659,31 +697,9 @@ pub fn run_controlled(
     )?;
     // Both storage opens perform header preflight before SQLite. Recovery is corruption-only.
     let storage = state.storage_path();
-    let catalog = match retry_start("catalog", &state, &shutdown, || {
-        match tidemark_store::catalog::Catalog::open(&storage, true) {
-            Err(error) if store_pressure(&error) => Err(startup_store_error(error)),
-            result => Ok(result),
-        }
-    })? {
-        Ok(c) => c,
-        Err(error) if corrupt(&error) => {
-            let c = retry_start("catalog", &state, &shutdown, || {
-                tidemark_store::catalog::recover_catalog(&storage).map_err(startup_store_error)
-            })?;
-            for path in c.recovery_files() {
-                tracing::warn!(path=%path.display(), "preserved corrupt catalog artifact");
-            }
-            c
-        }
-        Err(error) => return Err(DaemonError::Store(error.to_string())),
-    };
-    match tidemark_scan::orchestrator::ScanLock::acquire(&storage) {
-        Ok(_lock) => tidemark_store::catalog::cleanup_abandoned_scans(&storage, options.now),
-        Err(tidemark_scan::orchestrator::ScanError::Busy) => {
-            tracing::info!("startup scan cleanup skipped: host scan lock is held");
-        }
-        Err(error) => tracing::warn!(%error, "startup scan cleanup lock failed"),
-    }
+    let catalog = retry_start("catalog", &state, &shutdown, || {
+        startup_catalog(&storage, options.now, Duration::from_secs(30))
+    })?;
     // Read catalog history before treating any configured root as measured never-scanned.
     for root in &config.roots {
         let raw = tidemark_core::path::RawPath::from_path(&root.path)
@@ -1034,6 +1050,54 @@ fn join_until(
     }
     result
 }
+fn startup_catalog(
+    storage: &std::path::Path,
+    now: i64,
+    wait: Duration,
+) -> Result<tidemark_store::catalog::Catalog, DaemonError> {
+    // Probe without migrations or writes before deciding whether to wait.
+    let needs_recovery = match tidemark_store::catalog::Catalog::open(storage, false) {
+        Ok(catalog) => {
+            drop(catalog);
+            false
+        }
+        Err(error) if corrupt(&error) => true,
+        Err(_) => !storage.join("timeseries.db").exists(),
+    };
+    let deadline = Instant::now() + wait;
+    let lock = loop {
+        match tidemark_scan::orchestrator::ScanLock::acquire(storage) {
+            Ok(lock) => break Some(lock),
+            Err(tidemark_scan::orchestrator::ScanError::Busy) if needs_recovery => {
+                if Instant::now() >= deadline {
+                    return Err(DaemonError::Store(
+                        "state directory in use by another tidemark process".into(),
+                    ));
+                }
+                std::thread::sleep(
+                    Duration::from_millis(25)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(tidemark_scan::orchestrator::ScanError::Busy) => break None,
+            Err(error) => return Err(DaemonError::Store(error.to_string())),
+        }
+    };
+    let catalog = match &lock {
+        Some(lock) => {
+            let catalog = lock
+                .open_catalog(storage)
+                .map_err(|e| DaemonError::Store(e.to_string()))?;
+            tidemark_store::catalog::cleanup_abandoned_scans(storage, now);
+            catalog
+        }
+        None => {
+            tidemark_store::catalog::Catalog::open(storage, true).map_err(startup_store_error)?
+        }
+    };
+    Ok(catalog)
+}
+
 fn corrupt(e: &tidemark_store::StoreError) -> bool {
     // Match the exposed SQLite error code without adding a direct rusqlite dependency.
     matches!(e,tidemark_store::StoreError::Sql(e) if e.sqlite_error_code().is_some_and(|code|matches!(format!("{code:?}").as_str(),"DatabaseCorrupt"|"NotADatabase")))

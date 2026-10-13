@@ -130,3 +130,21 @@ fn catalog_failure_does_not_prevent_file_cleanup() {
         b"not sqlite"
     );
 }
+
+#[test]
+fn checked_recovery_refuses_wrong_or_busy_scan_lock() {
+    use tidemark_store::catalog::recover_catalog_with_lock;
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("timeseries.db");
+    std::fs::write(&database, b"corrupt").unwrap();
+    let held = std::fs::File::create(dir.path().join("scan.lock")).unwrap();
+    rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+    let other = std::fs::File::open(dir.path().join("scan.lock")).unwrap();
+    assert!(recover_catalog_with_lock(dir.path(), &other).is_err());
+    let wrong = std::fs::File::create(dir.path().join("wrong.lock")).unwrap();
+    assert!(recover_catalog_with_lock(dir.path(), &wrong).is_err());
+    assert_eq!(std::fs::read(&database).unwrap(), b"corrupt");
+    assert!(!dir.path().join("timeseries-recovery-0").exists());
+    let catalog = recover_catalog_with_lock(dir.path(), &held).unwrap();
+    assert_eq!(catalog.recovery_files().len(), 1);
+}

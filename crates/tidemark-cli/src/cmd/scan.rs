@@ -157,12 +157,12 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     {
         // Recover only in direct mode, under the scan lock, before any recorder
         // or catalog connections are retained.
-        let _lock =
+        let lock =
             tidemark_scan::orchestrator::ScanLock::acquire(&context.config.general.state_dir)
                 .map_err(scan_error)?;
         require_absent_daemon(context)?;
         drop(
-            tidemark_scan::orchestrator::open_catalog(&context.config.general.state_dir, true)
+            lock.open_catalog(&context.config.general.state_dir)
                 .map_err(scan_error)?,
         );
     }

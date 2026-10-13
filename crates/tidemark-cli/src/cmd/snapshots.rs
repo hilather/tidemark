@@ -62,7 +62,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         )
         .into());
     }
-    let _lock = if mutation {
+    let lock = if mutation {
         if std::os::unix::net::UnixStream::connect(&context.config.general.socket).is_ok() {
             return Err(crate::CliError::Precondition(
                 "catalog mutation requires the daemon to be stopped".into(),
@@ -77,7 +77,11 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         None
     };
     let catalog = if matches!(args.command, Command::RebuildCatalog { .. }) {
-        tidemark_scan::orchestrator::open_catalog(state, true)?
+        lock.as_ref()
+            .ok_or_else(|| {
+                crate::CliError::Precondition("catalog mutation requires scan ownership".into())
+            })?
+            .open_catalog(state)?
     } else {
         Catalog::open(state, mutation)?
     };

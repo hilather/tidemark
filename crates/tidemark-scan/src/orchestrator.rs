@@ -678,6 +678,32 @@ pub struct ScanLock {
     _file: std::fs::File,
 }
 impl ScanLock {
+    /// Open or recover shared storage while this scan ownership guard is retained.
+    pub fn open_catalog(
+        &self,
+        state: &std::path::Path,
+    ) -> Result<tidemark_store::catalog::Catalog, ScanError> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self._file.metadata()?;
+        let named = std::fs::symlink_metadata(state.join("scan.lock"))?;
+        if held.dev() != named.dev() || held.ino() != named.ino() {
+            return Err(ScanError::Busy);
+        }
+        match tidemark_store::catalog::Catalog::open(state, true) {
+            Ok(catalog) => Ok(catalog),
+            Err(tidemark_store::StoreError::Sql(ref error))
+                if error
+                    .sqlite_error()
+                    .is_some_and(|e| matches!(e.extended_code & 255, 11 | 26)) =>
+            {
+                Ok(tidemark_store::catalog::recover_catalog_with_lock(
+                    state,
+                    &self._file,
+                )?)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
     /// Create only inside state_dir and refuse a concurrent scan.
     pub fn acquire(state: &std::path::Path) -> Result<Self, ScanError> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};

@@ -331,6 +331,30 @@ impl Catalog {
     }
 }
 
+/// Recover with a retained scan-lock descriptor, verifying its identity and exclusion.
+/// All local catalog/sample connections must be closed before calling this function.
+/// The legacy recovery entry point remains for existing callers; production callers
+/// should use this checked entry point.
+pub fn recover_catalog_with_lock(
+    state_dir: &Path,
+    scan_lock: &fs::File,
+) -> Result<Catalog, StoreError> {
+    use std::os::unix::fs::MetadataExt;
+    let held = scan_lock.metadata()?;
+    let named = fs::symlink_metadata(state_dir.join("scan.lock"))?;
+    if !named.is_file() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+        return Err(StoreError::Invalid(
+            "recovery requires the state directory scan lock".into(),
+        ));
+    }
+    rustix::fs::flock(
+        scan_lock,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .map_err(std::io::Error::from)?;
+    recover_catalog(state_dir)
+}
+
 /// Preserve the shared database and sidecars, then rebuild from published snapshots.
 ///
 /// The caller must stop writers and close all catalog/sample connections first.
