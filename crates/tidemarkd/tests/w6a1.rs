@@ -1057,3 +1057,114 @@ fn missing_configured_mount_has_no_sample_or_persistence_and_unhealthy_firstboot
     stop.store(true, Ordering::Release);
     worker.join().unwrap().unwrap();
 }
+
+#[test]
+fn scheduler_consumer_validation_is_shared_by_check_startup_and_reload() {
+    let (_dir, path, cfg) = fixture();
+    let state = LiveState::new(&cfg, 0);
+    let before = state.config();
+    let bytes = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("schedule='off'", "schedule='every 10000000000000000000s'");
+    std::fs::write(&path, bytes).unwrap();
+    let invalid = Config::load(&path).unwrap();
+    assert!(invalid.validate().is_empty());
+    let mut output = Vec::new();
+    assert_eq!(
+        tidemarkd::run_args(
+            &tidemarkd::Args {
+                config: path.clone(),
+                check_config: true
+            },
+            &mut output
+        ),
+        2
+    );
+    assert!(String::from_utf8_lossy(&output).contains("roots[0].schedule"));
+    let result = tidemarkd::run_controlled(
+        invalid,
+        tidemarkd::RunOptions {
+            config_path: path.clone(),
+            now: 0,
+        },
+        state.clone(),
+        Shutdown::default(),
+        Shutdown::default(),
+    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("roots[0].schedule"));
+    let result = tidemarkd::reload_callback(path, state.clone())().unwrap();
+    assert!(!result.reloaded);
+    assert!(result.warnings[0].contains("roots[0].schedule"));
+    assert_eq!(state.config(), before);
+    assert!(state
+        .view()
+        .status(0)
+        .unwrap()
+        .components
+        .iter()
+        .any(|c| c.name == "config" && c.state == "error"));
+}
+
+#[test]
+fn reload_inventory_failure_is_contained_and_active_removed_root_is_retired() {
+    let (_dir, path, cfg) = fixture();
+    let state = LiveState::new(&cfg, 0);
+    let before = state.config();
+    // An unreadable catalog must reject before the configuration changes.
+    let result = tidemarkd::reload_callback(path, state.clone())().unwrap();
+    assert!(!result.reloaded);
+    assert!(!result.warnings.is_empty());
+    assert_eq!(state.config(), before);
+    let root = cfg.roots[0].path.to_string_lossy().into_owned();
+    state
+        .publish(
+            Publication::Scan(ScanStatus {
+                root: root.clone(),
+                running: Some(ScanProgress {
+                    scan_id: "active".into(),
+                    phase: "scan".into(),
+                    dirs: 0,
+                    entries: 0,
+                    started_at: 0,
+                    rate: 0.0,
+                }),
+                last_complete: None,
+                next_due: None,
+            }),
+            health(),
+        )
+        .unwrap();
+    let mut next = cfg.clone();
+    next.roots = (0..128)
+        .map(|n| {
+            let mut r = cfg.roots[0].clone();
+            r.path = cfg.roots[0].path.join(format!("new-{n}"));
+            r
+        })
+        .collect();
+    assert!(state
+        .replace_config(next)
+        .unwrap_err()
+        .to_string()
+        .contains("capacity"));
+    assert_eq!(state.config(), before);
+    let mut next = cfg;
+    next.roots.clear();
+    state.replace_config(next).unwrap();
+    assert_eq!(state.view().scans().unwrap().len(), 1);
+    state
+        .publish(
+            Publication::Scan(ScanStatus {
+                root,
+                running: None,
+                last_complete: None,
+                next_due: None,
+            }),
+            health(),
+        )
+        .unwrap();
+    assert!(state.view().scans().unwrap().is_empty());
+}

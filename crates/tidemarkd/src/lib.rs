@@ -87,14 +87,12 @@ pub fn run_args(args: &Args, output: &mut impl Write) -> u8 {
             return 2;
         }
     };
-    let issues = config.validate();
-    for issue in &issues {
-        let _ = writeln!(output, "{issue}");
-    }
-    if issues.is_empty() {
-        0
-    } else {
-        2
+    match validate_config(&config) {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(output, "{error}");
+            2
+        }
     }
 }
 /// Thin process entry point.
@@ -631,7 +629,18 @@ fn validate_config(c: &tidemark_core::config::Config) -> Result<(), DaemonError>
                 .join("; "),
         ));
     }
-    state::validate_bounds(c)
+    state::validate_bounds(c)?;
+    for (index, root) in c.roots.iter().enumerate() {
+        scheduler::parse_schedule(&root.schedule)
+            .map_err(|e| DaemonError::Config(format!("roots[{index}].schedule: {e}")))?;
+        if let Some(window) = &root.window {
+            scheduler::parse_window(window)
+                .map_err(|e| DaemonError::Config(format!("roots[{index}].window: {e}")))?;
+        }
+    }
+    tidemark_live::alerts::AlertEngine::new(&c.alerts.rule, c.alerts.renotify)
+        .map_err(|e| DaemonError::Config(format!("alerts: {e}")))?;
+    Ok(())
 }
 /// Add state_dir to all collector and scan exclusions before publishing config.
 pub fn protect_config(c: &mut tidemark_core::config::Config) -> Result<(), DaemonError> {
