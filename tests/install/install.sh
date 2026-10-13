@@ -3,6 +3,8 @@
 # TIDEMARK_INSTALL_UPGRADE_RPM must be built with:
 # cargo xtask rpm --native --version 0.1.1 --upgrade-fixture
 set -euo pipefail
+# Compare and display byte-ordered paths consistently in every guest locale.
+export LC_ALL=C
 [[ ${TIDEMARK_DEPLOY_TEST_VM:-} == 1 ]] || { echo 'Requires disposable VM marker TIDEMARK_DEPLOY_TEST_VM=1' >&2; exit 1; }
 # shellcheck disable=SC2164 # set -e exits if this directory change fails.
 cd "$(dirname "$0")/../.."
