@@ -936,6 +936,8 @@ mod tests {
     use super::*;
     #[test]
     fn descriptor_limit_counts_and_unreadable_pressure_are_lossy() {
+        assert_eq!(count_descriptors(1).unwrap(), 1);
+        assert!(count_descriptors(65536).unwrap() > 0);
         assert!(descriptor_limit_with(Some(64), |_| Ok(64)));
         assert!(!descriptor_limit_with(Some(64), |_| Ok(63)));
         assert!(!descriptor_limit_with(None, |_| panic!("unlimited")));
