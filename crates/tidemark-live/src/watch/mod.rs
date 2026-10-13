@@ -174,7 +174,7 @@ pub struct CompletedMinute {
     pub overflow_total_at_end: u64,
     /// Any loss from overflow, recovery, caps, rollback, or a preceding retention gap.
     pub lossy: bool,
-    /// A per-minute list was cut by its storage or requested output cap.
+    /// A per-minute list or distinct-file count was capped by storage or requested output.
     pub truncated: bool,
     /// Ranked directory rows, bounded by the existing completed-minute cap and top_k.
     pub dirs: Vec<HotEntry>,

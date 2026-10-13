@@ -455,6 +455,27 @@ mod tests {
         ]
     }
     #[test]
+    fn diagnostics_distinguish_caps_from_each_transport_loss() {
+        let mut r = Rings::new();
+        r.advance(0);
+        r.read_failure(60, true);
+        r.read_failure(61, false);
+        r.queue_overflow(62);
+        let bucket = r.buckets.back_mut().unwrap();
+        bucket.truncated = true;
+        bucket.distinct_capped = true;
+        let detail = r.detail(62);
+        for reason in [
+            "truncated: distinct-file cap",
+            "lost events: queue overflow",
+            "lost events: read error",
+            "lost events: descriptor pressure",
+            "00:01 UTC (timestamp 60)",
+        ] {
+            assert!(detail.contains(reason), "{detail}");
+        }
+    }
+    #[test]
     fn completed_empty_minutes_and_overflow_boundaries() {
         let mut r = Rings::new();
         r.advance(17);
