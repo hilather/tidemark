@@ -1035,3 +1035,49 @@ Review findings without landed fix notes: core S1 writer rollover failure/superv
 Sources: `docs/reviews/W6-core-review.md`, `docs/reviews/W6-edge-review.md` and the fix notes listed above.
 
 Plan locations: 12 open risks; W7 gate.
+
+---
+
+## Hardening, second guest runs and Wave 7 decisions
+
+Later R5 sections supersede earlier R5 wording where stated. Handoff notes establish implementation evidence, not independent release acceptance.
+
+### R5-1 — No HTTP in v1
+
+**Decision: accepted; open gates explicitly retained.**
+
+ADR-020 removes all network listeners and webhook delivery: metrics are node-exporter textfiles and alerts go to the journal. No ureq or TLS dependency remains; obsolete metrics.listen and alerts.webhook keys are rejected. CODE-drop-http initially permitted AF_UNIX AF_NETLINK; GATE-fix supersedes that with AF_UNIX alone, measured sufficient on both Rocky 8.8 and 8.10. Final guest acceptance remains separate.
+
+Sources: `docs/handoff/CODE-drop-http.md`, `docs/handoff/GATE-fix.md`.
+
+### R5-2 — Daemon core after review
+
+**Decision: accepted; open gates explicitly retained.**
+
+S1: one writer supervisor retains the bounded 64-message queue across worker exits/panics, reports persistence lost, joins workers and retries after 5 seconds doubling to 300; successful persistence resets health. In-flight/buffered messages can be lost. S2: failed collections invalidate alert evidence, preserving display history; freshness is at most three configured intervals and missed failure epochs restart continuity. S3: the mutable ProcScanner is private; readers clone immutable Arc<ProcReport>, never wait on collection. S4: LVM collection retries start at max(interval,300 seconds), double to max(interval,3600 seconds); persistence congestion uses ordinary cadence. S5: operational waits/cadence/backoff/compaction triggers are monotonic; calendar windows, retention and timestamps use wall time. S6/S9 retain R4-11 bounded captured configuration validation and ordered shutdown. S7: sampler publication checks generation and membership atomically. S8: 10,000 configured alert summaries plus one reserved internal state-space summary; diagnostics remain capped at 10,000.
+
+Sources: `docs/handoff/CORE-fix-2.md`, `docs/handoff/CORE-fix-3.md`, `docs/handoff/CORE-fix-1.md`.
+
+### R5-3 — Cancellation and durable outcomes
+
+**Decision: accepted; open gates explicitly retained.**
+
+Operator cancellation does not stop recorder queue/acknowledgement waits: the final failed catalog outcome is always attempted. Only daemon shutdown/shared deadline interrupts recording, with existing eight-second operation limits and 50 ms polls. The cancellation bound covers stopping scan work, excluding subsequent durable syncs, which can stall on busy storage. Interrupted persistence is uncertain and requires crash recovery.
+
+Sources: `docs/handoff/CORE-fix-cancel-record.md`, `docs/handoff/TEST-cancel-deadline.md`.
+
+### R5-4 — Unix API server ownership and limits
+
+**Decision: accepted; open gates explicitly retained.**
+
+Socket ancestry is walked through retained no-follow directory descriptors. Beneath a sticky ancestor the immediately owned private descendant must be mode 0700 for the API policy; unsafe parents are refused, never chmodded. Bind/connect/unlink use the retained parent through procfs and verify socket identity. Startup serializes on <socket>.lock, not a directory lock (DAEMON-misc supersedes EDGE-api). SO_PEERCRED authorizes uid 0 before parsing; unauthorized peers receive EOF with zero response bytes. Frames are JSON lines capped at 1 MiB including newline, with 32 admitted/retained workers. Frame, handler and response-write budgets are separate absolute ten-second limits; partial bytes cannot extend a frame deadline, syscall polling is at most 50 ms. Handlers retain admission ownership and are joined even after timeout. Request cancellation reaches scan admission under R5-19; blocked kernel/SQLite operations remain a limitation.
+
+Sources: `docs/handoff/EDGE-api.md`, `docs/handoff/DAEMON-misc.md`, `docs/handoff/RECHECK-edge.md`.
+
+### R5-5 — Lock files
+
+**Decision: accepted; open gates explicitly retained.**
+
+The exporter flocks <textfile>.tmp and the API flocks <socket>.lock. No component flocks a directory. The host scan lock serializes scans and shared database replacement/recreation; holding an exporter/API lock does not confer scan recovery ownership.
+
+Sources: `docs/handoff/DAEMON-misc.md`.
