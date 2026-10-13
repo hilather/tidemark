@@ -985,16 +985,8 @@ impl LiveStateView {
                 .map(|s| {
                     let rate = v.fs_rate(&s.mount, Duration::from_secs(3600));
                     MountRates {
-                        rate_15m: if v.rate_ready(&s.mount) {
-                            v.fs_rate(&s.mount, Duration::from_secs(900))
-                        } else {
-                            Some(0.0)
-                        },
-                        rate_1h: if v.rate_ready(&s.mount) {
-                            rate
-                        } else {
-                            Some(0.0)
-                        },
+                        rate_15m: v.fs_rate(&s.mount, Duration::from_secs(900)),
+                        rate_1h: rate,
                         ttf: rate.and_then(|r| time_to_full(s.avail, r)),
                         mount: s.mount,
                         size: s.size,
@@ -1413,6 +1405,49 @@ fn interrupt_fs(d: &mut Inner, mount: &str) -> Result<(), crate::DaemonError> {
 #[cfg(test)]
 mod presence_lock_tests {
     use super::*;
+    #[test]
+    fn now_rates_are_missing_until_five_minutes_for_every_window() {
+        let mut config = Config::default();
+        config.sampler.mounts = vec!["/fixture".into()];
+        let state = LiveState::new(&config, 0);
+        for ts in [0, 33, 66, 270, 299, 300] {
+            state
+                .publish(
+                    Publication::Fs(FsSample {
+                        ts,
+                        mount: "/fixture".into(),
+                        size: 10_000,
+                        used: ts as u64,
+                        avail: 10_000 - ts as u64,
+                        inodes: 100,
+                        inodes_used: 1,
+                    }),
+                    crate::component("sampler", "ok", "sampled"),
+                )
+                .unwrap();
+            let view = state.view_at(ts);
+            let report = view.now(&NowParams { mount: None }, ts).unwrap();
+            if ts < 300 {
+                assert!(report.mounts[0].rate_15m.is_none());
+                assert!(report.mounts[0].rate_1h.is_none());
+                assert!(report.mounts[0].ttf_secs.is_none());
+                for window in [60, 300, 900, 3600] {
+                    assert!(view
+                        .fs_rate("/fixture", Duration::from_secs(window))
+                        .is_none());
+                }
+            } else {
+                assert_eq!(report.mounts[0].rate_15m, Some(1.0));
+                assert_eq!(report.mounts[0].rate_1h, Some(1.0));
+                for window in [60, 300, 900, 3600] {
+                    assert_eq!(
+                        view.fs_rate("/fixture", Duration::from_secs(window)),
+                        Some(1.0)
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn blocked_resolution_and_logging_leave_readers_free_and_reject_stale_generation() {
         for phase in [0, 1, 2] {
