@@ -379,12 +379,22 @@ impl Browser {
             parent_id: self.dir.parent_id,
             ..rows.root
         };
+        let growth_unavailable =
+            rows.children.len() > 10_000 && self.state.sort == state::Sort::Growth;
+        if growth_unavailable {
+            self.state.sort = state::Sort::Name;
+        }
         self.pages.live = Some(rows.children);
         self.pages.live_order = Some(rows.sort);
         self.pages.live_growth = rows.growth;
         self.pages.offset = 0;
         self.load()?;
-        self.message = "live values; delta against snapshot".into();
+        self.message = if growth_unavailable {
+            "live values; delta against snapshot; growth exceeds 10,000 children, showing name"
+                .into()
+        } else {
+            "live values; delta against snapshot".into()
+        };
         Ok(())
     }
     fn deltas(&mut self, height: usize, all: bool) -> anyhow::Result<()> {

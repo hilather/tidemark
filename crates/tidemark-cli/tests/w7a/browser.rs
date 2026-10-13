@@ -564,3 +564,34 @@ fn live_growth_order_keeps_snapshot_display_deltas() {
     assert_eq!(rows[0].1, Some(-100));
     assert_eq!(rows[1].1, Some(100));
 }
+
+#[test]
+fn live_additions_exceeding_growth_cap_fall_back_without_exiting() {
+    let (_temp, mut b) = browser(1);
+    b.state.sort = state::Sort::Growth;
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+    });
+    let children = (1..=10_001)
+        .map(|id| {
+            (
+                fixture::row(id, Some(0), format!("/fixture/{id:08}").as_bytes(), 1),
+                Some(1),
+            )
+        })
+        .collect();
+    tx.send(Ok(LiveResult {
+        root: b.dir.clone(),
+        children,
+        sort: state::Sort::Growth,
+        growth: Default::default(),
+    }))
+    .unwrap();
+    b.poll_refresh().unwrap();
+    assert_eq!(b.state.sort, state::Sort::Name);
+    assert_eq!(b.rows.len(), PAGE);
+    assert!(b.message.contains("showing name"));
+}
