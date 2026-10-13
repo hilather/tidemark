@@ -1301,7 +1301,10 @@ mod tests {
                 flag.store(true, Ordering::Release);
                 Err(DaemonError::Shutdown)
             }));
-            let (mut stream, stop, handle) = pair(reload, Duration::from_millis(100));
+            // Allow the client to be scheduled under workspace load before the
+            // idle deadline closes the pair. The three-second reader limit
+            // still fails if the callback does not observe its real deadline.
+            let (mut stream, stop, handle) = pair(reload, Duration::from_secs(1));
             stream
                 .get_mut()
                 .write_all(b"{\"v\":1,\"id\":\"x\",\"method\":\"config.reload\",\"params\":{}}\n")
