@@ -120,12 +120,12 @@ fn run_scan_with_environment(
     let excludes = globs
         .build()
         .map_err(|e| ScanError::Configuration(e.to_string()))?;
+    let catalog = tidemark_store::catalog::Catalog::open(&cfg.general.state_dir, true)?;
     let _lock = ScanLock::acquire(&cfg.general.state_dir)?;
     let preflight_now = clock();
     tidemark_store::catalog::cleanup_abandoned_scans(&cfg.general.state_dir, preflight_now);
     // The daemon can have a live sample writer: recovery belongs to startup,
     // or to the daemon-absent CLI preflight with all connections closed.
-    let catalog = tidemark_store::catalog::Catalog::open(&cfg.general.state_dir, true)?;
     let previous = catalog.latest(&req.root)?;
     let mounts = mount::read_mountinfo()?;
     let mount = mount::mount_for_path(&mounts, &req.root)
@@ -704,6 +704,18 @@ impl ScanLock {
             Err(error) => Err(error.into()),
         }
     }
+    /// Recover while the caller retains writer ownership acquired before this lock.
+    pub fn recover_catalog(
+        &self,
+        state: &std::path::Path,
+        lease: &tidemark_store::lease::RecoveryLease,
+    ) -> Result<Vec<std::path::PathBuf>, ScanError> {
+        Ok(tidemark_store::catalog::recover_catalog_with_leases(
+            state,
+            &self._file,
+            lease,
+        )?)
+    }
     /// Create only inside state_dir and refuse a concurrent scan.
     pub fn acquire(state: &std::path::Path) -> Result<Self, ScanError> {
         let directory = tidemark_store::state_dir::StateDir::open(state, true)?;
@@ -734,7 +746,33 @@ pub fn open_catalog(
     rw: bool,
 ) -> Result<tidemark_store::catalog::Catalog, ScanError> {
     if rw {
-        ScanLock::acquire(state)?.open_catalog(state)
+        let needs_recovery = matches!(tidemark_store::catalog::Catalog::open(state, false), Err(tidemark_store::StoreError::Sql(ref e)) if e.sqlite_error().is_some_and(|e| matches!(e.extended_code & 255, 11 | 26)));
+        if needs_recovery {
+            let lease = tidemark_store::lease::RecoveryLease::acquire(
+                state,
+                std::time::Duration::from_secs(30),
+            )?;
+            let lock = ScanLock::acquire(state)?;
+            let files = match tidemark_store::catalog::Catalog::open(state, false) {
+                Ok(_) => Vec::new(),
+                Err(tidemark_store::StoreError::Sql(ref e))
+                    if e.sqlite_error()
+                        .is_some_and(|e| matches!(e.extended_code & 255, 11 | 26)) =>
+                {
+                    lock.recover_catalog(state, &lease)?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            drop(lock);
+            drop(lease);
+            Ok(tidemark_store::catalog::Catalog::open_after_recovery(
+                state, files,
+            )?)
+        } else {
+            let catalog = tidemark_store::catalog::Catalog::open(state, true)?;
+            let _lock = ScanLock::acquire(state)?;
+            Ok(catalog)
+        }
     } else {
         Ok(tidemark_store::catalog::Catalog::open(state, false)?)
     }

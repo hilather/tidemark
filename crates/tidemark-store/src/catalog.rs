@@ -58,6 +58,7 @@ pub struct ScanEntry {
 /// Lists are capped at 1,000,000 rows; select a root when exceeding that bound.
 pub struct Catalog {
     conn: Connection,
+    _lease: Option<crate::lease::WriterLease>,
     state_dir: PathBuf,
     recovery_files: Vec<PathBuf>,
 }
@@ -117,11 +118,28 @@ impl Catalog {
     /// Open the source-of-truth catalog, optionally applying sample migrations.
     pub fn open(state_dir: &Path, rw: bool) -> Result<Self, StoreError> {
         crate::state_dir::StateDir::open(state_dir, rw)?;
+        let (conn, lease) = if rw {
+            let (conn, lease) =
+                crate::timeseries::open_writer_connection(&state_dir.join("timeseries.db"))?;
+            (conn, Some(lease))
+        } else {
+            (
+                crate::timeseries::open_connection(&state_dir.join("timeseries.db"), false, None)?,
+                None,
+            )
+        };
         Ok(Self {
-            conn: crate::timeseries::open_connection(&state_dir.join("timeseries.db"), rw)?,
+            conn,
             state_dir: state_dir.to_owned(),
             recovery_files: Vec::new(),
+            _lease: lease,
         })
+    }
+    /// Open normally after releasing recovery ownership, retaining artifact paths.
+    pub fn open_after_recovery(state: &Path, files: Vec<PathBuf>) -> Result<Self, StoreError> {
+        let mut catalog = Self::open(state, true)?;
+        catalog.recovery_files = files;
+        Ok(catalog)
     }
     /// Paths preserved by explicit recovery; historical samples remain in these files.
     pub fn recovery_files(&self) -> &[PathBuf] {
@@ -383,6 +401,22 @@ pub fn recover_catalog_with_lock(
     state_dir: &Path,
     scan_lock: &fs::File,
 ) -> Result<Catalog, StoreError> {
+    let lease = crate::lease::RecoveryLease::acquire(state_dir, std::time::Duration::from_secs(2))?;
+    let files = recover_catalog_with_leases(state_dir, scan_lock, &lease)?;
+    drop(lease);
+    let mut catalog = Catalog::open(state_dir, true)?;
+    catalog.recovery_files = files;
+    Ok(catalog)
+}
+
+/// Recover under exclusive writer ownership and retained scan ownership.
+/// Close all local writers first; acquire writer ownership before scan ownership.
+pub fn recover_catalog_with_leases(
+    state_dir: &Path,
+    scan_lock: &fs::File,
+    lease: &crate::lease::RecoveryLease,
+) -> Result<Vec<PathBuf>, StoreError> {
+    lease.verify(state_dir)?;
     use std::os::unix::fs::MetadataExt;
     let verified = crate::state_dir::StateDir::open(state_dir, false)?;
     verified.check_leaf(std::ffi::OsStr::new("scan.lock"))?;
@@ -398,7 +432,7 @@ pub fn recover_catalog_with_lock(
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
     )
     .map_err(std::io::Error::from)?;
-    recover_catalog_owned(state_dir)
+    recover_catalog_owned(state_dir, lease)
 }
 
 /// Preserve the shared database and sidecars, then rebuild from published snapshots.
@@ -409,6 +443,7 @@ pub fn recover_catalog_with_lock(
 /// Historical samples remain in `Catalog::recovery_files()` and are unavailable in
 /// the new database. Ordinary `Catalog::open` never performs this recovery.
 pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError> {
+    let lease = crate::lease::RecoveryLease::acquire(state_dir, std::time::Duration::from_secs(2))?;
     let verified = crate::state_dir::StateDir::open(state_dir, false)?;
     for name in [
         "timeseries.db",
@@ -428,9 +463,18 @@ pub fn recover_catalog(state_dir: &Path) -> Result<Catalog, StoreError> {
         Err(error) => return Err(error.into()),
     }
     let lock = verified.open_leaf(std::ffi::OsStr::new("scan.lock"), true, true)?;
-    recover_catalog_with_lock(state_dir, &lock)
+    let files = recover_catalog_with_leases(state_dir, &lock, &lease)?;
+    drop(lock);
+    drop(lease);
+    let mut catalog = Catalog::open(state_dir, true)?;
+    catalog.recovery_files = files;
+    Ok(catalog)
 }
-fn recover_catalog_owned(state_dir: &Path) -> Result<Catalog, StoreError> {
+fn recover_catalog_owned(
+    state_dir: &Path,
+    lease: &crate::lease::RecoveryLease,
+) -> Result<Vec<PathBuf>, StoreError> {
+    lease.verify(state_dir)?;
     let verified = crate::state_dir::StateDir::open(state_dir, false)?;
     for name in [
         "timeseries.db",
@@ -468,7 +512,16 @@ fn recover_catalog_owned(state_dir: &Path) -> Result<Catalog, StoreError> {
     let recovery =
         recovery.ok_or_else(|| StoreError::Invalid("recovery namespace exhausted".into()))?;
     let mut preserved = Vec::new();
-    for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
+    for name in [
+        "timeseries.db",
+        "timeseries.db-wal",
+        "timeseries.db-shm",
+        "timeseries.db-journal",
+        "timeseries.db.bak-v0",
+        "timeseries.db.bak-v0-wal",
+        "timeseries.db.bak-v0-shm",
+        "timeseries.db.bak-v0-journal",
+    ] {
         let source = state_dir.join(name);
         let destination = recovery.join(name);
         match fs::rename(&source, &destination) {
@@ -482,10 +535,19 @@ fn recover_catalog_owned(state_dir: &Path) -> Result<Catalog, StoreError> {
     }
     fs::File::open(&recovery)?.sync_all()?;
     fs::File::open(state_dir)?.sync_all()?;
-    let mut catalog = Catalog::open(state_dir, true)?;
-    catalog.recovery_files = preserved;
+    let catalog = Catalog {
+        conn: crate::timeseries::open_connection(
+            &state_dir.join("timeseries.db"),
+            true,
+            Some(lease),
+        )?,
+        state_dir: state_dir.to_owned(),
+        recovery_files: Vec::new(),
+        _lease: None,
+    };
     catalog.rebuild_from_files()?;
-    Ok(catalog)
+    drop(catalog);
+    Ok(preserved)
 }
 
 /// Repair abandoned scans and remove snapshot temporaries, best effort.

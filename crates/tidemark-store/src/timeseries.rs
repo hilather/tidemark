@@ -20,6 +20,7 @@ pub(crate) const SCHEMA: &str = include_str!("../migrations/timeseries-v1.sql");
 /// Query results are capped at 1,000,000 rows; narrow ranges exceeding that bound.
 pub struct TimeSeries {
     pub(crate) conn: Connection,
+    _lease: Option<crate::lease::WriterLease>,
 }
 /// Counts changed by an idempotent compaction.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +30,41 @@ pub struct CompactStats {
     /// Expired rows deleted across all tables.
     pub deleted: u64,
 }
-pub(crate) fn open_connection(path: &Path, rw: bool) -> Result<Connection, StoreError> {
+pub(crate) fn open_writer_connection(
+    path: &Path,
+) -> Result<(Connection, crate::lease::WriterLease), StoreError> {
+    let parent = crate::state_dir::file_parent(path)?;
+    // Inspect before taking shared ownership: migration requires absence of all writers.
+    let initialize = match open_connection(path, false, None) {
+        Ok(_) => false,
+        Err(StoreError::Invalid(ref text)) if text == "uninitialized timeseries database" => true,
+        Err(StoreError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(StoreError::Sql(ref error))
+            if error
+                .sqlite_error()
+                .is_some_and(|e| e.extended_code & 255 == 14)
+                && !path.exists() =>
+        {
+            true
+        }
+        Err(error) => return Err(error),
+    };
+    if initialize {
+        let lease =
+            crate::lease::RecoveryLease::acquire(&parent, std::time::Duration::from_secs(2))?;
+        let conn = open_connection(path, true, Some(&lease))?;
+        drop(conn);
+        drop(lease);
+    }
+    let lease = crate::lease::WriterLease::acquire(&parent)?;
+    let conn = open_connection(path, true, None)?;
+    Ok((conn, lease))
+}
+pub(crate) fn open_connection(
+    path: &Path,
+    rw: bool,
+    recovery: Option<&crate::lease::RecoveryLease>,
+) -> Result<Connection, StoreError> {
     let parent = crate::state_dir::file_parent(path)?;
     let name = path
         .file_name()
@@ -58,6 +93,11 @@ pub(crate) fn open_connection(path: &Path, rw: bool) -> Result<Connection, Store
         preflight_header(path)?;
     }
     if rw && !existing {
+        recovery
+            .ok_or_else(|| {
+                StoreError::Invalid("database creation requires exclusive writer ownership".into())
+            })?
+            .verify(&parent)?;
         directory.open_leaf(name, true, true)?;
     }
     check()?;
@@ -82,27 +122,12 @@ pub(crate) fn open_connection(path: &Path, rw: bool) -> Result<Connection, Store
                 "uninitialized timeseries database".into(),
             ));
         }
+        let lease = recovery.ok_or_else(|| {
+            StoreError::Invalid("initialization requires exclusive writer ownership".into())
+        })?;
+        lease.verify(&parent)?;
         if existing {
-            let mut backup = path.as_os_str().to_os_string();
-            backup.push(".bak-v0");
-            let backup = std::path::PathBuf::from(backup);
-            if backup.try_exists()? {
-                return Err(StoreError::Invalid(
-                    "migration backup already exists".into(),
-                ));
-            }
-            let file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&backup)?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            let target = crate::catalog::SqlPath(backup.as_os_str().as_bytes());
-            conn.execute("VACUUM INTO ?", [target])?;
-            std::fs::File::open(&backup)?.sync_all()?;
-            if let Some(parent) = backup.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::File::open(parent)?.sync_all()?;
-            }
+            backup_v0(&conn, path, lease)?;
         }
         migration_v1(&conn)?;
     }
@@ -110,6 +135,35 @@ pub(crate) fn open_connection(path: &Path, rw: bool) -> Result<Connection, Store
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     }
     Ok(conn)
+}
+// Database backup creation requires absence of all live writer handles.
+fn backup_v0(
+    conn: &Connection,
+    path: &Path,
+    lease: &crate::lease::RecoveryLease,
+) -> Result<(), StoreError> {
+    lease.verify(&crate::state_dir::file_parent(path)?)?;
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".bak-v0");
+    let backup = std::path::PathBuf::from(backup);
+    if backup.try_exists()? {
+        return Err(StoreError::Invalid(
+            "migration backup already exists".into(),
+        ));
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&backup)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let target = crate::catalog::SqlPath(backup.as_os_str().as_bytes());
+    conn.execute("VACUUM INTO ?", [target])?;
+    std::fs::File::open(&backup)?.sync_all()?;
+    if let Some(parent) = backup.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 // Inspect only our own state file before SQLite can mutate its sidecars.
 fn preflight_header(path: &Path) -> Result<(), StoreError> {
@@ -158,8 +212,15 @@ fn resolution(from: i64, to: i64) -> i64 {
 impl TimeSeries {
     /// Open a sample database; writable opens apply numbered migrations.
     pub fn open(path: &Path, rw: bool) -> Result<Self, StoreError> {
+        let (conn, lease) = if rw {
+            let (conn, lease) = open_writer_connection(path)?;
+            (conn, Some(lease))
+        } else {
+            (open_connection(path, false, None)?, None)
+        };
         Ok(Self {
-            conn: open_connection(path, rw)?,
+            conn,
+            _lease: lease,
         })
     }
     /// Append fs_samples rows atomically with checked integer values.

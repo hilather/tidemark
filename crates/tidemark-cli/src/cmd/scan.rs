@@ -156,6 +156,9 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         .into());
     }
     require_absent_daemon(context)?;
+    drop(offline_catalog(context)?);
+    let _writer_lease =
+        tidemark_store::lease::WriterLease::acquire(&context.config.general.state_dir)?;
     {
         // Recover only in direct mode, under the scan lock, before any recorder
         // or catalog connections are retained.
@@ -337,6 +340,52 @@ pub(crate) fn daemon_connection(
         }
     }
 }
+/// Prepare offline storage with definitive daemon absence checked under recovery locks.
+pub(crate) fn offline_catalog(
+    context: &crate::Context,
+) -> anyhow::Result<tidemark_store::catalog::Catalog> {
+    let state = &context.config.general.state_dir;
+    require_absent_daemon(context)?;
+    let needs_recovery = match tidemark_store::catalog::Catalog::open(state, false) {
+        Ok(_) => false,
+        Err(tidemark_store::StoreError::Sql(ref e))
+            if e.sqlite_error()
+                .is_some_and(|e| matches!(e.extended_code & 255, 11 | 26)) =>
+        {
+            true
+        }
+        Err(_) => !state.join("timeseries.db").exists(),
+    };
+    if needs_recovery {
+        let lease = tidemark_store::lease::RecoveryLease::acquire(
+            state,
+            std::time::Duration::from_secs(30),
+        )?;
+        let lock = tidemark_scan::orchestrator::ScanLock::acquire(state).map_err(scan_error)?;
+        require_absent_daemon(context)?;
+        let files = match tidemark_store::catalog::Catalog::open(state, false) {
+            Ok(_) => Vec::new(),
+            Err(tidemark_store::StoreError::Sql(ref e))
+                if e.sqlite_error()
+                    .is_some_and(|e| matches!(e.extended_code & 255, 11 | 26)) =>
+            {
+                lock.recover_catalog(state, &lease).map_err(scan_error)?
+            }
+            Err(_) if !state.join("timeseries.db").exists() => {
+                lock.recover_catalog(state, &lease).map_err(scan_error)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        drop(lock);
+        drop(lease);
+        Ok(tidemark_store::catalog::Catalog::open_after_recovery(
+            state, files,
+        )?)
+    } else {
+        Ok(tidemark_store::catalog::Catalog::open(state, true)?)
+    }
+}
+
 fn require_absent_daemon(context: &crate::Context) -> anyhow::Result<()> {
     if daemon_connection(context)?.is_some() {
         return Err(crate::CliError::Precondition(

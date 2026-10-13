@@ -26,6 +26,9 @@ pub mod writer;
 /// Verified state-directory trust boundary.
 pub mod state_dir;
 
+/// State-wide writer and recovery leases.
+pub mod lease;
+
 mod error;
 
 pub use error::StoreError;

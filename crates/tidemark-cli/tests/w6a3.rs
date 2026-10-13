@@ -1261,3 +1261,75 @@ fn unavailable_process_measurements_keep_daemon_reason_and_name_method() {
         );
     }
 }
+
+#[test]
+fn pre_api_writer_child() {
+    let Some(state) = std::env::var_os("TIDEMARK_CLI_LEASE_CHILD") else {
+        return;
+    };
+    let state = std::path::PathBuf::from(state);
+    let _catalog = tidemark_store::catalog::Catalog::open(&state, true).unwrap();
+    let _series =
+        tidemark_store::timeseries::TimeSeries::open(&state.join("timeseries.db"), true).unwrap();
+    test_support::private_write(state.join("ready"), b"ready").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+#[test]
+fn rebuild_refuses_pre_api_writer_without_renaming() {
+    use std::{
+        os::unix::fs::MetadataExt,
+        time::{Duration, Instant},
+    };
+    let dir = test_support::private_tempdir().unwrap();
+    let p = config(&dir);
+    let state = dir.path().join("state");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pre_api_writer_child"])
+        .env("TIDEMARK_CLI_LEASE_CHILD", &state)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !state.join("ready").exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut originals = Vec::new();
+    for name in ["timeseries.db", "timeseries.db-wal", "timeseries.db-shm"] {
+        let path = state.join(name);
+        test_support::private_write(&path, b"deliberate corruption").unwrap();
+        originals.push((path.clone(), std::fs::metadata(path).unwrap().ino()));
+    }
+    let start = Instant::now();
+    let out = Command::new("timeout")
+        .arg("40s")
+        .arg(env!("CARGO_BIN_EXE_tidemark"))
+        .arg("-c")
+        .arg(&p)
+        .args(["snapshots", "rebuild-catalog"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("state directory in use by another tidemark process"));
+    assert!(start.elapsed() < Duration::from_secs(35));
+    for (path, inode) in originals {
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(path).unwrap(), b"deliberate corruption");
+    }
+    assert!(!state.join("timeseries-recovery-0").exists());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let out = cli(&p, &["snapshots", "rebuild-catalog"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(state.join("timeseries-recovery-0/timeseries.db").exists());
+}
