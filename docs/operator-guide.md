@@ -57,7 +57,7 @@ dir_metrics_depth = 2
 max_series_per_metric = 500
 ```
 
-Keep `general.state_dir` on local storage, normally `/var/lib/tidemark` on the root filesystem, away from the busy data array where possible. Tidemark excludes its own state automatically. Stage requires an allowlisted local state filesystem (or the longest existing ancestor if the directory is missing); network or unsupported storage is refused. Validate the full candidate:
+Keep `general.state_dir` on local storage, normally `/var/lib/tidemark` on the root filesystem, away from the busy data array where possible. Tidemark excludes its own state automatically. Stage requires an allowlisted local state filesystem (or the longest existing ancestor if the directory is missing); network or unsupported storage is refused. The stage allowlist is xfs, ext2, ext3, ext4, btrfs, tmpfs, zfs, f2fs, jfs and reiserfs; unknown types block. Use persistent storage for retained production history. Validate the full candidate:
 
 ```sh
 sudo tidemarkd --check-config --config ./tidemark.toml
@@ -83,7 +83,7 @@ sudo tidemark now
 sudo tidemark hot --mount /data --window 5m
 ```
 
-Verify returns 0 only when healthy, and 6 when not healthy yet or timed out. Archive machine results with `sudo tidemark --json deploy verify --wait 5m`. `--start-now` on stage is available for an approved immediate start. The global `--config` names the installed destination; `--from` names the independent source candidate. See [failed verification](runbooks/deploy-verify-failed.md).
+Verify requires an active service, matching staged/firstboot config hashes, healthy sampler/scheduler/api/tswriter components and a working API ping. It returns 0 when these checks pass, and 6 when not healthy yet or timed out. Other collectors can still be degraded or disabled: inspect status before relying on their reports. Archive machine results with `sudo tidemark --json deploy verify --wait 5m`. `--start-now` on stage is available for an approved immediate start. The global `--config` names the installed destination; `--from` names the independent source candidate. See [failed verification](runbooks/deploy-verify-failed.md).
 
 ## What is filling the filesystem now?
 
@@ -249,7 +249,7 @@ RULE  SUBJECT  SINCE                 VALUE  MESSAGE
 full  /data    1970-01-01 00:00:01Z  90     full
 ```
 
-Rules use `for` before firing (default 5m), `resolve_for` before resolving (default 10m), and `[alerts].renotify` (default 4h). If a collector is disabled or its data is unavailable, a rule is **not evaluable**: it must not be treated as healthy or zero. Review degraded reasons and journal diagnostics. Defining an explicit rule list replaces the built-in defaults; include all rules you intend to keep.
+Rules use `for` before firing (default 5m), `resolve_for` before resolving (default 10m), and `[alerts].renotify` (default 4h). If a collector is disabled or its data is unavailable, a rule is **not evaluable**: it must not be treated as healthy or zero. Review degraded reasons and journal diagnostics. Rules are merged by name with built-in defaults. Override a default using its exact name (or set its `enabled = false`); a differently named rule is an additional rule. Review the full effective set.
 
 | Kind | Use |
 |---|---|
@@ -263,7 +263,7 @@ Rules use `for` before firing (default 5m), `resolve_for` before resolving (defa
 | `scan_stale` | `root`, `older_than` duration or `auto` (twice effective cadence). |
 | `watch_lossy` | `mount`, numeric `above` overflow count, `window`. |
 
-Example addition to a full intended rule list:
+Example additional rule (review default rules too):
 
 ```toml
 [[alerts.rule]]
