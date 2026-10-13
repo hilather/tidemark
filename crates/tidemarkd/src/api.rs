@@ -12,6 +12,76 @@ use std::{
 };
 use tidemark_core::api::*;
 const LIMIT: usize = 1024 * 1024;
+/// Pure incremental JSON-line framing state, bounded to one MiB including newline.
+/// Reuse after Incomplete to supply more bytes, or after InvalidJson for the next
+/// line. No transport, thread, peer check or clock is stored here.
+#[doc(hidden)]
+pub struct FrameDecoder {
+    line: Vec<u8>,
+}
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self {
+            line: Vec::with_capacity(8192),
+        }
+    }
+}
+/// Typed refusals from the pure request framing seam.
+#[derive(Debug, thiserror::Error)]
+#[doc(hidden)]
+pub enum FrameError {
+    /// Input ended with no pending frame.
+    #[error("end of input")]
+    EndOfInput,
+    /// EOF before newline; decoder retains the bounded partial frame.
+    #[error("incomplete request line")]
+    Incomplete,
+    /// Limit counts the terminating newline, matching the connection handler.
+    #[error("request line exceeds 1 MiB")]
+    TooLarge,
+    /// A complete line did not decode as a Request; decoder is reset.
+    #[error("{0}")]
+    InvalidJson(serde_json::Error),
+    /// Read failure; the caller decides whether to retry or close.
+    #[error("{0}")]
+    Io(std::io::Error),
+}
+/// Read one JSON-line request, leaving subsequent bytes unread.
+/// Work is linear in bytes read, with at most LIMIT bytes of framing capacity.
+/// EOF returns EndOfInput/Incomplete. Read errors return immediately (including
+/// Interrupted), so an adversarial reader cannot trigger a retry loop here.
+/// The connection owns retries, timeouts, credentials and dispatch.
+#[doc(hidden)]
+pub fn read_frame(
+    reader: &mut impl Read,
+    decoder: &mut FrameDecoder,
+) -> Result<Request, FrameError> {
+    let mut byte = [0];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                return Err(if decoder.line.is_empty() {
+                    FrameError::EndOfInput
+                } else {
+                    FrameError::Incomplete
+                })
+            }
+            Ok(_) => {}
+            Err(error) => return Err(FrameError::Io(error)),
+        }
+        if decoder.line.len() + 1 > LIMIT {
+            return Err(FrameError::TooLarge);
+        }
+        if byte[0] != b'\n' {
+            decoder.line.push(byte[0]);
+            continue;
+        }
+        let result = serde_json::from_slice(&decoder.line).map_err(FrameError::InvalidJson);
+        decoder.line.clear();
+        return result;
+    }
+}
+
 const CONNECTIONS: usize = 32;
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Cooperative request cancellation and absolute handler deadline.
@@ -331,7 +401,7 @@ fn connection(
         return;
     }
     let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-    let mut line = Vec::with_capacity(8192);
+    let mut frame = FrameDecoder::default();
     let mut buffer = [0; 8192];
     let permit = Arc::new(permit);
     while !shutdown.load(Ordering::Acquire) && Instant::now() < read_deadline {
@@ -354,23 +424,21 @@ fn connection(
             if shutdown.load(Ordering::Acquire) || Instant::now() >= read_deadline {
                 return;
             }
-            if line.len() + 1 > LIMIT {
-                let _ = send(
-                    &mut stream,
-                    &error("", ApiErrorCode::BadRequest, "request line exceeds 1 MiB"),
-                    &shutdown,
-                    timeout,
-                );
-                return;
-            }
-            if b != b'\n' {
-                line.push(b);
-                continue;
-            }
-            let request: Request = match serde_json::from_slice(&line) {
-                Ok(r) => r,
-                Err(e) => {
-                    line.clear();
+            // Keep the existing per-byte shutdown/deadline boundary above.
+            // The pure seam retains incomplete bytes across one-byte slices.
+            let request = match read_frame(&mut std::slice::from_ref(&b), &mut frame) {
+                Ok(request) => request,
+                Err(FrameError::Incomplete) => continue,
+                Err(FrameError::TooLarge) => {
+                    let _ = send(
+                        &mut stream,
+                        &error("", ApiErrorCode::BadRequest, "request line exceeds 1 MiB"),
+                        &shutdown,
+                        timeout,
+                    );
+                    return;
+                }
+                Err(FrameError::InvalidJson(e)) => {
                     if send(
                         &mut stream,
                         &error("", ApiErrorCode::BadRequest, e.to_string()),
@@ -384,8 +452,8 @@ fn connection(
                     read_deadline = Instant::now() + timeout;
                     continue;
                 }
+                Err(_) => return,
             };
-            line.clear();
             tracing::info!(uid, pid, method = %request.method, "API request");
             let scan_start = request.method == "scan.start";
             let id = request.id.clone();
@@ -872,9 +940,119 @@ impl AcceptPressure {
     }
 }
 #[cfg(test)]
+#[path = "../../../fuzz/support/seams.rs"]
+mod fuzz_seams;
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    const FRAME_SEED: &[u8] = include_bytes!("../../../fuzz/corpus/api_frame/sample");
+    fn exercise_frame(bytes: &[u8]) {
+        let mut input = bytes;
+        let mut decoder = FrameDecoder::default();
+        let mut calls = 0;
+        loop {
+            let before = input.len();
+            let result = read_frame(&mut input, &mut decoder);
+            assert!(decoder.line.len() <= LIMIT);
+            assert!(decoder.line.capacity() <= LIMIT);
+            calls += 1;
+            assert!(calls <= bytes.len() + 1);
+            match result {
+                Ok(_) | Err(FrameError::InvalidJson(_)) => assert!(input.len() < before),
+                Err(_) => break,
+            }
+        }
+    }
+    #[test]
+    fn frame_arbitrary_bytes_and_mutated_valid_requests() {
+        super::fuzz_seams::generated(exercise_frame, &[FRAME_SEED, b"{}\n", b"\xff\n"]);
+    }
+    #[test]
+    fn frame_round_trip_chunking_and_typed_refusals() {
+        let mut decoder = FrameDecoder::default();
+        let mut input = FRAME_SEED;
+        let request = read_frame(&mut input, &mut decoder).unwrap();
+        assert_eq!(request.id, "x");
+        assert_eq!(request.method, "status");
+        assert_eq!(request.v, 1);
+        assert_eq!(request.params, serde_json::json!({}));
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        assert_eq!(
+            read_frame(&mut encoded.as_slice(), &mut decoder)
+                .unwrap()
+                .id,
+            "x"
+        );
+        for byte in &FRAME_SEED[..FRAME_SEED.len() - 1] {
+            assert!(matches!(
+                read_frame(&mut std::slice::from_ref(byte), &mut decoder),
+                Err(FrameError::Incomplete)
+            ));
+        }
+        assert_eq!(
+            read_frame(&mut b"\n".as_slice(), &mut decoder).unwrap().id,
+            "x"
+        );
+        assert!(matches!(
+            read_frame(&mut b"".as_slice(), &mut decoder),
+            Err(FrameError::EndOfInput)
+        ));
+        let mut two = b"bad\n".to_vec();
+        two.extend_from_slice(FRAME_SEED);
+        let mut input = two.as_slice();
+        assert!(matches!(
+            read_frame(&mut input, &mut decoder),
+            Err(FrameError::InvalidJson(_))
+        ));
+        assert_eq!(input, FRAME_SEED);
+        assert_eq!(read_frame(&mut input, &mut decoder).unwrap().id, "x");
+    }
+    #[test]
+    fn frame_limit_includes_newline_and_read_failures_do_not_spin() {
+        let mut exact = vec![b' '; LIMIT - FRAME_SEED.len()];
+        exact.extend_from_slice(FRAME_SEED);
+        assert_eq!(exact.len(), LIMIT);
+        assert!(read_frame(&mut exact.as_slice(), &mut FrameDecoder::default()).is_ok());
+        exact.insert(0, b' ');
+        let mut input = exact.as_slice();
+        let mut decoder = FrameDecoder::default();
+        assert!(matches!(
+            read_frame(&mut input, &mut decoder),
+            Err(FrameError::TooLarge)
+        ));
+        assert!(decoder.line.capacity() <= LIMIT);
+        struct Interrupted;
+        impl Read for Interrupted {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::Interrupted.into())
+            }
+        }
+        assert!(matches!(
+            read_frame(&mut Interrupted, &mut FrameDecoder::default()),
+            Err(FrameError::Io(_))
+        ));
+    }
+    #[test]
+    fn frame_large_inputs_and_scaling() {
+        // Whitespace has no newline and exercises full-buffer framing.
+        super::fuzz_seams::scaling(b" ", exercise_frame);
+        for byte in [0, 255, b'9'] {
+            super::fuzz_seams::timed(&vec![byte; LIMIT + 1], exercise_frame);
+        }
+        let mut deep = b"{\"v\":1,\"id\":\"x\",\"method\":\"status\",\"params\":".to_vec();
+        deep.extend(std::iter::repeat_n(b'[', 512));
+        deep.extend(std::iter::repeat_n(b']', 512));
+        deep.extend_from_slice(b"}\n");
+        assert!(matches!(
+            read_frame(&mut deep.as_slice(), &mut FrameDecoder::default()),
+            Err(FrameError::InvalidJson(_))
+        ));
+        super::fuzz_seams::timed(&deep, exercise_frame);
+    }
+
     use std::io::{BufRead, BufReader};
     fn pair(
         reload: Reload,

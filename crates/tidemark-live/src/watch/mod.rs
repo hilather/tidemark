@@ -636,7 +636,9 @@ fn mount_mark_path(fd: &impl AsRawFd) -> std::path::PathBuf {
     // retained directory itself, rather than the procfs descriptor symlink.
     std::path::PathBuf::from(format!("/proc/self/fd/{}/.", fd.as_raw_fd()))
 }
-fn parse_mount_id(text: &str) -> io::Result<u64> {
+/// Test support for the fdinfo parser; production callers use mount_identity.
+#[doc(hidden)]
+pub fn parse_mount_id(text: &str) -> io::Result<u64> {
     text.lines()
         .find_map(|line| line.strip_prefix("mnt_id:"))
         .and_then(|id| id.trim().parse().ok())

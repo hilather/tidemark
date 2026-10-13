@@ -9,6 +9,8 @@ cargo-fuzz = true
 [workspace]
 [dependencies]
 libfuzzer-sys = "0.4"
+tidemark-sys = { path = "../crates/tidemark-sys" }
+tidemark-live = { path = "../crates/tidemark-live" }
 tidemark-fs = { path = "../crates/tidemark-fs" }
 tidemark-core = { path = "../crates/tidemark-core" }
 tidemark-cli = { path = "../crates/tidemark-cli" }
@@ -105,6 +107,27 @@ bench = false
 [[bin]]
 name = "catalog_path"
 path = "fuzz_targets/catalog_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fanotify_events"
+path = "fuzz_targets/fanotify_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mount_id"
+path = "fuzz_targets/mount_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_frame"
+path = "fuzz_targets/api_frame.rs"
 test = false
 doc = false
 bench = false
