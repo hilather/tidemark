@@ -284,6 +284,49 @@ const DIRTY_NODE_BYTES: usize = 128;
 // Weak handles only; old views may not hold unbounded retired pathname payloads.
 const WINDOW_HANDLE_CAP: usize = 1024;
 const WINDOW_HANDLE_BYTES: usize = WINDOW_HANDLE_CAP * 32;
+// Fixed storage keeps the four most recently observed distinct errno values.
+#[derive(Default)]
+struct ReopenErrors {
+    recent: [Option<(i32, u64)>; 4],
+    warned: bool,
+}
+impl ReopenErrors {
+    fn record(&mut self, error: &io::Error) -> bool {
+        let code = error.raw_os_error().unwrap_or(0);
+        let position = self
+            .recent
+            .iter()
+            .position(|entry| entry.is_some_and(|v| v.0 == code));
+        let count = position
+            .and_then(|i| self.recent[i])
+            .map_or(1, |v| v.1.saturating_add(1));
+        let end = position.unwrap_or(self.recent.len() - 1);
+        for i in (1..=end).rev() {
+            self.recent[i] = self.recent[i - 1];
+        }
+        self.recent[0] = Some((code, count));
+        let warn = code != rustix::io::Errno::STALE.raw_os_error() && !self.warned;
+        self.warned |= warn;
+        warn
+    }
+    fn detail(&self) -> String {
+        self.recent
+            .iter()
+            .flatten()
+            .map(|(code, count)| {
+                let name = match *code {
+                    9 => "EBADF".to_owned(),
+                    1 => "EPERM".to_owned(),
+                    22 => "EINVAL".to_owned(),
+                    116 => "ESTALE".to_owned(),
+                    _ => format!("errno={code}"),
+                };
+                format!("{name} count={count}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
 struct State {
     rings: rings::Rings,
     dirty: BTreeSet<RawPath>,
@@ -306,6 +349,7 @@ struct State {
     stream_nodes: usize,
     dropped_events: u64,
     unmapped_events: u64,
+    reopen_errors: ReopenErrors,
 }
 impl State {
     fn mark_loss(&mut self) {
@@ -443,6 +487,7 @@ impl Watcher {
                 stream_nodes: 0,
                 dropped_events: 0,
                 unmapped_events: 0,
+                reopen_errors: ReopenErrors::default(),
             })),
             shutdown: Mutex::new(Some(Arc::new(rustix::event::eventfd(
                 0,
@@ -515,7 +560,7 @@ impl Watcher {
                 _ => return Err(WatchError::Unsupported),
             }
         }
-        let mount_fd = Arc::new(
+        let mut mount_fd = Arc::new(
             rustix::fs::open(
                 cfg.mount.as_path(),
                 rustix::fs::OFlags::PATH
@@ -559,6 +604,28 @@ impl Watcher {
         if mode == WatchMode::FdMount {
             mode = fd_mode_selected;
         }
+        if mode == WatchMode::FdFilesystem {
+            let identity = descriptor_identity(mount_fd.as_fd())?;
+            let flags = mount_open_flags(mode);
+            let replacement =
+                match rustix::fs::open(cfg.mount.as_path(), flags, rustix::fs::Mode::empty()) {
+                    Err(rustix::io::Errno::PERM) => rustix::fs::open(
+                        cfg.mount.as_path(),
+                        flags & !rustix::fs::OFlags::NOATIME,
+                        rustix::fs::Mode::empty(),
+                    ),
+                    result => result,
+                }
+                .map_err(io::Error::from)?;
+            if descriptor_identity(replacement.as_fd())? != identity {
+                return Err(io::Error::other(
+                    "watched mount changed while opening handle mount descriptor",
+                )
+                .into());
+            }
+            // The mark already targets this verified mount. Retain only the real open.
+            mount_fd = Arc::new(replacement);
+        }
         let shutdown = Arc::new(
             rustix::event::eventfd(
                 0,
@@ -588,6 +655,7 @@ impl Watcher {
             stream_nodes: 0,
             dropped_events: 0,
             unmapped_events: 0,
+            reopen_errors: ReopenErrors::default(),
         }));
         state
             .lock()
@@ -966,11 +1034,23 @@ impl Watcher {
         self.state.lock().rings.budget().used()
     }
     /// Explain caps and loss in the retained fifteen-minute history.
-    /// Reports at most eight causes, each with its latest affected UTC minute.
+    /// Reports at most eight ring causes with their latest affected UTC minute,
+    /// plus counts for the four most recent distinct handle-reopen errors.
     /// Truncation diagnostics do not change legacy lossy flags or alert availability.
     pub fn health_detail(&self) -> String {
         let state = self.state.lock();
-        state.rings.detail(now())
+        let mut detail = state.rings.detail(now());
+        if state.reopen_errors.recent[0].is_some() {
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str(&format!(
+                "unmapped_events={} (reopen failed: {})",
+                state.unmapped_events,
+                state.reopen_errors.detail()
+            ));
+        }
+        detail
     }
     /// Read counters and the loss indicator for the latest fifteen minute buckets.
     pub fn stats(&self) -> WatchStats {
@@ -1045,6 +1125,18 @@ pub fn parse_mount_id(text: &str) -> io::Result<u64> {
                 "missing or invalid fdinfo mount id",
             )
         })
+}
+fn mount_open_flags(mode: WatchMode) -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
+    let base = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    if mode == WatchMode::FdFilesystem {
+        base | OFlags::RDONLY | OFlags::NOATIME
+    } else {
+        base | OFlags::PATH
+    }
+}
+fn descriptor_identity(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<(u64, u64)> {
+    Ok((descriptor_mount_id(fd)?, rustix::fs::fstat(fd)?.st_dev))
 }
 fn descriptor_mount_id(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<u64> {
     use std::io::Read;
@@ -1186,6 +1278,28 @@ impl Processor<'_> {
         retry
     }
     fn process(&mut self, event: RawEvent, at: i64, state: &Mutex<State>) {
+        self.process_with(
+            event,
+            at,
+            state,
+            |handle, fd| handle.identify(fd),
+            |handle, mount| handle.reopen(mount),
+        );
+    }
+    fn process_with(
+        &mut self,
+        event: RawEvent,
+        at: i64,
+        state: &Mutex<State>,
+        identify: impl FnOnce(
+            &mut tidemark_sys::fanotify::EventHandle,
+            std::os::fd::BorrowedFd<'_>,
+        ) -> io::Result<u64>,
+        reopen: impl FnOnce(
+            &mut tidemark_sys::fanotify::EventHandle,
+            std::os::fd::BorrowedFd<'_>,
+        ) -> io::Result<OwnedFd>,
+    ) {
         let mount_fd = self.mount_fd;
         let is_fid = matches!(&event, RawEvent::Fid { .. });
         let event_mask = match &event {
@@ -1206,12 +1320,21 @@ impl Processor<'_> {
                 }
                 let event_mount = self
                     .filesystem_mount
-                    .and_then(|_| self.event_handle.identify(fd.as_fd()).ok());
+                    .and_then(|_| identify(&mut self.event_handle, fd.as_fd()).ok());
                 let reopened = if self
                     .filesystem_mount
                     .is_some_and(|watched| event_mount.is_some_and(|id| id != watched))
                 {
-                    self.event_handle.reopen(mount_fd).ok()
+                    match reopen(&mut self.event_handle, mount_fd) {
+                        Ok(fd) => Some(fd),
+                        Err(error) => {
+                            let warn = state.lock().reopen_errors.record(&error);
+                            if warn {
+                                tracing::warn!(mount = %self.cfg.mount.display_lossy(), %error, "event handle reopen failed");
+                            }
+                            None
+                        }
+                    }
                 } else {
                     None
                 };
@@ -1581,6 +1704,98 @@ mod tests {
         );
     }
     #[test]
+    fn mount_descriptor_flags_depend_on_mode() {
+        use rustix::fs::OFlags;
+        assert_eq!(
+            mount_open_flags(WatchMode::FdFilesystem),
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NOATIME
+                | OFlags::CLOEXEC
+        );
+        assert_eq!(
+            mount_open_flags(WatchMode::FdMount),
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+        );
+    }
+    #[test]
+    fn reopen_errors_are_bounded_recent_counted_and_warn_once() {
+        let mut errors = ReopenErrors::default();
+        assert!(!errors.record(&io::Error::from_raw_os_error(116)));
+        assert!(errors.record(&io::Error::from_raw_os_error(9)));
+        assert!(!errors.record(&io::Error::from_raw_os_error(9)));
+        assert_eq!(errors.detail(), "EBADF count=2, ESTALE count=1");
+        for code in [1, 22, 5, 2] {
+            assert!(!errors.record(&io::Error::from_raw_os_error(code)));
+        }
+        assert_eq!(errors.recent.iter().flatten().count(), 4);
+        assert!(!errors.detail().contains("EBADF"));
+    }
+    #[test]
+    fn injected_foreign_reopen_maps_or_reports_badfd() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("directory")).unwrap();
+        let path = temp.path().join("directory/file");
+        std::fs::write(&path, b"fixture").unwrap();
+        let cfg = WatcherOptions {
+            mount: RawPath::from_path(temp.path()).unwrap(),
+            events: vec![],
+            hot_depth: 6,
+            exclude_prefixes: vec![],
+            lru_entries: 10,
+        };
+        let attribution = AttributionCache::new(std::time::Duration::from_secs(60), 10);
+        let mount = std::fs::File::open(temp.path()).unwrap();
+        for success in [false, true] {
+            let watcher = Watcher::from_injected_events(cfg.mount.clone(), []).unwrap();
+            let at = now();
+            let mut processor = Processor {
+                filesystem_mount: Some(1),
+                event_handle: Default::default(),
+                own_pid: -1,
+                cfg: &cfg,
+                attribution: &attribution,
+                mount_fd: mount.as_fd(),
+                sizes: fdmode::Sizes::new(10, at),
+                paths: fidmode::PathSizes::new(10),
+                handles: fidmode::HandlePaths::new(10),
+            };
+            processor.process_with(
+                RawEvent::Fd {
+                    pid: 0,
+                    mask: mask::CLOSE_WRITE,
+                    fd: std::fs::File::open(&path).unwrap().into(),
+                },
+                at,
+                &watcher.state,
+                |_, _| Ok(2),
+                |_, _| {
+                    if success {
+                        Ok(std::fs::File::open(&path).unwrap().into())
+                    } else {
+                        Err(io::Error::from_raw_os_error(9))
+                    }
+                },
+            );
+            assert_eq!(watcher.stats().events_total, 1);
+            assert_eq!(watcher.unmapped_events(), u64::from(!success));
+            let detail = watcher.health_detail();
+            assert_eq!(
+                detail.contains("unmapped_events=1 (reopen failed: EBADF count=1)"),
+                !success
+            );
+            let rows = watcher.hot(1, HotScope::Dir, 10);
+            assert_eq!(rows.len(), 1);
+            let expected = if success {
+                RawPath::from_path(&temp.path().join("directory")).unwrap()
+            } else {
+                cfg.mount.clone()
+            };
+            assert_eq!(rows[0].key.as_slice(), expected.as_bytes());
+        }
+    }
+    #[test]
     fn unmapped_event_keeps_totals_and_root_directory() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("child");
@@ -1872,6 +2087,7 @@ mod tests {
             stream_nodes: 0,
             dropped_events: 0,
             unmapped_events: 0,
+            reopen_errors: ReopenErrors::default(),
         })
     }
     fn dirty_watcher() -> Watcher {

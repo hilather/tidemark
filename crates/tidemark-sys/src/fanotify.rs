@@ -212,6 +212,10 @@ impl EventHandle {
         Ok(mount_id)
     }
     /// Reopen the identified inode in the watched mount for metadata-only path resolution.
+    /// Uses O_PATH | O_NOFOLLOW | O_CLOEXEC; EINVAL retries read-only with
+    /// O_NONBLOCK | O_NOFOLLOW | O_NOATIME | O_CLOEXEC. Never reads content,
+    /// and deliberately does not retry without O_NOATIME for the target inode.
+    /// The mount descriptor must be a real open on EL8, rather than O_PATH.
     pub fn reopen(&mut self, mount: BorrowedFd<'_>) -> io::Result<OwnedFd> {
         if !self.identified {
             return Err(invalid("no successfully identified event handle"));
@@ -219,7 +223,11 @@ impl EventHandle {
         let ptr = self.storage.as_mut_ptr().cast::<libc::file_handle>();
         // SAFETY: identify initialized the bounded aligned handle; no contents are read.
         let mut fd = unsafe {
-            libc::open_by_handle_at(mount.as_raw_fd(), ptr, libc::O_PATH | libc::O_CLOEXEC)
+            libc::open_by_handle_at(
+                mount.as_raw_fd(),
+                ptr,
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
         };
         if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
             // SAFETY: same valid handle, with nonblocking, no-follow, no-atime read-only flags.
