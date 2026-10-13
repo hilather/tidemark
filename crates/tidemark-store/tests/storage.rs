@@ -1502,3 +1502,39 @@ fn catalog_legacy_paths_and_rebuild_repair() {
     assert_eq!(raw, tail.as_os_str().as_bytes());
     assert!(Snapshot::open(c.list(None).unwrap()[0].file.as_ref().unwrap()).is_ok());
 }
+
+#[test]
+fn metrics_ranked_query_counts_large_inventory_and_independent_families() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut meta = meta();
+    meta.dirs = 100_001;
+    let mut writer = SnapshotWriter::create(tmp.path(), &meta).unwrap();
+    for begin in (0..100_001u32).step_by(1000) {
+        let rows: Vec<_> = (begin..(begin + 1000).min(100_001))
+            .map(|id| {
+                let mut row = dir(id);
+                row.subtree_end = if id == 0 { 100_000 } else { id };
+                row.t_reclaimable = u64::from(100_001 - id);
+                row
+            })
+            .collect();
+        writer.put_dirs(&rows).unwrap();
+    }
+    let file = writer.finish(&meta).unwrap();
+    let snapshot = Snapshot::open(&file).unwrap();
+    let (used, reclaimable, eligible, source) = snapshot.metrics_candidates(1, 3).unwrap();
+    assert_eq!(eligible, 100_001);
+    assert_eq!(source, file);
+    assert_eq!(
+        used.iter().map(|r| r.id).collect::<Vec<_>>(),
+        [100_000, 99_999, 99_998]
+    );
+    assert_eq!(
+        reclaimable.iter().map(|r| r.id).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    let (used, reclaimable, eligible, _) = snapshot.metrics_candidates(0, 3).unwrap();
+    assert_eq!(eligible, 1);
+    assert_eq!(used.len(), 1);
+    assert_eq!(reclaimable.len(), 1);
+}

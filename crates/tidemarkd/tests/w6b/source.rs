@@ -173,7 +173,10 @@ fn every_contract_metric_and_exact_labels_from_populated_source() {
         b"/fixture".to_vec(),
         CachedRoot {
             rows: vec![fixtures::dir(0), fixtures::dir(1)],
+            reclaimable: vec![fixtures::dir(0), fixtures::dir(1)],
+            eligible: 2,
             errors: 1,
+            ..CachedRoot::default()
         },
     );
     let config = MetricsConfig {
@@ -207,4 +210,107 @@ fn every_contract_metric_and_exact_labels_from_populated_source() {
         assert_eq!(expected[name].1, labels, "labels for {name}");
     }
     assert_eq!(actual, expected.into_keys().collect());
+}
+
+fn tcp_pair() -> Option<(TcpStream, TcpStream)> {
+    let listener = match listen("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("TCP bind unavailable: {error}");
+            return None;
+        }
+    };
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match listener.accept() {
+            Ok((server, _)) => return Some((client, server)),
+            Err(e) if transient(&e) => {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    }
+}
+#[test]
+fn http_ninth_idle_client_closed_and_shutdown_joins_all_workers() {
+    let mut workers = HttpWorkers(Vec::new());
+    let text = Arc::new(RwLock::new("tidemark_up 1\n".into()));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut clients = Vec::new();
+    for _ in 0..8 {
+        let Some((client, server)) = tcp_pair() else {
+            return;
+        };
+        workers.admit(server, text.clone(), stop.clone()).unwrap();
+        clients.push(client);
+    }
+    let Some((mut ninth, server)) = tcp_pair() else {
+        return;
+    };
+    workers.admit(server, text, stop).unwrap();
+    ninth
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    assert_eq!(ninth.read(&mut [0; 1]).unwrap(), 0);
+    assert_eq!(workers.0.len(), 8);
+    let start = Instant::now();
+    workers.close();
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(workers.0.is_empty());
+    drop(clients);
+}
+#[test]
+fn http_unending_head_expires_under_absolute_deadline() {
+    let Some((mut client, server)) = tcp_pair() else {
+        return;
+    };
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let start = Instant::now();
+    let worker = std::thread::spawn(move || respond(server, "up 1\n", &stop));
+    client
+        .write_all(b"GET /metrics HTTP/1.1\r\nX: never ends")
+        .unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(7)))
+        .unwrap();
+    assert_eq!(client.read(&mut [0; 1]).unwrap(), 0);
+    worker.join().unwrap().unwrap();
+    assert!(start.elapsed() >= Duration::from_secs(4));
+    assert!(start.elapsed() < Duration::from_secs(6));
+}
+#[test]
+fn http_head_bytes_are_bounded() {
+    let Some((mut client, server)) = tcp_pair() else {
+        return;
+    };
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker = std::thread::spawn(move || respond(server, "up 1\n", &stop));
+    client.write_all(&[b'x'; 8192]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    worker.join().unwrap().unwrap();
+}
+#[test]
+fn http_slow_reader_cannot_extend_write_deadline() {
+    let Some((mut client, server)) = tcp_pair() else {
+        return;
+    };
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let start = Instant::now();
+    let worker = std::thread::spawn(move || respond(server, &"x".repeat(16 * 1024 * 1024), &stop));
+    client.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").unwrap();
+    // Hold the receive window closed; a per-write timeout loop would never end.
+    let deadline = Instant::now() + Duration::from_secs(7);
+    while !worker.is_finished() {
+        assert!(Instant::now() < deadline, "response worker did not expire");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    worker.join().unwrap().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(6));
 }

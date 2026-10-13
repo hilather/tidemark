@@ -348,6 +348,41 @@ impl Snapshot {
         crate::error::check_result_bound(&result)?;
         Ok(result)
     }
+    /// Return independent largest used/reclaimable candidates through a root-relative
+    /// depth, the exact eligible row count, and the immutable source path.
+    /// Each family is bounded by `limit` (the existing query ceiling applies); ties use raw path bytes.
+    pub fn metrics_candidates(
+        &self,
+        depth: u32,
+        limit: usize,
+    ) -> Result<(Vec<DirRow>, Vec<DirRow>, u64, std::path::PathBuf)> {
+        if limit > crate::error::MAX_QUERY_ROWS {
+            return Err(StoreError::Invalid(
+                "metrics candidate limit exceeds 1,000,000-row query cap".into(),
+            ));
+        }
+        sql_limit(limit)?;
+        let count: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM dirs WHERE depth<=?", [depth], |r| {
+                    r.get(0)
+                })?;
+        let query = |column: &str| -> Result<Vec<DirRow>> {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT * FROM dirs WHERE depth<=? ORDER BY {column} DESC, path, id LIMIT ?"
+            ))?;
+            let result = stmt
+                .query_map(params![depth, sql_limit(limit)?], dir_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(result)
+        };
+        Ok((
+            query("t_disk")?,
+            query("t_reclaimable")?,
+            count as u64,
+            self.file.clone(),
+        ))
+    }
     /// Fetch the inclusive subtree through a relative depth, using an id range.
     pub fn subtree_dirs(
         &self,

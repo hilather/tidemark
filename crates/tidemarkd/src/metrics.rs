@@ -3,33 +3,39 @@
 use parking_lot::RwLock;
 use std::{
     collections::BTreeMap,
-    io::Write,
-    net::SocketAddr,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    io::{Read, Write},
+    net::{Shutdown as SocketShutdown, SocketAddr, TcpListener, TcpStream},
+    os::unix::fs::PermissionsExt,
     path::Path,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
-use tidemark_core::{
-    api::*,
-    config::MetricsConfig,
-    scan::SnapshotStatus,
-    snapshot::{DirRow, SortKey},
-};
+use tidemark_core::{api::*, config::MetricsConfig, scan::SnapshotStatus, snapshot::DirRow};
 use tidemark_live::alerts::AlertSource;
 
-/// Maximum cached directories across all roots; oversized refreshes preserve the old cache.
-const MAX_DIRS: usize = 100_000;
+/// Default candidate capacity per family; reconciled to the configured series cap.
+const DEFAULT_CANDIDATES: usize = 500;
 const MAX_ROOTS: usize = 128;
 #[derive(Default)]
 struct CachedRoot {
     rows: Vec<DirRow>,
+    reclaimable: Vec<DirRow>,
+    eligible: u64,
+    source: Option<(std::path::PathBuf, u32)>,
     errors: u64,
 }
 /// Latest complete snapshot data, replaced atomically per root after a scan.
-#[derive(Default)]
 pub struct SnapshotMetrics {
     roots: RwLock<BTreeMap<Vec<u8>, CachedRoot>>,
+    capacity: std::sync::atomic::AtomicUsize,
+}
+impl Default for SnapshotMetrics {
+    fn default() -> Self {
+        Self {
+            roots: RwLock::new(BTreeMap::new()),
+            capacity: std::sync::atomic::AtomicUsize::new(DEFAULT_CANDIDATES),
+        }
+    }
 }
 impl SnapshotMetrics {
     /// Refresh bounded directory aggregates from an immutable complete snapshot.
@@ -43,45 +49,162 @@ impl SnapshotMetrics {
                 "metrics requires a complete snapshot".into(),
             ));
         }
-        let rows = snapshot
-            .subtree_dirs(
-                snapshot.root().map_err(store)?.id,
-                depth,
-                SortKey::Name,
-                MAX_DIRS + 1,
-            )
-            .map_err(store)?;
-        if rows.len() > MAX_DIRS {
-            return Err(crate::DaemonError::Unavailable(
-                "metrics directory cache capacity exceeded".into(),
-            ));
-        }
         let key = snapshot.meta().root.as_bytes().to_vec();
         let mut roots = self.roots.write();
+        let capacity = self.capacity.load(Ordering::Acquire);
         if !roots.contains_key(&key) && roots.len() >= MAX_ROOTS {
             return Err(crate::DaemonError::Unavailable(
                 "metrics root capacity exceeded".into(),
             ));
         }
-        let retained: usize = roots
-            .iter()
-            .filter(|(root, _)| **root != key)
-            .map(|(_, r)| r.rows.len())
-            .sum();
-        if retained.saturating_add(rows.len()) > MAX_DIRS {
-            return Err(crate::DaemonError::Unavailable(
-                "metrics total directory capacity exceeded".into(),
-            ));
+        // Requery immutable sources so replacing/removing a root can uncover candidates
+        // previously below the global cutoff. Build a replacement before publishing.
+        let mut replacement = BTreeMap::new();
+        let mut used = Vec::new();
+        let mut reclaimable = Vec::new();
+        for root in roots
+            .keys()
+            .filter(|root| **root != key)
+            .chain(std::iter::once(&key))
+        {
+            let opened;
+            let (reader, depth) = if *root == key {
+                (snapshot, depth)
+            } else {
+                let Some((file, depth)) = roots[root].source.as_ref() else {
+                    continue;
+                };
+                opened = tidemark_store::reader::Snapshot::open(file).map_err(store)?;
+                (&opened, *depth)
+            };
+            if reader.meta().status != SnapshotStatus::Complete
+                || reader.meta().root.as_bytes() != root.as_slice()
+            {
+                return Err(crate::DaemonError::Store(
+                    "metrics source must match its complete catalog root".into(),
+                ));
+            }
+            let (u, r, eligible, file) =
+                reader.metrics_candidates(depth, capacity).map_err(store)?;
+            replacement.insert(
+                root.clone(),
+                CachedRoot {
+                    eligible,
+                    source: Some((file, depth)),
+                    errors: reader.meta().errors,
+                    ..CachedRoot::default()
+                },
+            );
+            used.extend(u.into_iter().map(|row| (root.clone(), row)));
+            reclaimable.extend(r.into_iter().map(|row| (root.clone(), row)));
+            // Each merge holds at most twice the configured cap per family;
+            // retained candidates are bounded globally, independently per family.
+            used.sort_by(|a, b| {
+                b.1.t_disk
+                    .cmp(&a.1.t_disk)
+                    .then(a.0.cmp(&b.0))
+                    .then(a.1.path.as_bytes().cmp(b.1.path.as_bytes()))
+            });
+            reclaimable.sort_by(|a, b| {
+                b.1.t_reclaimable
+                    .cmp(&a.1.t_reclaimable)
+                    .then(a.0.cmp(&b.0))
+                    .then(a.1.path.as_bytes().cmp(b.1.path.as_bytes()))
+            });
+            used.truncate(capacity);
+            reclaimable.truncate(capacity);
         }
-        roots.insert(
-            key,
-            CachedRoot {
-                rows,
-                errors: snapshot.meta().errors,
-            },
-        );
+        for (root, row) in used {
+            if let Some(cache) = replacement.get_mut(&root) {
+                cache.rows.push(row);
+            }
+        }
+        for (root, row) in reclaimable {
+            if let Some(cache) = replacement.get_mut(&root) {
+                cache.reclaimable.push(row);
+            }
+        }
+        *roots = replacement;
         Ok(())
     }
+}
+fn reconcile(
+    state: &crate::state::LiveState,
+    config: &tidemark_core::config::Config,
+) -> Result<(), crate::DaemonError> {
+    if config.roots.len() > MAX_ROOTS {
+        return Err(crate::DaemonError::Unavailable(
+            "metrics root capacity exceeded".into(),
+        ));
+    }
+    let cache = state.view().snapshot_metrics_handle();
+    use tidemark_core::path::RawPath;
+    let mut sources = Vec::with_capacity(config.roots.len());
+    if !config.roots.is_empty() {
+        let catalog =
+            tidemark_store::catalog::Catalog::open(&state.storage_path(), false).map_err(store)?;
+        for root in &config.roots {
+            let raw = RawPath::from_path(&root.path)
+                .map_err(|e| crate::DaemonError::Invalid(e.to_string()))?;
+            if let Some(entry) = catalog.latest(&raw).map_err(store)? {
+                if let Some(file) = entry.file {
+                    sources.push((raw, file));
+                }
+            }
+        }
+    }
+    if let Some(cache) = &cache {
+        let roots = cache.roots.read();
+        if cache.capacity.load(Ordering::Acquire) == config.metrics.max_series_per_metric
+            && roots.len() == sources.len()
+            && sources.iter().all(|(root, file)| {
+                roots.get(root.as_bytes()).is_some_and(|r| {
+                    r.source.as_ref().is_some_and(|(cached_file, depth)| {
+                        cached_file == file && *depth == config.metrics.dir_metrics_depth
+                    })
+                })
+            })
+        {
+            return Ok(());
+        }
+    }
+    let fresh = SnapshotMetrics::default();
+    fresh
+        .capacity
+        .store(config.metrics.max_series_per_metric, Ordering::Release);
+    if let Some((root, file)) = sources.pop() {
+        // Seed source identities first, then rank every root once. Repeated refresh
+        // calls here would reread all previously loaded inventories quadratically.
+        for (root, file) in sources {
+            fresh.roots.write().insert(
+                root.as_bytes().to_vec(),
+                CachedRoot {
+                    source: Some((file, config.metrics.dir_metrics_depth)),
+                    ..CachedRoot::default()
+                },
+            );
+        }
+        let snapshot = tidemark_store::reader::Snapshot::open(&file).map_err(store)?;
+        if snapshot.meta().root != root {
+            return Err(crate::DaemonError::Store(
+                "metrics snapshot root disagrees with catalog".into(),
+            ));
+        }
+        fresh.refresh(&snapshot, config.metrics.dir_metrics_depth)?;
+    }
+    if let Some(cache) = cache {
+        let mut roots = cache.roots.write();
+        *roots = fresh.roots.into_inner();
+        cache
+            .capacity
+            .store(config.metrics.max_series_per_metric, Ordering::Release);
+    } else {
+        state.publish(
+            crate::state::Publication::SnapshotMetrics(fresh),
+            crate::component("snapshot_metrics", "ok", "latest complete snapshots loaded"),
+        )?;
+    }
+    Ok(())
 }
 fn store(e: tidemark_store::StoreError) -> crate::DaemonError {
     crate::DaemonError::Store(e.to_string())
@@ -105,7 +228,10 @@ fn labels(pairs: &[(&str, &str)]) -> String {
     )
 }
 #[derive(Default)]
-struct Series(BTreeMap<&'static str, BTreeMap<String, f64>>);
+struct Series(
+    BTreeMap<&'static str, BTreeMap<String, f64>>,
+    BTreeMap<&'static str, u64>,
+);
 impl Series {
     fn add(&mut self, name: &'static str, pairs: &[(&str, &str)], value: f64) {
         if value.is_finite() {
@@ -117,11 +243,18 @@ impl Series {
                 .or_insert(value);
         }
     }
-    fn finish(self, cap: usize) -> String {
+    fn finish(mut self, cap: usize) -> String {
+        for name in self.1.keys() {
+            self.0.entry(name).or_default();
+        }
         let mut output = String::new();
         let mut dropped = Vec::new();
         for (name, rows) in self.0 {
-            let count = rows.len().saturating_sub(cap);
+            let count = if let Some(total) = self.1.get(name) {
+                total.saturating_sub(rows.len().min(cap) as u64)
+            } else {
+                rows.len().saturating_sub(cap) as u64
+            };
             if count > 0 {
                 dropped.push((name, count));
             }
@@ -427,8 +560,20 @@ fn render_source(
                 let path = String::from_utf8_lossy(r.path.as_bytes());
                 let l = [("root", root.as_ref()), ("path", path.as_ref())];
                 s.add("tidemark_dir_used_bytes", &l, r.t_disk as f64);
-                s.add("tidemark_dir_reclaimable_bytes", &l, r.t_reclaimable as f64);
             }
+        }
+        for r in &cached.reclaimable {
+            if r.depth <= config.dir_metrics_depth {
+                let path = String::from_utf8_lossy(r.path.as_bytes());
+                s.add(
+                    "tidemark_dir_reclaimable_bytes",
+                    &[("root", root.as_ref()), ("path", path.as_ref())],
+                    r.t_reclaimable as f64,
+                );
+            }
+        }
+        for name in ["tidemark_dir_used_bytes", "tidemark_dir_reclaimable_bytes"] {
+            *s.1.entry(name).or_default() += cached.eligible;
         }
     }
     Ok(s.finish(config.max_series_per_metric))
@@ -438,28 +583,43 @@ pub fn write_textfile(path: &Path, text: &str) -> std::io::Result<()> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
-    let mut tmp = path.as_os_str().to_os_string();
+    use rustix::fs::{flock, openat, renameat, FlockOperation, Mode, OFlags};
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("missing textfile name"))?;
+    let dir = std::fs::File::open(parent)?;
+    // Serialize our create/open/rename cycle as well as locking the temporary inode.
+    flock(&dir, FlockOperation::NonBlockingLockExclusive)?;
+    let mut tmp = name.to_os_string();
     tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    let result = (|| {
-        f.write_all(text.as_bytes())?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let fd = openat(
+        &dir,
+        &tmp,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?;
+    let mut f = std::fs::File::from(fd);
+    use std::os::unix::fs::MetadataExt;
+    let md = f.metadata()?;
+    if !md.is_file() || md.uid() != rustix::process::geteuid().as_raw() || md.nlink() != 1 {
+        return Err(std::io::Error::other(
+            "metrics temporary must be an owned regular single-link file",
+        ));
     }
-    result
+    flock(&f, FlockOperation::NonBlockingLockExclusive)?;
+    f.set_len(0)?;
+    f.write_all(text.as_bytes())?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    f.sync_all()?;
+    renameat(&dir, &tmp, &dir, name)?;
+    Ok(())
 }
-/// Start the loopback-only listener; exposed for ephemeral-port integration tests.
-pub fn listen(address: &str) -> Result<tiny_http::Server, crate::DaemonError> {
+/// Bind the loopback-only metrics listener, with nonblocking admission.
+pub fn listen(address: &str) -> Result<TcpListener, crate::DaemonError> {
     let address: SocketAddr = address.parse().map_err(|_| {
         crate::DaemonError::Config("metrics.listen must be a loopback IP:port".into())
     })?;
@@ -468,17 +628,183 @@ pub fn listen(address: &str) -> Result<tiny_http::Server, crate::DaemonError> {
             "metrics.listen must be loopback".into(),
         ));
     }
-    tiny_http::Server::http(address).map_err(|e| crate::DaemonError::Unavailable(e.to_string()))
+    // Set reuse before bind so reload can reclaim a port with scrapes in TIME_WAIT.
+    // The responder and admission loop use std::net::TcpListener/TcpStream.
+    let bind = || -> std::io::Result<TcpListener> {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType};
+        let fd = rustix::net::socket_with(
+            if address.is_ipv4() {
+                AddressFamily::INET
+            } else {
+                AddressFamily::INET6
+            },
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )?;
+        rustix::net::sockopt::set_socket_reuseaddr(&fd, true)?;
+        rustix::net::bind(&fd, &address)?;
+        rustix::net::listen(&fd, HTTP_CONNECTIONS as i32)?;
+        Ok(TcpListener::from(fd))
+    };
+    bind().map_err(|e| crate::DaemonError::Unavailable(e.to_string()))
 }
-/// Answer only GET /metrics, with the Prometheus content type.
-pub fn respond(request: tiny_http::Request, text: &str) -> std::io::Result<()> {
-    if request.method() != &tiny_http::Method::Get || request.url() != "/metrics" {
-        return request.respond(tiny_http::Response::empty(404));
+const HTTP_CONNECTIONS: usize = 8;
+const HTTP_DEADLINE: Duration = Duration::from_secs(5);
+fn transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    )
+}
+/// Answer one request with a fixed 8 KiB head and absolute read/write deadlines.
+pub fn respond(mut stream: TcpStream, text: &str, stop: &crate::Shutdown) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(50)))?;
+    let mut head = [0u8; 8192];
+    let mut len = 0;
+    let deadline = Instant::now() + HTTP_DEADLINE;
+    let code = loop {
+        if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Ok(());
+        }
+        if len == head.len() {
+            break 400;
+        }
+        match stream.read(&mut head[len..]) {
+            Ok(0) => return Ok(()),
+            Ok(n) => len += n,
+            Err(e) if transient(&e) => continue,
+            Err(e) => return Err(e),
+        }
+        if let Some(end) = head[..len].windows(4).position(|w| w == b"\r\n\r\n") {
+            let mut lines = head[..end + 2].split(|b| *b == b'\n');
+            let line = lines.next().unwrap_or_default();
+            let Some(line) = line.strip_suffix(b"\r") else {
+                break 400;
+            };
+            let mut fields = line.split(|b| *b == b' ');
+            let method = fields.next().unwrap_or_default();
+            let path = fields.next().unwrap_or_default();
+            let version = fields.next().unwrap_or_default();
+            let headers_valid = lines.filter(|line| !line.is_empty()).all(|line| {
+                let Some(line) = line.strip_suffix(b"\r") else {
+                    return false;
+                };
+                let Some(colon) = line.iter().position(|b| *b == b':') else {
+                    return false;
+                };
+                colon > 0
+                    && line[..colon]
+                        .iter()
+                        .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b))
+                    && line[colon + 1..]
+                        .iter()
+                        .all(|b| *b == b'\t' || *b >= 32 && *b != 127)
+            });
+            break if fields.next().is_some()
+                || method.is_empty()
+                || path.is_empty()
+                || !matches!(version, b"HTTP/1.1" | b"HTTP/1.0")
+                || !headers_valid
+            {
+                400
+            } else if path != b"/metrics" {
+                404
+            } else if !matches!(method, b"GET" | b"HEAD") {
+                405
+            } else {
+                200
+            };
+        }
+    };
+    let is_head = head[..len].starts_with(b"HEAD ");
+    let body = if code == 200 { text.as_bytes() } else { b"" };
+    let reason = match code {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "Method Not Allowed",
+    };
+    let header = format!("HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+    let deadline = Instant::now() + HTTP_DEADLINE;
+    for bytes in [header.as_bytes(), if is_head { b"" } else { body }] {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return Ok(());
+            }
+            match stream.write(&bytes[offset..]) {
+                Ok(0) => return Ok(()),
+                Ok(n) => offset += n,
+                Err(e) if transient(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
-    let header =
-        tiny_http::Header::from_bytes("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-            .map_err(|_| std::io::Error::other("invalid content type"))?;
-    request.respond(tiny_http::Response::from_string(text).with_header(header))
+    Ok(())
+}
+struct HttpWorkers(Vec<(TcpStream, std::thread::JoinHandle<()>)>);
+impl HttpWorkers {
+    fn reap(&mut self) {
+        let mut i = 0;
+        while i < self.0.len() {
+            if self.0[i].1.is_finished() {
+                let (_, worker) = self.0.swap_remove(i);
+                let _ = worker.join();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    fn admit(
+        &mut self,
+        stream: TcpStream,
+        text: Arc<RwLock<String>>,
+        stop: crate::Shutdown,
+    ) -> std::io::Result<()> {
+        self.reap();
+        if self.0.len() >= HTTP_CONNECTIONS {
+            let _ = stream.shutdown(SocketShutdown::Both);
+            return Ok(());
+        }
+        let control = stream.try_clone()?;
+        let worker = std::thread::Builder::new()
+            .name("metrics-client".into())
+            .spawn(move || {
+                let output = text.read().clone();
+                let _ = respond(stream, &output, &stop);
+            })?;
+        self.0.push((control, worker));
+        Ok(())
+    }
+    fn close(&mut self) {
+        for (stream, _) in &self.0 {
+            let _ = stream.shutdown(SocketShutdown::Both);
+        }
+        for (_, worker) in self.0.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+impl Drop for HttpWorkers {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+struct HttpService {
+    stop: crate::Shutdown,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for HttpService {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 /// Start reload-aware textfile and HTTP exporters with bounded shutdown polling.
 pub fn start(
@@ -493,6 +819,8 @@ pub fn start(
             let initial_now = crate::unix_now();
             let initial_view = state.view_at(initial_now);
             let (initial_config, _) = initial_view.config();
+            // Failed seeding is retried and reported by the first export below.
+            let _ = reconcile(&state, &initial_config);
             let initial_cache = initial_view.snapshot_metrics_handle();
             let text = Arc::new(RwLock::new(render(
                 &initial_view,
@@ -505,17 +833,22 @@ pub fn start(
             let http_health = http_error.clone();
             let http_state = state.clone();
             let http_shutdown = shutdown.clone();
-            // One response worker isolates tiny_http's potentially blocking socket writes.
-            // No per-request threads or application queue are created.
+            let http_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_stop = http_stop.clone();
+            // Admission owns at most eight clients; every worker is joined on reload/shutdown.
             let http = std::thread::Builder::new()
                 .name("metrics-http".into())
                 .spawn(move || {
                     let mut listener = None;
                     let mut generation = None;
-                    while !http_shutdown.load(Ordering::Acquire) {
+                    let mut workers = HttpWorkers(Vec::with_capacity(HTTP_CONNECTIONS));
+                    while !http_shutdown.load(Ordering::Acquire)
+                        && !worker_stop.load(Ordering::Acquire)
+                    {
                         let (config, g) = http_state.config();
                         if generation != Some(g) {
                             listener = None;
+                            workers.close();
                             *http_health.write() = None;
                             if !config.metrics.listen.is_empty() {
                                 match listen(&config.metrics.listen) {
@@ -526,12 +859,20 @@ pub fn start(
                             generation = Some(g);
                         }
                         if let Some(server) = &listener {
-                            match server.recv_timeout(Duration::from_millis(50)) {
-                                Ok(Some(request)) => {
-                                    let output = http_text.read().clone();
-                                    let _ = respond(request, &output);
+                            workers.reap();
+                            match server.accept() {
+                                Ok((stream, _)) => {
+                                    if let Err(error) = workers.admit(
+                                        stream,
+                                        http_text.clone(),
+                                        worker_stop.clone(),
+                                    ) {
+                                        *http_health.write() = Some(error.to_string());
+                                    }
                                 }
-                                Ok(None) => {}
+                                Err(error) if transient(&error) => {
+                                    std::thread::sleep(Duration::from_millis(10))
+                                }
                                 Err(error) => {
                                     *http_health.write() = Some(error.to_string());
                                     listener = None;
@@ -551,16 +892,35 @@ pub fn start(
                     context: "start metrics HTTP".into(),
                     source,
                 })?;
+            let http = HttpService {
+                stop: http_stop,
+                worker: Some(http),
+            };
             let mut generation = None;
-            let mut next = Instant::now();
+            let mut next = Some(Instant::now());
             let mut last_log: Option<Instant> = None;
             while !shutdown.load(Ordering::Acquire) {
                 let (config, g) = state.config();
                 if generation != Some(g) {
                     generation = Some(g);
-                    next = Instant::now();
+                    next = if Instant::now()
+                        .checked_add(config.metrics.interval)
+                        .is_some()
+                    {
+                        Some(Instant::now())
+                    } else {
+                        state.publish_component(crate::component(
+                            "metrics",
+                            "error",
+                            "metrics.interval cannot be represented by the monotonic clock",
+                        ))?;
+                        None
+                    };
                 }
-                if Instant::now() >= next {
+                if next.is_some_and(|deadline| Instant::now() >= deadline) {
+                    // Compare catalog identities at each export to repair startup/reload
+                    // races with a post-scan publication; unchanged snapshots need no read.
+                    let cache_error = reconcile(&state, &config).err().map(|e| e.to_string());
                     let now = crate::unix_now();
                     let view = state.view_at(now);
                     let cache = view.snapshot_metrics_handle();
@@ -573,7 +933,8 @@ pub fn start(
                     let error = write_textfile(&config.metrics.textfile, &output)
                         .err()
                         .map(|e| e.to_string())
-                        .or_else(|| http_error.read().clone());
+                        .or_else(|| http_error.read().clone())
+                        .or_else(|| cache_error.clone());
                     *text.write() = output;
                     if let Some(error) = error {
                         if last_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
@@ -590,19 +951,22 @@ pub fn start(
                             "exported",
                         ))?;
                     }
-                    next = Instant::now() + config.metrics.interval.max(Duration::from_millis(1));
+                    if let Some(deadline) = Instant::now()
+                        .checked_add(config.metrics.interval.max(Duration::from_millis(1)))
+                    {
+                        next = Some(deadline);
+                    } else {
+                        next = None;
+                        state.publish_component(crate::component(
+                            "metrics",
+                            "error",
+                            "metrics.interval cannot be represented by the monotonic clock",
+                        ))?;
+                    }
                 }
                 crate::wait_service(&state, g, &shutdown, Duration::from_millis(50));
             }
-            // tiny_http exposes no socket write deadline or cancellation API. Never let
-            // a stalled client delay daemon shutdown; at most one responder is detached.
-            let deadline = Instant::now() + Duration::from_millis(250);
-            while !http.is_finished() && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            if http.is_finished() {
-                let _ = http.join();
-            }
+            drop(http);
             Ok(())
         })
         .map_err(|source| crate::DaemonError::Io {
