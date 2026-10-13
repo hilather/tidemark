@@ -56,6 +56,7 @@ pub struct ScanEntry {
 
 /// Catalog backed by the scans table in timeseries.db.
 /// Lists are capped at 1,000,000 rows; select a root when exceeding that bound.
+/// Writable handles retain a shared writer lease until their SQLite connection closes.
 pub struct Catalog {
     conn: Connection,
     _lease: Option<crate::lease::WriterLease>,
@@ -134,6 +135,18 @@ impl Catalog {
             recovery_files: Vec::new(),
             _lease: lease,
         })
+    }
+    /// Initialize or migrate storage while exclusive writer ownership is retained.
+    /// The temporary connection closes before this function returns.
+    pub fn initialize_with_lease(
+        state: &Path,
+        lease: &crate::lease::RecoveryLease,
+    ) -> Result<(), StoreError> {
+        lease.verify(state)?;
+        let conn =
+            crate::timeseries::open_connection(&state.join("timeseries.db"), true, Some(lease))?;
+        drop(conn);
+        Ok(())
     }
     /// Open normally after releasing recovery ownership, retaining artifact paths.
     pub fn open_after_recovery(state: &Path, files: Vec<PathBuf>) -> Result<Self, StoreError> {
@@ -395,8 +408,9 @@ fn verify_snapshot_tree(
 
 /// Recover with a retained scan-lock descriptor, verifying its identity and exclusion.
 /// All local catalog/sample connections must be closed before calling this function.
-/// The legacy recovery entry point remains for existing callers; production callers
-/// should use this checked entry point.
+/// This compatibility entry point acquires writer ownership with a two-second bound.
+/// New callers acquire writer ownership before scan ownership and use
+/// `recover_catalog_with_leases` to retain that acquisition order.
 pub fn recover_catalog_with_lock(
     state_dir: &Path,
     scan_lock: &fs::File,

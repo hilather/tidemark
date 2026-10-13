@@ -18,6 +18,7 @@ pub(crate) const SCHEMA: &str = include_str!("../migrations/timeseries-v1.sql");
 /// Long-lived single-writer time-series database.
 ///
 /// Query results are capped at 1,000,000 rows; narrow ranges exceeding that bound.
+/// Writable handles retain a shared writer lease until their SQLite connection closes.
 pub struct TimeSeries {
     pub(crate) conn: Connection,
     _lease: Option<crate::lease::WriterLease>,

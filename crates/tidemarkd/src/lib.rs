@@ -440,6 +440,19 @@ mod tests {
         assert_eq!(attempts, 1);
     }
     #[test]
+    fn startup_initializes_empty_database_without_self_conflicting_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        tidemark_store::state_dir::StateDir::open(dir.path(), true)
+            .unwrap()
+            .open_leaf(std::ffi::OsStr::new("timeseries.db"), true, true)
+            .unwrap();
+        let catalog = startup_catalog(dir.path(), 100, Duration::ZERO).unwrap();
+        assert!(catalog.list(None).unwrap().is_empty());
+        assert!(catalog.recovery_files().is_empty());
+        assert!(dir.path().join("timeseries.db.bak-v0").exists());
+        assert!(!dir.path().join("timeseries-recovery-0").exists());
+    }
+    #[test]
     fn requested_shutdown_preserves_first_startup_attempt() {
         let state = state::LiveState::new(&tidemark_core::config::Config::default(), 0);
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -1344,7 +1357,7 @@ fn startup_catalog(
             drop(catalog);
             false
         }
-        Err(error) if corrupt(&error) => true,
+        Err(error) if corrupt(&error) || uninitialized(&error) => true,
         Err(_) => !storage.join("timeseries.db").exists(),
     };
     let recovery_lease = if needs_recovery {
@@ -1392,6 +1405,11 @@ fn startup_catalog(
             Err(_) if !storage.join("timeseries.db").exists() => held
                 .recover_catalog(storage, &lease)
                 .map_err(startup_scan_error)?,
+            Err(error) if uninitialized(&error) => {
+                tidemark_store::catalog::Catalog::initialize_with_lease(storage, &lease)
+                    .map_err(startup_store_error)?;
+                Vec::new()
+            }
             Err(error) => return Err(startup_store_error(error)),
         };
         drop(lock);
@@ -1447,6 +1465,10 @@ fn startup_scan_error(error: tidemark_scan::orchestrator::ScanError) -> DaemonEr
         }
         error => DaemonError::Store(error.to_string()),
     }
+}
+
+fn uninitialized(error: &tidemark_store::StoreError) -> bool {
+    matches!(error, tidemark_store::StoreError::Invalid(message) if message == "uninitialized timeseries database")
 }
 
 fn corrupt(e: &tidemark_store::StoreError) -> bool {
