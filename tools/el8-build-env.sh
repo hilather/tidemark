@@ -1,7 +1,7 @@
 #!/bin/sh
 # Owned by: CI-rpm. CHANGES THE SYSTEM: disposable build containers/guests only.
 set -eu
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 # os-release is a trusted system file in this disposable guest.
 # shellcheck disable=SC1091 # Provided by the disposable EL8 guest, not the source tree.
 . /etc/os-release
