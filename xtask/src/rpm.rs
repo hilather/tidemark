@@ -58,6 +58,8 @@ pub struct Options {
     pub online: bool,
     /// Explicitly bypass the EL8 host guard.
     pub allow_foreign_host: bool,
+    /// Use the changed-default install-test package metadata.
+    pub upgrade_fixture: bool,
     /// Validated package version.
     pub version: String,
 }
@@ -69,6 +71,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
         online: false,
         allow_foreign_host: false,
         version: "0.1.0".into(),
+        upgrade_fixture: false,
     };
     let mut seen = std::collections::BTreeSet::new();
     let mut args = args;
@@ -78,6 +81,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
         }
         match arg.as_str() {
             "--native" => options.native = true,
+            "--upgrade-fixture" => options.upgrade_fixture = true,
             "--container" => {}
             "--online" => options.online = true,
             "--allow-foreign-host" => options.allow_foreign_host = true,
@@ -90,6 +94,9 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
     }
     if !options.native && (options.online || options.allow_foreign_host) {
         bail!("--online and --allow-foreign-host require --native");
+    }
+    if options.upgrade_fixture && (!options.native || options.version != "0.1.1") {
+        bail!("--upgrade-fixture requires --native and --version 0.1.1");
     }
     generate_rpm_args(&options.version)?;
     Ok(options)
@@ -121,7 +128,18 @@ pub struct NativeCommand {
 }
 
 /// Assemble the ordered build, completion and generator commands.
-pub fn native_commands(version: &str, online: bool) -> Result<Vec<NativeCommand>> {
+pub fn native_commands(
+    version: &str,
+    online: bool,
+    upgrade_fixture: bool,
+) -> Result<Vec<NativeCommand>> {
+    if upgrade_fixture && version != "0.1.1" {
+        bail!("--upgrade-fixture requires version 0.1.1");
+    }
+    let mut rpm_args = generate_rpm_args(version)?;
+    if upgrade_fixture {
+        rpm_args[4] = "tests/install/rpm-upgrade.toml".into();
+    }
     let mut build = vec![
         "build",
         "--locked",
@@ -150,7 +168,7 @@ pub fn native_commands(version: &str, online: bool) -> Result<Vec<NativeCommand>
         },
         NativeCommand {
             program: "cargo".into(),
-            args: generate_rpm_args(version)?,
+            args: rpm_args,
             stdout: None,
         },
     ])
@@ -176,7 +194,7 @@ pub fn run(root: &Path, args: impl Iterator<Item = String>) -> Result<()> {
         {
             bail!("Install cargo-generate-rpm 0.20.0 before running rpm --native");
         }
-        for spec in native_commands(&options.version, options.online)? {
+        for spec in native_commands(&options.version, options.online, options.upgrade_fixture)? {
             let mut command = Command::new(&spec.program);
             command.args(&spec.args).current_dir(root);
             if let Some(path) = spec.stdout {

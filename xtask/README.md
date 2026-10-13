@@ -118,3 +118,5 @@ use `--online` to permit Cargo network access, `--version 0.1.1` for an upgrade
 package, or `--allow-foreign-host` to explicitly override the EL8 host guard.
 `--native` conflicts with `--container`; the default remains the cached container
 build. See `packaging/rpm/README.md` for CI and guest preparation commands.
+
+For the install gate, build `TIDEMARK_INSTALL_UPGRADE_RPM` with `cargo xtask rpm --native --version 0.1.1 --upgrade-fixture` inside the prepared EL8 guest. `--upgrade-fixture` requires native mode and version 0.1.1; it selects the test metadata and changed default config under `tests/install/`, whose exact relationship to the production files is checked by xtask tests. The install harness rejects an upgrade package missing the fixture marker and checks config preservation plus `.rpmnew`; use ordinary builds for release packages.

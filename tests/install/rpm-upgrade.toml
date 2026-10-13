@@ -1,0 +1,22 @@
+name = "tidemark"
+version = "0.1.0"
+release = "1.el8"
+license = "MIT"
+summary = "Read-only disk usage intelligence"
+post_install_script = "packaging/rpm/post.sh"
+pre_uninstall_script = "packaging/rpm/preun.sh"
+post_uninstall_script = "packaging/rpm/postun.sh"
+assets = [
+  { source = "target/release/tidemark", dest = "/usr/bin/tidemark", mode = "0755", user = "root", group = "root" },
+  { source = "target/release/tidemarkd", dest = "/usr/bin/tidemarkd", mode = "0755", user = "root", group = "root" },
+  { source = "packaging/systemd/tidemarkd.service", dest = "/usr/lib/systemd/system/tidemarkd.service", mode = "0644", user = "root", group = "root" },
+  { source = "packaging/tmpfiles.d/tidemark.conf", dest = "/usr/lib/tmpfiles.d/tidemark.conf", mode = "0644", user = "root", group = "root" },
+  { source = "tests/install/upgrade-config/tidemark.toml", dest = "/etc/tidemark/tidemark.toml", mode = "0600", user = "root", group = "root", config = "noreplace" },
+  { source = "packaging/rpm/README-installed.md", dest = "/usr/share/doc/tidemark/README.md", mode = "0644", user = "root", group = "root", doc = true },
+  { source = "docs/plan/07-live-monitoring.md", dest = "/usr/share/doc/tidemark/07-live-monitoring.md", mode = "0644", user = "root", group = "root", doc = true },
+  { source = "docs/plan/08-interfaces.md", dest = "/usr/share/doc/tidemark/08-interfaces.md", mode = "0644", user = "root", group = "root", doc = true },
+  { source = "docs/plan/11-rollout-runbook.md", dest = "/usr/share/doc/tidemark/11-rollout-runbook.md", mode = "0644", user = "root", group = "root", doc = true },
+  { source = "target/release/tidemark.bash", dest = "/usr/share/bash-completion/completions/tidemark", mode = "0644", user = "root", group = "root" },
+]
+[requires]
+systemd = "*"
