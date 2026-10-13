@@ -23,6 +23,9 @@ fn config(dir: &tempfile::TempDir) -> std::path::PathBuf {
     .unwrap();
     p
 }
+fn no_space_line(state: &std::path::Path) -> String {
+    format!("scan: /: scan state: {}: NoSpace\n", state.display())
+}
 fn cli(path: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new("timeout")
         .arg("20s")
@@ -983,13 +986,7 @@ fn direct_scan_space_refusal_has_state_context() {
         eprintln!("pending unrestricted host: root mount identity differs in sandbox");
         return;
     }
-    assert_eq!(
-        error,
-        format!(
-            "scan: /: scan state: {}: NoSpace\n",
-            dir.path().join("state").display()
-        )
-    );
+    assert_eq!(error, no_space_line(&dir.path().join("state")));
 }
 
 #[test]
@@ -999,29 +996,19 @@ fn daemon_scan_space_refusal_matches_direct_exit_and_wording() {
     }
     use tidemark_core::api::{ApiError, ApiErrorCode};
     for (code, message, exit, expected) in [
-        (
-            ApiErrorCode::Unavailable,
-            "scan: NoSpace",
-            5,
-            "scan: /: NoSpace\n",
-        ),
-        (
-            ApiErrorCode::Unavailable,
-            "scan: NoSpace: floor",
-            5,
-            "scan: /: NoSpace\n",
-        ),
+        (ApiErrorCode::Unavailable, "scan: NoSpace", 5, None),
+        (ApiErrorCode::Unavailable, "scan: NoSpace: floor", 5, None),
         (
             ApiErrorCode::Unavailable,
             "measurement unavailable",
             4,
-            "scan: /: daemon request scan.start: measurement unavailable\n",
+            Some("scan: /: daemon request scan.start: measurement unavailable\n"),
         ),
         (
             ApiErrorCode::Internal,
             "scan: NoSpace",
             1,
-            "scan: /: daemon request scan.start: daemon error: scan: NoSpace\n",
+            Some("scan: /: daemon request scan.start: daemon error: scan: NoSpace\n"),
         ),
     ] {
         let dir = ::test_support::private_tempdir().unwrap();
@@ -1070,10 +1057,9 @@ fn daemon_scan_space_refusal_matches_direct_exit_and_wording() {
         server.join().unwrap();
         assert_eq!(out.status.code(), Some(exit));
         let error = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(error, expected);
+        let common = no_space_line(&dir.path().join("state"));
+        assert_eq!(error, expected.unwrap_or(&common));
         if exit == 5 {
-            // Direct mode additionally includes scan state context; see the
-            // separate direct-mode test and GATE-fix2 handoff for this gap.
             assert!(!error.contains("scan: scan:"), "{error}");
             assert!(!error.contains("daemon error"), "{error}");
         }
