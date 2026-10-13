@@ -5,7 +5,6 @@ use crate::{
     state::{LiveState, Publication},
     DaemonError, ServiceHandle, Shutdown,
 };
-use parking_lot::Mutex;
 use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
@@ -73,27 +72,26 @@ pub fn start(
             );
             if !config.procscan.enabled {
                 collector = None;
-                state.publish_component(crate::component("procscan", "disabled", "disabled by config"))?;
+                state.publish(Publication::ProcscanAttempt { generation, report: None }, crate::component("procscan", "disabled", "disabled by config"))?;
             } else {
                 if previous.as_ref() != Some(&key) || collector.is_none() {
                     collector = None;
+                    state.publish(Publication::ProcscanAttempt { generation, report: None }, crate::component("procscan", "degraded", "reconfigured; awaiting completed scan"))?;
                     match scanner(&config) {
-                        Ok(s) => collector = Some(Arc::new(Mutex::new(s))),
-                        Err(e) => { state.publish_component(crate::component("procscan", "error", e.to_string()))?; }
+                        Ok(s) => collector = Some(s),
+                        Err(e) => { state.publish(Publication::ProcscanAttempt { generation, report: None }, crate::component("procscan", "error", e.to_string()))?; }
                     }
                 }
-                if let Some(s) = &collector {
-                    let mut guard = s.lock();
-                    match guard.scan_once(crate::unix_now()) {
+                if let Some(s) = &mut collector {
+                    match s.scan_once(crate::unix_now()) {
                         Ok(result) => {
-                            let (phantom, writers) = guard.take_samples();
-                            drop(guard);
+                            let (phantom, writers) = s.take_samples();
                             let mut dropped = false;
                             for rows in phantom.chunks(super::tswriter::MAX_BATCH_ROWS) { dropped |= writer.try_send(super::tswriter::Message::Phantom(rows.to_vec())).is_err(); }
                             for rows in writers.chunks(super::tswriter::MAX_BATCH_ROWS) { dropped |= writer.try_send(super::tswriter::Message::Writers(rows.to_vec())).is_err(); }
-                            state.publish(Publication::Procscan(s.clone()), crate::component("procscan", if dropped || result.writers_full { "degraded" } else { "ok" }, format!("fds_seen={} writers_full={} writer_evictions={} persistence_dropped={dropped}", result.fds_seen, result.writers_full, result.writer_evictions)))?;
+                            state.publish(Publication::ProcscanAttempt { generation, report: s.report().map(Arc::new) }, crate::component("procscan", if dropped || result.writers_full { "degraded" } else { "ok" }, format!("fds_seen={} writers_full={} writer_evictions={} persistence_dropped={dropped}", result.fds_seen, result.writers_full, result.writer_evictions)))?;
                         }
-                        Err(e) => { drop(guard); state.publish_component(crate::component("procscan", "error", e.to_string()))?; }
+                        Err(e) => { state.publish(Publication::ProcscanAttempt { generation, report: None }, crate::component("procscan", "error", e.to_string()))?; }
                     }
                 }
             }

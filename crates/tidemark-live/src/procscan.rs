@@ -56,6 +56,7 @@ impl Source for ProcSource {
         self.0.lookup(pid)
     }
 }
+#[derive(Clone)]
 struct Tracked {
     row: WriterSample,
     samples: VecDeque<(i64, u64, u64)>,
@@ -79,6 +80,36 @@ pub struct ProcScanner {
     now: Option<i64>,
     admission_cursor: Option<(u64, u64)>,
     rotate: bool,
+}
+/// Immutable completed process report with bounded retained writer histories.
+/// Sharing this value never exposes the mutable procfs collector to readers.
+pub struct ProcReport {
+    mounts: Vec<(RawPath, DevId)>,
+    phantom: Vec<PhantomSummary>,
+    tracked: BTreeMap<(u64, u64), Tracked>,
+    now: i64,
+}
+impl ProcReport {
+    /// Latest completed phantom totals, including measured empty mounts.
+    pub fn phantom(&self, mount: Option<&RawPath>) -> Vec<PhantomSummary> {
+        phantom_rows(&self.phantom, &self.mounts, mount)
+    }
+    /// Compute growth over any positive window using the retained timestamp history.
+    pub fn writers(
+        &self,
+        mount: Option<&RawPath>,
+        window: Duration,
+        limit: usize,
+    ) -> Vec<OpenWriter> {
+        writer_rows(
+            &self.tracked,
+            &self.mounts,
+            Some(self.now),
+            mount,
+            window,
+            limit,
+        )
+    }
 }
 impl ProcScanner {
     /// Construct a real procfs scanner using the shared attribution cache.
@@ -310,86 +341,116 @@ impl ProcScanner {
             duration: started.elapsed(),
         })
     }
+    /// Snapshot the completed report without exposing collector synchronization.
+    /// None before the first successful pass; failures retain private collector history.
+    pub fn report(&self) -> Option<ProcReport> {
+        Some(ProcReport {
+            mounts: self.cfg.mounts.clone(),
+            phantom: self.phantom.clone(),
+            tracked: self.tracked.clone(),
+            now: self.now?,
+        })
+    }
     /// Latest totals with each inode counted once and each process holder listed once.
     pub fn phantom(&self, mount: Option<&RawPath>) -> Vec<PhantomSummary> {
-        self.phantom
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| mount.is_none_or(|p| p == &self.cfg.mounts[*i].0))
-            .map(|(_, s)| s.clone())
-            .collect()
+        phantom_rows(&self.phantom, &self.cfg.mounts, mount)
     }
-    /// Positive allocated growth from the most recent sample at or before the window
-    /// boundary, falling back to the oldest retained sample for shorter histories.
-    /// The reported duration is the actual timestamp span, even for incomplete
-    /// history; observations within the same second yield no measured growth.
+    /// Positive allocated growth over the caller's exact window and retained history.
     pub fn writers(
         &self,
         mount: Option<&RawPath>,
         window: Duration,
         limit: usize,
     ) -> Vec<OpenWriter> {
-        if window.is_zero() {
-            return Vec::new();
-        }
-        let Some(now) = self.now else {
-            return Vec::new();
-        };
-        let cutoff = now.saturating_sub(
-            i64::try_from(
-                window
-                    .as_secs()
-                    .saturating_add(u64::from(window.subsec_nanos() != 0)),
-            )
-            .unwrap_or(i64::MAX),
-        );
-        let mut rows = Vec::new();
-        for t in self.tracked.values().filter(|t| t.missed == 0) {
-            let r = &t.row;
-            if mount.is_some_and(|p| !self.cfg.mounts.iter().any(|(m, d)| m == p && *d == r.dev)) {
-                continue;
-            }
-            let Some(base) = t
-                .samples
-                .iter()
-                .rev()
-                .find(|s| s.0 <= cutoff)
-                .or_else(|| t.samples.front())
-            else {
-                continue;
-            };
-            let growth = delta(r.disk, base.1);
-            let elapsed = r.ts.saturating_sub(base.0);
-            if growth <= 0 || elapsed <= 0 {
-                continue;
-            }
-            rows.push(OpenWriter {
-                mount: r.mount.clone(),
-                pid: r.pid,
-                comm: r.comm.clone(),
-                unit: r.unit.clone(),
-                path: r.path.clone(),
-                dev: r.dev,
-                ino: r.ino,
-                size: r.size,
-                disk: r.disk,
-                growth,
-                window_secs: elapsed as u64,
-            });
-        }
-        rows.sort_unstable_by(|a, b| {
-            b.growth
-                .cmp(&a.growth)
-                .then(a.path.cmp(&b.path))
-                .then((a.dev, a.ino, a.pid).cmp(&(b.dev, b.ino, b.pid)))
-        });
-        rows.truncate(limit);
-        rows
+        writer_rows(
+            &self.tracked,
+            &self.cfg.mounts,
+            self.now,
+            mount,
+            window,
+            limit,
+        )
     }
     /// Drain the latest pass's persistence samples exactly once.
     pub fn take_samples(&mut self) -> (Vec<PhantomSample>, Vec<WriterSample>) {
         std::mem::take(&mut self.pending)
     }
+}
+fn phantom_rows(
+    rows: &[PhantomSummary],
+    mounts: &[(RawPath, DevId)],
+    mount: Option<&RawPath>,
+) -> Vec<PhantomSummary> {
+    rows.iter()
+        .enumerate()
+        .filter(|(i, _)| mount.is_none_or(|p| p == &mounts[*i].0))
+        .map(|(_, s)| s.clone())
+        .collect()
+}
+fn writer_rows(
+    tracked: &BTreeMap<(u64, u64), Tracked>,
+    mounts: &[(RawPath, DevId)],
+    now: Option<i64>,
+    mount: Option<&RawPath>,
+    window: Duration,
+    limit: usize,
+) -> Vec<OpenWriter> {
+    if window.is_zero() {
+        return Vec::new();
+    }
+    let Some(now) = now else {
+        return Vec::new();
+    };
+    let cutoff = now.saturating_sub(
+        i64::try_from(
+            window
+                .as_secs()
+                .saturating_add(u64::from(window.subsec_nanos() != 0)),
+        )
+        .unwrap_or(i64::MAX),
+    );
+    let mut rows = Vec::new();
+    for t in tracked.values().filter(|t| t.missed == 0) {
+        let r = &t.row;
+        if mount.is_some_and(|p| !mounts.iter().any(|(m, d)| m == p && *d == r.dev)) {
+            continue;
+        }
+        let Some(base) = t
+            .samples
+            .iter()
+            .rev()
+            .find(|s| s.0 <= cutoff)
+            .or_else(|| t.samples.front())
+        else {
+            continue;
+        };
+        let growth = delta(r.disk, base.1);
+        let elapsed = r.ts.saturating_sub(base.0);
+        if growth <= 0 || elapsed <= 0 {
+            continue;
+        }
+        rows.push(OpenWriter {
+            mount: r.mount.clone(),
+            pid: r.pid,
+            comm: r.comm.clone(),
+            unit: r.unit.clone(),
+            path: r.path.clone(),
+            dev: r.dev,
+            ino: r.ino,
+            size: r.size,
+            disk: r.disk,
+            growth,
+            window_secs: elapsed as u64,
+        });
+    }
+    rows.sort_unstable_by(|a, b| {
+        b.growth
+            .cmp(&a.growth)
+            .then(a.path.cmp(&b.path))
+            .then((a.dev, a.ino, a.pid).cmp(&(b.dev, b.ino, b.pid)))
+    });
+    rows.truncate(limit);
+    rows
 }
 fn under(path: &[u8], prefix: &[u8]) -> bool {
     path == prefix

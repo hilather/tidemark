@@ -21,7 +21,7 @@ pub const MAX_FS_SAMPLES: usize = 7201;
 /// Shared bounded publication handle; cloned handles observe atomic config reloads.
 #[derive(Clone)]
 pub struct LiveState(Arc<RwLock<Inner>>);
-/// Consistent data/config snapshot. Watcher and scanner handles have their own locks.
+/// Consistent data/config snapshot. Process reports are immutable; watchers own their locks.
 pub struct LiveStateView {
     data: Inner,
     now: i64,
@@ -34,10 +34,13 @@ struct Inner {
     hash: Option<String>,
     fs: BTreeMap<String, VecDeque<FsSample>>,
     fs_available: BTreeMap<String, bool>,
+    fs_failures: BTreeMap<String, u64>,
+    fs_failure_epoch: u64,
+    lvm_failures: u64,
     lvm_available: bool,
     lvm: Option<LvmResult>,
     watchers: BTreeMap<String, Arc<tidemark_live::watch::Watcher>>,
-    procscan: Option<Arc<parking_lot::Mutex<tidemark_live::procscan::ProcScanner>>>,
+    procscan: Option<Arc<tidemark_live::procscan::ProcReport>>,
     alerts: Option<(Vec<AlertSummary>, Vec<AlertDiagnostic>)>,
     scans: BTreeMap<String, ScanStatus>,
     retired_scans: std::collections::BTreeSet<String>,
@@ -88,7 +91,14 @@ pub enum Publication {
     /// Publish watcher measurements.
     Watcher((String, Arc<tidemark_live::watch::Watcher>)),
     /// Publish procscan measurements.
-    Procscan(Arc<parking_lot::Mutex<tidemark_live::procscan::ProcScanner>>),
+    Procscan(Arc<tidemark_live::procscan::ProcReport>),
+    /// Generation-bound completed process report, or unavailable after failure.
+    ProcscanAttempt {
+        /// Configuration observed before collection.
+        generation: u64,
+        /// Immutable completed report; None clears the publication.
+        report: Option<Arc<tidemark_live::procscan::ProcReport>>,
+    },
     /// Publish alerts measurements.
     Alerts((Vec<AlertSummary>, Vec<AlertDiagnostic>)),
     /// Publish scan measurements.
@@ -136,6 +146,9 @@ impl LiveState {
             hash: None,
             fs: BTreeMap::new(),
             fs_available: BTreeMap::new(),
+            fs_failures: BTreeMap::new(),
+            fs_failure_epoch: 0,
+            lvm_failures: 0,
             lvm_available: false,
             lvm: None,
             watchers: BTreeMap::new(),
@@ -262,6 +275,13 @@ impl LiveState {
                 .iter()
                 .any(|p| p.to_string_lossy() == m.as_str())
         });
+        d.fs_failures.retain(|m, _| {
+            config
+                .sampler
+                .mounts
+                .iter()
+                .any(|p| p.to_string_lossy() == m.as_str())
+        });
         d.fs_available.retain(|m, _| {
             config
                 .sampler
@@ -269,8 +289,17 @@ impl LiveState {
                 .iter()
                 .any(|p| p.to_string_lossy() == m.as_str())
         });
+        for path in &config.sampler.mounts {
+            if !d.config.sampler.mounts.contains(path) {
+                interrupt_fs(&mut d, &path.to_string_lossy())?;
+            }
+        }
         if d.config.lvm != config.lvm || d.config.sampler.mounts != config.sampler.mounts {
+            d.lvm_failures = d.lvm_failures.saturating_add(1);
             d.lvm_available = false;
+        }
+        if d.config.procscan != config.procscan || d.config.watch.mounts != config.watch.mounts {
+            d.procscan = None;
         }
         d.windows.clear();
         d.config = Arc::new(config);
@@ -279,7 +308,7 @@ impl LiveState {
     }
     /// Clear a mount's current samples on a presence/identity transition.
     /// Obsolete passes cannot change the current generation's measurements.
-    pub fn reset_fs_mount(&self, generation: u64, mount: &str) {
+    pub fn reset_fs_mount(&self, generation: u64, mount: &str) -> Result<(), crate::DaemonError> {
         let mut d = self.0.write();
         if generation == d.generation
             && d.config
@@ -288,9 +317,11 @@ impl LiveState {
                 .iter()
                 .any(|p| p.to_string_lossy() == mount)
         {
+            interrupt_fs(&mut d, mount)?;
             d.fs.remove(mount);
             d.fs_available.remove(mount);
         }
+        Ok(())
     }
     /// Retain a verified state directory for descriptor-anchored SQLite paths.
     pub fn bind_storage(&self, fd: std::os::fd::OwnedFd) {
@@ -339,6 +370,7 @@ impl LiveState {
                     }
                     Publication::Fs(sample)
                 } else {
+                    interrupt_fs(&mut d, &mount)?;
                     d.fs_available.insert(mount, false);
                     health(&mut d, component);
                     return Ok(());
@@ -351,6 +383,7 @@ impl LiveState {
                 if let Some(report) = report {
                     Publication::Lvm(report)
                 } else {
+                    d.lvm_failures = d.lvm_failures.saturating_add(1);
                     d.lvm_available = false;
                     health(&mut d, component);
                     return Ok(());
@@ -365,6 +398,15 @@ impl LiveState {
             Publication::Fs(s) => {
                 check_key(&d.fs, &s.mount, MAX_SUBJECTS)?;
                 check_key(&d.fs_available, &s.mount, MAX_SUBJECTS)?;
+                if d.fs
+                    .get(&s.mount)
+                    .and_then(|rows| rows.back())
+                    .is_some_and(|last| {
+                        s.ts >= last.ts && !fresh(last.ts, s.ts, d.config.sampler.interval)
+                    })
+                {
+                    interrupt_fs(&mut d, &s.mount)?;
+                }
                 d.fs_available.insert(s.mount.clone(), true);
                 let r = d.fs.entry(s.mount.clone()).or_default();
                 if r.back().is_some_and(|last| s.ts < last.ts) {
@@ -384,6 +426,12 @@ impl LiveState {
                 check_len(r.vgs.len(), MAX_INVENTORY)?;
                 r.mounts.sort_by(|a, b| a.0.cmp(&b.0));
                 r.vgs.sort_by(|a, b| a.vg.cmp(&b.vg));
+                if d.lvm.as_ref().is_some_and(|last| {
+                    r.sampled_at >= last.sampled_at
+                        && !fresh(last.sampled_at, r.sampled_at, d.config.lvm.interval)
+                }) {
+                    d.lvm_failures = d.lvm_failures.saturating_add(1);
+                }
                 d.lvm_available = true;
                 d.lvm = Some(r);
             }
@@ -392,6 +440,12 @@ impl LiveState {
                 d.watchers.insert(mount, w);
             }
             Publication::Procscan(p) => d.procscan = Some(p),
+            Publication::ProcscanAttempt { generation, report } => {
+                if generation != d.generation {
+                    return Ok(());
+                }
+                d.procscan = report;
+            }
             Publication::Alerts((mut a, mut diagnostics)) => {
                 let internal = a
                     .iter()
@@ -834,7 +888,7 @@ impl LiveStateView {
             .as_ref()
             .map(|m| RawPath::new(m.as_bytes().to_vec()).ok())
             .transpose_option()?;
-        Some(self.data.procscan.as_ref()?.lock().phantom(raw.as_ref()))
+        Some(self.data.procscan.as_ref()?.phantom(raw.as_ref()))
     }
     /// Scanner growth using the caller's exact positive duration.
     pub fn writers(&self, p: &WritersParams) -> Option<Vec<OpenWriter>> {
@@ -847,7 +901,6 @@ impl LiveStateView {
             self.data
                 .procscan
                 .as_ref()?
-                .lock()
                 .writers(raw.as_ref(), p.window, MAX_INVENTORY),
         )
     }
@@ -898,6 +951,9 @@ impl LiveStateView {
                     .collect(),
             )
         }
+    }
+    pub(crate) fn collector_failures(&self) -> (BTreeMap<String, u64>, u64) {
+        (self.data.fs_failures.clone(), self.data.lvm_failures)
     }
     /// Known degradation reasons, capped at MAX_SUBJECTS.
     pub fn degraded(&self) -> Option<Vec<String>> {
@@ -1037,4 +1093,11 @@ fn fresh(at: i64, now: i64, interval: Duration) -> bool {
     age >= 0
         && age * 1_000_000_000
             <= (interval.as_nanos().saturating_mul(3).min(i128::MAX as u128) as i128)
+}
+
+fn interrupt_fs(d: &mut Inner, mount: &str) -> Result<(), crate::DaemonError> {
+    check_key(&d.fs_failures, &mount.to_owned(), MAX_SUBJECTS)?;
+    d.fs_failure_epoch = d.fs_failure_epoch.saturating_add(1);
+    d.fs_failures.insert(mount.into(), d.fs_failure_epoch);
+    Ok(())
 }

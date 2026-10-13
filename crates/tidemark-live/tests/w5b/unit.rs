@@ -242,3 +242,77 @@ fn enumeration_identity_mismatch_is_unknown() {
     assert_eq!(row.unit, None);
     assert_eq!(s.take_samples().1[0].comm, "?");
 }
+
+#[test]
+fn immutable_report_keeps_exact_windows_while_collector_blocks() {
+    let mut collector = scanner(vec![
+        Ok(vec![file(1, 1, 512)]),
+        Ok(vec![file(1, 1, 1024)]),
+        Ok(vec![file(1, 1, 2048)]),
+    ]);
+    assert!(collector.report().is_none());
+    collector.scan_once(0).unwrap();
+    collector.scan_once(10).unwrap();
+    collector.scan_once(30).unwrap();
+    let report = Arc::new(collector.report().unwrap());
+    for window in [
+        Duration::from_nanos(1),
+        Duration::from_secs(15),
+        Duration::from_secs(30),
+        Duration::from_secs(300),
+    ] {
+        let actual = report.writers(None, window, 10);
+        let expected = collector.writers(None, window, 10);
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+    struct Blocked {
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    }
+    impl Source for Blocked {
+        fn scan(&mut self, _: &[DevId], _: bool) -> io::Result<Vec<OpenFile>> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(vec![])
+        }
+        fn attribution(&self, _: u32) -> Attribution {
+            unreachable!()
+        }
+    }
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    collector.source = Box::new(Blocked {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let worker = std::thread::spawn(move || {
+        collector.scan_once(40).unwrap();
+        collector
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let reader = {
+        let report = report.clone();
+        std::thread::spawn(move || {
+            tx.send((
+                report.phantom(None),
+                report.writers(None, Duration::from_secs(15), 10),
+            ))
+            .unwrap()
+        })
+    };
+    let read = rx.recv_timeout(Duration::from_millis(50));
+    release_tx.send(()).unwrap();
+    reader.join().unwrap();
+    let collector = worker.join().unwrap();
+    let (phantom, writers) =
+        read.expect("immutable readers must finish during a blocked collection");
+    assert_eq!(phantom[0].total_bytes, 2048);
+    assert_eq!(writers[0].growth, 1024);
+    assert_eq!(writers[0].window_secs, 20);
+    assert_eq!(collector.report().unwrap().phantom(None)[0].total_bytes, 0);
+    assert_eq!(report.phantom(None)[0].total_bytes, 2048);
+}

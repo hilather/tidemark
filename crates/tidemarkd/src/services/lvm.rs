@@ -212,6 +212,12 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(1100));
         assert_eq!(count.load(Ordering::Acquire), 1);
+        use tidemark_live::alerts::AlertSource;
+        let report = state
+            .view()
+            .lvm_report(&tidemark_core::api::LvmParams { mount: None })
+            .unwrap();
+        assert_eq!(state.view_at(report.sampled_at).lvm(), Some(vec![]));
         stop.store(true, Ordering::Release);
         handle.join().unwrap().unwrap();
     }
@@ -289,6 +295,8 @@ mod tests {
             .view()
             .lvm_report(&tidemark_core::api::LvmParams { mount: None })
             .is_some());
+        use tidemark_live::alerts::AlertSource;
+        assert!(state.view_at(report.sampled_at).lvm().is_none());
         shutdown.store(true, Ordering::Release);
         handle.join().unwrap().unwrap();
     }

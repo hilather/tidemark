@@ -25,6 +25,7 @@ pub fn start(
         .spawn(move || {
             let mut previous = None;
             let mut engine = None;
+            let mut previous_failures = (std::collections::BTreeMap::new(), 0);
             let mut sinks: Vec<Box<dyn Deliver>> = vec![Box::new(JournalDeliver)];
             while !shutdown.load(Ordering::Acquire) {
                 let (config, generation) = state.config();
@@ -50,28 +51,13 @@ pub fn start(
                     previous = Some(config.alerts.clone());
                 }
                 if let Some(engine) = engine.as_mut() {
-                    let now = crate::unix_now();
-                    let view = state.view_at(now);
-                    let procscan_ok = view.status(now).is_some_and(|status| {
-                        status.components.iter().any(|c| {
-                            c.name == "procscan" && matches!(c.state.as_str(), "ok" | "degraded")
-                        })
-                    });
-                    let source = EnabledSource {
-                        source: &view,
-                        config: &config,
-                        procscan_ok,
-                    };
-                    tick(
+                    tick_current(
                         engine,
-                        now,
-                        &AlertInputs {
-                            source: &source,
-                            state_space_refused: view.state_space_refused().unwrap_or(false),
-                        },
+                        crate::unix_now(),
                         &state,
                         &writer,
                         &mut sinks,
+                        &mut previous_failures,
                     )?;
                 }
                 crate::wait_service(&state, generation, &shutdown, Duration::from_secs(30));
@@ -85,6 +71,70 @@ pub fn start(
         })
 }
 
+type CollectorFailures = (std::collections::BTreeMap<String, u64>, u64);
+
+fn tick_current(
+    engine: &mut AlertEngine,
+    now: i64,
+    state: &LiveState,
+    writer: &super::tswriter::Sender,
+    sinks: &mut [Box<dyn Deliver>],
+    previous_failures: &mut CollectorFailures,
+) -> Result<(), DaemonError> {
+    let view = state.view_at(now);
+    let (config, _) = view.config();
+    let procscan_ok = view.status(now).is_some_and(|status| {
+        status
+            .components
+            .iter()
+            .any(|c| c.name == "procscan" && matches!(c.state.as_str(), "ok" | "degraded"))
+    });
+    let failures = view.collector_failures();
+    let interrupted: Vec<_> = failures
+        .0
+        .iter()
+        .filter(|(mount, epoch)| previous_failures.0.get(*mount).copied().unwrap_or(0) != **epoch)
+        .map(|(mount, _)| mount.clone())
+        .collect();
+    let mut events = Vec::new();
+    if !interrupted.is_empty() || previous_failures.1 != failures.1 {
+        // Replay a missed unavailability observation before recovery. A
+        // failed and recovered pass between alert ticks still breaks continuity.
+        let source = EnabledSource {
+            source: &view,
+            config: &config,
+            procscan_ok,
+            interrupted_fs: &interrupted,
+            interrupted_lvm: previous_failures.1 != failures.1,
+        };
+        events.extend(engine.evaluate(
+            now,
+            &AlertInputs {
+                source: &source,
+                state_space_refused: view.state_space_refused().unwrap_or(false),
+            },
+        ));
+    }
+    *previous_failures = failures;
+    let source = EnabledSource {
+        source: &view,
+        config: &config,
+        procscan_ok,
+        interrupted_fs: &[],
+        interrupted_lvm: false,
+    };
+    events.extend(engine.evaluate(
+        now,
+        &AlertInputs {
+            source: &source,
+            state_space_refused: view.state_space_refused().unwrap_or(false),
+        },
+    ));
+    tick_evaluated(engine, state, writer, sinks, events)?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn tick(
     engine: &mut AlertEngine,
     now: i64,
@@ -93,12 +143,23 @@ fn tick(
     writer: &super::tswriter::Sender,
     sinks: &mut [Box<dyn Deliver>],
 ) -> Result<(), DaemonError> {
+    let events = engine.evaluate(now, inputs);
+    tick_evaluated(engine, state, writer, sinks, events)
+}
+
+fn tick_evaluated(
+    engine: &AlertEngine,
+    state: &LiveState,
+    writer: &super::tswriter::Sender,
+    sinks: &mut [Box<dyn Deliver>],
+    events: Vec<tidemark_core::live::AlertEvent>,
+) -> Result<(), DaemonError> {
     let mut errors = Vec::new();
     let (config, _) = state.config();
     if !config.alerts.webhook.is_empty() && sinks.len() < 2 {
         errors.push("configured webhook deliverer unavailable".into());
     }
-    for event in engine.evaluate(now, inputs) {
+    for event in events {
         for sink in sinks.iter_mut() {
             if let Err(e) = sink.deliver(&event) {
                 errors.push(e.to_string());
@@ -161,12 +222,20 @@ struct EnabledSource<'a> {
     source: &'a dyn tidemark_live::alerts::AlertSource,
     config: &'a Config,
     procscan_ok: bool,
+    interrupted_fs: &'a [String],
+    interrupted_lvm: bool,
 }
 impl tidemark_live::alerts::AlertSource for EnabledSource<'_> {
     fn fs_sample(&self, mount: &str) -> Option<tidemark_core::live::FsSample> {
+        if self.interrupted_fs.iter().any(|m| m == mount) {
+            return None;
+        }
         self.source.fs_sample(mount)
     }
     fn fs_rate(&self, mount: &str, window: Duration) -> Option<f64> {
+        if self.interrupted_fs.iter().any(|m| m == mount) {
+            return None;
+        }
         self.source.fs_rate(mount, window)
     }
     fn hot_dirs(
@@ -192,7 +261,7 @@ impl tidemark_live::alerts::AlertSource for EnabledSource<'_> {
         self.source.phantom_bytes(mount)
     }
     fn lvm(&self) -> Option<Vec<tidemark_core::live::LvmNow>> {
-        if !self.config.lvm.enabled {
+        if !self.config.lvm.enabled || self.interrupted_lvm {
             return None;
         }
         self.source.lvm()
@@ -309,6 +378,8 @@ mod tests {
                         source: &view,
                         config: &cfg,
                         procscan_ok: false,
+                        interrupted_fs: &[],
+                        interrupted_lvm: false,
                     },
                     state_space_refused: false,
                 },
@@ -392,6 +463,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state.view_at(140).lvm(), Some(vec![]));
+    }
+    #[test]
+    fn failure_between_alert_ticks_restarts_continuity() {
+        let mut cfg = Config::default();
+        cfg.sampler.mounts = vec!["/data".into()];
+        cfg.sampler.interval = Duration::from_secs(10);
+        cfg.alerts.rule = vec![AlertRule {
+            name: "usage".into(),
+            mount: Some("/data".into()),
+            above: Some(AlertThreshold::Number(50.)),
+            for_: Duration::from_secs(10),
+            ..Default::default()
+        }];
+        let state = LiveState::new(&cfg, 0);
+        let publish = |ts| {
+            state
+                .publish(
+                    Publication::FsAttempt {
+                        generation: 0,
+                        mount: "/data".into(),
+                        sample: Some(FsSample {
+                            ts,
+                            mount: "/data".into(),
+                            size: 100,
+                            used: 95,
+                            avail: 5,
+                            inodes: 1,
+                            inodes_used: 0,
+                        }),
+                    },
+                    crate::component("sampler", "ok", "sample"),
+                )
+                .unwrap()
+        };
+        let mut engine = AlertEngine::new(&cfg.alerts.rule, Duration::from_secs(20)).unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let mut failures = CollectorFailures::default();
+        publish(0);
+        tick_current(&mut engine, 0, &state, &tx, &mut [], &mut failures).unwrap();
+        state
+            .publish(
+                Publication::FsAttempt {
+                    generation: 0,
+                    mount: "/data".into(),
+                    sample: None,
+                },
+                crate::component("sampler", "error", "failed"),
+            )
+            .unwrap();
+        publish(9);
+        tick_current(&mut engine, 10, &state, &tx, &mut [], &mut failures).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "recovery must restart pending evidence"
+        );
+        tick_current(&mut engine, 20, &state, &tx, &mut [], &mut failures).unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            super::super::tswriter::Message::Alert(_)
+        ));
+        // A freshness gap between ticks also breaks continuity, even when
+        // neither tick directly observes the expired sample.
+        let mut engine = AlertEngine::new(&cfg.alerts.rule, Duration::from_secs(20)).unwrap();
+        tick_current(&mut engine, 20, &state, &tx, &mut [], &mut failures).unwrap();
+        publish(100);
+        tick_current(&mut engine, 100, &state, &tx, &mut [], &mut failures).unwrap();
+        assert!(rx.try_recv().is_err());
+        tick_current(&mut engine, 110, &state, &tx, &mut [], &mut failures).unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            super::super::tswriter::Message::Alert(_)
+        ));
     }
     #[test]
     fn transitions_delivery_persistence_and_unavailable_pause() {
@@ -513,6 +656,8 @@ mod tests {
             source: &Source(None),
             config: &config,
             procscan_ok: true,
+            interrupted_fs: &[],
+            interrupted_lvm: false,
         };
         assert!(source.hot_dirs("/data", Duration::from_secs(60)).is_none());
         assert!(source.phantom_bytes("/data").is_none());
@@ -522,6 +667,8 @@ mod tests {
             source: &Source(None),
             config: &config,
             procscan_ok: true,
+            interrupted_fs: &[],
+            interrupted_lvm: false,
         };
         for window in [
             Duration::ZERO,

@@ -57,8 +57,39 @@ fn disabled_services_reload_and_stop() {
     let alerts = alerts::start(Arc::new(cfg.clone()), state.clone(), tx, stop.clone()).unwrap();
     wait(|| state.view_at(0).active_alerts().is_some());
     cfg.procscan.enabled = true;
-    state.replace_config(cfg).unwrap();
+    state.replace_config(cfg.clone()).unwrap();
     wait(|| state.view_at(0).phantom(&PhantomParams { mount: None }) == Some(vec![]));
+    cfg.watch.mounts = vec!["/tidemark-nonexistent-fixture".into()];
+    state.replace_config(cfg.clone()).unwrap();
+    wait(|| {
+        state
+            .view_at(0)
+            .status(0)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "procscan" && c.state == "error")
+    });
+    assert!(state
+        .view_at(0)
+        .phantom(&PhantomParams { mount: None })
+        .is_none());
+    cfg.watch.mounts.clear();
+    cfg.procscan.enabled = false;
+    state.replace_config(cfg).unwrap();
+    wait(|| {
+        state
+            .view_at(0)
+            .status(0)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "procscan" && c.state == "disabled")
+    });
+    assert!(state
+        .view_at(0)
+        .phantom(&PhantomParams { mount: None })
+        .is_none());
     stop.store(true, Ordering::Release);
     wait(|| watcher.is_finished() && procscan.is_finished() && alerts.is_finished());
     watcher.join().unwrap().unwrap();
@@ -113,7 +144,10 @@ fn alert_threshold_reload_applies_without_restarting_service() {
     state
         .publish(
             Publication::Fs(FsSample {
-                ts: 0,
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
                 mount: "/data".into(),
                 size: 100,
                 used: 80,

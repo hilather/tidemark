@@ -153,7 +153,7 @@ fn start_with(
                 crate::mounts::log(&changes, "sampler");
                 for change in &changes {
                     last_sample.remove(&change.path);
-                    state.reset_fs_mount(generation, &change.path.to_string_lossy());
+                    state.reset_fs_mount(generation, &change.path.to_string_lossy())?;
                 }
                 if !changes.is_empty() {
                     next_sample = std::time::Instant::now();
@@ -329,6 +329,7 @@ mod tests {
         bytes.lock().clear();
         now.store(102, Ordering::Release);
         wait(&degraded);
+        assert!(state.view_at(102).fs_samples().is_none());
         assert!(rx.try_recv().is_err());
         stop.store(true, Ordering::Release);
         worker.join().unwrap().unwrap();
