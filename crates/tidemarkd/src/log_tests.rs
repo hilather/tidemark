@@ -66,6 +66,15 @@ fn every_operator_message_formats_with_values_and_without_debug_fields() {
             maximum: None,
         });
         crate::api::log_request(0, 1234, "status", true, std::time::Duration::from_millis(3));
+        crate::api::log_request(
+            0,
+            1234,
+            "status",
+            false,
+            std::time::Duration::from_millis(7),
+        );
+        assert!(String::from_utf8_lossy(&bytes.lock())
+            .contains("API request: status from uid 0 pid 1234, failed in 7 ms"));
         crate::raise_fd_limit(
             || rustix::process::Rlimit {
                 current: Some(1024),

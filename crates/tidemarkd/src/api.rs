@@ -487,13 +487,17 @@ fn connection(
                 });
             let _handler = match spawned {
                 Ok(handle) => Handler(Some(handle)),
-                Err(_) => return,
+                Err(_) => {
+                    log_request(uid, pid, &method, false, request_started.elapsed());
+                    return;
+                }
             };
             let deadline = cancellation.deadline;
             let mut timed_out = false;
             let response = loop {
                 if shutdown.load(Ordering::Acquire) {
                     cancellation.cancel();
+                    log_request(uid, pid, &method, false, request_started.elapsed());
                     return;
                 }
                 if Instant::now() >= deadline {
