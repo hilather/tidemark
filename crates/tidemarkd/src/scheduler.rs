@@ -401,9 +401,9 @@ impl Recorder {
         self.send(message)?;
         self.ack(&rx)?.map_err(scan_error)
     }
+    // Outcome persistence belongs to the daemon lifecycle, not scan work.
     fn stopped(&self) -> bool {
-        self.cancel.load(Ordering::Acquire)
-            || self.shutdown.load(Ordering::Acquire)
+        self.shutdown.load(Ordering::Acquire)
             || self.deadline.lock().is_some_and(|d| Instant::now() >= d)
     }
     fn send(&self, mut message: Message) -> Result<(), ScanError> {
@@ -602,6 +602,9 @@ fn last_scan(e: &ScanEntry) -> LastScan {
 }
 impl ScanRecorder for Recorder {
     fn scan_started(&self, e: &ScanEntry) -> Result<(), ScanError> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(ScanError::Cancelled);
+        }
         // run_scan holds the host lock here. Capture the actual predecessor,
         // rather than a catalog observation made before lock acquisition.
         *self.previous.lock() =
@@ -1463,11 +1466,8 @@ mod tests {
             let state = LiveState::new(&cfg, 0);
             let (writer, rx) = bounded(1);
             let rec = recorder(cfg, state, writer.clone(), None);
-            let cancel = if daemon_stop {
-                rec.shutdown.clone()
-            } else {
-                rec.cancel.clone()
-            };
+            let shutdown = rec.shutdown.clone();
+            let deadline = rec.deadline.clone();
             if !enqueued {
                 let (tx, _) = bounded(1);
                 writer.send(Message::Flush(tx)).unwrap();
@@ -1495,7 +1495,11 @@ mod tests {
             } else {
                 None
             };
-            cancel.store(true, Ordering::Release);
+            if daemon_stop {
+                shutdown.store(true, Ordering::Release);
+            } else {
+                *deadline.lock() = Some(Instant::now());
+            }
             let error = result
                 .recv_timeout(Duration::from_millis(500))
                 .unwrap()
@@ -1513,6 +1517,33 @@ mod tests {
             worker.join().unwrap();
             drop(held);
         }
+    }
+    #[test]
+    fn scan_cancel_does_not_interrupt_queue_or_ack_waits() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(config(root.path(), storage.path()));
+        let state = LiveState::new(&cfg, 0);
+        let (writer, rx) = bounded(1);
+        let rec = recorder(cfg, state, writer.clone(), None);
+        let (occupied, _) = bounded(1);
+        writer.send(Message::Flush(occupied)).unwrap();
+        rec.cancel.store(true, Ordering::Release);
+        let worker = std::thread::spawn(move || {
+            let (tx, ack) = bounded(1);
+            rec.send(Message::Flush(tx)).unwrap();
+            rec.ack(&ack).unwrap();
+        });
+        // A cancelled scan still waits for queue capacity and writer acknowledgement.
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Message::Flush(_)
+        ));
+        let Message::Flush(ack) = rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+            panic!("unexpected message");
+        };
+        ack.send(()).unwrap();
+        worker.join().unwrap();
     }
     #[test]
     fn recorder_shared_deadline_interrupts_series_queue_and_barrier_ack() {
@@ -1536,7 +1567,7 @@ mod tests {
             .contains("persistence uncertain"));
     }
     #[test]
-    fn series_cancellation_interrupts_each_queue_and_ack_wait() {
+    fn series_shutdown_interrupts_each_queue_and_ack_wait() {
         for phase in 0..3 {
             let root = tempfile::tempdir().unwrap();
             let storage = tempfile::tempdir().unwrap();
@@ -1545,7 +1576,7 @@ mod tests {
             let state = LiveState::new(&cfg, 0);
             let (writer, rx) = bounded(1);
             let rec = recorder(cfg, state, writer.clone(), None);
-            let cancel = rec.cancel.clone();
+            let shutdown = rec.shutdown.clone();
             if phase == 0 {
                 let (tx, _) = bounded(1);
                 writer.send(Message::Flush(tx)).unwrap();
@@ -1569,7 +1600,7 @@ mod tests {
                 assert!(matches!(held[0], Message::DirSeries(_)));
                 assert!(matches!(held[1], Message::Flush(_)));
             }
-            cancel.store(true, Ordering::Release);
+            shutdown.store(true, Ordering::Release);
             let error = result
                 .recv_timeout(Duration::from_millis(500))
                 .unwrap()
