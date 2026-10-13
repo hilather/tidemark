@@ -348,6 +348,135 @@ impl Snapshot {
         crate::error::check_result_bound(&result)?;
         Ok(result)
     }
+    /// Count direct children matching a raw-byte substring; empty matches all.
+    pub fn children_count(&self, id: u32, filter: &[u8]) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM dirs WHERE parent_id=?1 AND (length(?2)=0 OR instr(name,?2)>0)",
+            params![id, filter],
+            |r| crate::error::read_u64(r, 0),
+        )?)
+    }
+
+    /// Fetch a bounded page after an exclusive sort-key/raw-name cursor.
+    /// Numeric ties always use ascending raw names; name sorting uses `descending`.
+    /// `reverse` returns the preceding rows in reverse order, or the last page
+    /// when no cursor is supplied. Reuse parent, sort, direction and filter.
+    /// Existing indexes narrow by parent, but no index covers the sort order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn children_page(
+        &self,
+        id: u32,
+        sort: SortKey,
+        descending: bool,
+        cursor: Option<&DirRow>,
+        reverse: bool,
+        limit: usize,
+        filter: &[u8],
+    ) -> Result<Vec<DirRow>> {
+        if limit > crate::error::MAX_QUERY_ROWS {
+            return Err(StoreError::Invalid("child page exceeds query cap".into()));
+        }
+        let column = match sort {
+            SortKey::Disk => "t_disk",
+            SortKey::Apparent => "t_apparent",
+            SortKey::Reclaimable => "t_reclaimable",
+            SortKey::Charged => "t_charged",
+            SortKey::Files => "t_files",
+            SortKey::Inodes => "t_inodes",
+            SortKey::Newest => "newest_mtime",
+            SortKey::Name => "name",
+        };
+        let key = match cursor {
+            Some(r) => match sort {
+                SortKey::Disk => rusqlite::types::Value::Integer(sql_u64(r.t_disk)?),
+                SortKey::Apparent => rusqlite::types::Value::Integer(sql_u64(r.t_apparent)?),
+                SortKey::Reclaimable => rusqlite::types::Value::Integer(sql_u64(r.t_reclaimable)?),
+                SortKey::Charged => rusqlite::types::Value::Integer(sql_u64(r.t_charged)?),
+                SortKey::Files => rusqlite::types::Value::Integer(sql_u64(r.t_files)?),
+                SortKey::Inodes => rusqlite::types::Value::Integer(sql_u64(r.t_inodes)?),
+                SortKey::Newest => rusqlite::types::Value::Integer(r.newest_mtime),
+                SortKey::Name => rusqlite::types::Value::Blob(r.name.clone()),
+            },
+            None => rusqlite::types::Value::Null,
+        };
+        let primary_desc = descending ^ reverse;
+        let name_desc = if sort == SortKey::Name {
+            primary_desc
+        } else {
+            reverse
+        };
+        let cmp = if primary_desc { "<" } else { ">" };
+        let name_cmp = if name_desc { "<" } else { ">" };
+        let direction = if primary_desc { "DESC" } else { "ASC" };
+        let name_direction = if name_desc { "DESC" } else { "ASC" };
+        // Omit the cursor predicate entirely for the first page.
+        let after = if cursor.is_some() {
+            format!(" AND ({column}{cmp}?3 OR ({column}=?3 AND name{name_cmp}?4))")
+        } else {
+            String::new()
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "WITH page AS (SELECT id FROM dirs WHERE parent_id=?1 AND (length(?2)=0 OR instr(name,?2)>0){after} ORDER BY {column} {direction},name {name_direction} LIMIT ?5) SELECT dirs.* FROM page JOIN dirs ON dirs.id=page.id ORDER BY {column} {direction},name {name_direction}"
+        ))?;
+        let result = stmt
+            .query_map(
+                params![
+                    id,
+                    filter,
+                    key,
+                    cursor.map(|r| r.name.as_slice()).unwrap_or_default(),
+                    sql_limit(limit)?
+                ],
+                dir_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(result)
+    }
+
+    /// Fetch a bounded link page after an exclusive `(rowid, instance)` cursor.
+    /// Order is directory ID, nullable raw name (NULL first), then rowid to
+    /// distinguish repeated unresolved instances. Reverse reads preceding rows
+    /// in reverse order; without a cursor it starts at the end. Cursors must
+    /// come from this snapshot and inode. No existing index covers this order.
+    pub fn link_instances_page(
+        &self,
+        ino: u64,
+        cursor: Option<&(i64, LinkInstanceRow)>,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<Vec<(i64, LinkInstanceRow)>> {
+        if limit > crate::error::MAX_QUERY_ROWS {
+            return Err(StoreError::Invalid("link page exceeds query cap".into()));
+        }
+        let cmp = if reverse { "<" } else { ">" };
+        let direction = if reverse { "DESC" } else { "ASC" };
+        let after = if cursor.is_some() {
+            format!(" AND (dir_id,name IS NOT NULL,COALESCE(name,x''),rowid){cmp}(?2,?3,?4,?5)")
+        } else {
+            String::new()
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT ino,dir_id,name,rowid FROM link_instances WHERE ino=?1{after} ORDER BY dir_id {direction},name {direction},rowid {direction} LIMIT ?6"
+        ))?;
+        let result = stmt
+            .query_map(
+                params![
+                    sql_u64(ino)?,
+                    cursor.map(|r| r.1.dir_id).unwrap_or(0),
+                    cursor.is_some_and(|r| r.1.name.is_some()),
+                    cursor
+                        .and_then(|r| r.1.name.as_ref())
+                        .map(|n| n.as_bytes())
+                        .unwrap_or_default(),
+                    cursor.map(|r| r.0).unwrap_or(0),
+                    sql_limit(limit)?
+                ],
+                |r| Ok((r.get(3)?, instance_row(r)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(result)
+    }
+
     /// Return independent largest used/reclaimable candidates through a root-relative
     /// depth, the exact eligible row count, and the immutable source path.
     /// Each family is bounded by `limit` (the existing query ceiling applies); ties use raw path bytes.
