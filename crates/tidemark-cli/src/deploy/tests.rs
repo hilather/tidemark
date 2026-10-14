@@ -1666,3 +1666,24 @@ fn refused_purge_restores_each_previous_service_state_and_reports_failures() {
         );
     }
 }
+
+#[test]
+fn staged_inactive_verify_returns_with_start_hint_without_waiting() {
+    let fixture = Fixture::new();
+    fixture.stage();
+    let start = Instant::now();
+    let result = verify(
+        &fixture.state,
+        Duration::from_secs(300),
+        &fixture.sys,
+        &Ping(true),
+    )
+    .unwrap();
+    assert!(start.elapsed() < Duration::from_secs(10));
+    assert!(!result.healthy);
+    assert_eq!(result.items[0].status, CheckStatus::Fail);
+    assert!(result
+        .items
+        .iter()
+        .any(|item| item.detail == SERVICE_START_HINT));
+}

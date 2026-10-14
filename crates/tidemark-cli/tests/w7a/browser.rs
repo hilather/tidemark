@@ -623,9 +623,10 @@ fn own_row_sorts_and_enter_lists_direct_files() {
     b.state.selected = b.own_position();
     b.enter().unwrap();
     assert_eq!(b.state.pane, Pane::Files);
-    assert!(b
-        .text
-        .contains("12 other files, 8 KiB not individually retained"));
+    assert!(b.text.contains(&format!(
+        "12 other files, {} not individually retained",
+        crate::render::size::bytes(8192)
+    )));
 }
 
 #[test]
@@ -681,9 +682,10 @@ fn direct_retained_files_filter_before_limit_and_show_utc() {
     assert!(b.text.contains("/fixture/root"));
     assert!(!b.text.contains("child"));
     assert!(b.text.contains("1970-01-01 00:00:00Z"));
-    assert!(b
-        .text
-        .contains("2 other files, 4 KiB not individually retained"));
+    assert!(b.text.contains(&format!(
+        "2 other files, {} not individually retained",
+        crate::render::size::bytes(4096)
+    )));
 }
 
 #[test]
