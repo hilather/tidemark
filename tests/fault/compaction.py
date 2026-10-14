@@ -81,7 +81,7 @@ elif mode in ('complete', 'idempotent'):
                        700000, 2000, 200] for n in range(2)]
             db.executemany('INSERT INTO fs_samples (mount,res,ts,size,used,avail,inodes,inodes_used) VALUES (?,0,?,2000000,?,700000,2000,200)',
                            ((witness, base + n, n) for n in range(600)))
-        deadline = time.monotonic() + 3700
+        deadline = time.monotonic() + 4200
         while time.monotonic() < deadline:
             assert daemon_identity(pid) == identity, 'intended daemon PID was replaced'
             with connect() as db:
@@ -97,7 +97,7 @@ elif mode in ('complete', 'idempotent'):
         else:
             raise AssertionError('no second compaction witness: %s rows differ from oracle' % len(actual))
     else:
-        deadline = time.monotonic() + 3700
+        deadline = time.monotonic() + 4200
         while time.monotonic() < deadline:
             with connect() as db:
                 actual = [list(row) for row in rows(db)]

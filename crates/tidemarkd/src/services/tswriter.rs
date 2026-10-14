@@ -85,6 +85,9 @@ pub fn start_with_clocks(
         .map_err(store_error)?;
     let (sender, receiver) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
     state.publish_component(crate::component("tswriter", "ok", "bounded single writer"))?;
+    let compact_at = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+        monotonic().saturating_add(3600),
+    ));
     let handle = std::thread::Builder::new()
         .name("ts-writer".into())
         .spawn(move || {
@@ -92,7 +95,7 @@ pub fn start_with_clocks(
                 config,
                 state,
                 shutdown,
-                (clock, monotonic),
+                (clock, monotonic, compact_at),
                 receiver,
                 catalog,
                 ts,
@@ -135,6 +138,9 @@ fn start_supervised_with_clocks(
         "ok",
         "bounded supervised writer",
     ))?;
+    let compact_at = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+        monotonic().saturating_add(3600),
+    ));
     let handle = std::thread::Builder::new()
         .name("ts-supervisor".into())
         .spawn(move || {
@@ -146,7 +152,7 @@ fn start_supervised_with_clocks(
                         let config = config.clone();
                         let state = state.clone();
                         let shutdown = shutdown.clone();
-                        let clocks = (wall.clone(), monotonic.clone());
+                        let clocks = (wall.clone(), monotonic.clone(), compact_at.clone());
                         let receiver = receiver.clone();
                         match std::thread::Builder::new().name("ts-writer".into()).spawn(
                             move || {
@@ -194,6 +200,7 @@ fn start_supervised_with_clocks(
                 let cause = result
                     .err()
                     .map_or_else(|| "writer exited unexpectedly".into(), |e| e.to_string());
+                tracing::warn!(%cause, "restarting time-series writer");
                 state.publish_component(crate::component(
                     "tswriter",
                     if transient { "degraded" } else { "error" },
@@ -262,14 +269,17 @@ fn writer_loop(
     config: std::sync::Arc<tidemark_core::config::Config>,
     state: crate::state::LiveState,
     shutdown: crate::Shutdown,
-    clocks: (crate::Clock, crate::Clock),
+    clocks: (
+        crate::Clock,
+        crate::Clock,
+        std::sync::Arc<std::sync::atomic::AtomicI64>,
+    ),
     receiver: crossbeam_channel::Receiver<Message>,
     catalog: tidemark_store::catalog::Catalog,
     ts: tidemark_store::timeseries::TimeSeries,
 ) -> Result<(), crate::DaemonError> {
     use std::{sync::atomic::Ordering, time::Duration};
-    let (clock, monotonic) = clocks;
-    let mut compact_at = monotonic().saturating_add(3600);
+    let (clock, monotonic, compact_at) = clocks;
     let mut fs_batch = Vec::new();
     let mut failure = None;
     let mut pressure = false;
@@ -376,13 +386,26 @@ fn writer_loop(
             }
         }
         let now = clock();
-        if monotonic() >= compact_at {
+        let started = monotonic();
+        if started >= compact_at.load(Ordering::Acquire) {
+            // Retain the next start across worker death, including a panic during
+            // compaction. Missed intervals coalesce into one attempt, without a
+            // catch-up loop or drift by the operation's duration.
+            compact_at.store(started.saturating_add(3600), Ordering::Release);
+            let duration = std::time::Instant::now();
             let policy = state.config().0.retention.samples.clone();
-            if let Err(error) = ts.compact(now, &policy) {
-                pressure = crate::store_pressure(&error);
-                failure = Some(error.to_string());
+            match ts.compact(now, &policy) {
+                Ok(stats) => tracing::info!(
+                    duration_ms = duration.elapsed().as_millis() as u64,
+                    inserted = stats.inserted,
+                    deleted = stats.deleted,
+                    "time-series compaction completed"
+                ),
+                Err(error) => {
+                    pressure = crate::store_pressure(&error);
+                    failure = Some(error.to_string());
+                }
             }
-            compact_at = monotonic().saturating_add(3600);
         }
         if let Some(error) = failure.take() {
             tracing::error!(%error,"time-series writer failure: {error}");
@@ -527,7 +550,7 @@ mod tests {
             inodes_used: 1,
         }
     }
-    fn wait(mut predicate: impl FnMut() -> bool) {
+    pub(super) fn wait(mut predicate: impl FnMut() -> bool) {
         let end = Instant::now() + Duration::from_secs(15);
         while !predicate() {
             assert!(Instant::now() < end);
@@ -558,7 +581,11 @@ mod tests {
                     Arc::new(config),
                     state,
                     stop,
-                    (Arc::new(|| 0), Arc::new(|| 0)),
+                    (
+                        Arc::new(|| 0),
+                        Arc::new(|| 0),
+                        Arc::new(std::sync::atomic::AtomicI64::new(3600)),
+                    ),
                     rx,
                     catalog,
                     ts,
