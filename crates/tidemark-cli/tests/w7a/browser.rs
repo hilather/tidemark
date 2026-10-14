@@ -708,7 +708,12 @@ fn missing_path_message_does_not_invent_a_mount_reason() {
 #[test]
 fn own_row_appears_once_across_pages_and_sorts_between_children() {
     let (_temp, mut b) = browser(2500);
-    for sort in [state::Sort::Size, state::Sort::Files, state::Sort::Name] {
+    for sort in [
+        state::Sort::Size,
+        state::Sort::Files,
+        state::Sort::Name,
+        state::Sort::Growth,
+    ] {
         b.state.sort = sort;
         b.boundary(false).unwrap();
         let mut own_rows = 0;
@@ -819,4 +824,19 @@ fn missing_path_message_includes_daemon_schedule_for_configured_root() {
         message.contains("next scheduled scan: 1970-01-01 00:00:00Z"),
         "{message}"
     );
+}
+
+#[test]
+fn end_includes_own_row_at_an_exact_page_boundary() {
+    let (_temp, mut b) = browser(2000);
+    b.boundary(true).unwrap();
+    assert_eq!(b.own_position(), PAGE);
+    assert_eq!(b.state.selected, PAGE);
+    b.page(true).unwrap();
+    assert_eq!(b.own_position(), usize::MAX);
+    b.state.sort = state::Sort::Name;
+    b.boundary(true).unwrap();
+    b.page(true).unwrap();
+    assert_eq!(b.pages.offset, 0);
+    assert_eq!(b.own_position(), 0);
 }

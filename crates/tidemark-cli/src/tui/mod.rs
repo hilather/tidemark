@@ -18,6 +18,7 @@ struct Pages {
     reverse: bool,
     growth: Option<Vec<(DirRow, Option<i128>)>>,
     offset: usize,
+    total: usize,
     instances: Vec<(i64, tidemark_core::snapshot::LinkInstanceRow)>,
     inode: Option<u64>,
     live: Option<Vec<(DirRow, Option<i128>)>>,
@@ -61,6 +62,14 @@ struct Browser {
 }
 impl Browser {
     fn load(&mut self) -> anyhow::Result<()> {
+        self.pages.total = if let Some(live) = &self.pages.live {
+            live.iter()
+                .filter(|(row, _)| byte_contains(&row.name, self.state.filter.as_bytes()))
+                .count()
+        } else {
+            self.snapshot
+                .children_count(self.dir.id, self.state.filter.as_bytes())? as usize
+        };
         if self.state.sort == state::Sort::Growth
             && (self.snapshot.children_count(self.dir.id, b"")? > 10_000
                 || self
@@ -172,6 +181,8 @@ impl Browser {
         if self.state.pane == Pane::Instances {
             return self.instance_page(reverse, false);
         }
+        let previous_cursor = self.pages.cursor.clone();
+        let previous_reverse = self.pages.reverse;
         let previous_offset = self.pages.offset;
         let previous_selection = self.state.selected;
         if self.pages.live.is_some() || self.state.sort == state::Sort::Growth {
@@ -183,22 +194,29 @@ impl Browser {
                 return Ok(());
             }
         } else {
-            let cursor = if reverse {
-                self.rows.first()
+            self.pages.offset = if reverse {
+                self.pages.offset.saturating_sub(PAGE)
             } else {
-                self.rows.last()
-            }
-            .map(|r| r.0.clone());
-            if cursor.is_none() {
-                return Ok(());
-            }
-            self.pages.cursor = cursor;
-            self.pages.reverse = reverse;
+                self.pages.offset.saturating_add(self.rows.len())
+            };
         }
+        let cursor = if reverse {
+            self.rows.first()
+        } else {
+            self.rows.last()
+        }
+        .map(|row| row.0.clone());
+        if cursor.is_none() {
+            return Ok(());
+        }
+        self.pages.cursor = cursor;
+        self.pages.reverse = reverse;
         let previous = self.rows.clone();
         self.load()?;
         if self.rows.is_empty() {
             self.pages.offset = previous_offset;
+            self.pages.cursor = previous_cursor;
+            self.pages.reverse = previous_reverse;
             self.state.selected = previous_selection;
             self.rows = previous;
         }
@@ -421,6 +439,16 @@ impl Browser {
         self.rows.iter().collect()
     }
     fn own_position(&self) -> usize {
+        // Own growth is not retained; put unknown growth after known children.
+        if self.state.sort == state::Sort::Growth {
+            return if byte_contains(b".", self.state.filter.as_bytes())
+                && self.pages.offset.saturating_add(self.rows.len()) >= self.pages.total
+            {
+                self.rows.len()
+            } else {
+                usize::MAX
+            };
+        }
         let mut own = self.dir.clone();
         own.name = b".".to_vec();
         own.t_disk = own.own_charged;
@@ -431,16 +459,16 @@ impl Browser {
         let before = |row: &(DirRow, Option<i128>)| self.state.compare(row, &own).is_lt();
         let position = self.rows.iter().take_while(|row| before(row)).count();
         let matches = byte_contains(b".", self.state.filter.as_bytes());
+        let at_beginning = self.pages.offset == 0;
+        let at_end = self.pages.offset.saturating_add(self.rows.len()) >= self.pages.total;
         let in_page = if let Some(cursor) = &self.pages.cursor {
             if self.pages.reverse {
-                !before(&(cursor.clone(), None)) && (position > 0 || self.rows.len() < PAGE)
+                !before(&(cursor.clone(), None)) && (position > 0 || at_beginning)
             } else {
-                before(&(cursor.clone(), None))
-                    && (position < self.rows.len() || self.rows.len() < PAGE)
+                before(&(cursor.clone(), None)) && (position < self.rows.len() || at_end)
             }
         } else {
-            (position > 0 || self.pages.offset == 0)
-                && (position < self.rows.len() || self.rows.len() < PAGE)
+            (position > 0 || at_beginning) && (position < self.rows.len() || at_end)
         };
         if matches && in_page {
             position
