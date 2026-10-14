@@ -260,6 +260,12 @@ pub fn file_parent(path: &Path) -> io::Result<PathBuf> {
     })))
 }
 
+#[cfg(test)]
+thread_local! {
+    // Model statat holding an inode reference across a concurrent SQLite unlink.
+    pub(crate) static STAT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&OsStr, &mut fs::Stat)>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// A verified euid-owned directory with no group/world write permissions.
 pub struct StateDir {
     fd: OwnedFd,
@@ -371,6 +377,12 @@ impl StateDir {
         self.name(name)?;
         match fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => {
+                #[cfg(test)]
+                let mut stat = stat;
+                #[cfg(test)]
+                STAT_HOOK.with_borrow_mut(|hook| {
+                    if let Some(hook) = hook { hook(name, &mut stat); }
+                });
                 self.leaf(name, &stat)?;
                 Ok(true)
             }
