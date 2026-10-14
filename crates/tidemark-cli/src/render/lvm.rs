@@ -166,7 +166,7 @@ mod tests {
             let mut out = Vec::new();
             super::write_width(&report, false, width, &mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
-            assert!(text.contains("size=1 GiB free=1 MiB"), "{text}");
+            assert!(text.contains("size=1.00 GiB free=1.00 MiB"), "{text}");
             assert!(text
                 .lines()
                 .all(|line| line.chars().count() <= width || line.split_whitespace().count() == 1));
