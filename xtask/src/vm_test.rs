@@ -123,13 +123,18 @@ fn remote_command(o: &Options) -> String {
         sudo_env.push(' ');
         sudo_env.push_str(&quote(pair));
     }
+    let mut build_env = String::from("env");
+    for pair in &o.env {
+        build_env.push(' ');
+        build_env.push_str(&quote(pair));
+    }
     if o.suite == "cargo" {
         let fail_fast = if o.no_fail_fast {
             " --no-fail-fast"
         } else {
             ""
         };
-        script.push_str(&format!("cargo build --workspace --features privileged --tests; {sudo_env} cargo test --workspace --features privileged{fail_fast} -- --test-threads=1"));
+        script.push_str(&format!("{build_env} cargo build --workspace --features privileged --tests; {sudo_env} cargo test --workspace --features privileged{fail_fast} -- --test-threads=1"));
         if let Some(filter) = &o.filter {
             script.push(' ');
             script.push_str(&quote(filter));
@@ -139,11 +144,18 @@ fn remote_command(o: &Options) -> String {
         }
     } else {
         script.push_str(&format!(
-            "failed=0; summary=$(mktemp); for script in tests/{}/*.sh; do [ -f \"$script\" ] || {{ echo 'missing script suite' >&2; rm -f \"$summary\"; exit 1; }}; started=$(date +%s); if {sudo_env} bash \"$script\"; then rc=0; result=PASS; else rc=$?; result=FAIL; failed=1; fi; elapsed=$(($(date +%s) - started)); printf '%s %s exit=%s seconds=%s\\n' \"$result\" \"$script\" \"$rc\" \"$elapsed\" >> \"$summary\"; done; cat \"$summary\"; rm -f \"$summary\"; exit \"$failed\"",
+            "failed=0; passed=0; skipped=0; summary=$(mktemp); log=$(mktemp); trap 'rm -f \"$summary\" \"$log\"' EXIT; for script in tests/{}/*.sh; do [ -f \"$script\" ] || {{ echo 'missing script suite' >&2; exit 1; }}; started=$(date +%s); if bash -o pipefail -c 'log=$1; shift; \"$@\" 2>&1 | tee \"$log\"' -- \"$log\" {sudo_env} bash \"$script\"; then rc=0; else rc=$?; fi; reason=$(sed -n '/^SKIP:/{{p;q;}}' \"$log\"); if [ \"$rc\" -ne 0 ]; then result=FAIL; failed=1; elif [ -n \"$reason\" ]; then result=SKIP; skipped=$((skipped + 1)); else result=PASS; passed=$((passed + 1)); fi; elapsed=$(($(date +%s) - started)); printf '%s %s exit=%s seconds=%s\\n' \"$result\" \"$script\" \"$rc\" \"$elapsed\" >> \"$summary\"; if [ \"$result\" = SKIP ]; then printf '%s\\n' \"$reason\" >> \"$summary\"; fi; done; cat \"$summary\"; printf 'passed=%s skipped=%s\\n' \"$passed\" \"$skipped\"; exit \"$failed\"",
             o.suite
         ));
     }
     script
+}
+/// Construct a VM command without contacting a host, for contract tests.
+#[cfg(test)]
+pub fn test_command(args: Vec<String>, identity: &[String]) -> Result<String> {
+    let mut options = parse(args)?;
+    options.env.extend_from_slice(identity);
+    Ok(remote_command(&options))
 }
 fn success(status: ExitStatus, step: &str) -> Result<()> {
     if !status.success() {
@@ -157,7 +169,20 @@ fn success(status: ExitStatus, step: &str) -> Result<()> {
 /// Sync the workspace and stream the selected test suite on a disposable VM.
 /// A failed subprocess's numeric exit code is preserved.
 pub fn run(root: &Path, args: impl IntoIterator<Item = String>) -> Result<()> {
-    let o = parse(args)?;
+    let mut o = parse(args)?;
+    let (commit, date, _) = crate::rpm::build_identity(root);
+    let identity = [
+        format!("TIDEMARK_BUILD_COMMIT={commit}"),
+        format!("TIDEMARK_BUILD_DATE={date}"),
+    ];
+    std::fs::write(
+        root.join(".tidemark-build-id"),
+        format!("{}\n{}\n", identity[0], identity[1]),
+    )?;
+    o.env.retain(|pair| {
+        !pair.starts_with("TIDEMARK_BUILD_COMMIT=") && !pair.starts_with("TIDEMARK_BUILD_DATE=")
+    });
+    o.env.extend(identity);
     let mkdir = format!("mkdir -p -- {}", quote(&o.remote_dir));
     success(
         Command::new("ssh").args(["--", &o.host, &mkdir]).status()?,
@@ -170,6 +195,7 @@ pub fn run(root: &Path, args: impl IntoIterator<Item = String>) -> Result<()> {
                 "--protect-args",
                 "--exclude=target/",
                 "--exclude=.git/",
+                "--exclude=.git",
                 "--",
             ])
             .arg(format!("{}/", root.display()))
@@ -192,6 +218,7 @@ mod tests {
     }
     #[test]
     fn validates_arguments_without_contacting_host() {
+        assert!(test_command(args(&["--host", "vm"]), &[]).is_ok());
         for v in [
             vec![],
             vec!["--host"],
@@ -283,7 +310,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(remote_command(&o),
-            "set -eu; cd -- 'tidemark-vm-test'; cargo build --workspace --features privileged --tests; sudo env \"PATH=$PATH\" 'TIDEMARK_A=a b'\\''c;$(false)' 'TIDEMARK_B=x=y' cargo test --workspace --features privileged -- --test-threads=1 'probe' --nocapture");
+            "set -eu; cd -- 'tidemark-vm-test'; env 'TIDEMARK_A=a b'\\''c;$(false)' 'TIDEMARK_B=x=y' cargo build --workspace --features privileged --tests; sudo env \"PATH=$PATH\" 'TIDEMARK_A=a b'\\''c;$(false)' 'TIDEMARK_B=x=y' cargo test --workspace --features privileged -- --test-threads=1 'probe' --nocapture");
         for suite in ["install", "fault"] {
             let o = parse(args(&[
                 "--host",

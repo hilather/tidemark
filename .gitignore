@@ -3,3 +3,6 @@
 /fuzz/target/
 /fuzz/artifacts/
 /fuzz/coverage/
+
+# Host identity carried into git-free VM source copies.
+.tidemark-build-id

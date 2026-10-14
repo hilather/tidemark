@@ -220,9 +220,8 @@ pub fn native_commands(
     ])
 }
 
-/// Build natively on EL8 or in the existing pre-provisioned container.
-pub fn run(root: &Path, args: impl Iterator<Item = String>) -> Result<()> {
-    let options = parse_args(args)?;
+/// Resolve host build identity using the same sources as native package builds.
+pub fn build_identity(root: &Path) -> (String, String, bool) {
     let git = |args: &[&str]| -> Option<String> {
         let output = Command::new("git")
             .args(args)
@@ -236,20 +235,39 @@ pub fn run(root: &Path, args: impl Iterator<Item = String>) -> Result<()> {
     };
     let dirty =
         git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
-    if options.require_clean && dirty {
-        bail!("--require-clean rejects changes to tracked files");
-    }
+    let file = std::fs::read_to_string(root.join(".tidemark-build-id")).ok();
+    let field = |key: &str| {
+        file.as_deref().and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix(key)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+        })
+    };
     let commit = std::env::var("TIDEMARK_BUILD_COMMIT")
         .ok()
         .unwrap_or_else(|| {
             git(&["rev-parse", "--short=12", "HEAD"])
                 .map(|c| if dirty { format!("{c}-dirty") } else { c })
+                .or_else(|| field("TIDEMARK_BUILD_COMMIT="))
                 .unwrap_or_else(|| "unknown".into())
         });
     let date = std::env::var("TIDEMARK_BUILD_DATE")
         .ok()
         .or_else(|| git(&["show", "-s", "--format=%cs", "HEAD"]))
+        .or_else(|| field("TIDEMARK_BUILD_DATE="))
         .unwrap_or_else(|| "unknown".into());
+    (commit, date, dirty)
+}
+
+/// Build natively on EL8 or in the existing pre-provisioned container.
+pub fn run(root: &Path, args: impl Iterator<Item = String>) -> Result<()> {
+    let options = parse_args(args)?;
+    let (commit, date, dirty) = build_identity(root);
+    if options.require_clean && dirty {
+        bail!("--require-clean rejects changes to tracked files");
+    }
     let identity = [
         ("TIDEMARK_BUILD_COMMIT", commit.as_str()),
         ("TIDEMARK_BUILD_DATE", date.as_str()),
