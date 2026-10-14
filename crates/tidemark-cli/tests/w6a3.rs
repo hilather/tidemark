@@ -1365,13 +1365,17 @@ fn daemon_lvm_numbers_are_percentages_and_unknowns_without_sockets() {
     for present in [true, false] {
         let value = present.then_some(25.0);
         let report: tidemark_core::api::LvmResult = serde_json::from_value(serde_json::json!({
-            "mounts":[["/data", {"vg":"vg", "lv":"lv", "lv_size":1024,
-                "vg_free":512,"thin_pool":"pool","data_pct":value,"meta_pct":value,"sampled_at":42}]],
-            "vgs":[],"sampled_at":42
+            "mounts":[["/data", {"vg":"vg", "lv":"lv", "lv_size":1073741824,
+                "vg_free":1048576,"thin_pool":"pool","data_pct":value,"meta_pct":value,"sampled_at":42}]],
+            "vgs":[{"vg":"vg","size":2147483648u64,"free":1048576}],"sampled_at":42
         })).unwrap();
         let mut now = example_now();
         now.mounts[0].lvm = Some(report.mounts[0].1.clone());
         let text = tidemark_cli::render::now::render_text(&now, 100);
+        assert!(
+            text.contains("1.00 GiB") && text.contains("VG free 1.00 MiB"),
+            "{text}"
+        );
         assert!(!text.contains("Some(") && !text.contains("None"));
         assert!(
             text.contains(if present {
@@ -1391,6 +1395,11 @@ fn daemon_lvm_numbers_are_percentages_and_unknowns_without_sockets() {
             tidemark_cli::render::now::lvm_width(&report, &trends, false, width, &mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
             assert!(!text.contains("Some(") && !text.contains("None"), "{text}");
+            assert!(
+                text.contains("1.00 GiB") && text.contains("1.00 MiB"),
+                "{text}"
+            );
+            assert!(text.contains("VG vg: 2.00 GiB, 1.00 MiB free"), "{text}");
             if present {
                 assert!(
                     text.contains("25.00%") && text.contains("+1.50") && text.contains("-0.50"),

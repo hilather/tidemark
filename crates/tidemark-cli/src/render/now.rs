@@ -155,8 +155,8 @@ pub fn lvm_width(
         table.push(vec![
             escape(m),
             format!("{}/{}", escape(&r.vg), escape(&r.lv)),
-            r.lv_size.to_string(),
-            r.vg_free.to_string(),
+            super::size::bytes(r.lv_size),
+            super::size::bytes(r.vg_free),
             escape(r.thin_pool.as_deref().unwrap_or("?")),
             super::lvm::pct(r.data_pct),
             super::lvm::pct(r.meta_pct),
@@ -170,7 +170,12 @@ pub fn lvm_width(
     for vg in vgs {
         out.write_all(
             crate::render::table::wrap(
-                &format!("VG {}: {} bytes, {} free", escape(&vg.vg), vg.size, vg.free),
+                &format!(
+                    "VG {}: {}, {} free",
+                    escape(&vg.vg),
+                    super::size::bytes(vg.size),
+                    super::size::bytes(vg.free)
+                ),
                 width,
             )
             .as_bytes(),
@@ -363,4 +368,56 @@ pub(crate) fn signed_bytes(bytes: i64) -> String {
         if bytes < 0 { "-" } else { "+" },
         tidemark_core::units::fmt_bytes(bytes.unsigned_abs())
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn daemon_lvm_sizes_are_human_readable_and_json_keeps_bytes() {
+        let report = tidemark_core::api::LvmResult {
+            mounts: vec![(
+                "/data".into(),
+                tidemark_core::live::LvmNow {
+                    vg: "vg".into(),
+                    lv: "lv".into(),
+                    lv_size: 2 << 30,
+                    vg_free: 3 << 20,
+                    thin_pool: None,
+                    data_pct: None,
+                    meta_pct: None,
+                    sampled_at: 42,
+                },
+            )],
+            vgs: vec![tidemark_core::api::VgInfo {
+                vg: "vg".into(),
+                size: 4 << 30,
+                free: 3 << 20,
+            }],
+            sampled_at: 42,
+        };
+        for width in [80, 100, 200] {
+            let mut out = Vec::new();
+            super::lvm_width(&report, &[], false, width, &mut out).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.contains("2.00 GiB") && text.contains("3.00 MiB"),
+                "{text}"
+            );
+            assert!(text.contains("VG vg: 4.00 GiB, 3.00 MiB free"), "{text}");
+            assert!(!text.contains(" bytes"), "{text}");
+            assert!(
+                text.lines().all(|line| line.chars().count() <= width),
+                "{text}"
+            );
+            let mut out = Vec::new();
+            super::lvm_width(&report, &[], true, width, &mut out).unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(doc["schema"], "tidemark.lvm.daemon.v1");
+            assert_eq!(doc["data"], serde_json::to_value(&report).unwrap());
+            assert_eq!(doc["data"]["mounts"][0][1]["lv_size"], 2u64 << 30);
+            assert_eq!(doc["data"]["mounts"][0][1]["vg_free"], 3u64 << 20);
+            assert_eq!(doc["data"]["vgs"][0]["size"], 4u64 << 30);
+            assert_eq!(doc["data"]["vgs"][0]["free"], 3u64 << 20);
+        }
+    }
 }
