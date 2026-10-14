@@ -370,3 +370,20 @@ fn child_guard_reaps_writer_when_an_assertion_panics() {
     );
     assert!(tidemark_store::lease::RecoveryLease::acquire(state.path(), Duration::ZERO).is_ok());
 }
+
+#[test]
+fn recovery_allocates_one_directory_only_when_preserving_artifacts() {
+    let state = test_support::private_tempdir().unwrap();
+    let catalog = tidemark_store::catalog::recover_catalog(state.path()).unwrap();
+    assert!(catalog.recovery_files().is_empty());
+    assert!(!state.path().join("timeseries-recovery-0").exists());
+    drop(catalog);
+    test_support::private_write(state.path().join("timeseries.db"), b"corrupt").unwrap();
+    let catalog = tidemark_store::catalog::recover_catalog(state.path()).unwrap();
+    assert!(!catalog.recovery_files().is_empty());
+    assert!(state
+        .path()
+        .join("timeseries-recovery-0/timeseries.db")
+        .exists());
+    assert!(!state.path().join("timeseries-recovery-1").exists());
+}

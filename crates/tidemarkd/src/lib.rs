@@ -546,6 +546,17 @@ mod tests {
         assert!(catalog.list(None).unwrap().is_empty());
     }
     #[test]
+    fn clean_first_start_and_restart_do_not_allocate_recovery_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for now in [100, 101] {
+            let catalog = startup_catalog(dir.path(), now, Duration::ZERO).unwrap();
+            assert!(catalog.recovery_files().is_empty());
+            assert!(!dir.path().join("timeseries-recovery-0").exists());
+            drop(catalog);
+        }
+    }
+
+    #[test]
     fn startup_initializes_empty_database_without_self_conflicting_lease() {
         let dir = tempfile::tempdir().unwrap();
         tidemark_store::state_dir::StateDir::open(dir.path(), true)

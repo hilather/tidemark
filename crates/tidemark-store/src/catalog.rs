@@ -507,6 +507,40 @@ fn recover_catalog_owned(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    // Recovery ownership excludes writers. Do not allocate an artifact directory
+    // for first startup when there is nothing to preserve.
+    let names = [
+        "timeseries.db",
+        "timeseries.db-wal",
+        "timeseries.db-shm",
+        "timeseries.db-journal",
+        "timeseries.db.bak-v0",
+        "timeseries.db.bak-v0-wal",
+        "timeseries.db.bak-v0-shm",
+        "timeseries.db.bak-v0-journal",
+    ];
+    let mut has_artifact = false;
+    for name in names {
+        match fs::symlink_metadata(state_dir.join(name)) {
+            Ok(_) => has_artifact = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !has_artifact {
+        let catalog = Catalog {
+            conn: crate::timeseries::open_connection(
+                &state_dir.join("timeseries.db"),
+                true,
+                Some(lease),
+            )?,
+            state_dir: state_dir.to_owned(),
+            recovery_files: Vec::new(),
+            _lease: None,
+        };
+        catalog.rebuild_from_files()?;
+        return Ok(Vec::new());
+    }
     // A private, exclusively created directory supplies a collision-free namespace.
     let mut recovery = None;
     for sequence in 0..10_000u32 {
