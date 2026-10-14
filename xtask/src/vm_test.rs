@@ -218,6 +218,7 @@ mod tests {
     }
     #[test]
     fn validates_arguments_without_contacting_host() {
+        assert!(test_command(args(&["--host", "vm"]), &[]).is_ok());
         for v in [
             vec![],
             vec!["--host"],
