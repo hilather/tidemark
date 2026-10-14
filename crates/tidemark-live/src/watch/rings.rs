@@ -133,36 +133,6 @@ impl Bucket {
             };
         self.release_nodes(nodes);
     }
-    fn clear_rows(&mut self) {
-        let bytes: usize = self
-            .maps
-            .iter()
-            .flat_map(|m| m.iter())
-            .map(|(k, r)| {
-                k.capacity() + r.key.capacity() + r.top_unit.as_ref().map_or(0, String::capacity)
-            })
-            .sum::<usize>()
-            + self
-                .units
-                .iter()
-                .flat_map(|m| m.iter())
-                .map(|(k, v)| k.capacity() + v.0.keys().map(String::capacity).sum::<usize>())
-                .sum::<usize>();
-        let nodes: usize = self
-            .maps
-            .iter()
-            .map(|m| m.len() * ROW_NODE_BYTES + if m.is_empty() { 0 } else { ROW_MAP_BYTES })
-            .sum::<usize>()
-            + self
-                .units
-                .iter()
-                .map(|m| m.len() * UNIT_NODE_BYTES + if m.is_empty() { 0 } else { UNIT_MAP_BYTES })
-                .sum::<usize>();
-        self.maps = std::array::from_fn(|_| BTreeMap::new());
-        self.units = std::array::from_fn(|_| BTreeMap::new());
-        self.release(bytes);
-        self.release_nodes(nodes);
-    }
 }
 impl Drop for Bucket {
     fn drop(&mut self) {
@@ -833,11 +803,10 @@ impl Rings {
         let mut result = Vec::new();
         let mut reservations = Vec::new();
         for b in &mut self.buckets {
-            if b.minute < now.div_euclid(60) * 60 {
+            if !b.drained && b.minute < now.div_euclid(60) * 60 {
                 let (limit, lease) = Self::output_reservation(b, top_k, mount, false);
                 reservations.push(lease);
                 result.extend(Self::persisted(b, mount, limit));
-                b.clear_rows();
                 self.rows_drained_until = self.rows_drained_until.max(Some(b.minute));
             }
         }
@@ -881,7 +850,6 @@ impl Rings {
                 dirs,
                 persisted,
             });
-            b.clear_rows();
             self.last_emitted_end = Some(b.overflow_end);
             next = b.minute.saturating_add(60);
         }
@@ -996,13 +964,13 @@ mod tests {
         }
     }
     #[test]
-    fn byte_budget_falls_back_to_root_and_releases_completed_maps() {
+    fn byte_budget_falls_back_to_root_and_retains_completed_maps() {
         let mut r = Rings::new();
-        let budget = Budget::with_limit(64 * 1024);
+        let budget = Budget::new();
         r.configure(budget.clone(), b"/mount").unwrap();
         for minute in 0..70 {
             for n in 0..8 {
-                let mut key = vec![b'x'; 1500];
+                let mut key = vec![b'x'; 150_000];
                 key[0] = b'/';
                 key[1] = b'a' + n;
                 r.add(
@@ -1016,19 +984,55 @@ mod tests {
             let rows = r.hot(minute * 60, 1, HotScope::Dir, 20);
             assert_eq!(rows.iter().map(|r| r.events).sum::<u64>(), 8);
             assert_eq!(rows.iter().map(|r| r.bytes_delta).sum::<i64>(), 56);
-            assert!(rows.iter().any(|r| r.key == b"/mount"));
-            assert!(r
-                .detail(minute * 60)
-                .contains("key bytes over the memory budget"));
+            if minute > 30 {
+                assert!(rows.iter().any(|r| r.key == b"/mount"));
+            }
+
             assert_eq!(budget.used(), payload(&r)); // exact, zero tolerance
-            assert!(budget.committed() <= 64 * 1024);
+            assert!(budget.committed() <= super::super::WATCH_MEMORY_BYTES);
             r.drain_minutes((minute + 1) * 60, "/mount", 1000);
-            assert!(r
-                .buckets
-                .iter()
-                .filter(|b| b.drained)
-                .all(|b| b.maps.iter().all(BTreeMap::is_empty)));
+            assert_eq!(
+                r.hot((minute + 1) * 60, 2, HotScope::Dir, 20)
+                    .iter()
+                    .map(|r| r.events)
+                    .sum::<u64>(),
+                8
+            );
             assert_eq!(budget.used(), payload(&r));
+        }
+    }
+    #[test]
+    fn every_scope_retains_history_after_both_delivery_paths() {
+        for legacy in [false, true] {
+            let mut r = Rings::new();
+            for minute in 0..60 {
+                r.add(
+                    minute * 60,
+                    [b"/dir".to_vec(), b"unit".to_vec(), b"comm".to_vec()],
+                    7,
+                    None,
+                    (1, minute as u64),
+                );
+                let at = (minute + 1) * 60;
+                r.advance(at);
+                for window in [5, 15, 60] {
+                    for scope in [HotScope::Dir, HotScope::Unit, HotScope::Comm] {
+                        let before = r.hot(at, window, scope, 1000);
+                        if legacy {
+                            r.drain(at, "/", 1000);
+                        } else {
+                            r.drain_minutes(at, "/", 1000);
+                        }
+                        assert_eq!(before, r.hot(at, window, scope, 1000));
+                    }
+                }
+                let remaining = r.drain(at, "/", 1000);
+                assert_eq!(remaining.len(), if !legacy && minute == 0 { 3 } else { 0 });
+                assert!(r
+                    .drain_minutes(at, "/", 1000)
+                    .iter()
+                    .all(|m| m.persisted.is_empty()));
+            }
         }
     }
     #[test]
@@ -1142,7 +1146,7 @@ mod tests {
             }
             let minutes = r.drain_minutes(120, "/", 1);
             assert_eq!(minutes.len(), 1);
-            assert_eq!(minutes[0].dirs.len(), usize::from(!legacy_first));
+            assert_eq!(minutes[0].dirs.len(), 1);
             assert_eq!(minutes[0].persisted.len(), if legacy_first { 0 } else { 3 });
             assert!(r.drain(120, "/", 1).is_empty());
             assert!(r.drain_minutes(120, "/", 1).is_empty());

@@ -833,7 +833,7 @@ impl Watcher {
     /// Recovery, overflow, rollback and cut lists make hot data unavailable (lossy).
     /// Persistence rows share a cursor with [`Self::drain_completed_minutes`]; a row
     /// is handed out once through whichever method drains its minute first. The
-    /// minute facts remain available after the legacy row drain; its key maps are released.
+    /// minute facts and admitted query rows remain available until their buckets expire.
     pub fn drain_minutes(&self, top_k: usize) -> Vec<CompletedMinute> {
         self.drain_minutes_at(now(), top_k)
     }
@@ -1951,12 +1951,8 @@ mod tests {
             let minutes = watcher.drain_minutes_at(180, 1000);
             assert_eq!(minutes.len(), 2);
             assert_eq!(minutes[0].started_at, 60);
-            if legacy_first {
-                assert!(minutes[0].dirs.is_empty());
-            } else {
-                assert_eq!(minutes[0].dirs[0].bytes_delta, 2);
-                assert_eq!(minutes[0].dirs[0].top_unit.as_deref(), Some("u"));
-            }
+            assert_eq!(minutes[0].dirs[0].bytes_delta, 2);
+            assert_eq!(minutes[0].dirs[0].top_unit.as_deref(), Some("u"));
             assert_eq!(minutes[0].persisted.len(), if legacy_first { 0 } else { 3 });
             assert!(minutes[1].dirs.is_empty() && minutes[1].persisted.is_empty());
             assert!(!minutes[1].lossy);
