@@ -275,6 +275,7 @@ impl Rings {
             for bucket in &mut self.buckets {
                 if bucket.minute >= minute {
                     bucket.lossy = true;
+                    bucket.transport_loss = true;
                 }
             }
             return;
@@ -701,6 +702,7 @@ impl Rings {
         }
     }
     pub fn detail(&self, now: i64) -> String {
+        let now = now.max(self.buckets.back().map_or(now, |b| b.minute));
         let cutoff = now.div_euclid(60) * 60 - 14 * 60;
         // One latest occurrence per cause bounds status text independently of
         // the number of affected minutes and configured watchers.

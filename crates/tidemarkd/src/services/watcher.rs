@@ -257,7 +257,27 @@ fn publish_tick(
     writer: &super::tswriter::Sender,
     tick: (bool, i64),
 ) -> Result<(), DaemonError> {
-    let (rules_changed, at) = tick;
+    publish_tick_with_status_hook(
+        mount,
+        w,
+        history,
+        config,
+        state,
+        writer,
+        (tick.0, tick.1, || {}),
+    )
+}
+
+fn publish_tick_with_status_hook(
+    mount: &str,
+    w: &Watcher,
+    history: &mut MinuteHistory,
+    config: &Config,
+    state: &LiveState,
+    writer: &super::tswriter::Sender,
+    tick: (bool, i64, impl FnOnce()),
+) -> Result<(), DaemonError> {
+    let (rules_changed, at, before_status) = tick;
     let mut published = 0;
     let mut rows = Vec::new();
     for mut minute in w.drain_minutes_at(at, 1000) {
@@ -273,6 +293,7 @@ fn publish_tick(
     }
     let rows = persistence_rows(rows);
     let dropped = enqueue_persistence(w, writer, rows);
+    before_status();
     state.publish_component(watcher_component_at(mount, w, dropped, published, at))
 }
 
@@ -793,6 +814,36 @@ fn persistence_rows(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejected_writer_queue_keeps_persistence_drop_signal() {
+        let cfg = Config::default();
+        let state = LiveState::new(&cfg, 0);
+        let watcher = activity_watcher(b"/data", 0);
+        let mut history = MinuteHistory::for_watcher(watcher.clone());
+        let (tx, _rx) = crossbeam_channel::bounded(0);
+        publish_tick(
+            "/data",
+            &watcher,
+            &mut history,
+            &cfg,
+            &state,
+            &tx,
+            (false, 120),
+        )
+        .unwrap();
+        assert!(state
+            .view_at(120)
+            .status(120)
+            .unwrap()
+            .components
+            .iter()
+            .find(|c| c.name == "watcher:/data")
+            .unwrap()
+            .detail
+            .contains("persistence_dropped=true"));
+        assert!(watcher.drain_minutes_at(120, 1000).is_empty());
+    }
+
     fn activity_watcher(mount: &[u8], start: i64) -> Arc<Watcher> {
         Arc::new(
             Watcher::from_injected_events(
@@ -822,7 +873,29 @@ mod tests {
     fn production_tick_moves_emergency_aggregate_through_full_normal_admission() {
         let cfg = Config::default();
         let state = LiveState::new(&cfg, 0);
-        let watcher = activity_watcher(b"/data", 0);
+        let watcher = Arc::new(
+            Watcher::from_injected_events_at(
+                RawPath::new(b"/data".to_vec()).unwrap(),
+                0,
+                [
+                    (
+                        60,
+                        [b"/data/a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                        71,
+                        None,
+                        (1, 1),
+                    ),
+                    (
+                        61,
+                        [b"/data/a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                        -9,
+                        None,
+                        (1, 2),
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
         let mut history = MinuteHistory::for_watcher(watcher.clone());
         // Reserve all remaining normal capacity while leaving emergency export
         // headroom available. Binary search handles conservative container charges.
@@ -857,7 +930,8 @@ mod tests {
             })
             .collect();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].bytes_delta, 82);
+        assert_eq!(rows[0].bytes_delta, 62);
+        assert_eq!(rows[0].events, 2);
         assert_eq!(rows[0].scope, "dir");
         assert_eq!(rows[0].key, b"/data");
         assert!(rows[0].lossy);
@@ -1003,26 +1077,78 @@ mod tests {
             .any(|s| s.contains("history starts")));
         // A new daemon and a replacement with no rows have the same unavailable semantics.
         let empty = Arc::new(
-            Watcher::from_injected_events(
-                RawPath::new(b"/A".to_vec()).unwrap(),
-                [(120, [Vec::new(), Vec::new(), Vec::new()], 0, None, (1, 1))],
-            )
-            .unwrap(),
+            Watcher::from_injected_events_at(RawPath::new(b"/A".to_vec()).unwrap(), 120, [])
+                .unwrap(),
         );
-        // Query a scope without events by using a zero result limit.
         state
+            .publish(
+                Publication::Watcher(("/A".into(), empty.clone())),
+                crate::component("watcher:/A", "ok", "test"),
+            )
+            .unwrap();
+        let p = queries[1].clone();
+        let fresh = LiveState::new(&cfg, 120);
+        fresh
             .publish(
                 Publication::Watcher(("/A".into(), empty)),
                 crate::component("watcher:/A", "ok", "test"),
             )
             .unwrap();
-        let p = HotParams {
-            limit: 0,
-            ..queries[1].clone()
-        };
+        assert!(fresh.view_at(120).hot(&p).is_none());
+        assert!(fresh
+            .view_at(120)
+            .now(
+                &NowParams {
+                    mount: Some("/A".into())
+                },
+                120
+            )
+            .unwrap()
+            .degraded
+            .iter()
+            .any(|s| s == "watcher /A: history starts at 00:03 UTC"));
+        for query in &queries {
+            assert!(fresh.view_at(120).hot(query).is_none());
+        }
+        let unavailable_detail = state.view_at(120).hot_unavailable_detail(&p);
+        let retiring = activity_watcher(b"/A", 120);
+        watchers.insert("/A".into(), retiring.clone());
+        histories.insert("/A".into(), MinuteHistory::for_watcher(retiring));
+        let old = cfg.watch.clone();
+        cfg.watch.hot_depth += 1;
+        reconcile_settings(
+            Some(&old),
+            &cfg.watch,
+            &state,
+            &tx,
+            &mut watchers,
+            &mut histories,
+            240,
+        );
+        assert!(watchers.is_empty());
+        assert!(histories.is_empty());
+        assert_eq!(
+            rx.try_iter()
+                .map(|message| match message {
+                    super::super::tswriter::Message::Hot(rows) => rows.len(),
+                    _ => 0,
+                })
+                .sum::<usize>(),
+            3
+        );
+        reconcile_settings(
+            Some(&old),
+            &cfg.watch,
+            &state,
+            &tx,
+            &mut watchers,
+            &mut histories,
+            240,
+        );
+        assert!(rx.is_empty());
         assert!(state.view_at(120).hot(&p).is_none());
         assert_eq!(
-            state.view_at(120).hot_unavailable_detail(&p),
+            unavailable_detail,
             "watch history for /A starts at 00:03 UTC; ask for a window of at most 0 minutes"
         );
     }
@@ -1051,19 +1177,36 @@ mod tests {
             )
             .unwrap(),
         );
-        let delivered = w.drain_minutes_at(179, 1000);
-        assert_eq!(
-            delivered.iter().map(|m| m.persisted.len()).sum::<usize>(),
-            3
-        );
+        let cfg = Config::default();
+        let state = LiveState::new(&cfg, 0);
+        let (tx, rx) = crossbeam_channel::bounded(64);
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let tick = {
             let w = w.clone();
             let barrier = barrier.clone();
             std::thread::spawn(move || {
-                barrier.wait();
-                barrier.wait();
-                watcher_component_at("/data", &w, false, 0, 179)
+                let mut history = MinuteHistory::for_watcher(w.clone());
+                publish_tick_with_status_hook(
+                    "/data",
+                    &w,
+                    &mut history,
+                    &cfg,
+                    &state,
+                    &tx,
+                    (false, 179, || {
+                        barrier.wait();
+                        barrier.wait();
+                    }),
+                )
+                .unwrap();
+                state
+                    .view_at(180)
+                    .status(180)
+                    .unwrap()
+                    .components
+                    .into_iter()
+                    .find(|c| c.name == "watcher:/data")
+                    .unwrap()
             })
         };
         barrier.wait();
@@ -1074,6 +1217,15 @@ mod tests {
             .collect();
         barrier.wait();
         assert_eq!(tick.join().unwrap().state, "ok");
+        assert_eq!(
+            rx.try_iter()
+                .map(|message| match message {
+                    super::super::tswriter::Message::Hot(rows) => rows.len(),
+                    _ => 0,
+                })
+                .sum::<usize>(),
+            3
+        );
         let after: Vec<_> = [HotScope::Dir, HotScope::Unit, HotScope::Comm]
             .into_iter()
             .flat_map(|scope| [5, 15, 60].map(|window| w.hot_at(180, window, scope, 1000)))

@@ -445,6 +445,22 @@ impl Watcher {
         mount: RawPath,
         events: impl IntoIterator<Item = (i64, [Vec<u8>; 3], i64, Option<String>, (u64, u64))>,
     ) -> io::Result<Self> {
+        Self::injected_events_at(mount, events, None)
+    }
+    /// Build an injected watcher with an explicit startup time, even without events.
+    #[doc(hidden)]
+    pub fn from_injected_events_at(
+        mount: RawPath,
+        at: i64,
+        events: impl IntoIterator<Item = (i64, [Vec<u8>; 3], i64, Option<String>, (u64, u64))>,
+    ) -> io::Result<Self> {
+        Self::injected_events_at(mount, events, Some(at))
+    }
+    fn injected_events_at(
+        mount: RawPath,
+        events: impl IntoIterator<Item = (i64, [Vec<u8>; 3], i64, Option<String>, (u64, u64))>,
+        start: Option<i64>,
+    ) -> io::Result<Self> {
         if mount.as_bytes().len() > WATCH_ROOT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -458,7 +474,7 @@ impl Watcher {
         let mut rings = rings::Rings::new();
         rings.configure(budget::Budget::new(), mount.as_bytes())?;
         let mut events = events.into_iter().peekable();
-        rings.advance(events.peek().map_or_else(now, |event| event.0));
+        rings.advance(start.unwrap_or_else(|| events.peek().map_or_else(now, |event| event.0)));
         let mut total = 0u64;
         for (at, keys, delta, unit, identity) in events {
             rings.add(at, keys, delta, unit, identity);
@@ -1088,7 +1104,10 @@ impl Watcher {
     /// Inject a diagnostic clock for deterministic service regressions.
     #[doc(hidden)]
     pub fn health_detail_at(&self, at: i64) -> String {
-        self.state.lock().rings.detail(at)
+        let state = self.state.lock();
+        state
+            .rings
+            .detail(state.last_at.map_or(at, |last| last.max(at)))
     }
 
     /// Read counters and the loss indicator for the latest fifteen minute buckets.
@@ -1321,6 +1340,7 @@ impl Processor<'_> {
             .any(|errno| errno.raw_os_error() == code)
         }) || error.kind() == io::ErrorKind::WouldBlock;
         let mut state = state.lock();
+        let at = state.last_at.map_or(at, |last| last.max(at));
         state.rings.read_failure(
             at,
             error.raw_os_error().is_some_and(|code| {
@@ -1365,6 +1385,7 @@ impl Processor<'_> {
         if matches!(event, RawEvent::Overflow) {
             self.loss(at, state);
             let mut state = state.lock();
+            let at = state.last_at.map_or(at, |last| last.max(at));
             state.overflows = state.overflows.saturating_add(1);
             state.rings.queue_overflow(at);
             return;
