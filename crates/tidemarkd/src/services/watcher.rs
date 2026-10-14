@@ -1156,24 +1156,16 @@ mod tests {
     fn delayed_status_after_drain_does_not_rollback_history() {
         use tidemark_live::watch::HotScope;
         let w = Arc::new(
-            Watcher::from_injected_events(
+            Watcher::from_injected_events_at(
                 RawPath::new(b"/data".to_vec()).unwrap(),
-                [
-                    (
-                        0,
-                        [b"/data/a".to_vec(), b"u".to_vec(), b"c".to_vec()],
-                        0,
-                        None,
-                        (1, 0),
-                    ),
-                    (
-                        60,
-                        [b"/data/a".to_vec(), b"u".to_vec(), b"c".to_vec()],
-                        82,
-                        None,
-                        (1, 1),
-                    ),
-                ],
+                -3600,
+                [(
+                    60,
+                    [b"/data/a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                    82,
+                    None,
+                    (1, 1),
+                )],
             )
             .unwrap(),
         );
@@ -1215,6 +1207,7 @@ mod tests {
             .into_iter()
             .flat_map(|scope| [5, 15, 60].map(|window| w.hot_at(180, window, scope, 1000)))
             .collect();
+        assert!(before.iter().flatten().all(|row| !row.lossy));
         barrier.wait();
         assert_eq!(tick.join().unwrap().state, "ok");
         assert_eq!(
