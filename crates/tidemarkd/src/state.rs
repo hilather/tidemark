@@ -223,6 +223,16 @@ impl LiveState {
                 "state_dir and socket changes require restart".into(),
             ));
         }
+        let mounts_changed = |old: &[std::path::PathBuf], new: &[std::path::PathBuf]| {
+            old.iter().collect::<std::collections::BTreeSet<_>>()
+                != new.iter().collect::<std::collections::BTreeSet<_>>()
+        };
+        let sampler_requirements_changed =
+            mounts_changed(&d.config.sampler.mounts, &config.sampler.mounts)
+                || mounts_changed(&d.config.watch.mounts, &config.watch.mounts);
+        if sampler_requirements_changed {
+            check_key(&d.components, &"sampler".to_owned(), MAX_SUBJECTS)?;
+        }
         // Remove retired configured roots, retaining an in-flight scan until completion.
         // Reserve slots for every new root before swapping config; inactive manual
         // history is expendable, active work is not.
@@ -365,6 +375,16 @@ impl LiveState {
         for name in retired {
             d.components.remove(&name);
             d.errors.remove(&name);
+        }
+        if sampler_requirements_changed {
+            health(
+                &mut d,
+                crate::component(
+                    "sampler",
+                    "degraded",
+                    "waiting for a complete pass under the new configuration",
+                ),
+            );
         }
         d.config = Arc::new(config);
         d.generation = d.generation.saturating_add(1);
@@ -781,6 +801,20 @@ impl LiveState {
     }
     pub(crate) fn alert_revision(&self) -> u64 {
         self.0.read().alert_revision
+    }
+    /// Publish health only if the pass still belongs to the effective configuration.
+    pub fn publish_component_for_generation(
+        &self,
+        generation: u64,
+        component: ComponentState,
+    ) -> Result<(), crate::DaemonError> {
+        let mut d = self.0.write();
+        if d.generation != generation {
+            return Ok(());
+        }
+        check_key(&d.components, &component.name, MAX_SUBJECTS)?;
+        health(&mut d, component);
+        Ok(())
     }
     /// Publish component health without implying a successful measurement.
     pub fn publish_component(&self, component: ComponentState) -> Result<(), crate::DaemonError> {
@@ -1441,6 +1475,48 @@ fn interrupt_fs(d: &mut Inner, mount: &str) -> Result<(), crate::DaemonError> {
 
 #[cfg(test)]
 mod presence_lock_tests {
+    #[test]
+    fn reload_health_tracks_mount_sets_and_rejects_stale_passes() {
+        let mut cfg = tidemark_core::config::Config::default();
+        let state = super::LiveState::new(&cfg, 100);
+        state
+            .publish_component(crate::component("sampler", "ok", "fixture"))
+            .unwrap();
+        let old = state.config().1;
+        cfg.sampler.interval = std::time::Duration::from_secs(42);
+        cfg.sampler.mounts.reverse();
+        state.replace_config(cfg.clone()).unwrap();
+        let health = || {
+            state
+                .view_at(100)
+                .status(100)
+                .unwrap()
+                .components
+                .into_iter()
+                .find(|c| c.name == "sampler")
+                .unwrap()
+        };
+        assert_eq!(health().state, "ok");
+        cfg.watch.mounts.push("/new-watch".into());
+        state.replace_config(cfg).unwrap();
+        assert_eq!(health().state, "degraded");
+        assert_eq!(
+            health().detail,
+            "waiting for a complete pass under the new configuration"
+        );
+        state
+            .publish_component_for_generation(old, crate::component("sampler", "ok", "stale"))
+            .unwrap();
+        assert_eq!(health().state, "degraded");
+        state
+            .publish_component_for_generation(
+                state.config().1,
+                crate::component("sampler", "ok", "current"),
+            )
+            .unwrap();
+        assert_eq!(health().state, "ok");
+    }
+
     use super::*;
     #[test]
     fn filesystem_watch_mode_state_string() {
