@@ -43,3 +43,9 @@ All Cargo validation uses the pinned 1.98.0 toolchain, offline mode, and a tempo
 | `cargo build --workspace --features privileged --tests` | exit 0; compile only, no privileged tests executed |
 
 All added regression cases also passed in the full workspace run. This attempt leaves the pre-existing watcher test and all source paths owned by other tasks untouched. CI completion and clean-tree confirmation are recorded in the final addendum below.
+
+### CI addendum
+
+`tools/ci.sh` exited 1 after the same sole pre-existing watcher failure (its inner `cargo test --workspace --no-fail-fast` exited 101). Source checks passed with 150 owner tags and a clean forbidden-symbol scan; formatting, Clippy and strict-ancestry feature checks passed. Cargo-deny was not reached because the test stage failed. No new failures were observed. Guest package identity, second-daemon refusal and real fault-suite behavior remain pending VM confirmation; rootless regressions and privileged-feature compilation are evidenced above.
+
+Only the twelve paths listed in this handoff's change descriptions differ from the attempt baseline. No frozen type, schema, flag, config key, exit-code mapping or metric changed. Final cleanup and clean git status are recorded in the attempt report.
