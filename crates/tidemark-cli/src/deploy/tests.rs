@@ -16,6 +16,7 @@ struct FakeSystemctl {
     fail_enable: Cell<bool>,
     refuse_stop: Cell<bool>,
     fail_restart: Cell<bool>,
+    restart_probe: RefCell<Option<Box<dyn FnOnce()>>>,
 }
 impl Systemctl for FakeSystemctl {
     fn is_enabled(&self, _: &str) -> io::Result<bool> {
@@ -45,6 +46,9 @@ impl Systemctl for FakeSystemctl {
     }
     fn restart(&self, _: &str) -> io::Result<()> {
         self.calls.borrow_mut().push("restart".into());
+        if let Some(probe) = self.restart_probe.borrow_mut().take() {
+            probe();
+        }
         if self.fail_restart.replace(false) {
             return Err(io::Error::other("injected restart failure"));
         }
@@ -66,9 +70,13 @@ struct FakeEnv {
     mutations: Cell<usize>,
     move_config_parent: Cell<bool>,
     source_replacement: RefCell<Option<(PathBuf, Vec<u8>)>>,
+    writes: std::rc::Rc<RefCell<Vec<String>>>,
 }
 impl FakeEnv {
     fn write_probe(&self, name: &std::ffi::OsStr, bytes: &[u8]) -> io::Result<()> {
+        self.writes
+            .borrow_mut()
+            .push(name.to_string_lossy().into_owned());
         self.mutations.set(self.mutations.get() + 1);
         if self.fail_restore.get() && name == "tidemark.toml" && bytes == b"original" {
             return Err(io::Error::other("injected compensation failure"));
@@ -228,6 +236,7 @@ impl Fixture {
             mutations: Cell::new(0),
             move_config_parent: Cell::new(false),
             source_replacement: RefCell::new(None),
+            writes: Default::default(),
         };
         Self {
             _dir: dir,
@@ -476,6 +485,8 @@ fn purge_waits_for_stop() {
         Err(DeployError::Guard(_))
     ));
     assert!(fixture.state.join("deploy/staged.json").exists());
+    assert!(fixture.sys.enabled.get());
+    assert!(fixture.sys.active.get());
 }
 
 #[test]
@@ -1408,8 +1419,13 @@ fn idle_purge_removes_data_locks_and_directory() {
     drop(tidemark_scan::orchestrator::ScanLock::acquire(&f.state).unwrap());
     assert!(f.state.join("writer.lock").exists());
     assert!(f.state.join("scan.lock").exists());
+    f.sys.active.set(true);
+    f.sys.calls.borrow_mut().clear();
     unstage(&f.state, true, &f.sys).unwrap();
     assert!(!f.state.exists());
+    assert!(!f.sys.enabled.get());
+    assert!(!f.sys.active.get());
+    assert_eq!(*f.sys.calls.borrow(), ["disable_now"]);
 }
 #[test]
 fn purge_finalization_never_traverses_new_entries_or_replacement() {
@@ -1527,4 +1543,126 @@ fn purge_refuses_busy_scan_without_removing_state() {
     assert!(f.state.join(MARKER).exists());
     assert!(f.state.join("writer.lock").exists());
     assert!(f.state.join("scan.lock").exists());
+}
+
+#[test]
+fn start_now_publishes_new_records_before_restart_and_restores_on_failure() {
+    for (previous, fail) in [(false, false), (true, false), (false, true), (true, true)] {
+        let f = Fixture::new();
+        if previous {
+            f.stage();
+            fs::write(
+                &f.source,
+                format!(
+                    "[general]\nstate_dir = {:?}\n[retention]\nmin_free_pct = 11.0\n",
+                    f.state
+                ),
+            )
+            .unwrap();
+        }
+        let old_config = fs::read(&f.env.installed).ok();
+        let old_marker = fs::read(f.state.join(MARKER)).ok();
+        let old_record = fs::read(f.state.join("deploy/staged.json")).ok();
+        let state = f.state.clone();
+        let installed = f.env.installed.clone();
+        let new_bytes = fs::read(&f.source).unwrap();
+        f.env.writes.borrow_mut().clear();
+        let writes = f.env.writes.clone();
+        *f.sys.restart_probe.borrow_mut() = Some(Box::new(move || {
+            writes.borrow_mut().push("restart".into());
+            let order = writes.borrow();
+            assert_eq!(
+                &order[order.len() - 3..],
+                &[MARKER, "staged.json", "restart"]
+            );
+            let marker: Marker =
+                serde_json::from_slice(&fs::read(state.join(MARKER)).unwrap()).unwrap();
+            assert_eq!(marker.state_dir.as_path(), state);
+            assert_eq!(marker.config_path.as_path(), installed);
+            let record: StagedRecord =
+                serde_json::from_slice(&fs::read(state.join("deploy/staged.json")).unwrap())
+                    .unwrap();
+            assert!(record.start_now);
+            assert_eq!(
+                record.config_sha256,
+                format!("{:x}", Sha256::digest(&new_bytes))
+            );
+        }));
+        f.sys.fail_restart.set(fail);
+        let result = stage(
+            &f.source,
+            &StageOptions {
+                start_now: true,
+                ..Default::default()
+            },
+            &f.sys,
+            &f.env,
+        );
+        if !fail {
+            assert!(result.is_ok());
+            assert!(f.sys.active.get());
+            continue;
+        }
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected restart failure"));
+        assert_eq!(fs::read(&f.env.installed).ok(), old_config);
+        assert_eq!(fs::read(f.state.join(MARKER)).ok(), old_marker);
+        assert_eq!(
+            fs::read(f.state.join("deploy/staged.json")).ok(),
+            old_record
+        );
+    }
+}
+
+#[test]
+fn refused_purge_restores_each_previous_service_state_and_reports_failures() {
+    for (enabled, active, fail) in [
+        (true, true, false),
+        (false, true, false),
+        (true, false, false),
+        (false, false, false),
+        (true, true, true),
+    ] {
+        let f = Fixture::new();
+        f.stage();
+        f.sys.enabled.set(enabled);
+        f.sys.active.set(active);
+        f.sys.fail_enable.set(fail);
+        f.sys.calls.borrow_mut().clear();
+        let _lease = tidemark_store::lease::WriterLease::acquire(&f.state).unwrap();
+        let marker = fs::read(f.state.join(MARKER)).unwrap();
+        let record = fs::read(f.state.join("deploy/staged.json")).unwrap();
+        let error = unstage(&f.state, true, &f.sys).unwrap_err();
+        assert!(matches!(error, DeployError::Guard(_)));
+        let message = error.to_string();
+        assert!(message.contains("nothing was removed"));
+        let mut expected = vec!["disable_now"];
+        if enabled {
+            expected.push("enable");
+        }
+        if active {
+            expected.push("restart");
+        }
+        assert_eq!(*f.sys.calls.borrow(), expected);
+        if fail {
+            assert!(
+                f.sys.active.get(),
+                "restart must still be attempted after failed enable"
+            );
+            assert!(message.contains("compensation failures"));
+            assert!(message.contains("injected enable failure"));
+            assert!(message.contains("enabled=false, expected true"));
+        } else {
+            assert!(message.contains("as before"));
+            assert_eq!(f.sys.enabled.get(), enabled);
+            assert_eq!(f.sys.active.get(), active);
+        }
+        assert_eq!(fs::read(f.state.join(MARKER)).unwrap(), marker);
+        assert_eq!(
+            fs::read(f.state.join("deploy/staged.json")).unwrap(),
+            record
+        );
+    }
 }
