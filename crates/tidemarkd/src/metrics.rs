@@ -439,7 +439,9 @@ fn render_source(
             })
         }) {
             hot.sort_by(|a, b| b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key)));
-            for h in hot.into_iter().take(10) {
+            // The fixed metric has no quality label: incomplete hot windows
+            // must be omitted rather than presented as complete five-minute facts.
+            for h in hot.into_iter().filter(|h| !h.lossy).take(10) {
                 s.add(
                     "tidemark_hot_bytes",
                     &[
@@ -461,7 +463,7 @@ fn render_source(
                 by,
                 limit: 10,
             }) {
-                for h in rows {
+                for h in rows.into_iter().filter(|h| !h.lossy) {
                     s.add(
                         "tidemark_hot_bytes",
                         &[
@@ -788,5 +790,70 @@ mod disabled_tests {
         }
         shutdown.store(true, std::sync::atomic::Ordering::Release);
         handle.join().unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod watch_history_tests {
+    #[test]
+    fn incomplete_startup_hot_windows_are_omitted_until_covered() {
+        use crate::state::{LiveState, Publication};
+        use std::sync::Arc;
+        use tidemark_core::{config::Config, path::RawPath};
+        use tidemark_live::watch::Watcher;
+        let mut config = Config::default();
+        config.watch.mounts = vec!["/data".into()];
+        let state = LiveState::new(&config, 0);
+        let watcher = |start| {
+            Arc::new(
+                Watcher::from_injected_events_at(
+                    RawPath::new(b"/data".to_vec()).unwrap(),
+                    start,
+                    [(
+                        240,
+                        [b"/data/a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                        14,
+                        None,
+                        (1, 1),
+                    )],
+                )
+                .unwrap(),
+            )
+        };
+        state
+            .publish(
+                Publication::Watcher(("/data".into(), watcher(180))),
+                crate::component("watcher:/data", "ok", "test"),
+            )
+            .unwrap();
+        let text = super::render(
+            &state.view_at(300),
+            &super::SnapshotMetrics::default(),
+            &config.metrics,
+            300,
+        )
+        .unwrap();
+        assert!(!text
+            .lines()
+            .any(|line| line.starts_with("tidemark_hot_bytes{")));
+        state
+            .publish(
+                Publication::Watcher(("/data".into(), watcher(0))),
+                crate::component("watcher:/data", "ok", "test"),
+            )
+            .unwrap();
+        let text = super::render(
+            &state.view_at(300),
+            &super::SnapshotMetrics::default(),
+            &config.metrics,
+            300,
+        )
+        .unwrap();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("tidemark_hot_bytes{"))
+                .count(),
+            3
+        );
     }
 }
