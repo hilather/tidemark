@@ -1023,7 +1023,7 @@ mod tests {
             );
             state
                 .publish(
-                    crate::state::Publication::Watcher(("/A".into(), watcher)),
+                    crate::state::Publication::Watcher(("/A".into(), watcher.clone())),
                     crate::component("watcher:/A", "ok", "test"),
                 )
                 .unwrap();
@@ -1044,6 +1044,16 @@ mod tests {
                     format!("unavailable: watch history for /A starts at {label}; {ending}")
                 );
             }
+            watcher.retire_at(start + 120);
+            let response = dispatch(&request, 0, &context, start + 120).unwrap();
+            assert_eq!(
+                response.error.unwrap().message,
+                format!(
+                    "unavailable: watcher for /A was replaced at {}",
+                    if start == 0 { "00:02 UTC" } else { "00:04 UTC" }
+                )
+            );
+            state.remove_watcher("/A");
         }
     }
     #[test]

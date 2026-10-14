@@ -881,7 +881,7 @@ mod tests {
         assert!(state.view_at(120).hot(&p).is_none());
         assert_eq!(
             state.view_at(120).hot_unavailable_detail(&p),
-            "watch history for /B starts at 00:03 UTC; ask for a window of at most 0 minutes"
+            "watch history for /B starts at 00:03 UTC; no complete window yet"
         );
         assert_eq!(state.view_at(3720).hot(&p), Some(Vec::new()));
     }
