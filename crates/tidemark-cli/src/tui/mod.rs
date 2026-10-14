@@ -651,7 +651,7 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         crate::cmd::snapshots::select(context, args.path.as_deref(), args.snapshot.as_deref())?;
     let dir = snapshot
         .dir_by_path(&path)?
-        .ok_or_else(|| crate::CliError::Precondition("path not present in snapshot".into()))?;
+        .ok_or_else(|| crate::cmd::snapshots::missing_path(context, &path, &snapshot))?;
     let catalog = tidemark_store::catalog::Catalog::open(&context.config.general.state_dir, false)?;
     let mut entries = catalog.list(Some(&snapshot.meta().root))?;
     entries.retain(|e| e.status == "complete" && e.file.is_some());

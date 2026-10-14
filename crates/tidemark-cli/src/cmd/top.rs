@@ -39,7 +39,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         super::snapshots::select(context, args.path.as_deref(), args.snapshot.as_deref())?;
     let dir = snapshot
         .dir_by_path(&path)?
-        .ok_or_else(|| crate::CliError::Precondition("path not present in snapshot".into()))?;
+        .ok_or_else(|| super::snapshots::missing_path(context, &path, &snapshot))?;
     if args.limit > 1_000_000 {
         return Err(crate::CliError::Configuration("limit exceeds 1,000,000".into()).into());
     }

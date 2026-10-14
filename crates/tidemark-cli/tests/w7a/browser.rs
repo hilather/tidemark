@@ -685,3 +685,20 @@ fn direct_retained_files_filter_before_limit_and_show_utc() {
         .text
         .contains("2 other files, 4 KiB not individually retained"));
 }
+
+#[test]
+fn missing_path_message_uses_recorded_mount_reason() {
+    let (_temp, b) = browser(0);
+    let context = crate::Context {
+        config: Default::default(),
+        config_path: "/unused".into(),
+        json: false,
+        color: false,
+    };
+    let path = RawPath::new(b"/fixture/data".to_vec()).unwrap();
+    let error = crate::cmd::snapshots::missing_path(&context, &path, &b.snapshot).to_string();
+    assert!(error.contains("of /fixture ("));
+    assert!(error.contains("run: tidemark scan /fixture/data"));
+    // An absent path alone does not prove a filesystem boundary.
+    assert!(!error.contains("different filesystem"));
+}

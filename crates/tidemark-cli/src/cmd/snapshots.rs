@@ -324,3 +324,54 @@ pub(crate) fn select(
             .with_context(|| format!("open snapshot: {}", super::display_path(&file)))?,
     ))
 }
+
+/// Explain an absent path using only recorded snapshot evidence and optional daemon scheduling.
+pub(crate) fn missing_path(
+    context: &crate::Context,
+    path: &tidemark_core::path::RawPath,
+    snapshot: &tidemark_store::reader::Snapshot,
+) -> crate::CliError {
+    let subject = path.display_lossy();
+    let mut detail = format!("no complete snapshot of {subject} yet; the selected complete snapshot covering it is of {} ({}), which does not contain {subject}", snapshot.meta().root.display_lossy(), snapshot.meta().scan_id);
+    if let Ok(root) = snapshot.root() {
+        if let Ok(skipped) = snapshot.skipped_under(root.id) {
+            for skip in skipped {
+                if let Ok(parent) = snapshot.dir(skip.dir_id) {
+                    if path.starts_with(&parent.path.join(&skip.name)) {
+                        detail.push_str(&format!(
+                            " (skipped: {})",
+                            crate::render::enum_label(skip.reason)
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    detail.push_str(&format!("; run: tidemark scan {subject}"));
+    if context.config.roots.iter().any(|root| {
+        tidemark_core::path::RawPath::from_path(&root.path).is_ok_and(|root| root == *path)
+    }) {
+        if let Ok(mut client) = crate::client::Client::connect(
+            &context.config.general.socket,
+            std::time::Duration::from_secs(1),
+        ) {
+            if let Ok(scans) = client.call::<_, Vec<tidemark_core::live::ScanStatus>>(
+                "scan.status",
+                &tidemark_core::api::ScanStatusParams { root: None },
+            ) {
+                if let Some(next) = scans
+                    .iter()
+                    .find(|scan| scan.root == subject)
+                    .and_then(|scan| scan.next_due)
+                {
+                    detail.push_str(&format!(
+                        "; next scheduled scan: {}",
+                        crate::render::size::timestamp(next)
+                    ));
+                }
+            }
+        }
+    }
+    crate::CliError::Precondition(detail)
+}
