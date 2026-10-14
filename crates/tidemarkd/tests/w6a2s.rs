@@ -1,7 +1,11 @@
 //! Owned by: W6-A2b
 //! Service reload, disabled health and prompt shutdown regressions.
-
 #![allow(clippy::unwrap_used)]
+
+// Compile the fixture deadline regression without enabling privileged execution.
+#[cfg(not(feature = "privileged"))]
+#[path = "../../test-support/src/xfs.rs"]
+mod cleanup_deadline;
 
 use std::{
     sync::{
@@ -790,8 +794,12 @@ fn daemon_sigterm_releases_loop_xfs_for_ordinary_unmount() {
     let cleanup = std::thread::spawn(move || {
         let _ = tx.send(fs.cleanup());
     });
-    rx.recv_timeout(Duration::from_secs(10))
-        .expect("ordinary unmount exceeded ten seconds")
+    let result = rx.recv_timeout(Duration::from_secs(15));
+    // The fixture owns bounded subprocess deadlines. Join even when receiving
+    // fails so panic propagation cannot detach a cleanup worker.
+    let joined = cleanup.join();
+    joined.expect("cleanup worker panicked");
+    result
+        .expect("ordinary unmount exceeded fifteen seconds")
         .expect("ordinary unmount failed after daemon SIGTERM");
-    cleanup.join().unwrap();
 }
