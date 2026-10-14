@@ -1,4 +1,4 @@
-//! Owned by: TSW-compact
+//! Owned by: TSW-compact2
 //! Repeated compaction witnesses through independent SQLite connections.
 use super::*;
 use std::sync::atomic::AtomicI64;
@@ -38,6 +38,12 @@ with sqlite3.connect(sys.argv[1],timeout=5) as db:
  base=(int(sys.argv[3])-3*86400)//300*300
  actual=db.execute('SELECT res,ts,size,used,avail,inodes,inodes_used FROM fs_samples WHERE mount=? ORDER BY res,ts',(sys.argv[2],)).fetchall()
  expected=[(1,base+n*300,2000000,n*300+299,700000,2000,200) for n in range(2)]
+ if actual!=expected:
+  import os,glob
+  print("Python SQLite",sqlite3.sqlite_version,"journal_mode",db.execute("PRAGMA journal_mode").fetchone(),file=sys.stderr)
+  for f in sorted(glob.glob(sys.argv[1]+'*')+glob.glob('/proc/'+str(os.getppid())+'/fd/*')):
+   try: print(f,os.readlink(f) if '/fd/' in f else '',os.stat(f).st_ino,os.stat(f).st_size,file=sys.stderr)
+   except OSError: pass
  assert actual==expected, (len(actual),actual[:2])
 "#;
 fn barrier(tx: &Sender) {
@@ -94,49 +100,24 @@ fn repeated(rounds: i64, duration: i64) {
 }
 #[test]
 fn two_compactions_see_external_witnesses() {
+    let Some(_logs) = capture("two_compactions_see_external_witnesses") else {
+        return;
+    };
     repeated(2, 0);
 }
 #[test]
 fn three_compactions_do_not_drift_by_duration() {
+    let Some(_logs) = capture("three_compactions_do_not_drift_by_duration") else {
+        return;
+    };
     repeated(3, 44);
 }
 
 #[test]
 fn restart_preserves_deadline_and_logs_compaction_results() {
-    const CHILD: &str = "TIDEMARK_COMPACT_LOG_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "services::tswriter::compact_tests::restart_preserves_deadline_and_logs_compaction_results", "--nocapture"])
-            .env(CHILD, "1").output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let Some(logs) = capture("restart_preserves_deadline_and_logs_compaction_results") else {
         return;
-    }
-    #[derive(Clone)]
-    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Sink {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = Sink(logs.clone());
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || sink.clone())
-            .finish(),
-    )
-    .unwrap();
+    };
     let dir = tempfile::tempdir().unwrap();
     let mut config = tidemark_core::config::Config::default();
     config.roots.clear();
@@ -193,7 +174,7 @@ fn restart_preserves_deadline_and_logs_compaction_results() {
     sql(&path, CHECK, "__tidemark_fault_compaction___third__", now);
     stop.store(true, Ordering::Release);
     handle.join().unwrap().unwrap();
-    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     let warnings: Vec<_> = text
         .lines()
         .filter(|l| l.contains("WARN") && l.contains("restarting time-series writer"))
@@ -220,4 +201,59 @@ fn restart_preserves_deadline_and_logs_compaction_results() {
         1,
         "{text}"
     );
+}
+
+struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+impl Drop for Logs {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "writer logs:\n{}",
+                String::from_utf8_lossy(&self.0.lock().unwrap())
+            );
+        }
+    }
+}
+fn capture(name: &str) -> Option<Logs> {
+    const CHILD: &str = "TIDEMARK_COMPACT_LOG_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("services::tswriter::compact_tests::{name}"),
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+    #[derive(Clone)]
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Sink(logs.clone());
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish(),
+    )
+    .unwrap();
+    Some(Logs(logs))
 }
