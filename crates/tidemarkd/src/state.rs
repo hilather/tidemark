@@ -1076,6 +1076,21 @@ impl LiveStateView {
                     .map(|(_, rows)| (m.clone(), rows))
             })
             .collect();
+        let unit_hot: Option<Vec<_>> = if v.data.watchers.is_empty() {
+            None
+        } else {
+            Some(
+                v.data
+                    .watchers
+                    .iter()
+                    .filter_map(|(m, w)| {
+                        w.query_at(now, 5, tidemark_live::watch::HotScope::Unit, MAX_INVENTORY)
+                            .ok()
+                            .map(|(_, rows)| (m.clone(), rows))
+                    })
+                    .collect(),
+            )
+        };
         let mut degraded = v.data.degraded.clone();
         for (mount, watcher) in &v.data.watchers {
             if p.mount.as_ref().is_none_or(|m| m == mount) {
@@ -1129,21 +1144,6 @@ impl LiveStateView {
                 })
                 .collect::<Vec<_>>()
         });
-        let unit_hot: Option<Vec<_>> = if v.data.watchers.is_empty() {
-            None
-        } else {
-            Some(
-                v.data
-                    .watchers
-                    .iter()
-                    .filter_map(|(m, w)| {
-                        w.query_at(now, 5, tidemark_live::watch::HotScope::Unit, MAX_INVENTORY)
-                            .ok()
-                            .map(|(_, rows)| (m.clone(), rows))
-                    })
-                    .collect(),
-            )
-        };
         let modes: Option<Vec<_>> = if v.data.watchers.is_empty() {
             None
         } else {
