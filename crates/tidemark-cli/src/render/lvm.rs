@@ -73,11 +73,11 @@ pub(crate) fn write_width(
         let now = &row.current;
         writeln!(
             output,
-            "{}: LV {}/{} size={} bytes segtype={}",
+            "{}: LV {}/{} size={} segtype={}",
             super::table::shorten(&row.mount_display, width / 2),
             display(&now.vg),
             display(&now.lv),
-            now.lv_size,
+            super::size::bytes(now.lv_size),
             display(&row.segtype)
         )?;
         if let Some(pool) = &now.thin_pool {
@@ -103,19 +103,19 @@ pub(crate) fn write_width(
     for vg in &report.vgs {
         writeln!(
             output,
-            "VG {} size={} bytes free={} bytes (headroom for lvextend + xfs_growfs)",
+            "VG {} size={} free={} (headroom for lvextend + xfs_growfs)",
             display(&vg.vg),
-            vg.size,
-            vg.free
+            super::size::bytes(vg.size),
+            super::size::bytes(vg.free)
         )?;
     }
     for lv in &report.other_lvs {
         writeln!(
             output,
-            "  other LV {}/{} size={} bytes segtype={}",
+            "  other LV {}/{} size={} segtype={}",
             display(&lv.vg),
             display(&lv.lv),
-            lv.size,
+            super::size::bytes(lv.size),
             display(&lv.segtype)
         )?;
     }
@@ -155,13 +155,18 @@ mod tests {
                 segtype: "linear".into(),
                 trend: None,
             }],
-            vgs: vec![],
+            vgs: vec![tidemark_core::api::VgInfo {
+                vg: "vg".into(),
+                size: 1 << 30,
+                free: 1 << 20,
+            }],
             other_lvs: vec![],
         };
         for width in [80, 100, 200] {
             let mut out = Vec::new();
             super::write_width(&report, false, width, &mut out).unwrap();
             let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("size=1 GiB free=1 MiB"), "{text}");
             assert!(text
                 .lines()
                 .all(|line| line.chars().count() <= width || line.split_whitespace().count() == 1));
@@ -169,6 +174,7 @@ mod tests {
             let mut out = Vec::new();
             super::write_width(&report, true, width, &mut out).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(value["data"]["vgs"][0]["size"], 1u64 << 30);
             assert_eq!(value["schema"], "tidemark.lvm.v1");
             assert_eq!(
                 value["data"]["tracked"][0]["current"]["vg"],
