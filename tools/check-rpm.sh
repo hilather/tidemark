@@ -70,5 +70,8 @@ for binary in tidemark tidemarkd; do
     # ELF e_type is ET_EXEC (2) or ET_DYN (3, PIE), little-endian x86_64.
     type=$(od -An -tx1 -j16 -N2 "$file" | tr -d ' \n')
     case "$type" in 0200|0300) ;; *) fail "ELF executable type: $binary" ;; esac
+    env -u TIDEMARK_STRICT_ANCESTRY "$file" --version > "$tmp/version"
+    grep -Fx "ancestry checks: strict" "$tmp/version" >/dev/null || fail "strict ancestry: $binary"
+    ok "strict ancestry: $binary"
     ok "ELF executable: $binary"
 done

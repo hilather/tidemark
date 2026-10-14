@@ -202,7 +202,7 @@ fn pure_commands_and_invalid_arguments() {
     );
     let script = args[10].to_str().unwrap();
     assert!(
-        script.contains("cargo build --offline --locked --release -p tidemark-cli -p tidemarkd")
+        script.contains("cargo build --offline --locked --release -p tidemark-cli -p tidemarkd --features strict-ancestry")
     );
     assert!(script.contains("tidemark completions bash > target/release/tidemark.bash"));
     assert!(script.contains("cargo run --offline --locked -p xtask -- man; cargo"));
@@ -263,13 +263,9 @@ fn shell_syntax_and_vm_guard() {
             );
         }
     }
-    let output = Command::new("bash")
-        .arg(root().join("tests/install/install.sh"))
-        .env_remove("TIDEMARK_DEPLOY_TEST_VM")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Requires disposable VM marker"));
+    // Workstation validation must only parse install scripts, never execute them.
+    let script = std::fs::read_to_string(root().join("tests/install/install.sh")).unwrap();
+    assert!(script.contains("Requires disposable VM marker"));
 }
 #[cfg(feature = "privileged")]
 #[test]
@@ -320,6 +316,10 @@ fn native_options_and_command_order() {
         assert_eq!(commands[0].args[0], "build");
         assert!(commands[0].args.contains(&"--locked".into()));
         assert!(commands[0].args.contains(&"--release".into()));
+        assert!(commands[0]
+            .args
+            .windows(2)
+            .any(|args| args == ["--features", "strict-ancestry"]));
         assert!(commands[0].args.contains(&"tidemark-cli".into()));
         assert!(commands[0].args.contains(&"tidemarkd".into()));
         assert_eq!(commands[0].args.contains(&"--offline".into()), !online);
@@ -534,4 +534,19 @@ fn require_clean_rejects_tracked_changes_before_building() {
     assert!(error
         .to_string()
         .contains("rejects changes to tracked files"));
+}
+
+#[test]
+fn strict_ancestry_packaging_gates() {
+    let workflow = std::fs::read_to_string(root().join(".github/workflows/ci.yml")).unwrap();
+    assert!(workflow.contains("if: matrix.el == '8.10'\n        env:\n          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true'"));
+    for binary in ["tidemark", "tidemarkd"] {
+        assert!(workflow.contains(&format!("env -u TIDEMARK_STRICT_ANCESTRY {binary} --version | grep -Fx 'ancestry checks: strict'")));
+        assert!(workflow.contains(&format!("env -u TIDEMARK_STRICT_ANCESTRY target/release/{binary} --version | grep -Fx 'ancestry checks: strict'")));
+    }
+    let checker = std::fs::read_to_string(root().join("tools/check-rpm.sh")).unwrap();
+    assert!(checker.contains("env -u TIDEMARK_STRICT_ANCESTRY \"$file\" --version"));
+    assert!(checker.contains("grep -Fx \"ancestry checks: strict\""));
+    let ci = std::fs::read_to_string(root().join("xtask/src/main.rs")).unwrap();
+    assert!(ci.contains("strict_feature_tests"));
 }

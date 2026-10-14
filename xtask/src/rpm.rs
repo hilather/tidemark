@@ -31,7 +31,7 @@ pub fn container_args(root: &Path, version: &str) -> Result<Vec<OsString>> {
     let mut volume = root.as_os_str().to_os_string();
     volume.push(":/src");
     let script = format!(
-        "set -eu; cargo generate-rpm --version >/dev/null 2>&1 || {{ echo 'Install cargo-generate-rpm in the build image' >&2; exit 1; }}; cargo build --offline --locked --release -p tidemark-cli -p tidemarkd; target/release/tidemark completions bash > target/release/tidemark.bash; cargo run --offline --locked -p xtask -- man; cargo {}",
+        "set -eu; cargo generate-rpm --version >/dev/null 2>&1 || {{ echo 'Install cargo-generate-rpm in the build image' >&2; exit 1; }}; cargo build --offline --locked --release -p tidemark-cli -p tidemarkd --features strict-ancestry; target/release/tidemark completions bash > target/release/tidemark.bash; cargo run --offline --locked -p xtask -- man; cargo {}",
         rpm.iter().map(|s| format!("'{}'", s.replace('\'', "'\\''"))).collect::<Vec<_>>().join(" ")
     );
     Ok(vec![
@@ -173,6 +173,8 @@ pub fn native_commands(
         "tidemark-cli",
         "-p",
         "tidemarkd",
+        "--features",
+        "strict-ancestry",
     ]
     .into_iter()
     .map(String::from)
