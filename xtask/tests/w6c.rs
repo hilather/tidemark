@@ -153,8 +153,14 @@ fn metadata_and_scriptlet_contract() {
     }
     assert_eq!(m["version"].as_str(), Some("0.1.0"));
     let post = read(m["post_install_script"].as_str().unwrap());
-    assert!(post.contains("if [ \"${1:-0}\" -eq 1 ]; then"));
-    assert!(post.contains("Tidemark installed. Configure /etc/tidemark/tidemark.toml, then: tidemark deploy stage --from <file> --start-now (service: tidemarkd)"));
+    assert_eq!(post, concat!(
+        "#!/bin/sh\n",
+        "systemd-tmpfiles --create /usr/lib/tmpfiles.d/tidemark.conf || :\n",
+        "systemctl daemon-reload || :\n",
+        "if [ \"${1:-0}\" -eq 1 ]; then\n",
+        "    printf '%s\\n' 'Tidemark installed. Configure /etc/tidemark/tidemark.toml, then: tidemark deploy stage --from <file> --start-now (service: tidemarkd)'\n",
+        "fi\n",
+    ));
     for line in post.lines() {
         // Ignore the one literal printf message, never arbitrary shell code.
         if line.trim() == "printf '%s\\n' 'Tidemark installed. Configure /etc/tidemark/tidemark.toml, then: tidemark deploy stage --from <file> --start-now (service: tidemarkd)'" {
