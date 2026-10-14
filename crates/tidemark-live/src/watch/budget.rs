@@ -39,7 +39,14 @@ impl Budget {
         let limit = if emergency {
             self.1
         } else {
-            self.1 - (self.1 / 64).min(1024 * 1024)
+            // Keep ingestion roots plus a simultaneous 60-minute aggregate export
+            // inside the same 64 MiB ceiling, including lossy UTF-8 mount labels.
+            self.1
+                - if self.1 == PATH_BYTES {
+                    3 * 1024 * 1024
+                } else {
+                    (self.1 / 64).min(1024 * 1024)
+                }
         };
         let mut a = self.0.lock();
         if a.payload

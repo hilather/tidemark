@@ -58,8 +58,11 @@ struct Bucket {
     charged: usize,
     nodes: usize,
     key_budget: bool,
+    output_budget: std::cell::Cell<bool>,
     dirty_full: bool,
     dirty_budget: bool,
+    events: u64,
+    bytes_delta: i64,
     minute: i64,
     maps: [BTreeMap<Vec<u8>, HotEntry>; 3],
     units: [BTreeMap<Vec<u8>, UnitCounts>; 3],
@@ -299,8 +302,11 @@ impl Rings {
                 charged: 0,
                 nodes: 0,
                 key_budget: false,
+                output_budget: std::cell::Cell::new(false),
                 dirty_full: false,
                 dirty_budget: false,
+                events: 0,
+                bytes_delta: 0,
                 minute: at,
                 maps: std::array::from_fn(|_| BTreeMap::new()),
                 units: std::array::from_fn(|_| BTreeMap::new()),
@@ -368,6 +374,8 @@ impl Rings {
         let Some(bucket) = self.buckets.back_mut() else {
             return;
         };
+        bucket.events = bucket.events.saturating_add(1);
+        bucket.bytes_delta = bucket.bytes_delta.saturating_add(delta);
         for (index, key) in keys.into_iter().enumerate() {
             if !bucket.maps[index].contains_key(&key) && bucket.maps[index].len() >= CURRENT_CAP {
                 self.dropped += (bucket.maps[index].len() / 2) as u64;
@@ -583,6 +591,15 @@ impl Rings {
             if limit == 0 {
                 return Vec::new();
             }
+            if selected().any(|b| b.events > 0) {
+                if let Some(b) = self
+                    .buckets
+                    .iter()
+                    .find(|b| b.minute == now.div_euclid(60) * 60)
+                {
+                    b.output_budget.set(true);
+                }
+            }
             let Some(_root) = Reservation::new(&self.budget, self.root.len()) else {
                 return Vec::new();
             };
@@ -603,10 +620,9 @@ impl Rings {
                 top_unit: None,
                 lossy: true,
             };
-            for r in selected().flat_map(|b| b.maps[index].values()) {
-                row.events = row.events.saturating_add(r.events);
-                row.files = row.files.saturating_add(r.files);
-                row.bytes_delta = row.bytes_delta.saturating_add(r.bytes_delta);
+            for b in selected() {
+                row.events = row.events.saturating_add(b.events);
+                row.bytes_delta = row.bytes_delta.saturating_add(b.bytes_delta);
             }
             return if row.events == 0 {
                 Vec::new()
@@ -616,10 +632,11 @@ impl Rings {
         };
         let mut sum: BTreeMap<Vec<u8>, HotEntry> = BTreeMap::new();
         let mut units: BTreeMap<Vec<u8>, BTreeMap<String, u64>> = BTreeMap::new();
-        let lossy = self
-            .buckets
-            .iter()
-            .any(|b| b.minute >= cutoff && b.minute <= now.div_euclid(60) * 60 && b.lossy);
+        let lossy = self.buckets.iter().any(|b| {
+            b.minute >= cutoff
+                && b.minute <= now.div_euclid(60) * 60
+                && (b.lossy || b.output_budget.get())
+        });
         for bucket in self
             .buckets
             .iter()
@@ -658,8 +675,8 @@ impl Rings {
         let cutoff = now.div_euclid(60) * 60 - 14 * 60;
         // One latest occurrence per cause bounds status text independently of
         // the number of affected minutes and configured watchers.
-        let mut reported = [false; 11];
-        let mut reasons = Vec::with_capacity(reported.len());
+        let mut reported = [false; 12];
+        let mut reasons = Vec::with_capacity(reported.len() + 1);
         for b in self
             .buckets
             .iter()
@@ -667,6 +684,10 @@ impl Rings {
             .filter(|b| b.minute >= cutoff && b.minute <= now)
         {
             let causes = [
+                (
+                    b.output_budget.get(),
+                    "truncated: output over the memory budget",
+                ),
                 (b.key_budget, "truncated: key bytes over the memory budget"),
                 (b.dirty_full, "lost events: dirty set full"),
                 (
@@ -701,9 +722,9 @@ impl Rings {
                     b.minute.div_euclid(3600).rem_euclid(24),
                     b.minute.div_euclid(60).rem_euclid(60)
                 );
-                let qualifier = if index == 3 && !b.transport_loss {
+                let qualifier = if index == 4 && !b.transport_loss {
                     " (events complete, per-file counts capped)"
-                } else if index == 3 {
+                } else if index == 4 {
                     " (per-file counts capped)"
                 } else {
                     ""
@@ -719,7 +740,7 @@ impl Rings {
             .filter(|b| {
                 b.minute >= now.div_euclid(60) * 60 - 14 * 60
                     && b.minute <= now.div_euclid(60) * 60
-                    && b.lossy
+                    && (b.lossy || b.output_budget.get())
             })
             .count() as u32
     }
@@ -749,38 +770,65 @@ impl Rings {
         mount: &str,
         dirs: bool,
     ) -> (usize, Option<(Reservation, Reservation)>) {
-        let mut limit = top_k.min(COMPLETED_CAP);
-        loop {
-            let payload = Reservation::new(&b.budget, Self::output_bytes(b, limit, mount, dirs));
-            let count: usize = b.maps.iter().map(|m| m.len().min(limit)).sum();
-            let count_dir = if dirs { b.maps[0].len().min(limit) } else { 0 };
-            let ranking_bytes = b.maps.iter().map(BTreeMap::len).max().unwrap_or(0)
-                * std::mem::size_of::<&HotEntry>();
-            let node_bytes = ranking_bytes
-                + count
-                    * (3 * std::mem::size_of::<HotEntry>() + 2 * std::mem::size_of::<HotMinute>())
-                + count_dir * 2 * std::mem::size_of::<HotEntry>();
-            let nodes = payload
-                .as_ref()
-                .and_then(|_| Reservation::nodes(&b.budget, node_bytes));
-            if let Some(lease) = payload.zip(nodes) {
-                return (limit, Some(lease));
-            }
-            b.drain_truncated = true;
-            b.key_budget = true;
-            b.truncated = true;
-            b.lossy = true;
-            if limit == 0 {
-                return (0, None);
-            }
-            limit /= 2;
+        let limit = top_k.min(COMPLETED_CAP);
+        let payload = Reservation::normal(&b.budget, Self::output_bytes(b, limit, mount, dirs));
+        let count: usize = b.maps.iter().map(|m| m.len().min(limit)).sum();
+        let ranking_bytes =
+            b.maps.iter().map(BTreeMap::len).max().unwrap_or(0) * std::mem::size_of::<&HotEntry>();
+        let nodes = payload.as_ref().and_then(|_| {
+            Reservation::nodes(
+                &b.budget,
+                ranking_bytes
+                    + count
+                        * (5 * std::mem::size_of::<HotEntry>()
+                            + 2 * std::mem::size_of::<HotMinute>()),
+            )
+        });
+        if let Some(lease) = payload.zip(nodes) {
+            return (limit, Some(lease));
         }
+        b.output_budget.set(true);
+        b.truncated = true;
+        b.lossy = true;
+        let payload = Reservation::new(&b.budget, 3 * mount.len() + 3);
+        let nodes = Reservation::emergency_nodes(
+            &b.budget,
+            4 * std::mem::size_of::<HotEntry>() + 4 * std::mem::size_of::<HotMinute>() + 256,
+        );
+        (usize::MAX, payload.zip(nodes))
     }
-    fn persisted(b: &mut Bucket, mount: &str, top_k: usize) -> Vec<HotMinute> {
+    fn aggregate(b: &Bucket, root: &[u8]) -> HotEntry {
+        let mut row = HotEntry {
+            key: root.to_vec(),
+            events: 0,
+            files: 0,
+            bytes_delta: 0,
+            top_unit: None,
+            lossy: true,
+        };
+        row.events = b.events;
+        row.bytes_delta = b.bytes_delta;
+        row
+    }
+
+    fn persisted(b: &mut Bucket, mount: &str, top_k: usize, root: &[u8]) -> Vec<HotMinute> {
         if b.drained {
             return Vec::new();
         }
         b.drained = true;
+        if top_k == usize::MAX {
+            let row = Self::aggregate(b, root);
+            return vec![HotMinute {
+                mount: mount.into(),
+                scope: "dir".into(),
+                key: row.key,
+                ts: b.minute,
+                events: row.events,
+                files: 0,
+                bytes_delta: row.bytes_delta,
+                lossy: true,
+            }];
+        }
         let limit = top_k.min(COMPLETED_CAP);
         b.drain_truncated |= b.maps.iter().any(|map| map.len() > limit);
         let mut result = Vec::new();
@@ -793,7 +841,7 @@ impl Rings {
                 events: r.events,
                 files: r.files,
                 bytes_delta: r.bytes_delta,
-                lossy: b.lossy,
+                lossy: b.lossy || b.output_budget.get(),
             }));
         }
         result
@@ -806,7 +854,7 @@ impl Rings {
             if !b.drained && b.minute < now.div_euclid(60) * 60 {
                 let (limit, lease) = Self::output_reservation(b, top_k, mount, false);
                 reservations.push(lease);
-                result.extend(Self::persisted(b, mount, limit));
+                result.extend(Self::persisted(b, mount, limit, &self.root));
                 self.rows_drained_until = self.rows_drained_until.max(Some(b.minute));
             }
         }
@@ -825,18 +873,24 @@ impl Rings {
             }
             let (limit, lease) = Self::output_reservation(b, top_k, mount, true);
             reservations.push(lease);
-            let persisted = Self::persisted(b, mount, limit);
+            let persisted = Self::persisted(b, mount, limit, &self.root);
             self.rows_drained_until = self.rows_drained_until.max(Some(b.minute));
-            let truncated =
-                b.truncated || b.drain_truncated || b.maps[0].len() > top_k.min(COMPLETED_CAP);
+            let truncated = b.truncated
+                || b.output_budget.get()
+                || b.drain_truncated
+                || b.maps[0].len() > top_k.min(COMPLETED_CAP);
             let lossy = b.lossy || truncated || b.minute != next;
-            let dirs = ranked(&b.maps[0], limit)
-                .into_iter()
-                .map(|mut row| {
-                    row.lossy = lossy;
-                    row
-                })
-                .collect();
+            let dirs = if limit == usize::MAX {
+                vec![Self::aggregate(b, &self.root)]
+            } else {
+                ranked(&b.maps[0], limit)
+            }
+            .into_iter()
+            .map(|mut row| {
+                row.lossy = lossy;
+                row
+            })
+            .collect();
             result.push(CompletedMinute {
                 started_at: b.minute,
                 overflow_total_at_start: if b.minute == next {
@@ -923,6 +977,32 @@ mod tests {
         let rows = r.hot(59 * 60, 60, HotScope::Dir, usize::MAX);
         assert_eq!(rows.iter().map(|row| row.events).sum::<u64>(), 359);
         assert_eq!(rows.iter().map(|row| row.bytes_delta).sum::<i64>(), 359 * 7);
+    }
+    #[test]
+    fn emergency_headroom_covers_full_history_and_aggregate_export() {
+        let mut r = Rings::new();
+        let root = vec![0xff; super::super::WATCH_ROOT_BYTES];
+        r.configure(Budget::new(), &root).unwrap();
+        let available = super::super::WATCH_MEMORY_BYTES - 3 * 1024 * 1024 - r.budget.committed();
+        let held = Reservation::nodes(&r.budget, available).unwrap();
+        for minute in 0..60 {
+            r.add(
+                minute * 60,
+                keys(minute as usize),
+                7,
+                None,
+                (1, minute as u64),
+            );
+        }
+        let mount = String::from_utf8_lossy(&root);
+        let rows = r.drain(60 * 60, &mount, 1000);
+        // The 60th boundary expires the oldest bucket, leaving 59 full minutes.
+        assert_eq!(rows.len(), 59);
+        assert!(rows
+            .iter()
+            .all(|row| row.key == root && row.events == 1 && row.bytes_delta == 7));
+        assert!(r.budget.committed() <= super::super::WATCH_MEMORY_BYTES);
+        drop(held);
     }
     #[test]
     fn output_admission_bounds_unequal_rows_before_ranking() {
@@ -1033,6 +1113,55 @@ mod tests {
                     .iter()
                     .all(|m| m.persisted.is_empty()));
             }
+        }
+    }
+    #[test]
+    fn exhausted_output_keeps_exact_aggregate_and_expiring_reason() {
+        for legacy in [false, true] {
+            let mut r = Rings::new();
+            r.configure(Budget::new(), b"/mount").unwrap();
+            r.advance(0);
+            r.add(
+                60,
+                [b"/a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                71,
+                None,
+                (1, 1),
+            );
+            r.add(
+                61,
+                [b"/b".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                -9,
+                None,
+                (1, 2),
+            );
+            r.advance(120);
+            let available =
+                super::super::WATCH_MEMORY_BYTES - 3 * 1024 * 1024 - r.budget.committed();
+            let held = Reservation::nodes(&r.budget, available).unwrap();
+            let hot = r.hot(120, 5, HotScope::Dir, 1000);
+            assert_eq!((hot[0].events, hot[0].bytes_delta), (2, 62));
+            assert!(r.detail(120).contains("output over the memory budget"));
+            assert_eq!(r.lossy(120), 1);
+            if legacy {
+                let rows = r.drain(120, "/mount", 1000);
+                assert_eq!(rows.len(), 1);
+                assert_eq!((rows[0].events, rows[0].bytes_delta), (2, 62));
+                assert_eq!(rows[0].key, b"/mount");
+                assert!(r.drain(120, "/mount", 1000).is_empty());
+            } else {
+                let rows = r.drain_minutes(120, "/mount", 1000);
+                assert_eq!(rows[0].persisted.len(), 1);
+                assert_eq!(
+                    (rows[0].dirs[0].events, rows[0].dirs[0].bytes_delta),
+                    (2, 62)
+                );
+                assert!(rows[0].truncated && rows[0].lossy);
+                assert!(r.drain_minutes(120, "/mount", 1000).is_empty());
+            }
+            drop(held);
+            assert!(r.detail(17 * 60).is_empty());
+            assert_eq!(r.lossy(17 * 60), 0);
         }
     }
     #[test]
