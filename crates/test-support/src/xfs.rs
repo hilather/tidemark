@@ -1,21 +1,73 @@
 //! Owned by: W0-C
 //! VM-only loop XFS lifecycle with rollback and conservative cleanup.
+#[cfg(feature = "privileged")]
 use crate::fixture::OwnedStorage;
+#[cfg(feature = "privileged")]
+use std::{ffi::OsStr, fs::File, path::PathBuf};
 use std::{
-    ffi::{OsStr, OsString},
-    fs::File,
+    ffi::OsString,
     io,
-    path::PathBuf,
-    process::Command,
+    process::{Child, Command, ExitStatus, Stdio},
+    time::{Duration, Instant},
 };
+#[cfg(feature = "privileged")]
 use tempfile::TempDir;
+
+const CLEANUP_DEADLINE: Duration = Duration::from_secs(3);
+
+fn wait_cleanup_child(mut child: Child, timeout: Duration) -> io::Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                // Own the subprocess through termination and reaping, including
+                // polling errors. No detached worker may retain the fixture.
+                let killed = child.kill();
+                let reaped = child.wait();
+                killed?;
+                reaped?;
+                return Err(match result {
+                    Err(error) => error,
+                    _ => io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "fixture cleanup command exceeded deadline",
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn run_cleanup(program: &str, args: &[OsString], timeout: Duration) -> io::Result<()> {
+    // Cleanup needs only status. Null streams avoid blocking on inherited pipes.
+    let child = Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let status = wait_cleanup_child(child, timeout)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{program} cleanup failed ({status})"
+        )))
+    }
+}
+
 /// Require real root privileges before any loop/mount operation.
+#[cfg(feature = "privileged")]
 pub(crate) fn require_root() {
     assert!(
         rustix::process::geteuid().is_root(),
         "privileged fixture requires root in a disposable VM; use cargo xtask vm-test"
     );
 }
+#[cfg(feature = "privileged")]
 pub(crate) fn run(program: &str, args: &[OsString]) -> io::Result<String> {
     let out = Command::new(program)
         .args(args)
@@ -30,10 +82,12 @@ pub(crate) fn run(program: &str, args: &[OsString]) -> io::Result<String> {
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
+#[cfg(feature = "privileged")]
 pub(crate) fn words(args: &[&str]) -> Vec<OsString> {
     args.iter().map(OsString::from).collect()
 }
 /// Owned loop filesystem. Drop unmounts and detaches before deleting storage.
+#[cfg(feature = "privileged")]
 #[derive(Debug)]
 pub struct LoopXfs {
     /// Backing image, inside the owned temporary directory.
@@ -45,6 +99,7 @@ pub struct LoopXfs {
     loopdev: Option<OsString>,
     mounted: bool,
 }
+#[cfg(feature = "privileged")]
 impl LoopXfs {
     /// Create and mount XFS; panics clearly when not root or commands fail.
     /// `size` is bytes; use at least 512 MiB with current xfsprogs.
@@ -109,11 +164,19 @@ impl LoopXfs {
                     "refusing modified mountpoint outside owned loop fixture",
                 ));
             }
-            run("umount", &[self.mountpoint.clone().into_os_string()])?;
+            run_cleanup(
+                "umount",
+                &[self.mountpoint.clone().into_os_string()],
+                CLEANUP_DEADLINE,
+            )?;
             self.mounted = false;
         }
         if let Some(device) = &self.loopdev {
-            run("losetup", &[OsStr::new("--detach").into(), device.clone()])?;
+            run_cleanup(
+                "losetup",
+                &[OsStr::new("--detach").into(), device.clone()],
+                CLEANUP_DEADLINE,
+            )?;
             self.loopdev = None;
         }
         if let Some(storage) = &self.storage {
@@ -124,6 +187,7 @@ impl LoopXfs {
         Ok(())
     }
 }
+#[cfg(feature = "privileged")]
 impl Drop for LoopXfs {
     fn drop(&mut self) {
         if let Err(e) = self.cleanup() {
@@ -132,5 +196,21 @@ impl Drop for LoopXfs {
                 let _ = dir.keep();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    #[test]
+    fn stalled_cleanup_is_killed_and_reaped_before_error() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let started = Instant::now();
+        let error = wait_cleanup_child(child, Duration::from_millis(30)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(run_cleanup("true", &[], CLEANUP_DEADLINE).is_ok());
     }
 }

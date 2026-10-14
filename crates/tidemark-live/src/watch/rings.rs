@@ -155,6 +155,7 @@ pub(super) struct Rings {
     pub dropped: u64,
     overflow_total: u64,
     next_minute: Option<i64>,
+    history_start: Option<i64>,
     rollback_until: Option<i64>,
     last_emitted_end: Option<u64>,
     rows_drained_until: Option<i64>,
@@ -214,10 +215,14 @@ impl Rings {
             dropped: 0,
             overflow_total: 0,
             next_minute: None,
+            history_start: None,
             rollback_until: None,
             last_emitted_end: None,
             rows_drained_until: None,
         }
+    }
+    pub fn history_start(&self) -> Option<i64> {
+        self.history_start
     }
     pub fn budget(&self) -> &Budget {
         &self.budget
@@ -261,12 +266,19 @@ impl Rings {
     pub fn advance(&mut self, now: i64) {
         let minute = now.div_euclid(60) * 60;
         self.next_minute.get_or_insert(minute.saturating_add(60));
-        // Preserve the emission watermark across the existing rollback reset.
+        self.history_start.get_or_insert(minute.saturating_add(60));
+        // Completed facts and delivery watermarks survive a clock rollback.
         let rollback = self.buckets.back().is_some_and(|b| b.minute > minute);
         if rollback {
             let previous = self.buckets.back().map(|b| b.minute);
             self.rollback_until = self.rollback_until.max(previous);
-            self.buckets.clear();
+            for bucket in &mut self.buckets {
+                if bucket.minute >= minute {
+                    bucket.lossy = true;
+                    bucket.transport_loss = true;
+                }
+            }
+            return;
         }
         if self.buckets.back().is_some_and(|b| b.minute == minute) {
             return;
@@ -550,6 +562,7 @@ impl Rings {
         }
     }
     pub fn hot(&self, now: i64, window: u32, scope: HotScope, limit: usize) -> Vec<HotEntry> {
+        let now = now.max(self.buckets.back().map_or(now, |b| b.minute));
         let index = match scope {
             HotScope::Dir => 0,
             HotScope::Unit => 1,
@@ -689,6 +702,7 @@ impl Rings {
         }
     }
     pub fn detail(&self, now: i64) -> String {
+        let now = now.max(self.buckets.back().map_or(now, |b| b.minute));
         let cutoff = now.div_euclid(60) * 60 - 14 * 60;
         // One latest occurrence per cause bounds status text independently of
         // the number of affected minutes and configured watchers.
@@ -770,6 +784,7 @@ impl Rings {
         reasons.join("; ")
     }
     pub fn lossy(&self, now: i64) -> u32 {
+        let now = now.max(self.buckets.back().map_or(now, |b| b.minute));
         self.buckets
             .iter()
             .filter(|b| {
@@ -1490,16 +1505,15 @@ mod tests {
             r.add(minute * 60, keys(1), 1, None, (1, 1));
         }
         assert_eq!(r.buckets.len(), 60);
+        let before = r.hot(99 * 60, 60, HotScope::Dir, 1);
+        let delivered = r.drain_minutes(100 * 60, "/", 5);
         r.advance(0);
-        assert_eq!(r.buckets.len(), 1);
-        assert!(r.hot(0, 60, HotScope::Comm, 1).is_empty());
-        assert_eq!(r.lossy(0), 1);
-        r.add(0, keys(1), 5, None, (1, 1));
-        assert_eq!(r.hot(0, 1, HotScope::Dir, 1)[0].bytes_delta, 5);
-        assert!(r.hot(-60, 1, HotScope::Dir, 1).is_empty());
-        assert_eq!(r.lossy(-60), 0);
-        assert!(r.drain(0, "/", 5).is_empty());
-        assert_eq!(r.drain(60, "/", 5).len(), 3);
-        assert!(r.drain(60, "/", 5).is_empty());
+        assert_eq!(r.buckets.len(), 60);
+        let after = r.hot(0, 60, HotScope::Dir, 1);
+        assert_eq!(after[0].bytes_delta, before[0].bytes_delta - 1);
+        assert!(after[0].lossy);
+        assert_eq!(r.lossy(0), 15);
+        assert!(!delivered.is_empty());
+        assert!(r.drain_minutes(100 * 60, "/", 5).is_empty());
     }
 }
