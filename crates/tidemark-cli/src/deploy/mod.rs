@@ -705,6 +705,34 @@ pub fn unstage(
         ));
     }
     if let Some((parent, name, root)) = guarded {
+        let busy = || {
+            DeployError::Guard(
+                "state directory in use by another tidemark process; nothing was removed".into(),
+            )
+        };
+        let _writer =
+            tidemark_store::lease::RecoveryLease::acquire(state_dir, Duration::from_secs(10))
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        busy()
+                    } else {
+                        DeployError::Io(error)
+                    }
+                })?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let _scan = loop {
+            match tidemark_scan::orchestrator::ScanLock::acquire(state_dir) {
+                Ok(lock) => break lock,
+                Err(tidemark_scan::orchestrator::ScanError::Busy) if Instant::now() < deadline => {
+                    std::thread::sleep(
+                        Duration::from_millis(25)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(tidemark_scan::orchestrator::ScanError::Busy) => return Err(busy()),
+                Err(error) => return Err(io::Error::other(error).into()),
+            }
+        };
         purge_directory(parent, name, root)?;
     } else {
         if let Some(fd) = deploy {

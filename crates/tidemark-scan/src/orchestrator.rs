@@ -733,7 +733,16 @@ impl ScanLock {
         }
         let file = directory.open_leaf(std::ffi::OsStr::new("scan.lock"), true, true)?;
         match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => {
+                tidemark_store::lease::verify_lock_identity(
+                    &directory,
+                    state,
+                    &file,
+                    std::ffi::OsStr::new("scan.lock"),
+                )
+                .map_err(|_| ScanError::Busy)?;
+                Ok(Self { _file: file })
+            }
             Err(rustix::io::Errno::WOULDBLOCK) => Err(ScanError::Busy),
             Err(e) => Err(e.into()),
         }

@@ -265,3 +265,37 @@ fn writer_lock_obeys_verified_leaf_rules() {
             .is_err()
     );
 }
+
+#[test]
+fn detached_state_and_replaced_lock_refuse_ownership() {
+    use std::time::Duration;
+    use tidemark_store::{lease, state_dir::StateDir};
+    for name in ["writer.lock", "scan.lock"] {
+        for replace_directory in [false, true] {
+            let temp = test_support::private_tempdir().unwrap();
+            let state = temp.path().join("state");
+            let directory = StateDir::open(&state, true).unwrap();
+            let file = directory
+                .open_leaf(std::ffi::OsStr::new(name), true, true)
+                .unwrap();
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+            if replace_directory {
+                std::fs::rename(&state, temp.path().join("old")).unwrap();
+                std::fs::create_dir(&state).unwrap();
+            } else {
+                std::fs::remove_file(state.join(name)).unwrap();
+            }
+            let error =
+                lease::verify_lock_identity(&directory, &state, &file, std::ffi::OsStr::new(name))
+                    .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            assert!(error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<lease::LeaseBusy>()
+                .is_some());
+            // A distinct new namespace may be acquired, but never the detached one.
+            assert!(lease::RecoveryLease::acquire(&state, Duration::ZERO).is_ok());
+        }
+    }
+}
