@@ -326,6 +326,30 @@ fn io(e: std::io::Error) -> DaemonError {
         source: e,
     }
 }
+fn socket_lock_error(error: std::io::Error, path: &std::path::Path) -> std::io::Error {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        std::io::Error::new(error.kind(), format!(
+            "another tidemarkd is already running with this configuration (API socket lock {} is held)",
+            tidemark_core::path::display_lossy_bytes(path.as_os_str().as_encoded_bytes())
+        ))
+    } else {
+        error
+    }
+}
+
+#[cfg(test)]
+mod lock_error_tests {
+    #[test]
+    fn held_socket_lock_explains_refusal_without_binding() {
+        let path = std::path::Path::new("/run/tidemark/api.sock.lock");
+        let error = super::socket_lock_error(std::io::ErrorKind::WouldBlock.into(), path);
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(super::io(error).to_string(), "API socket: another tidemarkd is already running with this configuration (API socket lock /run/tidemark/api.sock.lock is held)");
+        let other = super::socket_lock_error(std::io::ErrorKind::PermissionDenied.into(), path);
+        assert_eq!(other.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+}
+
 struct Frame(Vec<u8>);
 impl Write for Frame {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -628,7 +652,8 @@ impl SocketPath {
                 "API lock must be an owned regular single-link file",
             ));
         }
-        fs::flock(&lock, fs::FlockOperation::NonBlockingLockExclusive)?;
+        fs::flock(&lock, fs::FlockOperation::NonBlockingLockExclusive)
+            .map_err(|error| socket_lock_error(error.into(), &path.with_file_name(&lock_name)))?;
         let named = fs::statat(&fd, &lock_name, fs::AtFlags::SYMLINK_NOFOLLOW)?;
         if (named.st_dev, named.st_ino) != (lock_stat.st_dev, lock_stat.st_ino) {
             return Err(std::io::ErrorKind::WouldBlock.into());
