@@ -153,10 +153,23 @@ fn metadata_and_scriptlet_contract() {
     }
     assert_eq!(m["version"].as_str(), Some("0.1.0"));
     let post = read(m["post_install_script"].as_str().unwrap());
-    assert_eq!(post, "#!/bin/sh\nsystemd-tmpfiles --create /usr/lib/tmpfiles.d/tidemark.conf || :\nsystemctl daemon-reload || :\n");
-    assert!(!post.contains("enable"));
-    assert!(!post.contains("start"));
-    assert!(!post.contains("restart"));
+    assert_eq!(post, concat!(
+        "#!/bin/sh\n",
+        "systemd-tmpfiles --create /usr/lib/tmpfiles.d/tidemark.conf || :\n",
+        "systemctl daemon-reload || :\n",
+        "if [ \"${1:-0}\" -eq 1 ]; then\n",
+        "    printf '%s\\n' 'Tidemark installed. Configure /etc/tidemark/tidemark.toml, then: tidemark deploy stage --from <file> --start-now (service: tidemarkd)'\n",
+        "fi\n",
+    ));
+    for line in post.lines() {
+        // Ignore the one literal printf message, never arbitrary shell code.
+        if line.trim() == "printf '%s\\n' 'Tidemark installed. Configure /etc/tidemark/tidemark.toml, then: tidemark deploy stage --from <file> --start-now (service: tidemarkd)'" {
+            continue;
+        }
+        assert!(!line.contains("enable"), "{line}");
+        assert!(!line.contains("start"), "{line}");
+        assert!(!line.contains("restart"), "{line}");
+    }
     assert_eq!(
         read(m["pre_uninstall_script"].as_str().unwrap()),
         "#!/bin/sh\nif [ \"$1\" -eq 0 ]; then\n    systemctl stop tidemarkd.service || :\n    systemctl disable tidemarkd.service || :\nfi\n"

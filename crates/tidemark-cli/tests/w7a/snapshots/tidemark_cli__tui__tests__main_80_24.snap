@@ -6,11 +6,11 @@ expression: first
 │20260101T000000Z-00000000 walk age 99s degraded=false                         │
 │/fixture                                                                      │
 └──────────────────────────────────────────────────────────────────────────────┘
-┌main | size | filter  | Name Share SIZE RECLAIM SHARED FILES NEWEST Δ─────────┐
-│> 00000001/H     #     4.00 KiB 2.00 KiB 2.00 KiB      1        100 -         │
-│  00000002/H     #     4.00 KiB 2.00 KiB 2.00 KiB      1        100 -         │
-│  00000003/H     #     4.00 KiB 2.00 KiB 2.00 KiB      1        100 -         │
-│  [own files]              0 B       -       -      1          - -            │
+┌main | size | filter  | Name Share SIZE APPARENT RECLAIM SHARED FILES NEWEST Δ┐
+│> 00000001/H   #     4.00 KiB 4.00 KiB 2.00 KiB 2.00 KiB      1        100 -  │
+│  00000002/H   #     4.00 KiB 4.00 KiB 2.00 KiB 2.00 KiB      1        100 -  │
+│  00000003/H   #     4.00 KiB 4.00 KiB 2.00 KiB 2.00 KiB      1        100 -  │
+│  .                      0 B 12.0 KiB       -       -      1          - -     │
 │                                                                              │
 │                                                                              │
 │                                                                              │

@@ -18,6 +18,7 @@ struct Pages {
     reverse: bool,
     growth: Option<Vec<(DirRow, Option<i128>)>>,
     offset: usize,
+    total: usize,
     instances: Vec<(i64, tidemark_core::snapshot::LinkInstanceRow)>,
     inode: Option<u64>,
     live: Option<Vec<(DirRow, Option<i128>)>>,
@@ -61,6 +62,14 @@ struct Browser {
 }
 impl Browser {
     fn load(&mut self) -> anyhow::Result<()> {
+        self.pages.total = if let Some(live) = &self.pages.live {
+            live.iter()
+                .filter(|(row, _)| byte_contains(&row.name, self.state.filter.as_bytes()))
+                .count()
+        } else {
+            self.snapshot
+                .children_count(self.dir.id, self.state.filter.as_bytes())? as usize
+        };
         if self.state.sort == state::Sort::Growth
             && (self.snapshot.children_count(self.dir.id, b"")? > 10_000
                 || self
@@ -172,6 +181,8 @@ impl Browser {
         if self.state.pane == Pane::Instances {
             return self.instance_page(reverse, false);
         }
+        let previous_cursor = self.pages.cursor.clone();
+        let previous_reverse = self.pages.reverse;
         let previous_offset = self.pages.offset;
         let previous_selection = self.state.selected;
         if self.pages.live.is_some() || self.state.sort == state::Sort::Growth {
@@ -183,22 +194,29 @@ impl Browser {
                 return Ok(());
             }
         } else {
-            let cursor = if reverse {
-                self.rows.first()
+            self.pages.offset = if reverse {
+                self.pages.offset.saturating_sub(PAGE)
             } else {
-                self.rows.last()
-            }
-            .map(|r| r.0.clone());
-            if cursor.is_none() {
-                return Ok(());
-            }
-            self.pages.cursor = cursor;
-            self.pages.reverse = reverse;
+                self.pages.offset.saturating_add(self.rows.len())
+            };
         }
+        let cursor = if reverse {
+            self.rows.first()
+        } else {
+            self.rows.last()
+        }
+        .map(|row| row.0.clone());
+        if cursor.is_none() {
+            return Ok(());
+        }
+        self.pages.cursor = cursor;
+        self.pages.reverse = reverse;
         let previous = self.rows.clone();
         self.load()?;
         if self.rows.is_empty() {
             self.pages.offset = previous_offset;
+            self.pages.cursor = previous_cursor;
+            self.pages.reverse = previous_reverse;
             self.state.selected = previous_selection;
             self.rows = previous;
         }
@@ -420,9 +438,56 @@ impl Browser {
     fn visible(&self) -> Vec<&(DirRow, Option<i128>)> {
         self.rows.iter().collect()
     }
+    fn own_position(&self) -> usize {
+        // Own growth is not retained; put unknown growth after known children.
+        if self.state.sort == state::Sort::Growth {
+            return if byte_contains(b".", self.state.filter.as_bytes())
+                && self.pages.offset.saturating_add(self.rows.len()) >= self.pages.total
+            {
+                self.rows.len()
+            } else {
+                usize::MAX
+            };
+        }
+        let mut own = self.dir.clone();
+        own.name = b".".to_vec();
+        own.t_disk = own.own_charged;
+        own.t_files = own.own_files;
+        own.t_reclaimable = 0;
+        own.newest_mtime = i64::MIN;
+        let own = (own, None);
+        let before = |row: &(DirRow, Option<i128>)| self.state.compare(row, &own).is_lt();
+        let position = self.rows.iter().take_while(|row| before(row)).count();
+        let matches = byte_contains(b".", self.state.filter.as_bytes());
+        let at_beginning = self.pages.offset == 0;
+        let at_end = self.pages.offset.saturating_add(self.rows.len()) >= self.pages.total;
+        let in_page = if let Some(cursor) = &self.pages.cursor {
+            if self.pages.reverse {
+                !before(&(cursor.clone(), None)) && (position > 0 || at_beginning)
+            } else {
+                before(&(cursor.clone(), None)) && (position < self.rows.len() || at_end)
+            }
+        } else {
+            (position > 0 || at_beginning) && (position < self.rows.len() || at_end)
+        };
+        if matches && in_page {
+            position
+        } else {
+            usize::MAX
+        }
+    }
+    fn child_at(&self, selected: usize) -> Option<&(DirRow, Option<i128>)> {
+        let own = self.own_position();
+        if selected == own {
+            None
+        } else {
+            self.rows
+                .get(selected - usize::from(selected > own && own != usize::MAX))
+        }
+    }
     fn count(&self) -> usize {
         match self.state.pane {
-            Pane::Main => self.visible().len() + 1,
+            Pane::Main => self.visible().len() + usize::from(self.own_position() != usize::MAX),
             Pane::Links => self.links.len(),
             Pane::Picker => self.snapshots.len(),
             _ => self.text.lines().count(),
@@ -446,7 +511,7 @@ impl Browser {
         self.load()
     }
     fn pane(&mut self, pane: Pane) -> anyhow::Result<()> {
-        let own = self.state.pane == Pane::Main && self.state.selected == self.rows.len();
+        let own = self.state.pane == Pane::Main && self.state.selected == self.own_position();
         self.state.pane = pane;
         self.state.selected = 0;
         self.text.clear();
@@ -487,10 +552,53 @@ impl Browser {
         }
         Ok(())
     }
+    fn close_pane(&mut self) {
+        self.state.pane = Pane::Main;
+        self.state.selected = 0;
+    }
     fn enter(&mut self) -> anyhow::Result<()> {
         match self.state.pane {
             Pane::Main => {
-                if let Some((row, _)) = self.visible().get(self.state.selected).copied() {
+                if self.state.selected == self.own_position() {
+                    let hits = crate::cmd::files::retained_files(
+                        &self.snapshot,
+                        self.dir.id,
+                        &Default::default(),
+                        1_000_000,
+                        true,
+                    )?;
+                    let count = hits.len() as u64;
+                    let bytes = hits
+                        .iter()
+                        .fold(0u64, |sum, hit| sum.saturating_add(hit.row.disk));
+                    self.text = "PATH  SIZE  APPARENT  MTIME UTC\n".into();
+                    self.text.push_str(
+                        &hits
+                            .iter()
+                            .map(|hit| {
+                                format!(
+                                    "{}  {}  {}  {}\n",
+                                    hit.path
+                                        .as_ref()
+                                        .map(|p| p.display_lossy())
+                                        .unwrap_or_else(|| "[unresolved]".into()),
+                                    crate::render::size::bytes(hit.row.disk),
+                                    crate::render::size::bytes(hit.row.apparent),
+                                    crate::render::size::timestamp(hit.row.mtime)
+                                )
+                            })
+                            .collect::<String>(),
+                    );
+                    self.text.push_str(&format!(
+                        "{} other files, {} not individually retained",
+                        self.dir.own_files.saturating_sub(count),
+                        crate::render::size::bytes(self.dir.own_charged.saturating_sub(bytes))
+                    ));
+                    self.state.pane = Pane::Files;
+                    self.state.selected = 0;
+                    return Ok(());
+                }
+                if let Some((row, _)) = self.child_at(self.state.selected) {
                     let row = self.snapshot.dir_by_path(&row.path)?;
                     if let Some(row) = row {
                         self.navigate(row)?;
@@ -575,7 +683,7 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         crate::cmd::snapshots::select(context, args.path.as_deref(), args.snapshot.as_deref())?;
     let dir = snapshot
         .dir_by_path(&path)?
-        .ok_or_else(|| crate::CliError::Precondition("path not present in snapshot".into()))?;
+        .ok_or_else(|| crate::cmd::snapshots::missing_path(context, &path, &snapshot))?;
     let catalog = tidemark_store::catalog::Catalog::open(&context.config.general.state_dir, false)?;
     let mut entries = catalog.list(Some(&snapshot.meta().root))?;
     entries.retain(|e| e.status == "complete" && e.file.is_some());
@@ -700,8 +808,7 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
                 KeyCode::Enter | KeyCode::Right => browser.enter()?,
                 KeyCode::Backspace | KeyCode::Left => {
                     if browser.state.pane != Pane::Main {
-                        browser.state.pane = Pane::Main;
-                        browser.state.selected = 0;
+                        browser.close_pane();
                     } else if let Some(parent) = browser.dir.parent_id {
                         browser.navigate(browser.snapshot.dir(parent)?)?;
                     }
@@ -723,10 +830,9 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
                             .cancel
                             .store(true, std::sync::atomic::Ordering::Release);
                     }
-                    browser.state.pane = Pane::Main;
                     browser.state.filter.clear();
                     browser.boundary(false)?;
-                    browser.state.selected = 0;
+                    browser.close_pane();
                 }
                 _ => {}
             }

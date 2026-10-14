@@ -91,6 +91,10 @@ pub trait Systemctl {
     fn is_enabled(&self, unit: &str) -> io::Result<bool>;
     /// Whether the unit is active.
     fn is_active(&self, unit: &str) -> io::Result<bool>;
+    /// Whether systemd is currently starting the unit.
+    fn is_activating(&self, _unit: &str) -> io::Result<bool> {
+        Ok(false)
+    }
     /// Enable for subsequent boots.
     fn enable(&self, unit: &str) -> io::Result<()>;
     /// Disable and synchronously stop.
@@ -498,12 +502,19 @@ pub fn verify(
     let started = Instant::now();
     loop {
         let result = verify_once(state_dir, sys, api);
-        if result.healthy || started.elapsed() >= wait {
+        if result.healthy
+            || started.elapsed() >= wait
+            || result
+                .items
+                .iter()
+                .any(|item| item.detail == SERVICE_START_HINT)
+        {
             return Ok(result);
         }
         std::thread::sleep(Duration::from_secs(5).min(wait.saturating_sub(started.elapsed())));
     }
 }
+const SERVICE_START_HINT: &str = "the service is enabled but not running: start it with 'systemctl start tidemarkd' (or reboot), or stage with --start-now";
 fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> VerifyResult {
     let staged = read_json(&state_dir.join("deploy/staged.json"));
     let firstboot = read_json(&state_dir.join("deploy/firstboot.json"));
@@ -513,11 +524,26 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
         sys.is_active(UNIT).and_then(|active| {
             if active {
                 Ok(())
+            } else if sys.is_activating(UNIT)? {
+                Err(io::Error::other("service activating, waiting for start"))
+            } else if sys.is_enabled(UNIT)? {
+                Err(io::Error::other(SERVICE_START_HINT))
             } else {
-                Err(io::Error::other("staged, waiting for start"))
+                Err(io::Error::other("service is not enabled or running"))
             }
         }),
     )];
+    if items
+        .first()
+        .is_some_and(|item| item.detail == SERVICE_START_HINT)
+    {
+        items[0].detail = "staged, waiting for start".into();
+        items.push(check(
+            "service_start",
+            CheckStatus::Warn,
+            SERVICE_START_HINT,
+        ));
+    }
     let expected = staged
         .as_ref()
         .ok()
@@ -611,7 +637,16 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
         },
         core_details,
     ));
-    items.push(outcome("api", false, api.ping()));
+    let stopped = items.iter().any(|item| item.detail == SERVICE_START_HINT);
+    items.push(outcome(
+        "api",
+        false,
+        if stopped {
+            Err(io::Error::other("service is not running"))
+        } else {
+            api.ping()
+        },
+    ));
     VerifyResult {
         healthy: items.iter().all(|item| item.status == CheckStatus::Pass),
         items,
@@ -854,7 +889,7 @@ impl RealSystemctl {
     fn status(operation: &str, unit: &str) -> io::Result<bool> {
         let status = Self::wait(
             std::process::Command::new("/usr/bin/systemctl").args([operation, "--quiet", unit]),
-            Duration::from_secs(10),
+            Duration::from_secs(3),
         )?;
         match status.code() {
             Some(0) => Ok(true),
@@ -884,6 +919,40 @@ impl Systemctl for RealSystemctl {
     }
     fn is_active(&self, unit: &str) -> io::Result<bool> {
         Self::status("is-active", unit)
+    }
+    fn is_activating(&self, unit: &str) -> io::Result<bool> {
+        // Read ActiveState rather than treating systemctl is-active's exit 3
+        // (which includes activating) as proof that nobody is starting it.
+        let output = std::process::Command::new("/usr/bin/systemctl")
+            .args(["show", "--property=ActiveState", "--value", unit])
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut child = output;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("missing systemctl output"))?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                if !status.success() {
+                    return Err(io::Error::other("systemctl show failed"));
+                }
+                use std::io::Read;
+                let mut state = String::new();
+                stdout.by_ref().take(128).read_to_string(&mut state)?;
+                return Ok(state.trim() == "activating");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "systemctl show timed out",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     fn enable(&self, unit: &str) -> io::Result<()> {
         Self::action(&["enable", unit])

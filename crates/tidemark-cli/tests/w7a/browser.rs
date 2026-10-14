@@ -97,7 +97,7 @@ fn deterministic_render_at_both_sizes() {
     for (width, height) in [(80, 24), (160, 48)] {
         let first = render(&b, width, height);
         assert_eq!(first, render(&b, width, height));
-        assert!(first.contains("[own files]"));
+        assert!(first.contains(if width >= 160 { "./ (files here)" } else { "." }));
         assert!(first.contains("degraded=false"));
         insta::with_settings!({snapshot_path => "snapshots"}, { insta::assert_snapshot!(format!("main_{width}_{height}"),first); });
     }
@@ -337,7 +337,7 @@ fn global_orders_filter_and_boundaries() {
         assert_eq!(ids, (1..=2500).collect::<Vec<_>>());
         b.boundary(true).unwrap();
         assert_eq!(b.rows.last().unwrap().0.id, 2500);
-        assert_eq!(b.state.selected, b.rows.len());
+        assert_eq!(b.state.selected, b.count().saturating_sub(1));
         b.boundary(false).unwrap();
         assert_eq!(b.rows[0].0.id, 1);
     }
@@ -350,7 +350,7 @@ fn global_orders_filter_and_boundaries() {
     b.state.filter = "no such name".into();
     b.boundary(false).unwrap();
     assert!(b.rows.is_empty());
-    assert_eq!(b.count(), 1);
+    assert_eq!(b.count(), 0);
 }
 
 #[test]
@@ -375,11 +375,14 @@ fn own_files_columns_and_info() {
     b.dir.own_charged = 4096;
     b.dir.own_files = 12;
     let output = render(&b, 160, 48);
-    let line = output.lines().find(|l| l.contains("[own files]")).unwrap();
+    let line = output
+        .lines()
+        .find(|l| l.contains("./ (files here)"))
+        .unwrap();
     assert!(line.contains(&crate::render::size::bytes(4096)));
     assert!(line.contains("12"));
     assert_eq!(line.matches('-').count(), 4);
-    b.state.selected = b.rows.len();
+    b.state.selected = b.own_position();
     b.pane(Pane::Info).unwrap();
     assert!(b.text.contains("own files as charged"));
 }
@@ -605,4 +608,235 @@ fn human_header_and_pane_labels_are_lowercase() {
         assert!(text.contains("main | size | filter"), "{text}");
         assert!(!text.contains("Walk") && !text.contains("Main | Size"));
     }
+}
+
+#[test]
+fn own_row_sorts_and_enter_lists_direct_files() {
+    let (_temp, mut b) = browser(3);
+    b.dir.own_charged = 8192;
+    b.dir.own_files = 12;
+    for sort in [state::Sort::Size, state::Sort::Name, state::Sort::Files] {
+        b.state.sort = sort;
+        b.state.order(&mut b.rows);
+        assert_eq!(b.own_position(), 0);
+    }
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    assert_eq!(b.state.pane, Pane::Files);
+    assert!(b.text.contains(&format!(
+        "12 other files, {} not individually retained",
+        crate::render::size::bytes(8192)
+    )));
+}
+
+#[test]
+fn direct_retained_files_filter_before_limit_and_show_utc() {
+    let (_temp, mut b) = browser(1);
+    let temp = ::test_support::private_tempdir().unwrap();
+    let mut rows = vec![b.dir.clone(), b.rows[0].0.clone()];
+    rows[0].own_charged = 12288;
+    rows[0].own_files = 3;
+    let meta = fixture::meta(rows[0].path.clone(), 2_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&rows).unwrap();
+    writer
+        .put_files(&[
+            FileRow {
+                id: 0,
+                dir_id: 1,
+                name: Some(RawName::new(b"child".to_vec()).unwrap()),
+                ino: 1,
+                disk: 16384,
+                apparent: 20000,
+                mtime: 0,
+                nlink: 1,
+            },
+            FileRow {
+                id: 1,
+                dir_id: 0,
+                name: Some(RawName::new(b"root".to_vec()).unwrap()),
+                ino: 2,
+                disk: 8192,
+                apparent: 9000,
+                mtime: 0,
+                nlink: 1,
+            },
+        ])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.dir = b.snapshot.root().unwrap();
+    let direct =
+        crate::cmd::files::retained_files(&b.snapshot, 0, &Default::default(), 1, true).unwrap();
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].row.dir_id, 0);
+    assert_eq!(
+        crate::cmd::files::retained_files(&b.snapshot, 0, &Default::default(), 1, false).unwrap()
+            [0]
+        .row
+        .dir_id,
+        1
+    );
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    assert!(b.text.contains("/fixture/root"));
+    assert!(!b.text.contains("child"));
+    assert!(b.text.contains("1970-01-01 00:00:00Z"));
+    assert!(b.text.contains(&format!(
+        "2 other files, {} not individually retained",
+        crate::render::size::bytes(4096)
+    )));
+}
+
+#[test]
+fn missing_path_message_does_not_invent_a_mount_reason() {
+    let (_temp, b) = browser(0);
+    let context = crate::Context {
+        config: Default::default(),
+        config_path: "/unused".into(),
+        json: false,
+        color: false,
+    };
+    let path = RawPath::new(b"/fixture/data".to_vec()).unwrap();
+    let error = crate::cmd::snapshots::missing_path(&context, &path, &b.snapshot).to_string();
+    assert!(error.contains("of /fixture ("));
+    assert!(error.contains("run: tidemark scan /fixture/data"));
+    // An absent path alone does not prove a filesystem boundary.
+    assert!(!error.contains("different filesystem"));
+}
+
+#[test]
+fn own_row_appears_once_across_pages_and_sorts_between_children() {
+    let (_temp, mut b) = browser(2500);
+    for sort in [
+        state::Sort::Size,
+        state::Sort::Files,
+        state::Sort::Name,
+        state::Sort::Growth,
+    ] {
+        b.state.sort = sort;
+        b.boundary(false).unwrap();
+        let mut own_rows = 0;
+        loop {
+            own_rows += usize::from(b.own_position() != usize::MAX);
+            if b.rows.len() < PAGE {
+                break;
+            }
+            b.page(false).unwrap();
+        }
+        assert_eq!(own_rows, 1);
+    }
+    let (_temp, mut b) = browser(3);
+    b.dir.own_charged = 8192;
+    b.dir.own_files = 2;
+    b.rows[0].0.t_disk = 16384;
+    b.rows[0].0.t_files = 3;
+    b.rows[1].0.t_files = 1;
+    b.rows[2].0.t_files = 0;
+    for sort in [state::Sort::Size, state::Sort::Files] {
+        b.state.sort = sort;
+        b.state.order(&mut b.rows);
+        assert_eq!(b.own_position(), 1);
+        assert_eq!(b.child_at(0).unwrap().0.id, 1);
+        assert_eq!(b.child_at(2).unwrap().0.id, 2);
+    }
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    b.close_pane();
+    assert_eq!(b.state.pane, Pane::Main);
+}
+
+#[test]
+fn missing_path_message_names_recorded_filesystem_boundary() {
+    let temp = ::test_support::private_tempdir().unwrap();
+    let root = fixture::row(0, None, b"/", 4096);
+    let meta = fixture::meta(root.path.clone(), 1_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&[root]).unwrap();
+    writer
+        .put_skipped(&[tidemark_core::snapshot::SkipRow {
+            dir_id: 0,
+            name: RawName::new(b"data".to_vec()).unwrap(),
+            reason: tidemark_core::scan::SkipReason::OtherFs,
+        }])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    let snapshot = Snapshot::open(&file).unwrap();
+    let mut config = tidemark_core::config::Config::default();
+    config.general.socket = temp.path().join("unreachable.sock");
+    let context = crate::Context {
+        config,
+        config_path: "/unused".into(),
+        json: false,
+        color: false,
+    };
+    let path = RawPath::new(b"/data".to_vec()).unwrap();
+    let message = crate::cmd::snapshots::missing_path(&context, &path, &snapshot).to_string();
+    assert!(message.contains("no complete snapshot of /data yet"));
+    assert!(message.contains("of / ("));
+    assert!(message.contains("a different filesystem"));
+    assert!(message.contains("run: tidemark scan /data"));
+    assert!(!message.contains("next scheduled scan"));
+}
+
+#[test]
+fn missing_path_message_includes_daemon_schedule_for_configured_root() {
+    use std::io::{BufRead, BufReader, Write};
+    let temp = ::test_support::private_tempdir().unwrap();
+    let socket = temp.path().join("daemon.sock");
+    let listener = match std::os::unix::net::UnixListener::bind(&socket) {
+        Ok(listener) => listener,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            eprintln!("socket unavailable; skipping schedule message test: {error}");
+            return;
+        }
+        Err(error) => panic!("bind fixture socket: {error}"),
+    };
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "scan.status");
+        writeln!(stream, "{}", serde_json::json!({"v": 1, "ok": true, "id": request["id"], "result": [{"root": "/data", "running": null, "last_complete": null, "next_due": 0}], "error": null})).unwrap();
+    });
+    let (_temp, b) = browser(0);
+    let mut config = tidemark_core::config::Config::default();
+    config.general.socket = socket;
+    let context = crate::Context {
+        config,
+        config_path: "/unused".into(),
+        json: false,
+        color: false,
+    };
+    let path = RawPath::new(b"/data".to_vec()).unwrap();
+    let message = crate::cmd::snapshots::missing_path(&context, &path, &b.snapshot).to_string();
+    worker.join().unwrap();
+    assert!(
+        message.contains("next scheduled scan: 1970-01-01 00:00:00Z"),
+        "{message}"
+    );
+}
+
+#[test]
+fn end_includes_own_row_at_an_exact_page_boundary() {
+    let (_temp, mut b) = browser(2000);
+    b.boundary(true).unwrap();
+    assert_eq!(b.own_position(), PAGE);
+    assert_eq!(b.state.selected, PAGE);
+    b.page(true).unwrap();
+    assert_eq!(b.own_position(), usize::MAX);
+    b.state.sort = state::Sort::Name;
+    b.boundary(true).unwrap();
+    b.page(true).unwrap();
+    assert_eq!(b.pages.offset, 0);
+    assert_eq!(b.own_position(), 0);
 }

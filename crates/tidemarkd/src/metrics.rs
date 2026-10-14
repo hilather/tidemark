@@ -581,10 +581,27 @@ fn render_source(
 }
 /// Atomically publish a textfile without creating the collector directory.
 pub fn write_textfile(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    write_textfile_inner(path, text).map_err(|error| {
+        if error.to_string().starts_with("metrics textfile ") {
+            error
+        } else {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "metrics textfile {}: {error}",
+                    tidemark_core::path::display_lossy_bytes(path.as_os_str().as_bytes())
+                ),
+            )
+        }
+    })
+}
+fn write_textfile_inner(path: &Path, text: &str) -> std::io::Result<()> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
     use rustix::fs::{flock, openat, renameat, FlockOperation, Mode, OFlags};
+    use std::os::unix::ffi::OsStrExt;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -597,7 +614,15 @@ pub fn write_textfile(path: &Path, text: &str) -> std::io::Result<()> {
     } else {
         std::env::current_dir()?.join(parent)
     };
-    let dir = std::fs::File::from(tidemark_store::state_dir::trusted_directory(&absolute)?);
+    let dir = std::fs::File::from(tidemark_store::state_dir::trusted_directory(&absolute).map_err(|error| {
+        let directory = tidemark_core::path::display_lossy_bytes(absolute.as_os_str().as_bytes());
+        let detail = if error.kind() == std::io::ErrorKind::NotFound {
+            format!("metrics textfile directory {directory} does not exist (create it for node_exporter's textfile collector, or set [metrics] textfile = \"\" to disable)")
+        } else {
+            format!("metrics textfile {}: {}", tidemark_core::path::display_lossy_bytes(path.as_os_str().as_bytes()), error.to_string().replacen("state directory", "collector directory", 1))
+        };
+        std::io::Error::new(error.kind(), detail)
+    })?);
     let mut tmp = name.to_os_string();
     tmp.push(".tmp");
     let fd = openat(
@@ -855,5 +880,29 @@ mod watch_history_tests {
                 .count(),
             3
         );
+    }
+}
+
+#[cfg(test)]
+mod ux_owner_tests {
+    #[test]
+    fn missing_collector_names_textfile_directory_and_remedy() {
+        let dir = test_support::private_tempdir().unwrap();
+        let collector = dir.path().join("missing/textfile_collector");
+        let error = super::write_textfile(&collector.join("tidemark.prom"), "test").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), format!("metrics textfile directory {} does not exist (create it for node_exporter's textfile collector, or set [metrics] textfile = \"\" to disable)", collector.display()));
+        assert!(!collector.exists());
+    }
+    #[test]
+    fn other_export_errors_name_the_textfile() {
+        let dir = test_support::private_tempdir().unwrap();
+        let path = dir.path().join("tidemark.prom");
+        std::fs::create_dir(&path).unwrap();
+        let error = super::write_textfile(&path, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&path.display().to_string()));
+        assert!(!error.contains("state directory"));
     }
 }

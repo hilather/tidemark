@@ -26,7 +26,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     let (path, snapshot) = super::snapshots::select(context, args.path.as_deref(), None)?;
     let dir = snapshot
         .dir_by_path(&path)?
-        .ok_or_else(|| crate::CliError::Precondition("path not present in snapshot".into()))?;
+        .ok_or_else(|| super::snapshots::missing_path(context, &path, &snapshot))?;
     let rows = snapshot.wide_dirs(dir.id, min, limit)?;
     let mut out = std::io::stdout().lock();
     if !context.json {
