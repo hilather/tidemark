@@ -466,8 +466,24 @@ fn retired_watcher_components_and_errors_release_capacity() {
         );
     }
     assert!(status.last_errors.len() <= MAX_SUBJECTS);
-    assert_eq!(status.last_errors.len(), 1);
-    assert_eq!(status.last_errors[0].0, current);
+    let watcher_errors: Vec<_> = status
+        .last_errors
+        .iter()
+        .filter(|(name, _, _)| name.starts_with("watcher:"))
+        .collect();
+    assert_eq!(watcher_errors.len(), 1);
+    assert_eq!(watcher_errors[0].0, current);
+    for (name, _, detail) in status
+        .last_errors
+        .iter()
+        .filter(|(name, _, _)| !name.starts_with("watcher:"))
+    {
+        assert_eq!(name, "sampler");
+        assert_eq!(
+            detail,
+            "waiting for a complete pass under the new configuration"
+        );
+    }
 }
 
 #[cfg(feature = "privileged")]
