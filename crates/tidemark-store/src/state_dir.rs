@@ -127,8 +127,24 @@ fn namespace() -> io::Result<(bool, u32)> {
 
 /// Whether ancestry exceptions are disabled for this process.
 pub fn strict_ancestry() -> bool {
-    !cfg!(debug_assertions)
-        || std::env::var_os("TIDEMARK_STRICT_ANCESTRY").is_some_and(|v| v == "1")
+    strict_ancestry_policy(
+        cfg!(feature = "strict-ancestry"),
+        cfg!(debug_assertions),
+        std::env::var_os("TIDEMARK_STRICT_ANCESTRY").is_some_and(|v| v == "1"),
+    )
+}
+
+fn strict_ancestry_policy(feature: bool, assertions: bool, runtime: bool) -> bool {
+    feature || !assertions || runtime
+}
+
+/// Operator-visible ancestry policy, computed from the admission helper.
+pub fn ancestry_checks() -> &'static str {
+    if strict_ancestry() {
+        "strict"
+    } else {
+        "development (relaxed)"
+    }
 }
 
 fn check(path: &Path, stat: &fs::Stat, role: Role, read_only_mount: bool) -> io::Result<()> {
@@ -861,5 +877,39 @@ mod tests {
             StateDir::open(&child, false).err().unwrap().kind(),
             io::ErrorKind::Other
         );
+    }
+}
+
+#[cfg(test)]
+mod strict_feature_tests {
+    #[test]
+    fn policy_feature_table() {
+        for (feature, assertions, runtime, expected) in [
+            (false, false, false, true),
+            (false, false, true, true),
+            (false, true, false, false),
+            (false, true, true, true),
+            (true, false, false, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
+            assert_eq!(
+                super::strict_ancestry_policy(feature, assertions, runtime),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "strict-ancestry")]
+    fn feature_forces_strict_with_assertions() {
+        assert!(
+            cfg!(debug_assertions),
+            "run this regression in the test profile"
+        );
+        assert!(super::strict_ancestry_policy(true, true, false));
+        assert!(super::strict_ancestry());
+        assert_eq!(super::ancestry_checks(), "strict");
     }
 }

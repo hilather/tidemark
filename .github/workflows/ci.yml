@@ -114,6 +114,17 @@ jobs:
         run: |
           tidemark --version | grep -F "commit: $TIDEMARK_BUILD_COMMIT ("
           tidemarkd --version | grep -F "commit: $TIDEMARK_BUILD_COMMIT ("
+          env -u TIDEMARK_STRICT_ANCESTRY tidemark --version | grep -Fx 'ancestry checks: strict'
+          env -u TIDEMARK_STRICT_ANCESTRY tidemarkd --version | grep -Fx 'ancestry checks: strict'
+      - name: Regression package with release assertions enabled
+        if: matrix.el == '8.10'
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true'
+        run: |
+          cargo xtask rpm --native --require-clean
+          tools/check-rpm.sh target/generate-rpm/tidemark-0.1.0-1.el8.x86_64.rpm
+          env -u TIDEMARK_STRICT_ANCESTRY target/release/tidemark --version | grep -Fx 'ancestry checks: strict'
+          env -u TIDEMARK_STRICT_ANCESTRY target/release/tidemarkd --version | grep -Fx 'ancestry checks: strict'
       - run: rpm -V tidemark
       - run: sha256sum target/generate-rpm/tidemark-0.1.0-1.el8.x86_64.rpm > target/generate-rpm/tidemark-0.1.0-1.el8.x86_64.rpm.sha256
       - uses: actions/upload-artifact@v6

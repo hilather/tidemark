@@ -21,7 +21,7 @@ fn short_and_long_versions() {
     assert_eq!(short, format!("tidemark {}\n", env!("CARGO_PKG_VERSION")));
     let long = run("--version");
     let lines: Vec<_> = long.lines().collect();
-    assert_eq!(lines.len(), 3);
+    assert_eq!(lines.len(), 4);
     assert_eq!(lines[0], short.trim());
     let commit = lines[1]
         .strip_prefix("commit: ")
@@ -34,6 +34,25 @@ fn short_and_long_versions() {
         commit == "unknown"
             || (commit.len() == 12 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
     );
+    assert_eq!(
+        lines[3],
+        format!(
+            "ancestry checks: {}",
+            tidemark_store::state_dir::ancestry_checks()
+        )
+    );
     assert!(lines[2].starts_with("target: "));
     assert!(lines[2].contains(", profile "));
+}
+
+#[test]
+fn runtime_strict_version() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
+        .arg("--version")
+        .env("TIDEMARK_STRICT_ANCESTRY", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.lines().nth(3), Some("ancestry checks: strict"));
 }

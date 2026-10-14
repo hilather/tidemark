@@ -68,6 +68,18 @@ fn main() -> Result<()> {
                     "warnings",
                 ],
             )?;
+            run(
+                root,
+                &[
+                    "test",
+                    "-p",
+                    "tidemark-store",
+                    "--features",
+                    "strict-ancestry",
+                    "--lib",
+                    "strict_feature_tests",
+                ],
+            )?;
             run(root, &["test", "--workspace", "--no-fail-fast"])?;
             run(
                 root,

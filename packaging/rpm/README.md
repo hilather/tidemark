@@ -113,3 +113,10 @@ RPM VCS metadata is unchanged: cargo-generate-rpm 0.20.0 was unavailable in the
 offline worker cache, so support for setting `vcs` at build time could not be
 confirmed. The coordinator should verify that capability before adding metadata;
 the executable identity is the available operator check.
+
+Packaged builds always enable `strict-ancestry` for both binaries. This disables
+development ancestry exceptions even when release debug assertions are enabled
+by Cargo profile overrides or Rust flags. `--version` reports `ancestry checks:
+strict`; the payload checker and installed-package CI assert this with the runtime
+strict variable unset. The Rocky 8.10 job also rebuilds the package with
+`CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true` as a regression.
