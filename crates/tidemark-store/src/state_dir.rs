@@ -416,6 +416,14 @@ impl StateDir {
             Err(e) => Err(context(&self.path.join(name), e)),
         }
     }
+    // Identity checks must not open/close a database already locked by SQLite.
+    pub(crate) fn leaf_identity(&self, name: &OsStr) -> io::Result<(u64, u64)> {
+        self.name(name)?;
+        let stat = fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| context(&self.path.join(name), e))?;
+        self.leaf(name, &stat)?;
+        Ok((stat.st_dev, stat.st_ino))
+    }
     /// Open a leaf without following links or blocking on special files.
     /// Creation is exclusive when absent; existing files are never repaired.
     pub fn open_leaf(&self, name: &OsStr, write: bool, create: bool) -> io::Result<File> {

@@ -296,7 +296,7 @@ impl Snapshot {
             .file_name()
             .ok_or_else(|| StoreError::Invalid("snapshot name missing".into()))?;
         let directory = crate::state_dir::StateDir::snapshot_dir(&parent, false)?;
-        let _leaf = directory.open_leaf(name, false, false)?;
+        directory.leaf_identity(name)?;
         let conn = immutable_connection(path)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version != 1 {
