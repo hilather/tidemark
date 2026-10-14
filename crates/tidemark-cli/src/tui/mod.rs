@@ -543,21 +543,24 @@ impl Browser {
                     let bytes = hits
                         .iter()
                         .fold(0u64, |sum, hit| sum.saturating_add(hit.row.disk));
-                    self.text = hits
-                        .iter()
-                        .map(|hit| {
-                            format!(
-                                "{}  {}  {}  {}\n",
-                                hit.path
-                                    .as_ref()
-                                    .map(|p| p.display_lossy())
-                                    .unwrap_or_else(|| "[unresolved]".into()),
-                                crate::render::size::bytes(hit.row.disk),
-                                crate::render::size::bytes(hit.row.apparent),
-                                crate::render::size::timestamp(hit.row.mtime)
-                            )
-                        })
-                        .collect();
+                    self.text = "PATH  SIZE  APPARENT  MTIME UTC\n".into();
+                    self.text.push_str(
+                        &hits
+                            .iter()
+                            .map(|hit| {
+                                format!(
+                                    "{}  {}  {}  {}\n",
+                                    hit.path
+                                        .as_ref()
+                                        .map(|p| p.display_lossy())
+                                        .unwrap_or_else(|| "[unresolved]".into()),
+                                    crate::render::size::bytes(hit.row.disk),
+                                    crate::render::size::bytes(hit.row.apparent),
+                                    crate::render::size::timestamp(hit.row.mtime)
+                                )
+                            })
+                            .collect::<String>(),
+                    );
                     self.text.push_str(&format!(
                         "{} other files, {} not individually retained",
                         self.dir.own_files.saturating_sub(count),
