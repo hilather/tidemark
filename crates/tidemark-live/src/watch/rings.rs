@@ -59,6 +59,8 @@ struct Bucket {
     nodes: usize,
     key_budget: bool,
     output_budget: std::cell::Cell<bool>,
+    unmapped: u64,
+    unmapped_errno: Option<i32>,
     dirty_full: bool,
     dirty_budget: bool,
     events: u64,
@@ -303,6 +305,8 @@ impl Rings {
                 nodes: 0,
                 key_budget: false,
                 output_budget: std::cell::Cell::new(false),
+                unmapped: 0,
+                unmapped_errno: None,
                 dirty_full: false,
                 dirty_budget: false,
                 events: 0,
@@ -671,18 +675,49 @@ impl Rings {
         }
         ranked(&sum, limit)
     }
+    pub fn unmapped(&mut self, at: i64, errno: Option<i32>) {
+        self.advance(at);
+        if let Some(b) = self
+            .buckets
+            .iter_mut()
+            .find(|b| b.minute == at.div_euclid(60) * 60)
+        {
+            b.unmapped = b.unmapped.saturating_add(1);
+            b.unmapped_errno = errno;
+            b.lossy = true;
+            b.truncated = true;
+        }
+    }
     pub fn detail(&self, now: i64) -> String {
         let cutoff = now.div_euclid(60) * 60 - 14 * 60;
         // One latest occurrence per cause bounds status text independently of
         // the number of affected minutes and configured watchers.
         let mut reported = [false; 12];
         let mut reasons = Vec::with_capacity(reported.len() + 1);
+        let mut unmapped_reported = false;
         for b in self
             .buckets
             .iter()
             .rev()
             .filter(|b| b.minute >= cutoff && b.minute <= now)
         {
+            if b.unmapped > 0 && !unmapped_reported {
+                unmapped_reported = true;
+                let cause = b.unmapped_errno.map_or_else(
+                    || "no provenance".into(),
+                    |errno| {
+                        format!(
+                            "reopen failed: {}",
+                            match errno {
+                                9 => "EBADF".into(),
+                                116 => "ESTALE".into(),
+                                code => format!("errno={code}"),
+                            }
+                        )
+                    },
+                );
+                reasons.push(format!("unmapped events: {} ({cause})", b.unmapped));
+            }
             let causes = [
                 (
                     b.output_budget.get(),
