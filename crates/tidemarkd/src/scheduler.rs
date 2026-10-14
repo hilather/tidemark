@@ -1661,6 +1661,9 @@ mod tests {
         drop(Catalog::open(dir.path(), true).unwrap());
         let mut config = Config::default();
         config.general.state_dir = dir.path().to_owned();
+        // Exercise catalog admission without unrelated default host scans, whose
+        // failures would overwrite scheduler health (especially without root).
+        config.roots.clear();
         let state = LiveState::new(&config, 0);
         state
             .publish_component(component("daemon", "ok", "ready"))
@@ -1679,17 +1682,24 @@ mod tests {
         let wait = |health: &str| {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                if state.view().status(0).unwrap().components.iter().any(|c| {
-                    c.name == "scheduler"
-                        && c.state == health
-                        && (health != "degraded" || c.detail.contains("writable by group"))
+                let status = state.view().status(0).unwrap();
+                let scheduler = status.components.iter().find(|c| c.name == "scheduler");
+                if scheduler.is_some_and(|c| {
+                    c.state == health
+                        && if health == "degraded" {
+                            c.detail.contains("writable by group")
+                        } else {
+                            // Startup health precedes admission; require an idle pass
+                            // that actually opened the catalog successfully.
+                            c.detail == "waiting for scheduled scan"
+                        }
                 }) {
                     break;
                 }
-                assert!(!handle.is_finished(), "scheduler exited");
+                assert!(!handle.is_finished(), "scheduler exited: {scheduler:?}");
                 assert!(
                     Instant::now() < deadline,
-                    "scheduler did not become {health}"
+                    "scheduler did not become {health}: {scheduler:?}"
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
