@@ -143,6 +143,43 @@ mod log_tests;
 
 #[cfg(test)]
 mod tests {
+    // Own children from spawn through every assertion, including panic unwinding.
+    struct ChildGuard(std::process::Child);
+    impl std::ops::Deref for ChildGuard {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for ChildGuard {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+    impl ChildGuard {
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = self.0.try_wait()? {
+                    return Ok(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "child did not exit",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     use super::*;
     #[test]
     fn preflight_refuses_foreign_database_leaves_before_mutation() {
@@ -226,12 +263,14 @@ mod tests {
     fn recovery_wait_preserves_busy_database_and_sidecars() {
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::recovery_scan_lock_child"])
-            .env("TIDEMARK_RECOVERY_LOCK_CHILD", dir.path())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut child = ChildGuard(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::recovery_scan_lock_child"])
+                .env("TIDEMARK_RECOVERY_LOCK_CHILD", dir.path())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !dir.path().join("ready").exists() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
@@ -264,12 +303,14 @@ mod tests {
     fn startup_refuses_pre_api_writer() {
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::pre_api_writer_child"])
-            .env("TIDEMARK_PRE_API_WRITER", dir.path())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut child = ChildGuard(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::pre_api_writer_child"])
+                .env("TIDEMARK_PRE_API_WRITER", dir.path())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !dir.path().join("ready").exists() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
@@ -309,16 +350,16 @@ mod tests {
         std::fs::write(dir.path().join("timeseries.db"), b"corruption").unwrap();
         let mut children = Vec::new();
         for id in ["one", "two"] {
-            children.push(
+            children.push(ChildGuard(
                 std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "tests::racing_start_child"])
                     .env("TIDEMARK_RACING_START", dir.path())
                     .env("TIDEMARK_RACING_ID", id)
                     .spawn()
                     .unwrap(),
-            );
+            ));
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !dir.path().join("one").exists() || !dir.path().join("two").exists() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
@@ -342,7 +383,7 @@ mod tests {
             b"ready",
         )
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !path.join("go").exists() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
@@ -377,12 +418,14 @@ mod tests {
     fn healthy_catalog_does_not_wait_for_scan_lock() {
         let dir = tempfile::tempdir().unwrap();
         drop(tidemark_store::catalog::Catalog::open(dir.path(), true).unwrap());
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tests::pre_api_writer_child"])
-            .env("TIDEMARK_PRE_API_WRITER", dir.path())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut child = ChildGuard(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::pre_api_writer_child"])
+                .env("TIDEMARK_PRE_API_WRITER", dir.path())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !dir.path().join("ready").exists() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));

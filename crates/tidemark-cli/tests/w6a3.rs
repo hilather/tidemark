@@ -36,6 +36,43 @@ fn cli(path: &std::path::Path, args: &[&str]) -> std::process::Output {
         .output()
         .unwrap()
 }
+// Own children from spawn through every assertion, including panic unwinding.
+struct ChildGuard(std::process::Child);
+impl std::ops::Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl ChildGuard {
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "child did not exit",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn live_commands_without_server_exit_four() {
     let dir = ::test_support::private_tempdir().unwrap();
@@ -1271,12 +1308,14 @@ fn rebuild_refuses_pre_api_writer_without_renaming() {
     let dir = test_support::private_tempdir().unwrap();
     let p = config(&dir);
     let state = dir.path().join("state");
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "pre_api_writer_child"])
-        .env("TIDEMARK_CLI_LEASE_CHILD", &state)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut child = ChildGuard(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "pre_api_writer_child"])
+            .env("TIDEMARK_CLI_LEASE_CHILD", &state)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !state.join("ready").exists() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(10));

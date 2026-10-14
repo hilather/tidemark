@@ -125,6 +125,13 @@ fn walk(root: &OwnedFd, path: &Path, mount: u64, remove: bool) -> io::Result<()>
                 if name.to_bytes() == b"." || name.to_bytes() == b".." {
                     continue;
                 }
+                // Root exclusion sentinels remain linked until all data is removed.
+                if remove
+                    && frame.name.is_none()
+                    && matches!(name.to_bytes(), b"writer.lock" | b"scan.lock")
+                {
+                    continue;
+                }
                 let stat = fs::statat(&frame.fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
                 if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
                     let child = directory_at(&frame.fd, name)?;
@@ -190,6 +197,28 @@ pub(super) fn purge_directory(parent: OwnedFd, name: CString, root: OwnedFd) -> 
     if current.st_dev != opened.st_dev || current.st_ino != opened.st_ino {
         return Err(io::Error::other("state directory replaced during purge"));
     }
+    #[cfg(test)]
+    BEFORE_LOCK_UNLINK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    for lock in ["scan.lock", "writer.lock"] {
+        fs::unlinkat(&root, lock, AtFlags::empty())?;
+    }
+    #[cfg(test)]
+    BEFORE_RMDIR.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    // A replacement or new entry is a refusal, never a reason to traverse again.
+    let current = fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if current.st_dev != opened.st_dev || current.st_ino != opened.st_ino {
+        return Err(io::Error::other(
+            "state directory replaced during purge finalization",
+        ));
+    }
     fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR)?;
     Ok(())
 }
@@ -238,5 +267,7 @@ fn verify_identity(
 type OpenHook = Box<dyn FnOnce(&Path)>;
 #[cfg(test)]
 thread_local! {
+    pub(super) static BEFORE_LOCK_UNLINK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static BEFORE_RMDIR: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_OPEN: std::cell::RefCell<Option<(PathBuf, OpenHook)>> = const { std::cell::RefCell::new(None) };
 }

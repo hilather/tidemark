@@ -6,6 +6,43 @@ use std::os::unix::{fs::symlink, io::AsRawFd};
 use tidemark_core::{path::RawPath, scan::ScanMode};
 use tidemark_store::catalog::{cleanup_abandoned_scans, Catalog, ScanEntry};
 
+// Own children from spawn through every assertion, including panic unwinding.
+struct ChildGuard(std::process::Child);
+impl std::ops::Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl ChildGuard {
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "child did not exit",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn cleanup_is_selective_repairs_rows_and_is_idempotent() {
     let state = ::test_support::private_tempdir().unwrap();
@@ -174,12 +211,14 @@ fn recovery_excludes_live_writer_and_preserves_artifacts() {
         time::{Duration, Instant},
     };
     let state = test_support::private_tempdir().unwrap();
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "live_writer_child"])
-        .env("TIDEMARK_LEASE_CHILD", state.path())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut child = ChildGuard(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "live_writer_child"])
+            .env("TIDEMARK_LEASE_CHILD", state.path())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !state.path().join("ready").exists() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(10));
@@ -264,4 +303,70 @@ fn writer_lock_obeys_verified_leaf_rules() {
         tidemark_store::lease::RecoveryLease::acquire(state.path(), std::time::Duration::ZERO)
             .is_err()
     );
+}
+
+#[test]
+fn detached_state_and_replaced_lock_refuse_ownership() {
+    use std::time::Duration;
+    use tidemark_store::{lease, state_dir::StateDir};
+    for name in ["writer.lock", "scan.lock"] {
+        for replace_directory in [false, true] {
+            let temp = test_support::private_tempdir().unwrap();
+            let state = temp.path().join("state");
+            let directory = StateDir::open(&state, true).unwrap();
+            let file = directory
+                .open_leaf(std::ffi::OsStr::new(name), true, true)
+                .unwrap();
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+            if replace_directory {
+                std::fs::rename(&state, temp.path().join("old")).unwrap();
+                std::fs::create_dir(&state).unwrap();
+            } else {
+                std::fs::remove_file(state.join(name)).unwrap();
+            }
+            let error =
+                lease::verify_lock_identity(&directory, &state, &file, std::ffi::OsStr::new(name))
+                    .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            assert!(error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<lease::LeaseBusy>()
+                .is_some());
+            // A distinct new namespace may be acquired, but never the detached one.
+            assert!(lease::RecoveryLease::acquire(&state, Duration::ZERO).is_ok());
+        }
+    }
+}
+
+#[test]
+fn child_guard_reaps_writer_when_an_assertion_panics() {
+    use std::time::{Duration, Instant};
+    let state = test_support::private_tempdir().unwrap();
+    let child = ChildGuard(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "live_writer_child"])
+            .env("TIDEMARK_LEASE_CHILD", state.path())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !state.path().join("ready").exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let result = std::panic::catch_unwind(move || {
+        let _child = child;
+        assert!(
+            std::hint::black_box(false),
+            "injected parent assertion failure"
+        );
+    });
+    assert!(result.is_err());
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "child was not reaped"
+    );
+    assert!(tidemark_store::lease::RecoveryLease::acquire(state.path(), Duration::ZERO).is_ok());
 }

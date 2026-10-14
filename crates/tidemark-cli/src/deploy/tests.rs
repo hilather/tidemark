@@ -1339,3 +1339,192 @@ fn purge_after_open_rename_preserves_moved_contents() {
     );
     assert!(f.state.join(MARKER).exists());
 }
+
+struct PurgeChild(std::process::Child);
+impl Drop for PurgeChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+#[test]
+fn purge_writer_child() {
+    let Some(state) = std::env::var_os("TIDEMARK_PURGE_WRITER") else {
+        return;
+    };
+    let state = PathBuf::from(state);
+    let _catalog = tidemark_store::catalog::Catalog::open(&state, true).unwrap();
+    let _series =
+        tidemark_store::timeseries::TimeSeries::open(&state.join("timeseries.db"), true).unwrap();
+    fs::write(state.join("ready"), b"ready").unwrap();
+    std::thread::sleep(Duration::from_secs(60));
+}
+#[test]
+fn purge_refuses_live_writer_without_changing_bytes_or_inodes() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new();
+    f.stage();
+    let mut child = PurgeChild(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "deploy::tests::purge_writer_child"])
+            .env("TIDEMARK_PURGE_WRITER", &f.state)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f.state.join("ready").exists() {
+        assert!(Instant::now() < deadline, "writer never became ready");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut paths = vec![f.state.clone()];
+    let mut originals = Vec::new();
+    while let Some(path) = paths.pop() {
+        let meta = fs::symlink_metadata(&path).unwrap();
+        if meta.is_dir() {
+            paths.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+        }
+        let bytes = meta.is_file().then(|| fs::read(&path).unwrap());
+        originals.push((path, meta.ino(), bytes));
+    }
+    let error = unstage(&f.state, true, &f.sys).unwrap_err();
+    assert!(matches!(error, DeployError::Guard(_)));
+    assert!(error
+        .to_string()
+        .contains("state directory in use by another tidemark process; nothing was removed"));
+    for (path, inode, bytes) in originals {
+        assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
+        if let Some(bytes) = bytes {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+    }
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+}
+#[test]
+fn idle_purge_removes_data_locks_and_directory() {
+    let f = Fixture::new();
+    f.stage();
+    drop(tidemark_store::catalog::Catalog::open(&f.state, true).unwrap());
+    drop(tidemark_scan::orchestrator::ScanLock::acquire(&f.state).unwrap());
+    assert!(f.state.join("writer.lock").exists());
+    assert!(f.state.join("scan.lock").exists());
+    unstage(&f.state, true, &f.sys).unwrap();
+    assert!(!f.state.exists());
+}
+#[test]
+fn purge_finalization_never_traverses_new_entries_or_replacement() {
+    for replace in [false, true] {
+        let f = Fixture::new();
+        f.stage();
+        let state = f.state.clone();
+        let moved = f._dir.path().join("moved");
+        super::purge::BEFORE_RMDIR.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(!state.join("scan.lock").exists());
+                assert!(!state.join("writer.lock").exists());
+                // A separate process recreates the namespace after the final unlink.
+                let script = if replace {
+                    "mv -- \"$1\" \"$2\" && mkdir -m 700 -- \"$1\" && echo new > \"$1/keep\""
+                } else {
+                    "echo new > \"$1/keep\""
+                };
+                let mut child = PurgeChild(
+                    std::process::Command::new("bash")
+                        .args(["-c", script, "purge-racer"])
+                        .arg(&state)
+                        .arg(&moved)
+                        .spawn()
+                        .unwrap(),
+                );
+                assert!(child.0.wait().unwrap().success());
+            }))
+        });
+        assert!(unstage(&f.state, true, &f.sys).is_err());
+        assert_eq!(fs::read(f.state.join("keep")).unwrap(), b"new\n");
+    }
+}
+
+#[test]
+fn purge_waiter_child() {
+    let Some(state) = std::env::var_os("TIDEMARK_PURGE_WAITER") else {
+        return;
+    };
+    let signal = PathBuf::from(std::env::var_os("TIDEMARK_PURGE_SIGNAL").unwrap());
+    let state = PathBuf::from(state);
+    let directory = tidemark_store::state_dir::StateDir::open(&state, false).unwrap();
+    let file = directory
+        .open_leaf(std::ffi::OsStr::new("writer.lock"), true, false)
+        .unwrap();
+    fs::write(signal.with_extension("ready"), b"ready").unwrap();
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared).unwrap();
+    let error = tidemark_store::lease::verify_lock_identity(
+        &directory,
+        &state,
+        &file,
+        std::ffi::OsStr::new("writer.lock"),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    fs::write(&signal, b"busy").unwrap();
+}
+#[test]
+fn purge_waiter_refuses_deleted_inode_after_complete_purge() {
+    let f = Fixture::new();
+    f.stage();
+    let signal = f._dir.path().join("waiter");
+    let state = f.state.clone();
+    let child_slot = std::rc::Rc::new(RefCell::new(None));
+    let slot = child_slot.clone();
+    let child_signal = signal.clone();
+    super::purge::BEFORE_LOCK_UNLINK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            *slot.borrow_mut() = Some(PurgeChild(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "deploy::tests::purge_waiter_child"])
+                    .env("TIDEMARK_PURGE_WAITER", &state)
+                    .env("TIDEMARK_PURGE_SIGNAL", &child_signal)
+                    .spawn()
+                    .unwrap(),
+            ));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !child_signal.with_extension("ready").exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }))
+    });
+    unstage(&f.state, true, &f.sys).unwrap();
+    assert!(!f.state.exists());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !signal.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(fs::read(signal).unwrap(), b"busy");
+    assert!(child_slot
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .0
+        .wait()
+        .unwrap()
+        .success());
+}
+
+#[test]
+fn purge_refuses_busy_scan_without_removing_state() {
+    let f = Fixture::new();
+    f.stage();
+    drop(tidemark_store::catalog::Catalog::open(&f.state, true).unwrap());
+    let _scan = tidemark_scan::orchestrator::ScanLock::acquire(&f.state).unwrap();
+    let keep = f.state.join("keep");
+    fs::write(&keep, b"data").unwrap();
+    let error = unstage(&f.state, true, &f.sys).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("state directory in use by another tidemark process; nothing was removed"));
+    assert_eq!(fs::read(keep).unwrap(), b"data");
+    assert!(f.state.join(MARKER).exists());
+    assert!(f.state.join("writer.lock").exists());
+    assert!(f.state.join("scan.lock").exists());
+}

@@ -37,8 +37,17 @@ fn acquire(state: &Path, wait: Duration, exclusive: bool) -> io::Result<File> {
                 FlockOperation::NonBlockingLockShared
             },
         ) {
-            Ok(()) => return Ok(file),
+            Ok(()) => {
+                verify_lock_identity(&directory, state, &file, OsStr::new("writer.lock"))?;
+                return Ok(file);
+            }
             Err(rustix::io::Errno::WOULDBLOCK) => {
+                #[cfg(test)]
+                AFTER_CONTENTION.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
@@ -58,6 +67,34 @@ fn acquire(state: &Path, wait: Duration, exclusive: bool) -> io::Result<File> {
             Err(error) => return Err(error.into()),
         }
     }
+}
+/// Refuse ownership of an unlinked lock or a detached/replaced state directory.
+/// The named lock is checked relative to the directory retained before flock.
+pub fn verify_lock_identity(
+    directory: &crate::state_dir::StateDir,
+    state: &Path,
+    file: &File,
+    name: &OsStr,
+) -> io::Result<()> {
+    let valid = (|| -> io::Result<bool> {
+        use rustix::fs::{fstat, statat, AtFlags};
+        let held = fstat(file)?;
+        let named = statat(directory.fd(), name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let opened = fstat(directory.fd())?;
+        let current = crate::state_dir::StateDir::open(state, false)?;
+        let current = fstat(current.fd())?;
+        Ok(held.st_nlink == 1
+            && named.st_nlink == 1
+            && held.st_dev == named.st_dev
+            && held.st_ino == named.st_ino
+            && opened.st_nlink != 0
+            && opened.st_dev == current.st_dev
+            && opened.st_ino == current.st_ino)
+    })();
+    if !matches!(valid, Ok(true)) {
+        return Err(io::Error::new(io::ErrorKind::WouldBlock, LeaseBusy::Writer));
+    }
+    Ok(())
 }
 /// Shared lifetime lease for a write-capable connection.
 /// flock is per open file description: local connections must be closed before
@@ -100,5 +137,45 @@ impl RecoveryLease {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_CONTENTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn waiter_on_deleted_lock_never_gets_ownership() {
+        for replace in [false, true] {
+            let temp = test_support::private_tempdir().unwrap();
+            let state = temp.path().join("state");
+            let exclusive = RecoveryLease::acquire(&state, Duration::ZERO).unwrap();
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let (go_tx, go_rx) = std::sync::mpsc::sync_channel(1);
+            let waiter_state = state.clone();
+            let waiter = std::thread::spawn(move || {
+                AFTER_CONTENTION.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        ready_tx.send(()).unwrap();
+                        go_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }))
+                });
+                WriterLease::acquire(&waiter_state).err().unwrap().kind()
+            });
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            std::fs::remove_file(state.join("writer.lock")).unwrap();
+            if replace {
+                std::fs::rename(&state, temp.path().join("moved")).unwrap();
+                std::fs::create_dir(&state).unwrap();
+            } else {
+                std::fs::remove_dir(&state).unwrap();
+            }
+            drop(exclusive);
+            go_tx.send(()).unwrap();
+            assert_eq!(waiter.join().unwrap(), io::ErrorKind::WouldBlock);
+        }
     }
 }
