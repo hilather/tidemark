@@ -184,11 +184,10 @@ fn start_with_pass(
                                 crate::component("sampler", "degraded", error.to_string()),
                             )?;
                         }
-                        state.publish_component(crate::component(
-                            "sampler",
-                            "degraded",
-                            error.to_string(),
-                        ))?;
+                        state.publish_component_for_generation(
+                            generation,
+                            crate::component("sampler", "degraded", error.to_string()),
+                        )?;
                         crate::wait_service(
                             &state,
                             generation,
@@ -223,11 +222,10 @@ fn start_with_pass(
                     // Invalidate previous health before collecting a new pass. On the
                     // initial pass there is no sampler health to certify firstboot;
                     // publish its first measurement and health together instead.
-                    state.publish_component(crate::component(
-                        "sampler",
-                        "degraded",
-                        "measurement pass in progress",
-                    ))?;
+                    state.publish_component_for_generation(
+                        generation,
+                        crate::component("sampler", "degraded", "measurement pass in progress"),
+                    )?;
                 }
                 // Include watch-only entries so the existing firstboot sampler
                 // health input cannot claim healthy while any entry is absent.
@@ -303,7 +301,7 @@ fn start_with_pass(
                 } else {
                     crate::component("sampler", "degraded", errors.join("; "))
                 };
-                state.publish_component(health)?;
+                state.publish_component_for_generation(generation, health)?;
                 pass_finished();
                 crate::wait_service(
                     &state,
@@ -423,6 +421,173 @@ mod tests {
             assert_eq!(report.healthy, healthy);
         };
         for b_success in [false, false, true] {
+            assert_eq!(
+                waiting.recv_timeout(Duration::from_secs(10)).unwrap(),
+                paths[0]
+            );
+            commands.send(true).unwrap();
+            assert_eq!(
+                waiting.recv_timeout(Duration::from_secs(10)).unwrap(),
+                paths[1]
+            );
+            assert_ne!(health(), "ok");
+            assert!(state
+                .view_at(100)
+                .fs_sample(&paths[0].to_string_lossy())
+                .is_some());
+            if !dir.path().join("deploy/firstboot.json").exists() {
+                let inputs = state.view_at(100).firstboot_inputs().unwrap();
+                crate::firstboot::write(dir.path(), &crate::firstboot::build(&inputs, 100))
+                    .unwrap();
+                std::fs::write(dir.path().join("deploy/staged.json"), b"{}").unwrap();
+            }
+            persisted(false);
+            commands.send(b_success).unwrap();
+            passes.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(health() == "ok", b_success);
+            persisted(b_success);
+            if b_success {
+                stop.store(true, Ordering::Release);
+            }
+            resume.send(()).unwrap();
+        }
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn reload_during_pass_waits_for_new_mount_and_persisted_firstboot() {
+        use std::time::Duration;
+        use tidemark_live::alerts::AlertSource;
+        let dir = test_support::private_tempdir().unwrap();
+        let paths = vec![dir.path().join("a"), dir.path().join("b")];
+        let mut cfg = Config::default();
+        cfg.sampler.mounts = vec![paths[0].clone()];
+        cfg.watch.mounts.clear();
+        cfg.sampler.interval = Duration::from_millis(20);
+        let state = LiveState::new(&cfg, 100);
+        state
+            .publish(
+                Publication::Deployment {
+                    config_sha256: "a".repeat(64),
+                    started_at: 100,
+                },
+                crate::component("scheduler", "ok", "fixture"),
+            )
+            .unwrap();
+        for name in ["api", "tswriter"] {
+            state
+                .publish_component(crate::component(name, "ok", "fixture"))
+                .unwrap();
+        }
+        let table = paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                format!(
+                    "{} 0 8:{} / {} rw - xfs /dev/fixture rw\n",
+                    i + 1,
+                    i,
+                    path.display()
+                )
+            })
+            .collect::<String>()
+            .into_bytes();
+        let (commands, responses) = crossbeam_channel::bounded(1);
+        let (entered, waiting) = crossbeam_channel::bounded(1);
+        let collect = Arc::new(move |path: &std::path::Path, now, _| {
+            entered.send(path.to_path_buf()).unwrap();
+            if responses.recv_timeout(Duration::from_secs(10)).unwrap() {
+                Ok(FsSample {
+                    ts: now,
+                    mount: path.to_string_lossy().into_owned(),
+                    size: 100,
+                    used: 10,
+                    avail: 90,
+                    inodes: 10,
+                    inodes_used: 1,
+                })
+            } else {
+                Err(DaemonError::Invalid("injected B failure".into()))
+            }
+        });
+        let (finished, passes) = crossbeam_channel::bounded(1);
+        let (resume, resumed) = crossbeam_channel::bounded(1);
+        let (tx, _rx) = crossbeam_channel::bounded(16);
+        let stop = Shutdown::default();
+        let worker = start_with_pass(
+            Arc::new(cfg.clone()),
+            state.clone(),
+            tx,
+            stop.clone(),
+            Arc::new(|| 100),
+            Arc::new(move || crate::mounts::parse(&table)),
+            collect,
+            Arc::new(move || {
+                finished.send(()).unwrap();
+                let _ = resumed.recv();
+            }),
+        )
+        .unwrap();
+        let health = || {
+            state
+                .view_at(100)
+                .status(100)
+                .unwrap()
+                .components
+                .into_iter()
+                .find(|c| c.name == "sampler")
+                .unwrap()
+                .state
+        };
+        let mut followup = crate::firstboot::Followup::default();
+        let mut elapsed = 0;
+        let mut persisted = |healthy| {
+            let inputs = state.view_at(100).firstboot_inputs().unwrap();
+            followup.poll(dir.path(), &inputs, 100, elapsed).unwrap();
+            elapsed += 10;
+            let report: crate::firstboot::FirstbootReport = serde_json::from_slice(
+                &std::fs::read(dir.path().join("deploy/firstboot.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(report.healthy, healthy);
+            assert_eq!(report.config_sha256, inputs.config_sha256);
+        };
+        // Establish a healthy old deployment, then block its next pass on A.
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(10)).unwrap(),
+            paths[0]
+        );
+        commands.send(true).unwrap();
+        passes.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(health(), "ok");
+        let inputs = state.view_at(100).firstboot_inputs().unwrap();
+        crate::firstboot::write(dir.path(), &crate::firstboot::build(&inputs, 100)).unwrap();
+        std::fs::write(dir.path().join("deploy/staged.json"), b"{}").unwrap();
+        persisted(true);
+        resume.send(()).unwrap();
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(10)).unwrap(),
+            paths[0]
+        );
+        cfg.sampler.mounts = paths.clone();
+        state.replace_config(cfg).unwrap();
+        assert_ne!(health(), "ok");
+        state
+            .publish(
+                Publication::Deployment {
+                    config_sha256: "b".repeat(64),
+                    started_at: 100,
+                },
+                crate::component("scheduler", "ok", "fixture"),
+            )
+            .unwrap();
+        persisted(false);
+        commands.send(true).unwrap();
+        passes.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_ne!(health(), "ok");
+        persisted(false);
+        resume.send(()).unwrap();
+        for b_success in [false, true] {
             assert_eq!(
                 waiting.recv_timeout(Duration::from_secs(10)).unwrap(),
                 paths[0]
