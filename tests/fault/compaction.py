@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Owned by: W7-C2-fault. Real daemon compaction spill detection and independent oracle.
+# Owned by: DOCS-fault. Real daemon compaction spill detection and independent oracle.
 import json
 import os
 import pathlib
@@ -15,8 +15,19 @@ manifest = pathlib.Path(path).parent / 'compaction-oracle.json'
 def connect():
     return sqlite3.connect(path, timeout=2)
 
-def rows(db):
-    return db.execute('SELECT res,ts,size,used,avail,inodes,inodes_used FROM fs_samples WHERE mount=? ORDER BY res,ts', (subject,)).fetchall()
+def daemon_identity(pid):
+    # /proc stat field 22 survives PID reuse; split after comm, which can contain spaces.
+    os.kill(pid, 0)
+    fields = pathlib.Path('/proc/%s/stat' % pid).read_text().rsplit(')', 1)[1].split()
+    assert fields[0] not in ('Z', 'X'), 'intended daemon is dead'
+    return fields[19]
+
+def row_bytes(values):
+    # Stable byte representation of every stored historical column, not DB page bytes.
+    return json.dumps(values, separators=(',', ':')).encode('utf-8')
+
+def rows(db, mount=subject):
+    return db.execute('SELECT res,ts,size,used,avail,inodes,inodes_used FROM fs_samples WHERE mount=? ORDER BY res,ts', (mount,)).fetchall()
 
 if mode == 'seed':
     # 300,000 raw rows across 1000 aligned five-minute buckets, three days old.
@@ -56,19 +67,45 @@ elif mode == 'kill':
 elif mode in ('complete', 'idempotent'):
     expected = json.loads(manifest.read_text())
     if mode == 'idempotent':
-        # Wait beyond the writer next hourly tick, then compare the exact historical set.
-        deadline = time.monotonic() + 3660
-        while time.monotonic() < deadline:
-            time.sleep(min(1, max(0, deadline - time.monotonic())))
-    deadline = time.monotonic() + (60 if mode == 'idempotent' else 3700)
-    while time.monotonic() < deadline:
+        pid, identity = int(args[0]), args[1]
+        assert daemon_identity(pid) == identity, 'intended daemon PID was replaced'
+        witness = subject + '_second__'
         with connect() as db:
-            actual = [list(row) for row in rows(db)]
-        if actual == expected:
-            print(f'PASS: {mode}: 1000 exact last-value buckets')
-            break
-        time.sleep(1)
+            db.execute('BEGIN IMMEDIATE')
+            prior = row_bytes(rows(db))
+            assert prior == row_bytes(expected), 'first compaction has not completed'
+            assert not rows(db, witness), 'second-compaction witness already exists'
+            # Disjoint mount key; two full buckets due under the guest's 48h raw policy.
+            base = (int(time.time()) - 3 * 86400) // 300 * 300
+            second = [[1, base + n * 300, 2000000, n * 300 + 299,
+                       700000, 2000, 200] for n in range(2)]
+            db.executemany('INSERT INTO fs_samples (mount,res,ts,size,used,avail,inodes,inodes_used) VALUES (?,0,?,2000000,?,700000,2000,200)',
+                           ((witness, base + n, n) for n in range(600)))
+        deadline = time.monotonic() + 3700
+        while time.monotonic() < deadline:
+            assert daemon_identity(pid) == identity, 'intended daemon PID was replaced'
+            with connect() as db:
+                # Compare both sets in one SQLite snapshot across a concurrent commit.
+                db.execute('BEGIN')
+                assert row_bytes(rows(db)) == prior, 'earlier compacted rows changed'
+                actual = [list(row) for row in rows(db, witness)]
+            if actual == second:
+                assert daemon_identity(pid) == identity, 'intended daemon PID was replaced'
+                print('PASS: idempotent: live intended daemon compacted 600 new raw rows into 2 exact buckets; earlier 1000 rows byte-identical')
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError('no second compaction witness: %s rows differ from oracle' % len(actual))
     else:
-        raise AssertionError(f'compaction differs from oracle: {len(actual)} rows')
+        deadline = time.monotonic() + 3700
+        while time.monotonic() < deadline:
+            with connect() as db:
+                actual = [list(row) for row in rows(db)]
+            if actual == expected:
+                print('PASS: complete: 1000 exact last-value buckets')
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError('compaction differs from oracle: %s rows' % len(actual))
 else:
     raise ValueError(mode)

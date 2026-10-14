@@ -1,5 +1,5 @@
 #!/bin/bash
-# Owned by: W7-C2-fault. Disposable Rocky guest fault injection.
+# Owned by: DOCS-fault. Disposable Rocky guest fault injection.
 set -euo pipefail
 # Historical text pinned by xtask/tests/w7c.rs: SKIP: 04-compaction-crash.sh needs TIDEMARK_FAULT_SLOW=1 (about 70 minutes)
 # The message below corrects that obsolete estimate.
@@ -45,8 +45,15 @@ for ((cycle = 0; cycle < cycles; cycle++)); do
     check 'killed compaction database opens cleanly' python3 tests/fault/check.py integrity "$state/timeseries.db"
 done
 start_daemon
+# Capture start time before either verification phase, rejecting PID reuse and zombies.
+daemon_start=$(python3 - "$daemon_pid" <<'PYCODE'
+import pathlib, sys
+fields = pathlib.Path('/proc/%s/stat' % sys.argv[1]).read_text().rsplit(')', 1)[1].split()
+assert fields[0] not in ('Z', 'X'), 'daemon is dead'
+print(fields[19])
+PYCODE
+)
 check 'recovery compaction reaches oracle' run_helper 3800 python3 tests/fault/compaction.py complete "$state/timeseries.db"
-pass 'restart compaction produces 1000 last-value rows (oracle helper exit recorded above)'
-# One more actual daemon compaction must leave seeded historical rows identical.
-check 'second compaction is idempotent' run_helper 3800 python3 tests/fault/compaction.py idempotent "$state/timeseries.db"
+# Seed disjoint due rows after recovery; require their exact compaction and unchanged history.
+check 'second compaction is idempotent' run_helper 3800 python3 tests/fault/compaction.py idempotent "$state/timeseries.db" "$daemon_pid" "$daemon_start"
 check 'compacted database integrity' python3 tests/fault/check.py integrity "$state/timeseries.db"
