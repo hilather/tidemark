@@ -264,7 +264,13 @@ pub(crate) fn dispatch_controlled(
                 value(available(view.status(now))?)
             }
             "now" => value(available(view.now(&params(request)?, now))?),
-            "hot" => value(available(view.hot(&params(request)?))?),
+            "hot" => {
+                let p = params(request)?;
+                value(
+                    view.hot(&p)
+                        .ok_or_else(|| DaemonError::Unavailable(view.hot_unavailable_detail(&p)))?,
+                )
+            }
             "lvm" => value(available(view.lvm_report(&params(request)?))?),
             "phantom" => value(available(view.phantom(&params(request)?))?),
             "writers" => value(
@@ -993,6 +999,63 @@ mod fuzz_seams;
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn hot_dispatch_reports_startup_and_replacement_boundaries() {
+        use tidemark_core::path::RawPath;
+        use tidemark_live::watch::Watcher;
+        let config = tidemark_core::config::Config::default();
+        let state = crate::state::LiveState::new(&config, 0);
+        let context = Context {
+            state: state.clone(),
+            scans: crate::scheduler::ScanControl::default(),
+            reload: Arc::new(|| unreachable!("hot does not reload")),
+        };
+        let request = Request {
+            v: 1,
+            id: "hot-boundary".into(),
+            method: "hot".into(),
+            params: serde_json::json!({"mount": "/A", "by": "dir", "window": "5m", "limit": 10}),
+        };
+        for start in [0, 120] {
+            let watcher = Arc::new(
+                Watcher::from_injected_events_at(RawPath::new(b"/A".to_vec()).unwrap(), start, [])
+                    .unwrap(),
+            );
+            state
+                .publish(
+                    crate::state::Publication::Watcher(("/A".into(), watcher.clone())),
+                    crate::component("watcher:/A", "ok", "test"),
+                )
+                .unwrap();
+            let label = if start == 0 { "00:01 UTC" } else { "00:03 UTC" };
+            for (at, ending) in [
+                (start, "no complete window yet".to_string()),
+                (
+                    start + 60,
+                    "ask for a window of at most 1 minutes".to_string(),
+                ),
+            ] {
+                let response = dispatch(&request, 0, &context, at).unwrap();
+                assert!(!response.ok);
+                let error = response.error.unwrap();
+                assert_eq!(error.code, ApiErrorCode::Unavailable);
+                assert_eq!(
+                    error.message,
+                    format!("unavailable: watch history for /A starts at {label}; {ending}")
+                );
+            }
+            watcher.retire_at(start + 120);
+            let response = dispatch(&request, 0, &context, start + 120).unwrap();
+            assert_eq!(
+                response.error.unwrap().message,
+                format!(
+                    "unavailable: watcher for /A was replaced at {}",
+                    if start == 0 { "00:02 UTC" } else { "00:04 UTC" }
+                )
+            );
+            state.remove_watcher("/A");
+        }
+    }
     #[test]
     fn writers_unavailable_names_the_process_scan_and_failure() {
         let mut config = tidemark_core::config::Config::default();

@@ -342,19 +342,21 @@ impl LiveState {
                 .any(|p| p.to_string_lossy() == m.as_str())
         });
         let old_watch = d.config.watch.clone();
+        // Map presentation keys back to their configured raw identity once.
         d.windows.retain(|(mount, window), _| {
+            let Some(raw) = old_watch
+                .mounts
+                .iter()
+                .find(|path| RawPath::from_path(path).is_ok_and(|p| p.display_lossy() == *mount))
+            else {
+                return false;
+            };
             config.watch.enabled
-                && config
-                    .watch
-                    .mounts
-                    .iter()
-                    .any(|p| p.to_string_lossy() == mount.as_str())
-                && crate::services::watcher::same_mount_settings(&old_watch, &config.watch, mount)
+                && config.watch.mounts.iter().any(|p| p == raw)
+                && crate::services::watcher::same_mount_settings(&old_watch, &config.watch, raw)
                 && config.alerts.rule.iter().any(|r| {
                     r.enabled
-                        && r.mount
-                            .as_ref()
-                            .is_some_and(|p| p.to_string_lossy() == mount.as_str())
+                        && r.mount.as_ref().is_some_and(|p| p == raw)
                         && r.window
                             .as_deref()
                             .and_then(|w| humantime::parse_duration(w).ok())
@@ -367,11 +369,9 @@ impl LiveState {
             .keys()
             .filter(|name| {
                 name.strip_prefix("watcher:").is_some_and(|mount| {
-                    !config
-                        .watch
-                        .mounts
-                        .iter()
-                        .any(|p| p.to_string_lossy() == mount)
+                    !config.watch.mounts.iter().any(|p| {
+                        RawPath::from_path(p).is_ok_and(|raw| raw.display_lossy() == mount)
+                    })
                 })
             })
             .cloned()
@@ -1070,15 +1070,38 @@ impl LiveStateView {
             .watchers
             .iter()
             .filter(|(_, w)| w.mode() != tidemark_live::watch::WatchMode::Failed)
-            .map(|(m, w)| {
-                (
-                    m.clone(),
-                    w.hot_at(now, 5, tidemark_live::watch::HotScope::Dir, MAX_INVENTORY),
-                )
+            .filter_map(|(m, w)| {
+                w.query_at(now, 5, tidemark_live::watch::HotScope::Dir, MAX_INVENTORY)
+                    .ok()
+                    .map(|(_, rows)| (m.clone(), rows))
             })
             .collect();
+        let unit_hot: Option<Vec<_>> = if v.data.watchers.is_empty() {
+            None
+        } else {
+            Some(
+                v.data
+                    .watchers
+                    .iter()
+                    .filter_map(|(m, w)| {
+                        w.query_at(now, 5, tidemark_live::watch::HotScope::Unit, MAX_INVENTORY)
+                            .ok()
+                            .map(|(_, rows)| (m.clone(), rows))
+                    })
+                    .collect(),
+            )
+        };
         let mut degraded = v.data.degraded.clone();
         for (mount, watcher) in &v.data.watchers {
+            if p.mount.as_ref().is_none_or(|m| m == mount) {
+                if let Some(at) = watcher.retired_at() {
+                    degraded.push(format!(
+                        "watcher for {mount} was replaced at {}",
+                        watch_start_label(at)
+                    ));
+                    continue;
+                }
+            }
             if p.mount.as_ref().is_none_or(|m| m == mount) && !watcher.history_covers_at(now, 60) {
                 if let Some(start) = watcher.history_start() {
                     degraded.push(format!(
@@ -1121,22 +1144,6 @@ impl LiveStateView {
                 })
                 .collect::<Vec<_>>()
         });
-        let unit_hot: Option<Vec<_>> = if v.data.watchers.is_empty() {
-            None
-        } else {
-            Some(
-                v.data
-                    .watchers
-                    .iter()
-                    .map(|(m, w)| {
-                        (
-                            m.clone(),
-                            w.hot_at(now, 5, tidemark_live::watch::HotScope::Unit, MAX_INVENTORY),
-                        )
-                    })
-                    .collect(),
-            )
-        };
         let modes: Option<Vec<_>> = if v.data.watchers.is_empty() {
             None
         } else {
@@ -1218,8 +1225,11 @@ impl LiveStateView {
         let mut incomplete = false;
         for (mount, w) in &self.data.watchers {
             if p.mount.as_ref().is_none_or(|m| m == mount) {
-                incomplete |= !w.history_covers_at(self.now, minutes);
-                rows.extend(w.hot_at(self.now, minutes, scope, p.limit.min(MAX_INVENTORY)));
+                let (covered, entries) = w
+                    .query_at(self.now, minutes, scope, p.limit.min(MAX_INVENTORY))
+                    .ok()?;
+                incomplete |= !covered;
+                rows.extend(entries);
             }
         }
         if incomplete {
@@ -1243,11 +1253,27 @@ impl LiveStateView {
             HotWindow::SixtyMinutes => 60,
         };
         for (mount, watcher) in &self.data.watchers {
+            if p.mount.as_ref().is_none_or(|m| m == mount) {
+                if let Some(at) = watcher.retired_at() {
+                    return format!(
+                        "watcher for {mount} was replaced at {}",
+                        watch_start_label(at)
+                    );
+                }
+            }
+        }
+        for (mount, watcher) in &self.data.watchers {
             if p.mount.as_ref().is_none_or(|m| m == mount)
                 && !watcher.history_covers_at(self.now, minutes)
             {
                 if let Some(start) = watcher.history_start() {
                     let available = ((self.now.div_euclid(60) * 60 - start) / 60 + 1).clamp(0, 60);
+                    if available == 0 {
+                        return format!(
+                            "watch history for {mount} starts at {}; no complete window yet",
+                            watch_start_label(start)
+                        );
+                    }
                     return format!("watch history for {mount} starts at {}; ask for a window of at most {available} minutes", watch_start_label(start));
                 }
             }
