@@ -19,15 +19,28 @@ fn identity(
     git_commit: Option<String>,
     git_date: Option<String>,
     dirty: bool,
+    file: Option<&str>,
 ) -> (String, String) {
+    let field = |key: &str| {
+        file.and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix(key)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+        })
+    };
     let commit = commit.unwrap_or_else(|| {
         git_commit
             .map(|c| if dirty { format!("{c}-dirty") } else { c })
+            .or_else(|| field("TIDEMARK_BUILD_COMMIT="))
             .unwrap_or_else(|| "unknown".into())
     });
     (
         commit,
-        date.or(git_date).unwrap_or_else(|| "unknown".into()),
+        date.or(git_date)
+            .or_else(|| field("TIDEMARK_BUILD_DATE="))
+            .unwrap_or_else(|| "unknown".into()),
     )
 }
 
@@ -60,12 +73,16 @@ fn main() {
             println!("cargo:rerun-if-changed={}", root.join(path).display());
         }
     }
+    let build_file = root.join(".tidemark-build-id");
+    println!("cargo:rerun-if-changed={}", build_file.display());
+    let file = std::fs::read_to_string(build_file).ok();
     let (commit, date) = identity(
         env::var("TIDEMARK_BUILD_COMMIT").ok(),
         env::var("TIDEMARK_BUILD_DATE").ok(),
         git(&["rev-parse", "--short=12", "HEAD"]),
         git(&["show", "-s", "--format=%cs", "HEAD"]),
         git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty()),
+        file.as_deref(),
     );
     for (key, value) in [
         ("TIDEMARK_BUILD_COMMIT", commit.clone()),
@@ -84,22 +101,42 @@ mod tests {
     use super::identity;
     #[test]
     fn identity_sources() {
+        let file = Some("TIDEMARK_BUILD_COMMIT=file-dirty\nTIDEMARK_BUILD_DATE=file-date\n");
+        assert_eq!(
+            identity(None, None, None, None, false, file),
+            ("file-dirty".into(), "file-date".into())
+        );
+        assert_eq!(
+            identity(
+                Some("env".into()),
+                None,
+                Some("git".into()),
+                Some("git-date".into()),
+                false,
+                file
+            ),
+            ("env".into(), "git-date".into())
+        );
+        assert_eq!(
+            identity(None, None, Some("git".into()), None, true, file),
+            ("git-dirty".into(), "file-date".into())
+        );
         let fake = Some("012345abcdef".into());
         let date = Some("2026-10-13".into());
         assert_eq!(
-            identity(fake.clone(), date.clone(), None, None, true),
+            identity(fake.clone(), date.clone(), None, None, true, None),
             ("012345abcdef".into(), "2026-10-13".into())
         );
         assert_eq!(
-            identity(None, None, fake.clone(), date.clone(), false),
+            identity(None, None, fake.clone(), date.clone(), false, None),
             ("012345abcdef".into(), "2026-10-13".into())
         );
         assert_eq!(
-            identity(None, None, fake, date, true),
+            identity(None, None, fake, date, true, None),
             ("012345abcdef-dirty".into(), "2026-10-13".into())
         );
         assert_eq!(
-            identity(None, None, None, None, false),
+            identity(None, None, None, None, false, None),
             ("unknown".into(), "unknown".into())
         );
     }
