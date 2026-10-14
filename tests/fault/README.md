@@ -61,7 +61,16 @@ cycles plus recovery and idempotence require four hourly phases
 at about 61 minutes each, about 244 minutes total (up to 4 × 3800 seconds
 plus setup/cleanup). `TIDEMARK_FAULT_CYCLES=1` selects the first kill delay
 and retains both verification phases: three hourly phases, about 183 minutes
-(up to 3 × 3800 seconds plus setup/cleanup). The runner runs every script
+(up to 3 × 3800 seconds plus setup/cleanup). Each kill helper sleeps 3590 seconds before polling
+for up to 120 seconds; recovery and idempotence each poll for up to 3700
+seconds. Thus one cycle has a helper wait budget of 11110 seconds (3 h
+5 min 10 s), enclosed by three 3800-second shell deadlines (3 h 10 min).
+Two cycles have a helper budget of 14820 seconds (4 h 7 min), enclosed
+by four shell deadlines (4 h 13 min 20 s). Setup, seeding, daemon readiness,
+integrity checks and cleanup add time. These are budgets, not guaranteed
+durations: progress may arrive earlier and slow setup may extend the total.
+The script prints an expected UTC finishing time and the helper deadline
+budget at startup, before allocating resources. The runner runs every script
 and prints PASS/FAIL, exit status and
 seconds per script at the end, exiting nonzero if any script failed. Fast
 coverage of the compaction row will be a Rust store test that kills compaction

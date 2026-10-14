@@ -256,6 +256,10 @@ exec "$@"
 
 #[test]
 fn strict_namespace_ancestry_refuses_before_creation() {
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped strict namespace ancestry: root maps the root-owned ancestors");
+        return;
+    }
     let t = ::test_support::private_tempdir().unwrap();
     fs::set_permissions(t.path(), fs::Permissions::from_mode(0o755)).unwrap();
     let root = t.path().join("root");

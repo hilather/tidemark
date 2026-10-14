@@ -504,6 +504,16 @@ fn container_receives_host_identity() {
 
 #[test]
 fn require_clean_rejects_tracked_changes_before_building() {
+    let work_tree = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(root())
+        .output();
+    if !matches!(work_tree, Ok(ref output) if output.status.success()
+        && String::from_utf8_lossy(&output.stdout).trim() == "true")
+    {
+        eprintln!("skipped require-clean fixture: git unavailable or checkout is not a work tree");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let git = |args: &[&str]| {
         let status = Command::new("git")

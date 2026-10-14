@@ -302,6 +302,7 @@ fn strict_ancestry_refuses_second_uid_before_writes() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let sentinel = temp.path().join("sentinel");
     test_support::private_write(&sentinel, b"unchanged").unwrap();
     let before = std::fs::metadata(&sentinel).unwrap();
@@ -309,7 +310,7 @@ fn strict_ancestry_refuses_second_uid_before_writes() {
     let config = direct_config(temp.path(), "");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
         .arg("--config")
-        .arg(config)
+        .arg(&config)
         .env("TIDEMARK_STRICT_ANCESTRY", "1")
         .arg("--state-dir")
         .arg(&state)
@@ -319,6 +320,22 @@ fn strict_ancestry_refuses_second_uid_before_writes() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("untrusted owner"));
+    assert!(!state.exists());
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+    // A separate refusal checks the sticky writable parent before foreign ownership.
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
+        .arg("--config")
+        .arg(&config)
+        .env("TIDEMARK_STRICT_ANCESTRY", "1")
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("scan")
+        .arg(&foreign)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("writable by group or others"));
     assert!(!state.exists());
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
     let after = std::fs::metadata(sentinel).unwrap();

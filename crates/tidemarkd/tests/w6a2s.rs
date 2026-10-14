@@ -444,7 +444,46 @@ fn retired_watcher_components_and_errors_release_capacity() {
             ))
             .unwrap();
     }
-    assert_eq!(state.view_at(0).status(0).unwrap().components.len(), 1);
+    let status = state.view_at(0).status(0).unwrap();
+    let current = format!("watcher:/fixture-{}", MAX_SUBJECTS * 2 - 1);
+    let watchers: Vec<_> = status
+        .components
+        .iter()
+        .filter(|c| c.name.starts_with("watcher:"))
+        .collect();
+    assert_eq!(watchers.len(), 1);
+    assert_eq!(watchers[0].name, current);
+    for component in status
+        .components
+        .iter()
+        .filter(|c| !c.name.starts_with("watcher:"))
+    {
+        assert_eq!(component.name, "sampler");
+        assert_eq!(component.state, "degraded");
+        assert_eq!(
+            component.detail,
+            "waiting for a complete pass under the new configuration"
+        );
+    }
+    assert!(status.last_errors.len() <= MAX_SUBJECTS);
+    let watcher_errors: Vec<_> = status
+        .last_errors
+        .iter()
+        .filter(|(name, _, _)| name.starts_with("watcher:"))
+        .collect();
+    assert_eq!(watcher_errors.len(), 1);
+    assert_eq!(watcher_errors[0].0, current);
+    for (name, _, detail) in status
+        .last_errors
+        .iter()
+        .filter(|(name, _, _)| !name.starts_with("watcher:"))
+    {
+        assert_eq!(name, "sampler");
+        assert_eq!(
+            detail,
+            "waiting for a complete pass under the new configuration"
+        );
+    }
 }
 
 #[cfg(feature = "privileged")]
