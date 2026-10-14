@@ -604,7 +604,7 @@ impl Rings {
                     b.output_budget.set(true);
                 }
             }
-            let Some(_root) = Reservation::new(&self.budget, self.root.len()) else {
+            let Some(_root) = Reservation::emergency_payload(&self.budget, self.root.len()) else {
                 return Vec::new();
             };
             let Some(_nodes) = Reservation::emergency_nodes(
@@ -826,7 +826,7 @@ impl Rings {
         b.output_budget.set(true);
         b.truncated = true;
         b.lossy = true;
-        let payload = Reservation::new(
+        let payload = Reservation::emergency_payload(
             &b.budget,
             mount.len() + (1 + usize::from(dirs)) * root_len + 3,
         );

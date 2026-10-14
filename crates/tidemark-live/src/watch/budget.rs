@@ -105,6 +105,9 @@ impl Reservation {
         })
     }
     pub fn new(budget: &Budget, bytes: usize) -> Option<Self> {
+        Self::normal(budget, bytes)
+    }
+    pub fn emergency_payload(budget: &Budget, bytes: usize) -> Option<Self> {
         budget.reserve_root(bytes).then(|| Self {
             budget: budget.clone(),
             bytes,

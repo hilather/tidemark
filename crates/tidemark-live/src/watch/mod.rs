@@ -959,7 +959,7 @@ impl Watcher {
         state.dirty_bytes -= removed;
         state.rings.budget().release(removed);
         let root_copy = if ancestor || lost {
-            budget::Reservation::new(state.rings.budget(), under.as_bytes().len())
+            budget::Reservation::emergency_payload(state.rings.budget(), under.as_bytes().len())
         } else {
             None
         };
