@@ -804,6 +804,7 @@ impl Rings {
         top_k: usize,
         mount: &str,
         dirs: bool,
+        root_len: usize,
     ) -> (usize, Option<(Reservation, Reservation)>) {
         let limit = top_k.min(COMPLETED_CAP);
         let payload = Reservation::normal(&b.budget, Self::output_bytes(b, limit, mount, dirs));
@@ -825,7 +826,10 @@ impl Rings {
         b.output_budget.set(true);
         b.truncated = true;
         b.lossy = true;
-        let payload = Reservation::new(&b.budget, 3 * mount.len() + 3);
+        let payload = Reservation::new(
+            &b.budget,
+            mount.len() + (1 + usize::from(dirs)) * root_len + 3,
+        );
         let nodes = Reservation::emergency_nodes(
             &b.budget,
             4 * std::mem::size_of::<HotEntry>() + 4 * std::mem::size_of::<HotMinute>() + 256,
@@ -887,7 +891,8 @@ impl Rings {
         let mut reservations = Vec::new();
         for b in &mut self.buckets {
             if !b.drained && b.minute < now.div_euclid(60) * 60 {
-                let (limit, lease) = Self::output_reservation(b, top_k, mount, false);
+                let (limit, lease) =
+                    Self::output_reservation(b, top_k, mount, false, self.root.len());
                 reservations.push(lease);
                 result.extend(Self::persisted(b, mount, limit, &self.root));
                 self.rows_drained_until = self.rows_drained_until.max(Some(b.minute));
@@ -906,7 +911,7 @@ impl Rings {
             if b.minute < next || b.minute >= now.div_euclid(60) * 60 {
                 continue;
             }
-            let (limit, lease) = Self::output_reservation(b, top_k, mount, true);
+            let (limit, lease) = Self::output_reservation(b, top_k, mount, true, self.root.len());
             reservations.push(lease);
             let persisted = Self::persisted(b, mount, limit, &self.root);
             self.rows_drained_until = self.rows_drained_until.max(Some(b.minute));
@@ -1030,6 +1035,15 @@ mod tests {
             );
         }
         let mount = String::from_utf8_lossy(&root);
+        let mut leases = Vec::new();
+        for b in &mut r.buckets {
+            let (limit, lease) = Rings::output_reservation(b, 1000, &mount, true, root.len());
+            assert_eq!(limit, usize::MAX);
+            assert!(lease.is_some(), "emergency output must be admitted");
+            leases.push(lease);
+        }
+        assert!(r.budget.committed() <= super::super::WATCH_MEMORY_BYTES);
+        drop(leases);
         let rows = r.drain(60 * 60, &mount, 1000);
         // The 60th boundary expires the oldest bucket, leaving 59 full minutes.
         assert_eq!(rows.len(), 59);
