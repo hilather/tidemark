@@ -296,7 +296,7 @@ fn watcher_component_at(
     published: usize,
     at: i64,
 ) -> tidemark_core::api::ComponentState {
-    let stats = watcher.stats_at(at);
+    let stats = watcher.stats_monotonic_at(at);
     let health = if stats.mode == WatchMode::Failed {
         "failed"
     } else if stats.recovering || dropped || stats.lossy_minutes_15m > 0 {
@@ -712,6 +712,73 @@ fn persistence_rows(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delayed_status_after_drain_does_not_rollback_history() {
+        use tidemark_live::watch::HotScope;
+        let w = Arc::new(
+            Watcher::from_injected_events(
+                RawPath::new(b"/data".to_vec()).unwrap(),
+                [
+                    (
+                        0,
+                        [b"/data/a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                        0,
+                        None,
+                        (1, 0),
+                    ),
+                    (
+                        60,
+                        [b"/data/a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                        82,
+                        None,
+                        (1, 1),
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+        let delivered = w.drain_minutes_at(179, 1000);
+        assert_eq!(
+            delivered.iter().map(|m| m.persisted.len()).sum::<usize>(),
+            3
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let tick = {
+            let w = w.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                barrier.wait();
+                watcher_component_at("/data", &w, false, 0, 179)
+            })
+        };
+        barrier.wait();
+        w.stats_at(180);
+        let before: Vec<_> = [HotScope::Dir, HotScope::Unit, HotScope::Comm]
+            .into_iter()
+            .flat_map(|scope| [5, 15, 60].map(|window| w.hot_at(180, window, scope, 1000)))
+            .collect();
+        barrier.wait();
+        assert_eq!(tick.join().unwrap().state, "ok");
+        let after: Vec<_> = [HotScope::Dir, HotScope::Unit, HotScope::Comm]
+            .into_iter()
+            .flat_map(|scope| [5, 15, 60].map(|window| w.hot_at(180, window, scope, 1000)))
+            .collect();
+        assert_eq!(before, after);
+        assert!(w
+            .drain_minutes_at(180, 1000)
+            .iter()
+            .all(|m| m.persisted.is_empty()));
+        w.stats_at(119);
+        for scope in [HotScope::Dir, HotScope::Unit, HotScope::Comm] {
+            for window in [5, 15, 60] {
+                let rows = w.hot_at(180, window, scope, 1000);
+                assert_eq!(rows[0].bytes_delta, 82);
+                assert!(rows[0].lossy);
+            }
+        }
+        assert!(w.drain_minutes_at(180, 1000).is_empty());
+    }
     #[test]
     fn second_ticks_keep_live_history_and_mapping_loss_expires() {
         use tidemark_live::{alerts::AlertSource, watch::HotScope};

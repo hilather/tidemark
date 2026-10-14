@@ -844,6 +844,7 @@ impl Watcher {
     }
     fn drain_completed_minutes_at(&self, at: i64, top_k: usize) -> Vec<HotMinute> {
         let mut state = self.state.lock();
+        let at = state.last_at.map_or(at, |last| last.max(at));
         state.observe_time(at);
         state.rings.drain(at, &self.mount.display_lossy(), top_k)
     }
@@ -864,6 +865,7 @@ impl Watcher {
     #[doc(hidden)]
     pub fn drain_minutes_at(&self, at: i64, top_k: usize) -> Vec<CompletedMinute> {
         let mut state = self.state.lock();
+        let at = state.last_at.map_or(at, |last| last.max(at));
         state.observe_time(at);
         if state.failed || state.recovering {
             state.rings.recovery(at);
@@ -1072,12 +1074,23 @@ impl Watcher {
 
     /// Read counters and the loss indicator for the latest fifteen minute buckets.
     pub fn stats(&self) -> WatchStats {
-        self.stats_at(now())
+        let mut state = self.state.lock();
+        self.stats_locked(&mut state, now())
+    }
+    /// Read status using a delayed clock, clamped under the watcher lock.
+    #[doc(hidden)]
+    pub fn stats_monotonic_at(&self, at: i64) -> WatchStats {
+        let mut state = self.state.lock();
+        let at = state.last_at.map_or(at, |last| last.max(at));
+        self.stats_locked(&mut state, at)
     }
     /// Inject a status clock for deterministic service regressions.
     #[doc(hidden)]
     pub fn stats_at(&self, at: i64) -> WatchStats {
         let mut state = self.state.lock();
+        self.stats_locked(&mut state, at)
+    }
+    fn stats_locked(&self, state: &mut State, at: i64) -> WatchStats {
         state.observe_time(at);
         if state.failed || state.recovering {
             state.rings.recovery(at);
@@ -1261,6 +1274,7 @@ struct Processor<'a> {
 impl Processor<'_> {
     fn unmapped_path(&self, at: i64, errno: Option<i32>, state: &Mutex<State>) -> RawPath {
         let mut locked = state.lock();
+        let at = locked.last_at.map_or(at, |last| last.max(at));
         locked.observe_time(at);
         locked.rings.unmapped(at, errno);
         locked.unmapped_events = locked.unmapped_events.saturating_add(1);
@@ -1270,6 +1284,7 @@ impl Processor<'_> {
         self.handles.clear();
         self.paths.clear();
         let mut state = state.lock();
+        let at = state.last_at.map_or(at, |last| last.max(at));
         state.observe_time(at);
         state.rings.overflow(at);
         state.mark_loss();
@@ -1454,6 +1469,7 @@ impl Processor<'_> {
             .unwrap_or_else(|| cfg.mount.clone());
         let key = dir_key(&parent, &cfg.mount, cfg.hot_depth);
         let mut state = state.lock();
+        let at = state.last_at.map_or(at, |last| last.max(at));
         state.observe_time(at);
         state.events = state.events.saturating_add(1);
         if state.stream.is_some() {

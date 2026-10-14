@@ -261,12 +261,17 @@ impl Rings {
     pub fn advance(&mut self, now: i64) {
         let minute = now.div_euclid(60) * 60;
         self.next_minute.get_or_insert(minute.saturating_add(60));
-        // Preserve the emission watermark across the existing rollback reset.
+        // Completed facts and delivery watermarks survive a clock rollback.
         let rollback = self.buckets.back().is_some_and(|b| b.minute > minute);
         if rollback {
             let previous = self.buckets.back().map(|b| b.minute);
             self.rollback_until = self.rollback_until.max(previous);
-            self.buckets.clear();
+            for bucket in &mut self.buckets {
+                if bucket.minute >= minute {
+                    bucket.lossy = true;
+                }
+            }
+            return;
         }
         if self.buckets.back().is_some_and(|b| b.minute == minute) {
             return;
@@ -550,6 +555,7 @@ impl Rings {
         }
     }
     pub fn hot(&self, now: i64, window: u32, scope: HotScope, limit: usize) -> Vec<HotEntry> {
+        let now = now.max(self.buckets.back().map_or(now, |b| b.minute));
         let index = match scope {
             HotScope::Dir => 0,
             HotScope::Unit => 1,
@@ -770,6 +776,7 @@ impl Rings {
         reasons.join("; ")
     }
     pub fn lossy(&self, now: i64) -> u32 {
+        let now = now.max(self.buckets.back().map_or(now, |b| b.minute));
         self.buckets
             .iter()
             .filter(|b| {
@@ -1490,16 +1497,15 @@ mod tests {
             r.add(minute * 60, keys(1), 1, None, (1, 1));
         }
         assert_eq!(r.buckets.len(), 60);
+        let before = r.hot(99 * 60, 60, HotScope::Dir, 1);
+        let delivered = r.drain_minutes(100 * 60, "/", 5);
         r.advance(0);
-        assert_eq!(r.buckets.len(), 1);
-        assert!(r.hot(0, 60, HotScope::Comm, 1).is_empty());
-        assert_eq!(r.lossy(0), 1);
-        r.add(0, keys(1), 5, None, (1, 1));
-        assert_eq!(r.hot(0, 1, HotScope::Dir, 1)[0].bytes_delta, 5);
-        assert!(r.hot(-60, 1, HotScope::Dir, 1).is_empty());
-        assert_eq!(r.lossy(-60), 0);
-        assert!(r.drain(0, "/", 5).is_empty());
-        assert_eq!(r.drain(60, "/", 5).len(), 3);
-        assert!(r.drain(60, "/", 5).is_empty());
+        assert_eq!(r.buckets.len(), 60);
+        let after = r.hot(0, 60, HotScope::Dir, 1);
+        assert_eq!(after[0].bytes_delta, before[0].bytes_delta - 1);
+        assert!(after[0].lossy);
+        assert_eq!(r.lossy(0), 15);
+        assert!(!delivered.is_empty());
+        assert!(r.drain_minutes(100 * 60, "/", 5).is_empty());
     }
 }
