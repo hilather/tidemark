@@ -144,7 +144,7 @@ fn remote_command(o: &Options) -> String {
         }
     } else {
         script.push_str(&format!(
-            "failed=0; summary=$(mktemp); for script in tests/{}/*.sh; do [ -f \"$script\" ] || {{ echo 'missing script suite' >&2; rm -f \"$summary\"; exit 1; }}; started=$(date +%s); if {sudo_env} bash \"$script\"; then rc=0; result=PASS; else rc=$?; result=FAIL; failed=1; fi; elapsed=$(($(date +%s) - started)); printf '%s %s exit=%s seconds=%s\\n' \"$result\" \"$script\" \"$rc\" \"$elapsed\" >> \"$summary\"; done; cat \"$summary\"; rm -f \"$summary\"; exit \"$failed\"",
+            "failed=0; passed=0; skipped=0; summary=$(mktemp); log=$(mktemp); trap 'rm -f \"$summary\" \"$log\"' EXIT; for script in tests/{}/*.sh; do [ -f \"$script\" ] || {{ echo 'missing script suite' >&2; exit 1; }}; started=$(date +%s); if bash -o pipefail -c 'log=$1; shift; \"$@\" 2>&1 | tee \"$log\"' -- \"$log\" {sudo_env} bash \"$script\"; then rc=0; else rc=$?; fi; reason=$(sed -n '/^SKIP:/{{p;q;}}' \"$log\"); if [ \"$rc\" -ne 0 ]; then result=FAIL; failed=1; elif [ -n \"$reason\" ]; then result=SKIP; skipped=$((skipped + 1)); else result=PASS; passed=$((passed + 1)); fi; elapsed=$(($(date +%s) - started)); printf '%s %s exit=%s seconds=%s\\n' \"$result\" \"$script\" \"$rc\" \"$elapsed\" >> \"$summary\"; if [ \"$result\" = SKIP ]; then printf '%s\\n' \"$reason\" >> \"$summary\"; fi; done; cat \"$summary\"; printf 'passed=%s skipped=%s\\n' \"$passed\" \"$skipped\"; exit \"$failed\"",
             o.suite
         ));
     }
