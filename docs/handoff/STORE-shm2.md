@@ -38,7 +38,7 @@ All commands below exited 0 on the final source; logs are in the canonical attem
 | Focused regression with umask 022, `TZ=UTC` | passed; `focused-utc.log` |
 | Focused regression with umask 022, `TZ=America/Toronto` | passed; `focused-toronto.log` |
 
-No privileged tests were run; pending VM. The anticipated socket restrictions did not cause workspace failures in this run. Cargo-deny availability is recorded in the CI log. No new privileged test is needed for this test-only correction.
+No privileged tests were run; pending VM. The anticipated socket restrictions did not cause workspace failures in this run. CI skipped cargo-deny because it is not installed; dependency policy audit remains pending an equipped host. No new privileged test is needed for this test-only correction.
 
 ## Scope and review
 
