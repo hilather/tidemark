@@ -185,3 +185,21 @@ The first direct-state audit F01 and second-audit state/metrics trust findings h
 | Guest security behavior | Real second-user state rules, filesystem marks under packaged restrictions, symlink boundary and external-link atime preservation |
 
 W6-recheck and W7-C1-audit2 results are recorded only through their supplied reviews/fix notes, not anticipated or certified. Wave tags and tidemark-core sign-off are the owner’s.
+
+## Release-candidate decisions and unresolved gates (13 R6)
+
+Earlier scan-lock-only recovery and ancestry exception descriptions are superseded by R6-1/2/3: packages force strict-ancestry, refuse state-path symbolic links and both namespace/read-only ownership exceptions. Every Catalog/TimeSeries write handle retains a shared lease; recovery/replacement requires exclusive writer then scan ownership. Purge verifies every directory before descent and deletes lock names last; every successful flock checks named identity. These remain cooperative guarantees inside trusted root-only state.
+
+R6-4/5 add shared 64 MiB watcher pathname/key admission, conservative fallback with reasons/exact measured event-byte totals, sixty-minute query history independent of persistence delivery, recoverable dirty caps, explicit shutdown before replacement and generic watcher health recovery. R6-6 makes unmappable filesystem events incomplete directory attribution rather than complete-looking root rows; mount-mode namespace/bind blindness remains on 8.8. Watches pin mounts until teardown (R6-7). R6-8 requires complete current-generation sampler health and invalidation before changed mount-set hash publication. No snapshot schema, core wire or normative unit/config block changes follow from these decisions.
+
+| Open item | Evidence and next decision |
+|---|---|
+| Non-path HotEntryWire key encoding | Byte-number arrays remain frozen pending owner/tidemark-core sign-off (R6-12) |
+| Reached aggregation-cap component policy | Truncation/loss facts exist; whether cap alone should degrade the component remains undecided |
+| Quiet-host fd/filesystem CPU | One supplied 2,000-events/s run used 8.65% of one core; loaded host exceeded 10%; repeat on owner hardware |
+| Owner hardware release runs | 72-hour soak and 5M/20M inode runs still outstanding |
+| Slow guest compaction-crash cycle | No completed cycle; second witness/live-daemon oracle is landed, one cycle plus verification about 183 minutes |
+| Independent review | Four rounds and per-finding fix notes in R6-11; no fifth report, so fourth-round fixes have not been independently re-reviewed |
+| Remaining implementation evidence | RC-fix-tests/product notes absent; SAMPLER-reload/PURGE-lease report stale component-count assertion, CLI-format retains normalized Debug-helper guard exception, PKG-build-id leaves status identity/RPM VCS metadata follow-ups |
+
+Retain the existing paging-index, cancellation, window-shape, cumulative fuzz, real second-user and restricted-unit guest gates. Supplied eight-of-eight Rocky 8.10 attribution is narrower evidence than performance/soak acceptance. Wave tags and core sign-off remain owner gates.

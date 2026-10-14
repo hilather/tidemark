@@ -1052,6 +1052,8 @@ Sources: `docs/handoff/CODE-drop-http.md`, `docs/handoff/GATE-fix.md`.
 
 ### R5-2 — Daemon core after review
 
+Relevant earlier guarantees are superseded by R6-8; retain the historical evidence below.
+
 **Decision: accepted; open gates explicitly retained.**
 
 S1: one writer supervisor retains the bounded 64-message queue across worker exits/panics, reports persistence lost, joins workers and retries after 5 seconds doubling to 300; successful persistence resets health. In-flight/buffered messages can be lost. S2: failed collections invalidate alert evidence, preserving display history; freshness is at most three configured intervals and missed failure epochs restart continuity. S3: the mutable ProcScanner is private; readers clone immutable Arc<ProcReport>, never wait on collection. S4: LVM collection retries start at max(interval,300 seconds), double to max(interval,3600 seconds); persistence congestion uses ordinary cadence. S5: operational waits/cadence/backoff/compaction triggers are monotonic; calendar windows, retention and timestamps use wall time. S6/S9 retain R4-11 bounded captured configuration validation and ordered shutdown. S7: sampler publication checks generation and membership atomically. S8: 10,000 configured alert summaries plus one reserved internal state-space summary; diagnostics remain capped at 10,000.
@@ -1076,6 +1078,8 @@ Sources: `docs/handoff/EDGE-api.md`, `docs/handoff/DAEMON-misc.md`, `docs/handof
 
 ### R5-5 — Lock files
 
+Relevant earlier guarantees are superseded by R6-2/3; retain the historical evidence below.
+
 **Decision: accepted; open gates explicitly retained.**
 
 The exporter flocks <textfile>.tmp and the API flocks <socket>.lock. No component flocks a directory. The host scan lock serializes scans and shared database replacement/recreation; holding an exporter/API lock does not confer scan recovery ownership.
@@ -1083,6 +1087,8 @@ The exporter flocks <textfile>.tmp and the API flocks <socket>.lock. No componen
 Sources: `docs/handoff/DAEMON-misc.md`.
 
 ### R5-6 — Crash recovery ownership
+
+Relevant earlier guarantees are superseded by R6-3; retain the historical evidence below.
 
 **Decision: accepted; open gates explicitly retained.**
 
@@ -1100,6 +1106,8 @@ Sources: `docs/handoff/DAEMON-misc.md`, `docs/handoff/W7-C2-fault.md`.
 
 ### R5-8 — Mount identity and first boot
 
+Relevant earlier guarantees are superseded by R6-8; retain the historical evidence below.
+
 **Decision: accepted; open gates explicitly retained.**
 
 Mount identity changes clear current filesystem samples and rate rings; persisted history is retained. Missing configured mounts contribute current not mounted entries to now.degraded, removed when healthy. First-boot reports are republished while unhealthy until a healthy report finalizes them; changed configuration starts a new report. Follow-up timing uses monotonic elapsed time.
@@ -1107,6 +1115,8 @@ Mount identity changes clear current filesystem samples and rate rings; persiste
 Sources: `docs/handoff/W6-mount-state.md`, `docs/handoff/RECHECK-life.md`.
 
 ### R5-9 — Completed watcher windows and alert evidence
+
+Relevant earlier guarantees are superseded by R6-4; retain the historical evidence below.
 
 **Decision: accepted; open gates explicitly retained.**
 
@@ -1148,6 +1158,8 @@ Sources: `docs/handoff/W7-B1.md`, `docs/handoff/W7-B1-fix2.md`, `docs/handoff/CI
 
 ### R5-14 — Guest fault suite
 
+Relevant earlier guarantees are superseded by R6-10; retain the historical evidence below.
+
 **Decision: accepted; open gates explicitly retained.**
 
 tests/fault/01 through 06 cover disk full, killed scans, fanotify overflow, compaction crashes, directory races and huge directories. cargo xtask vm-test --suite fault runs the scripts only with TIDEMARK_DEPLOY_TEST_VM=1; TIDEMARK_FAULT_SLOW=1 opts into compaction, TIDEMARK_FAULT_SCALE=1 opts into scale, and TIDEMARK_FAULT_KEEP=1 retains passing evidence (failures retain evidence automatically). Scripts use Rocky 8 guest tools, repeat overflow bursts and include a low-NOFILE pass. Locale is fixed, unmount cleanup retries and overflow forcing is explicit. Normal/low-limit overflow bursts require complete accounting with zero new overflows/loss; a separate SIGSTOP/queue-cap burst forces overflow, checks recovery within 60 seconds and healthy status after 120 quiet seconds. Unmount retries share a 180-second cleanup budget. The real compaction case takes about four hours and needs guest scratch capacity; printed skips/compile-only are not acceptance.
@@ -1180,6 +1192,8 @@ Sources: `docs/handoff/CI-fetch.md`, `docs/handoff/CI-deny.md`, `docs/handoff/CI
 
 ### R5-18 — Open work and review evidence
 
+Relevant earlier guarantees are superseded by R6-11/12; retain the historical evidence below.
+
 **Decision: accepted; open gates explicitly retained.**
 
 OPEN: million-child paging index decision; staging scale/soak; cumulative fuzz gate; scan.cancel cannot be conditional on scan id; HotMinute has no top_unit; multi-minute files sum minute counts. First-audit direct state trust F01 is addressed by R5-21/24, and symlink atime F03 is documented by R5-23/25. W6-recheck and W7-C1-audit2 are now available: their supplied fix notes establish implemented behavior, not independent acceptance. Final Rocky 8.8/8.10 passes, wave tags and tidemark-core sign-off remain owner gates. Later open items are R5-27.
@@ -1187,6 +1201,8 @@ OPEN: million-child paging index decision; staging scale/soak; cumulative fuzz g
 Sources: `docs/handoff/RECHECK-life.md`, `docs/handoff/RECHECK-state.md`, `docs/handoff/RECHECK-edge.md`, `docs/handoff/STATE-trust-A2.md`, `docs/handoff/SYMLINK-atime.md`.
 
 ### R5-19 — Recheck lifecycle, state and edge contracts
+
+Relevant earlier guarantees are superseded by R6-3/8; retain the historical evidence below.
 
 **Decision: accepted; open gates explicitly retained.**
 
@@ -1203,6 +1219,8 @@ Unauthorized or failed SO_PEERCRED lookup closes before parsing, with zero respo
 Sources: `docs/handoff/EDGE-api.md`, `docs/handoff/RECHECK-edge.md`.
 
 ### R5-21 — Verified state and metrics trust boundary
+
+Relevant earlier guarantees are superseded by R6-1; retain the historical evidence below.
 
 **Decision: accepted; open gates explicitly retained.**
 
@@ -1228,6 +1246,8 @@ Sources: `docs/handoff/SYMLINK-atime.md`, `docs/handoff/CI-deny-required.md`.
 
 ### R5-24 — Later hardening precision
 
+Relevant earlier guarantees are superseded by R6-1/4; retain the historical evidence below.
+
 **Decision: accepted; open gates explicitly retained.**
 
 Storage integrity requires euid-owned directories/leaves, no group/world write and one link for regular leaves; readable-by-others storage warns once rather than refusing. Packaged builds require root/invoking-euid-owned real ancestors, with no group/world write unless sticky with an owned child without group/world write; sticky writable chains propagate the constraint. User namespaces and read-only mounts provide no ownership exception. A symbolic link anywhere in the state path is refused (`Not a directory`); configure the real path. Development builds retain overflow-uid and read-only-mount ancestry exceptions, announce them once per process, and can enforce strict rules with TIDEMARK_STRICT_ANCESTRY=1 (TRUST-strict). Daemon/deploy state retains mode & 077 == 0, except a checked marker can authorize normalizing state read/execute bits to 0700; deploy children remain private. Markers never waive ownership or foreign-write refusal. Rates need five minutes and at least three samples in the fit window. The watcher shares 200,000 scope/key/file tuples across three scopes, allowing 66,667 distinct files/minute; the cap marks truncated/lossy while events continue. Status names cap/minute and distinguishes queue overflow, read errors and descriptor pressure. Unit families are AF_UNIX; guest scripts fix locale/retry unmount/force overflow; cargo xtask ci uses --no-fail-fast. Safe fuzz seams are parse_event_buffer(&[u8]) -> EventRecords, hidden parse_mount_id(&str) -> io::Result<u64>, and read_frame(&mut impl Read, &mut FrameDecoder) -> Result<Request, FrameError>, with no fd ownership in pure parsing. CLI errors retain operation/path/full cause/exit code; hostile controls escape, sizes are human units/right aligned, human enums lowercase and JSON unchanged.
@@ -1244,6 +1264,8 @@ Sources: `docs/handoff/SYMLINK-atime.md`.
 
 ### R5-26 — Filesystem-wide fd watcher marks
 
+Relevant earlier guarantees are superseded by R6-6; retain the historical evidence below.
+
 **Decision: accepted; open gates explicitly retained.**
 
 Fd mode independently probes filesystem marks: prefer fd/filesystem on supported Rocky 8.10, otherwise fd/mount on Rocky 8.8 or mark failure. Filesystem marks see writes through all mounts/private namespaces. Foreign events are mapped by bounded file handles against the retained watched mount; failure or outside-subtree paths retains totals/unit/command counts and attributes directory activity to watched root. unmapped_events is reported when nonzero; hard-link name attribution is best effort. fd/mount warns that other namespace/bind writes are unseen. Status/firstboot mode is fd_filesystem; foreground/detail display is fd/filesystem. ADR-013’s revisit is completed, but host namespace guard and service restrictions remain. OPEN RISK: database units using PrivateTmp=/ProtectSystem= can be invisible on 8.8; full watcher cost and packaged restricted-unit guest acceptance remain pending.
@@ -1251,6 +1273,8 @@ Fd mode independently probes filesystem marks: prefer fd/filesystem on supported
 Sources: `docs/handoff/WATCH-fsmark.md`.
 
 ### R5-27 — Open core and guest decisions
+
+Relevant earlier guarantees are superseded by R6-12; retain the historical evidence below.
 
 **Status: open risks; no behavior change decided.**
 
@@ -1298,7 +1322,7 @@ Source: `docs/handoff/LEASE.md`.
 
 **Decision: accepted; open gates explicitly retained.**
 
-Each watcher admits at most 64 MiB of retained path/key allocations plus conservative container/scratch credits across dirty tracking, aggregation copies, seen identities, FID caches, history and immutable views. Count caps remain. Dirty admission failure collapses to conservative mount-root invalidation, releases parents/acknowledgments and recovers for subsequent traffic. Key admission failure uses the watched mount point; detailed-export admission failure emits one lossy directory aggregate. These byte-budget fallbacks preserve exact event and signed-byte totals, with a reason; file counts and optional unit/command precision may be unavailable. This does not undo separate top-k truncation or transport loss. Query/export fallback reports output over the memory budget.
+Each watcher admits at most 64 MiB of retained path/key allocations including conservative container/scratch credits across dirty tracking, aggregation copies, seen identities, FID caches, history and immutable views. Count caps remain. Dirty admission failure collapses to conservative mount-root invalidation, releases parents/acknowledgments and recovers for subsequent traffic. Key admission failure uses the watched mount point; detailed-export admission failure emits one lossy directory aggregate. These byte-budget fallbacks preserve exact event and signed-byte totals, with a reason; file counts and optional unit/command precision may be unavailable. This does not undo separate top-k truncation or transport loss. Query/export fallback reports output over the memory budget.
 
 Completed minutes stay queryable for 60 minutes whether or not persistence delivery occurred: delivery and retention have separate cursors. Count and byte admission still apply. WATCH-bounds2's statement that drains release maps is superseded by WATCH-history. Numeric size caches, arbitrary retained caller responses and whole-daemon allocator RSS are outside this pathname budget. Supersedes R5-9/24 wherever delivery implied query-history removal.
 
@@ -1364,12 +1388,12 @@ Sources: `docs/handoff/FAULT-fix3.md`, `docs/handoff/GUEST-fix3.md`, `docs/hando
 
 | Round | Independent reports and verdicts | Landed fix-note trail |
 |---|---|---|
-| First | W7-C1-audit: CHANGES REQUIRED (1 blocker, 5 should-fix); W6-core-review: NOT READY (2 blockers, 9 should-fix); W6-edge-review: NOT READY (1 blocker, 12 should-fix) | Every finding has a landed fix-note disposition in R5: STATE-trust-A/A2, SYMLINK-atime, CORE-fix-1/2/3, CORE-fix-cancel-record, EDGE-api, DAEMON-misc, CLI-display2 and GATE-fix, with the R5 source trail. Later rounds found sibling/incomplete fixes. |
+| First | W7-C1-audit: CHANGES REQUIRED (1 blocker, 5 should-fix); W6-core-review: NOT READY (2 blockers, 9 should-fix); W6-edge-review: NOT READY (1 blocker, 12 should-fix) | Every finding has a landed fix-note disposition in R5: STATE-trust-A/A2, SYMLINK-atime, CORE-fix-1/2/3 (including captured configuration bytes), CORE-fix-cancel-record, EDGE-api, DAEMON-misc, CLI-display2, TEST-rules (scan setup), PKG-unit-fix, CI-deny-required and GATE-fix, with the R5 source trail. Later rounds found sibling/incomplete fixes. |
 | Second | W7-C1-audit2: CHANGES REQUIRED (1 blocker, 4 should-fix, 1 nit); W6-recheck: NOT READY (10 should-fix) | Every finding has a landed fix note: STATE-trust-A/A2/B, AUDIT-procfs-budget, SYMLINK-atime, CI-deny-required, CLI-polish; RECHECK-life/state/edge. Third review rechecked these and found partial closure. |
 | Third | W7-review3-security: CHANGES REQUIRED (1 blocker, 2 should-fix); W7-review3-correctness: NOT READY (11 should-fix, 1 nit) | Every finding has a landed fix note: security R3-01/02 TRUST-strict, R3-03 WATCH-bounds2; correctness C1/C4/C8 LEASE, C2/C10 DAEMON-tests, C3/C5/C6/C11/N1 WATCH-bounds2 (C11 also DAEMON-tests/TEST-flaky2), C7 FAULT-fix3/GUEST-fix3, C9 CLI-format. Fourth review reports 10 resolved and 2 partly resolved correctness findings. |
 | Fourth | W7-review4-security: CHANGES REQUIRED (3 should-fix, 1 nit); W7-review4-correctness: NOT READY (6 current should-fix; 7 on blind candidate including already-fixed CG1) | Every finding has a landed fix note: security R4-01 PKG-strict, R4-02 PURGE-lease, R4-03 WATCH-history, R4-N1 DOCS-fault; correctness F1 SAMPLER-reload, F2/F3 WATCH-history, F4/F6 DOCS-fault, F5 PURGE-lease; CG1 GUEST-fix3. |
 
-No fifth report exists under `docs/reviews/` at writing. **The fourth-round fixes have not been independently re-reviewed.** Fix-note existence is not a green merged gate: SAMPLER-reload reports one stale out-of-scope component-count assertion failing workspace CI; PURGE-lease also reports that assertion. RC-fix-tests.md / RC-fix-product.md are missing; record these limits rather than infer closure. The normalization exception and status/RPM identity follow-ups in R6-9 also remain explicit.
+No fifth report exists under `docs/reviews/` at writing. **The fourth-round fixes have not been independently re-reviewed.** Fix-note existence is not a green merged gate: SAMPLER-reload and PURGE-lease report one stale out-of-scope component-count assertion failing their workspace CI; WATCH-history separately reports a later passing local workspace/CI run. These differing historical observations do not replace a current merged gate. RC-fix-tests.md / RC-fix-product.md are missing; record these limits rather than infer closure. The normalization exception and status/RPM identity follow-ups in R6-9 also remain explicit.
 
 Sources: the review reports named above and each cited handoff under `docs/handoff/`; R5's per-decision source trail.
 
