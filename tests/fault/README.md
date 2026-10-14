@@ -10,7 +10,7 @@ They never use systemd, the packaged daemon, its socket, or its state directory.
 | `01-state-full.sh` | Free-space guard refusal, `state_space` alert, admitted writer interrupted by ENOSPC, no temporary or incomplete publication | 1–5 min; scan deadlines 300 s |
 | `02-snapshot-crash.sh` | Twelve fixed kill delays after observing a writer, complete metadata on every published snapshot, startup removes temporaries, subsequent scan succeeds | 2–10 min; 300 s to observe each writer, 900 s recovery |
 | `03-fanotify-overflow.sh` | Four live 100,000-close-write no-loss bursts over 20,000 reused files (including low fd limit); separate distinct-cap and SIGSTOP queue-overflow passes; resumed writes and optional history expiry | 3–10 min fast, up to 17 min extra slow; live writer 180 s, forced writer 180 s, loss evidence 60 s, transport recovery 120 s after SIGCONT |
-| `04-compaction-crash.sh` | SIGKILL during uncommitted compaction WAL spill, database integrity, restart produces independent last-value oracle, second hourly compaction leaves it identical | SKIP by default; slow mode default 2 kill cycles + 2 verification phases × about 61 min = 244 min (4 h 4 min); `TIDEMARK_FAULT_CYCLES=1` gives 183 min (3 h 3 min); each phase bounded by 3800 s |
+| `04-compaction-crash.sh` | SIGKILL during uncommitted compaction WAL spill, database integrity, restart produces independent last-value oracle, live intended daemon compacts a newly seeded disjoint witness while earlier rows stay byte-identical | SKIP by default; slow mode default 2 kill cycles + 2 verification phases × about 61 min = 244 min (4 h 4 min); `TIDEMARK_FAULT_CYCLES=1` gives 183 min (3 h 3 min); each phase bounded by 3800 s |
 | `05-directory-races.sh` | Background subtree deletion produces recorded races, complete valid snapshot, no panic | 1–5 min; scan 900 s |
 | `06-huge-directory.sh` | 50,000 entries by default or 1,000,000 with scale marker; direct scan PID peak RSS <= configured 1280 MiB; exact completed file count | 1–5 min normal, 5–20 min scale; fixture 600 s, scan 900 s |
 
@@ -90,7 +90,7 @@ cargo test --offline -p xtask --test w7c
 
 The test runs `bash -n` on every entrypoint, checks VM/root guards and trap
 ownership, rejects unsupported command words (`rg`, `jq`, `fd`, `bc`) in shell
-and Python helpers recursively, and runs `shellcheck -x` at its default severity when installed.
+and Python helpers recursively, and runs `shellcheck -x --severity=warning` as a gate when installed (default-severity diagnostics are also printed).
 `common.bash` is sourced and checked through the entrypoints, rather than being
 executed as a seventh script by the runner. `check.py` validates public JSON,
 SQLite integrity and publication metadata; the public cumulative overflow
@@ -146,3 +146,13 @@ component be `ok`, with no further overflow. Run this phase in each disposable g
 ```sh
 sudo env "PATH=$PATH" TIDEMARK_DEPLOY_TEST_VM=1 TIDEMARK_FAULT_KEEP=1 TIDEMARK_FAULT_SLOW=1 bash tests/fault/03-fanotify-overflow.sh
 ```
+
+Script 04 seeds 600 due raw rows under a separate mount key only after the first
+1000-bucket oracle matches. The second phase must produce exactly two last-value
+five-minute buckets, with no remaining raw or extra witness rows, while every
+earlier row column has the same stable byte serialization. It checks the intended
+daemon PID and `/proc/PID/stat` start time throughout, rejects zombies/PID reuse,
+and fails after 3700 seconds without progress. Waiting through an hourly boundary
+or preserving the earlier rows alone cannot pass. The unprivileged `w7c` regression
+runs the actual helper with an accelerated clock against unchanged SQLite data
+and requires refusal; this is helper evidence, not guest daemon acceptance.

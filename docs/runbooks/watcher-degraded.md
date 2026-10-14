@@ -36,7 +36,7 @@ Watcher CPU allowance is 5% of one core per 1,000 close-write events/second, sep
 ## Actions
 
 1. Confirm the daemon uses the host mount namespace and configured mounts match the host layout. Repair service/config through change control rather than enabling broad capabilities or changing SELinux mode. Tidemark ships no SELinux policy and does not require a particular mode.
-2. If the mount is absent, restore it through the storage team's established procedure or correct the configured inventory. No mount commands are part of this runbook.
+2. If the mount is absent, restore it through the storage team's established procedure or correct the configured inventory. For a planned unmount, follow the watcher teardown guidance below before using the storage team's procedure.
 3. Keep `watch.events = ["close_write"]`; remove investigation-only `modify` events if unnecessary. Consider approved `watch.exclude_prefixes` for irrelevant churn, noting those writes become invisible. Validate config before reload.
 4. For a burst/overflow, inspect the producer and allow healthy observations to accumulate. Use snapshots and direct writers for independent accounting; do not infer zero growth from missing hot rows.
 
@@ -44,6 +44,14 @@ Watcher CPU allowance is 5% of one core per 1,000 close-write events/second, sep
 Watcher alert rules require complete supported whole-minute windows of 1–60 minutes. Hot growth is unavailable across lost/truncated minutes; overflow rules need reliable boundary counts. The ranked `now` hot list does not validate these windows.
 <!-- gap: exact daemon watcher alert windows are pending; not-evaluable rules cannot establish watcher health. -->
 <!-- gap: mount-transition rate reset and reversible now degradation remain open; confirm fresh samples after recovery. -->
+
+## Planned unmount
+
+An active `tidemarkd` or foreground `tidemark watch` retains a directory descriptor on the watched mount. Ordinary `umount` therefore fails with `target is busy`.
+
+Run `sudo systemctl stop tidemarkd` and wait for it to exit; exit releases the mount. Stop any foreground watcher and wait for its exit too. Alternatively, remove the mount from `watch.mounts`, validate the edited configuration, run `sudo systemctl reload tidemarkd`, and confirm the daemon accepted the reload and tore down that watch before unmounting. Check the journal; CLI `status --show-config` alone does not prove reload acceptance.
+
+A lazy unmount (`umount -l`) detaches it but leaves the old filesystem busy until the daemon notices its absence, reports `not mounted` and releases the descriptor. The daemon automatically watches the configured mount again when it returns. Use the storage team's approved unmount procedure after releasing watchers; other holders can still keep the filesystem busy.
 
 ## Escalation
 

@@ -1,4 +1,4 @@
-//! Owned by: W7-C2-fault
+//! Owned by: DOCS-fault
 //! Static validation of disposable-guest fault entrypoints.
 
 use std::{io::Write, path::Path, process::Command};
@@ -306,4 +306,83 @@ with tempfile.TemporaryDirectory() as directory:
     assert!(script[slow..].contains("check.py watch-ok"));
     assert!(script[slow..].contains("SKIP: long fifteen-minute history recovery"));
     assert!(!script[..slow].contains("check.py watch-ok"));
+}
+
+#[test]
+fn second_compaction_requires_new_exact_rows_and_live_daemon() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(r#"
+import json, os, pathlib, runpy, sqlite3, sys, tempfile, time
+helper = sys.argv[1]
+subject = '__tidemark_fault_compaction__'
+witness = subject + '_second__'
+identity = pathlib.Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
+real_sleep, real_monotonic = time.sleep, time.monotonic
+for case in ('unchanged', 'exact', 'wrong_value', 'extra_raw', 'changed_prior', 'wrong_pid_identity', 'dead_pid'):
+    with tempfile.TemporaryDirectory() as directory:
+        path = pathlib.Path(directory) / 'timeseries.db'
+        expected = [[1, 300 * n, 1000000, n, 500000, 1000, 100] for n in range(1000)]
+        (path.parent / 'compaction-oracle.json').write_text(json.dumps(expected))
+        with sqlite3.connect(str(path)) as db:
+            db.execute('CREATE TABLE fs_samples (mount TEXT,res INTEGER,ts INTEGER,size INTEGER,used INTEGER,avail INTEGER,inodes INTEGER,inodes_used INTEGER,PRIMARY KEY(mount,res,ts))')
+            db.executemany('INSERT INTO fs_samples VALUES (?,?,?,?,?,?,?,?)', ([subject] + row for row in expected))
+        elapsed = [0]
+        sleeps = [0]
+        def sleep(seconds):
+            sleeps[0] += 1
+            if sleeps[0] > 1:
+                elapsed[0] += 3701
+                return
+            with sqlite3.connect(str(path)) as db:
+                assert db.execute('SELECT count(*) FROM fs_samples WHERE mount=? AND res=0', (witness,)).fetchone()[0] == 600
+                if case not in ('unchanged', 'wrong_pid_identity', 'dead_pid'):
+                    # Fixture controls exercise the helper oracle, not production compaction.
+                    raw = db.execute('SELECT ts,size,used,avail,inodes,inodes_used FROM fs_samples WHERE mount=? ORDER BY ts', (witness,)).fetchall()
+                    db.execute('DELETE FROM fs_samples WHERE mount=?', (witness,))
+                    for row in (raw[299], raw[599]):
+                        db.execute('INSERT INTO fs_samples VALUES (?,?,?,?,?,?,?,?)', [witness, 1, row[0] // 300 * 300] + list(row[1:]))
+                    if case == 'wrong_value':
+                        db.execute('UPDATE fs_samples SET used=-1 WHERE mount=?', (witness,))
+                    if case == 'extra_raw':
+                        db.execute('INSERT INTO fs_samples VALUES (?,0,0,0,0,0,0,0)', (witness,))
+                    if case == 'changed_prior':
+                        db.execute('UPDATE fs_samples SET used=-1 WHERE mount=? AND ts=0', (subject,))
+            elapsed[0] += 1
+        time.sleep = sleep
+        time.monotonic = lambda: elapsed[0]
+        sys.argv = [helper, 'idempotent', str(path), str(os.getpid()), identity]
+        if case == 'wrong_pid_identity':
+            sys.argv[-1] = 'invalid-start-time'
+        if case == 'dead_pid':
+            sys.argv[-2] = '2147483647'
+        try:
+            runpy.run_path(helper, run_name='__main__')
+        except (AssertionError, ProcessLookupError) as error:
+            assert case != 'exact', (case, str(error))
+            if case == 'unchanged':
+                assert 'no second compaction witness' in str(error), str(error)
+            if case == 'changed_prior':
+                assert 'earlier compacted rows changed' in str(error), str(error)
+            if case in ('wrong_value', 'extra_raw'):
+                assert 'no second compaction witness' in str(error), str(error)
+        else:
+            assert case == 'exact', case + ' falsely passed'
+        finally:
+            time.sleep, time.monotonic = real_sleep, real_monotonic
+"#)
+        .arg(root.join("tests/fault/compaction.py"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let script = std::fs::read_to_string(root.join("tests/fault/04-compaction-crash.sh")).unwrap();
+    assert!(
+        script.contains("idempotent \"$state/timeseries.db\" \"$daemon_pid\" \"$daemon_start\"")
+    );
 }
