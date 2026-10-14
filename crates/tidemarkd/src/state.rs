@@ -1070,15 +1070,23 @@ impl LiveStateView {
             .watchers
             .iter()
             .filter(|(_, w)| w.mode() != tidemark_live::watch::WatchMode::Failed)
-            .map(|(m, w)| {
-                (
-                    m.clone(),
-                    w.hot_at(now, 5, tidemark_live::watch::HotScope::Dir, MAX_INVENTORY),
-                )
+            .filter_map(|(m, w)| {
+                w.query_at(now, 5, tidemark_live::watch::HotScope::Dir, MAX_INVENTORY)
+                    .ok()
+                    .map(|(_, rows)| (m.clone(), rows))
             })
             .collect();
         let mut degraded = v.data.degraded.clone();
         for (mount, watcher) in &v.data.watchers {
+            if p.mount.as_ref().is_none_or(|m| m == mount) {
+                if let Some(at) = watcher.retired_at() {
+                    degraded.push(format!(
+                        "watcher for {mount} was replaced at {}",
+                        watch_start_label(at)
+                    ));
+                    continue;
+                }
+            }
             if p.mount.as_ref().is_none_or(|m| m == mount) && !watcher.history_covers_at(now, 60) {
                 if let Some(start) = watcher.history_start() {
                     degraded.push(format!(
@@ -1128,11 +1136,10 @@ impl LiveStateView {
                 v.data
                     .watchers
                     .iter()
-                    .map(|(m, w)| {
-                        (
-                            m.clone(),
-                            w.hot_at(now, 5, tidemark_live::watch::HotScope::Unit, MAX_INVENTORY),
-                        )
+                    .filter_map(|(m, w)| {
+                        w.query_at(now, 5, tidemark_live::watch::HotScope::Unit, MAX_INVENTORY)
+                            .ok()
+                            .map(|(_, rows)| (m.clone(), rows))
                     })
                     .collect(),
             )
@@ -1218,8 +1225,11 @@ impl LiveStateView {
         let mut incomplete = false;
         for (mount, w) in &self.data.watchers {
             if p.mount.as_ref().is_none_or(|m| m == mount) {
-                incomplete |= !w.history_covers_at(self.now, minutes);
-                rows.extend(w.hot_at(self.now, minutes, scope, p.limit.min(MAX_INVENTORY)));
+                let (covered, entries) = w
+                    .query_at(self.now, minutes, scope, p.limit.min(MAX_INVENTORY))
+                    .ok()?;
+                incomplete |= !covered;
+                rows.extend(entries);
             }
         }
         if incomplete {
@@ -1243,6 +1253,14 @@ impl LiveStateView {
             HotWindow::SixtyMinutes => 60,
         };
         for (mount, watcher) in &self.data.watchers {
+            if p.mount.as_ref().is_none_or(|m| m == mount) {
+                if let Some(at) = watcher.retired_at() {
+                    return format!(
+                        "watcher for {mount} was replaced at {}",
+                        watch_start_label(at)
+                    );
+                }
+            }
             if p.mount.as_ref().is_none_or(|m| m == mount)
                 && !watcher.history_covers_at(self.now, minutes)
             {

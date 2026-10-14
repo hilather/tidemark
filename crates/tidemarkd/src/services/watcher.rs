@@ -682,7 +682,7 @@ fn reconcile_settings(
         .collect();
     for mount in retired {
         flush_completed(watchers, &mount, writer, at);
-        retire_watcher(state, watchers, minutes, &mount);
+        retire_watcher_at(state, watchers, minutes, &mount, at);
         state.remove_component(&format!("watcher:{mount}"));
     }
     if let Some(old) = previous {
@@ -700,8 +700,18 @@ fn retire_watcher(
     minutes: &mut BTreeMap<String, MinuteHistory>,
     mount: &str,
 ) {
+    retire_watcher_at(state, watchers, minutes, mount, crate::unix_now());
+}
+
+fn retire_watcher_at(
+    state: &LiveState,
+    watchers: &mut BTreeMap<String, Arc<Watcher>>,
+    minutes: &mut BTreeMap<String, MinuteHistory>,
+    mount: &str,
+    at: i64,
+) {
     if let Some(watcher) = watchers.remove(mount) {
-        watcher.shutdown();
+        watcher.retire_at(at);
     }
     state.remove_watcher(mount);
     minutes.remove(mount);
@@ -1018,6 +1028,91 @@ mod tests {
         )
         .unwrap();
         assert!(rx.is_empty());
+    }
+    #[test]
+    fn held_mature_view_is_unavailable_after_retirement() {
+        use tidemark_core::api::{HotBy, HotParams, HotWindow, NowParams};
+        let state = LiveState::new(&Config::default(), 0);
+        let watcher = Arc::new(
+            Watcher::from_injected_events_at(
+                RawPath::new(b"/A".to_vec()).unwrap(),
+                0,
+                [(
+                    3600,
+                    [b"a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                    82,
+                    None,
+                    (1, 1),
+                )],
+            )
+            .unwrap(),
+        );
+        state
+            .publish(
+                Publication::Watcher(("/A".into(), watcher.clone())),
+                crate::component("watcher:/A", "ok", "test"),
+            )
+            .unwrap();
+        let queries: Vec<_> = [HotBy::Dir, HotBy::Unit, HotBy::Comm]
+            .into_iter()
+            .flat_map(|by| {
+                [
+                    HotWindow::OneMinute,
+                    HotWindow::FiveMinutes,
+                    HotWindow::FifteenMinutes,
+                    HotWindow::SixtyMinutes,
+                ]
+                .map(|window| HotParams {
+                    mount: Some("/A".into()),
+                    by,
+                    window,
+                    limit: 1000,
+                })
+            })
+            .collect();
+        let held = state.view_at(3600);
+        for p in &queries {
+            assert!(held.hot(p).is_some());
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let ready = barrier.clone();
+        let worker_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            ready.wait();
+            watcher.retire_at(3600);
+            worker_state.remove_watcher("/A");
+            let replacement = activity_watcher(b"/A", 3600);
+            worker_state
+                .publish(
+                    Publication::Watcher(("/A".into(), replacement)),
+                    crate::component("watcher:/A", "ok", "test"),
+                )
+                .unwrap();
+            ready.wait();
+        });
+        barrier.wait();
+        barrier.wait();
+        worker.join().unwrap();
+        for p in &queries {
+            assert!(held.hot(p).is_none());
+            assert_eq!(
+                held.hot_unavailable_detail(p),
+                "watcher for /A was replaced at 01:00 UTC"
+            );
+            assert_eq!(state.view_at(3660).hot(p).unwrap()[0].bytes_delta, 82);
+        }
+        let report = held
+            .now(
+                &NowParams {
+                    mount: Some("/A".into()),
+                },
+                3600,
+            )
+            .unwrap();
+        assert!(report
+            .degraded
+            .iter()
+            .any(|s| s == "watcher for /A was replaced at 01:00 UTC"));
     }
     #[test]
     fn reload_membership_preserves_unchanged_watchers_and_flushes_replacements() {

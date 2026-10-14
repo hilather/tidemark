@@ -339,6 +339,7 @@ struct State {
     loss_taken: VecDeque<RawPath>,
     loss_taken_bytes: usize,
     loss_taken_nodes: usize,
+    retired_at: Option<i64>,
     last_at: Option<i64>,
     events: u64,
     overflows: u64,
@@ -493,6 +494,7 @@ impl Watcher {
                 loss_taken: VecDeque::new(),
                 loss_taken_bytes: 0,
                 loss_taken_nodes: 0,
+                retired_at: None,
                 last_at: None,
                 events: total,
                 overflows: 0,
@@ -669,6 +671,7 @@ impl Watcher {
             loss_taken: VecDeque::new(),
             loss_taken_bytes: 0,
             loss_taken_nodes: 0,
+            retired_at: None,
             last_at: None,
             events: 0,
             overflows: 0,
@@ -822,6 +825,37 @@ impl Watcher {
             mount_fd: Mutex::new(Some(mount_fd)),
         })
     }
+    /// Raw mount identity; display escaping is reserved for labels.
+    pub fn mount_path(&self) -> &RawPath {
+        &self.mount
+    }
+    /// Retire query availability before releasing transport and retained memory.
+    pub fn retire_at(&self, at: i64) {
+        self.state.lock().retired_at.get_or_insert(at);
+        self.shutdown();
+    }
+    /// Atomically decide lifecycle, coverage and rows under the watcher lock.
+    pub fn query_at(
+        &self,
+        at: i64,
+        minutes: u32,
+        scope: HotScope,
+        limit: usize,
+    ) -> Result<(bool, Vec<HotEntry>), i64> {
+        let mut state = self.state.lock();
+        if let Some(retired) = state.retired_at {
+            return Err(retired);
+        }
+        let covered = state.rings.history_start().is_some_and(|start| {
+            at.div_euclid(60) * 60 - i64::from(minutes.clamp(1, 60) - 1) * 60 >= start
+        });
+        let rows = self.hot_at_locked(&mut state, at, minutes, scope, limit);
+        Ok((covered, rows))
+    }
+    /// Retirement timestamp, retained after payload reclamation.
+    pub fn retired_at(&self) -> Option<i64> {
+        self.state.lock().retired_at
+    }
     /// First fully observed minute of this watcher identity.
     pub fn history_start(&self) -> Option<i64> {
         self.state.lock().rings.history_start()
@@ -858,6 +892,9 @@ impl Watcher {
         scope: HotScope,
         limit: usize,
     ) -> Vec<HotEntry> {
+        if state.retired_at.is_some() {
+            return Vec::new();
+        }
         let at = state.last_at.map_or(at, |last| last.max(at));
         state.observe_time(at);
         state.rings.advance(at);
@@ -1166,6 +1203,11 @@ impl Watcher {
         let mut thread = self.thread.lock();
         if self.stopping.swap(true, Ordering::AcqRel) {
             return;
+        }
+        {
+            let mut state = self.state.lock();
+            let at = state.last_at.unwrap_or_else(now);
+            state.retired_at.get_or_insert(at);
         }
         let signal = self.shutdown.lock().take();
         if let Some(signal) = &signal {
@@ -2184,6 +2226,7 @@ mod tests {
             loss_taken: VecDeque::new(),
             loss_taken_bytes: 0,
             loss_taken_nodes: 0,
+            retired_at: None,
             last_at: None,
             events: 0,
             overflows: 0,
