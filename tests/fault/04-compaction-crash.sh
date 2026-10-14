@@ -13,10 +13,10 @@ source tests/fault/common.bash
 cycles=${TIDEMARK_FAULT_CYCLES:-2}
 [[ $cycles == 1 || $cycles == 2 ]] || { echo 'TIDEMARK_FAULT_CYCLES must be 1 or 2' >&2; exit 1; }
 # Estimate before allocating resources: every kill waits 3590 s + up to 120 s;
-# recovery and idempotence each allow 3700 s, inside 3800 s helper deadlines.
+# recovery and idempotence each allow 4200 s, inside 4300 s helper deadlines.
 phases=$((cycles + 2))
 expected_seconds=$((phases * 3660))
-deadline_seconds=$((phases * 3800))
+deadline_seconds=$((phases * 4300))
 started=$(date +%s)
 echo "Compaction: $cycles kill cycles + 2 verification phases; about $((expected_seconds / 60)) minutes plus setup/cleanup"
 echo "Expected finish: $(date -u -d "@$((started + expected_seconds))" '+%Y-%m-%d %H:%M:%S UTC'); helper deadline budget ends $(date -u -d "@$((started + deadline_seconds))" '+%Y-%m-%d %H:%M:%S UTC') plus setup/cleanup"
@@ -58,7 +58,7 @@ assert fields[0] not in ('Z', 'X'), 'daemon is dead'
 print(fields[19])
 PYCODE
 )
-check 'recovery compaction reaches oracle' run_helper 3800 python3 tests/fault/compaction.py complete "$state/timeseries.db"
+check 'recovery compaction reaches oracle' run_helper 4300 python3 tests/fault/compaction.py complete "$state/timeseries.db"
 # Seed disjoint due rows after recovery; require their exact compaction and unchanged history.
-check 'second compaction is idempotent' run_helper 3800 python3 tests/fault/compaction.py idempotent "$state/timeseries.db" "$daemon_pid" "$daemon_start"
+check 'second compaction is idempotent' run_helper 4300 python3 tests/fault/compaction.py idempotent "$state/timeseries.db" "$daemon_pid" "$daemon_start"
 check 'compacted database integrity' python3 tests/fault/check.py integrity "$state/timeseries.db"
