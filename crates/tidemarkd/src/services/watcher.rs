@@ -1306,7 +1306,7 @@ mod tests {
         assert!(state.view_at(120).hot(&p).is_none());
         assert_eq!(
             unavailable_detail,
-            "watch history for /A starts at 00:03 UTC; ask for a window of at most 0 minutes"
+            "watch history for /A starts at 00:03 UTC; no complete window yet"
         );
     }
     #[test]

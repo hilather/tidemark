@@ -1266,6 +1266,12 @@ impl LiveStateView {
             {
                 if let Some(start) = watcher.history_start() {
                     let available = ((self.now.div_euclid(60) * 60 - start) / 60 + 1).clamp(0, 60);
+                    if available == 0 {
+                        return format!(
+                            "watch history for {mount} starts at {}; no complete window yet",
+                            watch_start_label(start)
+                        );
+                    }
                     return format!("watch history for {mount} starts at {}; ask for a window of at most {available} minutes", watch_start_label(start));
                 }
             }
