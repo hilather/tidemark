@@ -631,7 +631,8 @@ fn run_row(row: &Row) {
         match row.command {
             Command::Stage if matches!(row.effects, Effects::Compensated) => 4,
             Command::Stage => 2,
-            Command::Unstage(_) | Command::Verify(_) => 1,
+            Command::Unstage(true) => 3,
+            Command::Unstage(false) | Command::Verify(_) => 1,
         }
     };
     assert_eq!(f.sys.queries.get(), queries, "{} service queries", row.name);

@@ -404,15 +404,16 @@ pub fn stage(
         }
         env.config_write(&config_parent, config_name, &bytes)?;
         sys.enable(UNIT)?;
-        if opts.start_now {
-            sys.restart(UNIT)?;
-        }
         env.state_write(&state_fd, std::ffi::OsStr::new(MARKER), &marker_bytes)?;
         env.state_write(
             &deploy_fd,
             std::ffi::OsStr::new("staged.json"),
             &record_bytes,
         )?;
+        // First-boot reporting decides whether to publish from these records.
+        if opts.start_now {
+            sys.restart(UNIT)?;
+        }
         Ok(())
     })();
     if let Err(error) = result {
@@ -698,51 +699,125 @@ pub fn unstage(
         None
     };
 
-    sys.disable_now(UNIT)?;
-    if sys.is_active(UNIT)? {
-        return Err(DeployError::Guard(
-            "service is still active; state retained".into(),
-        ));
-    }
-    if let Some((parent, name, root)) = guarded {
-        let busy = || {
-            DeployError::Guard(
-                "state directory in use by another tidemark process; nothing was removed".into(),
-            )
-        };
-        let _writer =
-            tidemark_store::lease::RecoveryLease::acquire(state_dir, Duration::from_secs(10))
-                .map_err(|error| {
+    let previous = if purge_state {
+        Some((sys.is_enabled(UNIT)?, sys.is_active(UNIT)?))
+    } else {
+        None
+    };
+    let mut removed = false;
+    let result = (|| -> Result<(), DeployError> {
+        sys.disable_now(UNIT)?;
+        if sys.is_active(UNIT)? {
+            return Err(DeployError::Guard(
+                "service is still active; state retained".into(),
+            ));
+        }
+        if let Some((parent, name, root)) = guarded {
+            let busy =
+                || DeployError::Guard("state directory in use by another tidemark process".into());
+            let _writer =
+                tidemark_store::lease::RecoveryLease::acquire(state_dir, Duration::from_secs(10))
+                    .map_err(|error| {
                     if error.kind() == io::ErrorKind::WouldBlock {
                         busy()
                     } else {
                         DeployError::Io(error)
                     }
                 })?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let _scan = loop {
-            match tidemark_scan::orchestrator::ScanLock::acquire(state_dir) {
-                Ok(lock) => break lock,
-                Err(tidemark_scan::orchestrator::ScanError::Busy) if Instant::now() < deadline => {
-                    std::thread::sleep(
-                        Duration::from_millis(25)
-                            .min(deadline.saturating_duration_since(Instant::now())),
-                    );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let _scan = loop {
+                match tidemark_scan::orchestrator::ScanLock::acquire(state_dir) {
+                    Ok(lock) => break lock,
+                    Err(tidemark_scan::orchestrator::ScanError::Busy)
+                        if Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(
+                            Duration::from_millis(25)
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        );
+                    }
+                    Err(tidemark_scan::orchestrator::ScanError::Busy) => return Err(busy()),
+                    Err(error) => return Err(io::Error::other(error).into()),
                 }
-                Err(tidemark_scan::orchestrator::ScanError::Busy) => return Err(busy()),
-                Err(error) => return Err(io::Error::other(error).into()),
-            }
-        };
-        purge_directory(parent, name, root)?;
-    } else {
-        if let Some(fd) = deploy {
-            match rustix::fs::unlinkat(&fd, "staged.json", rustix::fs::AtFlags::empty()) {
-                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-                Err(e) => return Err(io::Error::from(e).into()),
+            };
+            purge_directory(parent, name, root, &mut removed)?;
+        } else {
+            if let Some(fd) = deploy {
+                match rustix::fs::unlinkat(&fd, "staged.json", rustix::fs::AtFlags::empty()) {
+                    Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                    Err(e) => return Err(io::Error::from(e).into()),
+                }
             }
         }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if let Some((enabled, active)) = previous.filter(|_| !removed) {
+            return Err(restore_refused_purge(error, enabled, active, sys));
+        }
+        return Err(error);
     }
     Ok(())
+}
+
+// Purge guards may fail after stopping, but before the first successful unlink.
+fn restore_refused_purge(
+    error: DeployError,
+    enabled: bool,
+    active: bool,
+    sys: &dyn Systemctl,
+) -> DeployError {
+    let mut failures = Vec::new();
+    let current_enabled = sys.is_enabled(UNIT);
+    let current_active = sys.is_active(UNIT);
+    let needs_stop = (!enabled && current_enabled.as_ref().is_ok_and(|value| *value))
+        || (!active && current_active.as_ref().is_ok_and(|value| *value));
+    if needs_stop {
+        if let Err(e) = sys.disable_now(UNIT) {
+            failures.push(e.to_string());
+        }
+    }
+    if enabled && (needs_stop || !current_enabled.as_ref().is_ok_and(|value| *value)) {
+        if let Err(e) = sys.enable(UNIT) {
+            failures.push(e.to_string());
+        }
+    }
+    if active && (needs_stop || !current_active.as_ref().is_ok_and(|value| *value)) {
+        if let Err(e) = sys.restart(UNIT) {
+            failures.push(e.to_string());
+        }
+    }
+    for error in [current_enabled, current_active]
+        .into_iter()
+        .filter_map(Result::err)
+    {
+        failures.push(error.to_string());
+    }
+    for (label, desired, observed) in [
+        ("enabled", enabled, sys.is_enabled(UNIT)),
+        ("active", active, sys.is_active(UNIT)),
+    ] {
+        match observed {
+            Ok(value) if value == desired => {}
+            Ok(value) => failures.push(format!(
+                "service compensation {label}={value}, expected {desired}"
+            )),
+            Err(e) => failures.push(e.to_string()),
+        }
+    }
+    let detail = if failures.is_empty() {
+        format!(
+            "nothing was removed; service left {} and {} as before",
+            if enabled { "enabled" } else { "disabled" },
+            if active { "running" } else { "stopped" },
+        )
+    } else {
+        format!("nothing was removed; compensation failures: {}; inspect service state and re-run deploy stage or deploy unstage", failures.join("; "))
+    };
+    match error {
+        DeployError::Guard(message) => DeployError::Guard(format!("{message}; {detail}")),
+        other => DeployError::Io(io::Error::other(format!("{other}; {detail}"))),
+    }
 }
 
 /// Production service-manager implementation. Never used by unprivileged tests.

@@ -88,7 +88,7 @@ pub(super) fn purge_guard(state_dir: &Path) -> Result<GuardedRoot, DeployError> 
             "state directory is a mount point".into(),
         ));
     }
-    walk(&root, state_dir, mount, false)?;
+    walk(&root, state_dir, mount, false, &mut false)?;
     Ok((parent, name, root))
 }
 struct Frame {
@@ -97,7 +97,13 @@ struct Frame {
     name: Option<CString>,
     path: PathBuf,
 }
-fn walk(root: &OwnedFd, path: &Path, mount: u64, remove: bool) -> io::Result<()> {
+fn walk(
+    root: &OwnedFd,
+    path: &Path,
+    mount: u64,
+    remove: bool,
+    removed: &mut bool,
+) -> io::Result<()> {
     let fd = rustix::io::dup(root)?;
     fs::seek(&fd, rustix::fs::SeekFrom::Start(0))?;
     verify_directory(&fd, path, mount)?;
@@ -163,6 +169,7 @@ fn walk(root: &OwnedFd, path: &Path, mount: u64, remove: bool) -> io::Result<()>
                     });
                 } else if remove {
                     fs::unlinkat(&frame.fd, name, AtFlags::empty())?;
+                    *removed = true;
                 }
             }
             None => {
@@ -177,6 +184,7 @@ fn walk(root: &OwnedFd, path: &Path, mount: u64, remove: bool) -> io::Result<()>
                                 ));
                             }
                             fs::unlinkat(&parent.fd, &name, AtFlags::REMOVEDIR)?;
+                            *removed = true;
                         }
                     }
                 }
@@ -185,14 +193,19 @@ fn walk(root: &OwnedFd, path: &Path, mount: u64, remove: bool) -> io::Result<()>
     }
     Ok(())
 }
-pub(super) fn purge_directory(parent: OwnedFd, name: CString, root: OwnedFd) -> io::Result<()> {
+pub(super) fn purge_directory(
+    parent: OwnedFd,
+    name: CString,
+    root: OwnedFd,
+    removed: &mut bool,
+) -> io::Result<()> {
     let current = fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)?;
     let opened = fs::fstat(&root)?;
     if current.st_dev != opened.st_dev || current.st_ino != opened.st_ino {
         return Err(io::Error::other("state directory replaced before purge"));
     }
     let path = PathBuf::from(format!("/proc/self/fd/{}/.", root.as_raw_fd()));
-    walk(&root, &path, mount_id(&root)?, true)?;
+    walk(&root, &path, mount_id(&root)?, true, removed)?;
     let current = fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)?;
     if current.st_dev != opened.st_dev || current.st_ino != opened.st_ino {
         return Err(io::Error::other("state directory replaced during purge"));
@@ -205,6 +218,7 @@ pub(super) fn purge_directory(parent: OwnedFd, name: CString, root: OwnedFd) -> 
     });
     for lock in ["scan.lock", "writer.lock"] {
         fs::unlinkat(&root, lock, AtFlags::empty())?;
+        *removed = true;
     }
     #[cfg(test)]
     BEFORE_RMDIR.with(|hook| {
@@ -220,6 +234,7 @@ pub(super) fn purge_directory(parent: OwnedFd, name: CString, root: OwnedFd) -> 
         ));
     }
     fs::unlinkat(&parent, &name, AtFlags::REMOVEDIR)?;
+    *removed = true;
     Ok(())
 }
 
