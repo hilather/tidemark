@@ -663,3 +663,32 @@ fn ancestor_snapshot_missing_path_names_scan_remedy() {
         assert!(error.contains("run: tidemark scan"), "{error}");
     }
 }
+
+#[test]
+fn files_direct_flag_keeps_existing_json_shape() {
+    let fixture = ::test_support::private_tempdir().unwrap();
+    let state = ::test_support::private_tempdir().unwrap();
+    config_support::direct_config(state.path(), "");
+    let root = RawPath::from_path(fixture.path()).unwrap();
+    publish(state.path(), &root, 1_000_000, [4096; 4]);
+    let output = fixture_command(state.path(), true)
+        .args(["files", "--direct"])
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["schema"], "tidemark.files.v1");
+    assert_eq!(json["data"], serde_json::json!([]));
+    let output = fixture_command(state.path(), true)
+        .arg("files")
+        .arg(fixture.path())
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["data"].as_array().unwrap().len(), 1);
+}

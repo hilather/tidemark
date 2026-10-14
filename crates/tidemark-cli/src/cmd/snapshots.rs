@@ -338,10 +338,17 @@ pub(crate) fn missing_path(
             for skip in skipped {
                 if let Ok(parent) = snapshot.dir(skip.dir_id) {
                     if path.starts_with(&parent.path.join(&skip.name)) {
-                        detail.push_str(&format!(
-                            " (skipped: {})",
-                            crate::render::enum_label(skip.reason)
-                        ));
+                        detail.push_str(match skip.reason {
+                            tidemark_core::scan::SkipReason::Mount => {
+                                " (a mount point; snapshots do not cross mounts)"
+                            }
+                            tidemark_core::scan::SkipReason::OtherFs => {
+                                " (a different filesystem; snapshots do not cross filesystems)"
+                            }
+                            tidemark_core::scan::SkipReason::Excluded => {
+                                " (excluded from this scan)"
+                            }
+                        });
                         break;
                     }
                 }

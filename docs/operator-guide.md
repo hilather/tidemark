@@ -151,6 +151,8 @@ Bulk mode is faster on eligible XFS roots. Disk allocation is exact, but apparen
 
 `top` reads the chosen snapshot, not live totals. Check its ID, mode, age, status and degraded marker. `--snapshot ID` fixes a report to an older snapshot. `!` indicates recorded errors: totals may be incomplete. `--wide` adds apparent size, inode count and newest modification time (UTC). `files` lists retained notable files, not every filename; raise configured thresholds/caps deliberately if necessary. Shared files carry a marker and a representative path. `wide` identifies directories with many direct entries, which can make listing and sorting costly.
 
+`tidemark files PATH --direct` shows retained notable files directly in PATH, excluding subdirectories. In the TUI, Enter on `.` shows these files and the remaining file count and charged bytes not individually retained.
+
 The following real direct-mode fixture has one 1.5 MiB file hard-linked into two siblings and an 8 MiB sparse file. It ran unprivileged with a private config/socket and state directory; production commands above use sudo.
 <!-- Real CLI stdout captured on 2026-10-13; /tmp fixture on workstation, not the normative XFS example. -->
 ```text
@@ -387,5 +389,3 @@ An active daemon or foreground `tidemark watch` keeps a directory descriptor ope
 `sudo tidemark symlinks /data --check-targets` resolves components only within the selected mount, including same-device bind boundaries. `other_fs` means the external target was not checked: it does not tell you whether it exists, dangles or loops. Reading link text may update that link’s atime under mount policy. No scan and no other command reads the text of symbolic links it finds; resolving an administrator-supplied path on the command line follows links in that path as ordinary tools do. The 40-expansion bound also treats overlong chains as loops. Tidemark never restores timestamps or changes mount options to hide this limit.
 
 `man tidemark` and `man tidemarkd` provide the packaged command references. Final guest acceptance for real second-user trust, filesystem marks under packaged restrictions and cross-mount link atime remains pending; implemented checks and earlier capability measurements do not replace those gates.
-
-`tidemark files PATH --direct` shows retained notable files directly in PATH, excluding subdirectories. In the TUI, Enter on `.` shows these files and the remaining file count and charged bytes not individually retained.

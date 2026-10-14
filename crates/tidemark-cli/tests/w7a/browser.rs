@@ -689,7 +689,7 @@ fn direct_retained_files_filter_before_limit_and_show_utc() {
 }
 
 #[test]
-fn missing_path_message_uses_recorded_mount_reason() {
+fn missing_path_message_does_not_invent_a_mount_reason() {
     let (_temp, b) = browser(0);
     let context = crate::Context {
         config: Default::default(),
@@ -703,4 +703,120 @@ fn missing_path_message_uses_recorded_mount_reason() {
     assert!(error.contains("run: tidemark scan /fixture/data"));
     // An absent path alone does not prove a filesystem boundary.
     assert!(!error.contains("different filesystem"));
+}
+
+#[test]
+fn own_row_appears_once_across_pages_and_sorts_between_children() {
+    let (_temp, mut b) = browser(2500);
+    for sort in [state::Sort::Size, state::Sort::Files, state::Sort::Name] {
+        b.state.sort = sort;
+        b.boundary(false).unwrap();
+        let mut own_rows = 0;
+        loop {
+            own_rows += usize::from(b.own_position() != usize::MAX);
+            if b.rows.len() < PAGE {
+                break;
+            }
+            b.page(false).unwrap();
+        }
+        assert_eq!(own_rows, 1);
+    }
+    let (_temp, mut b) = browser(3);
+    b.dir.own_charged = 8192;
+    b.dir.own_files = 2;
+    b.rows[0].0.t_disk = 16384;
+    b.rows[0].0.t_files = 3;
+    b.rows[1].0.t_files = 1;
+    b.rows[2].0.t_files = 0;
+    for sort in [state::Sort::Size, state::Sort::Files] {
+        b.state.sort = sort;
+        b.state.order(&mut b.rows);
+        assert_eq!(b.own_position(), 1);
+        assert_eq!(b.child_at(0).unwrap().0.id, 1);
+        assert_eq!(b.child_at(2).unwrap().0.id, 2);
+    }
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    b.close_pane();
+    assert_eq!(b.state.pane, Pane::Main);
+}
+
+#[test]
+fn missing_path_message_names_recorded_filesystem_boundary() {
+    let temp = ::test_support::private_tempdir().unwrap();
+    let root = fixture::row(0, None, b"/", 4096);
+    let meta = fixture::meta(root.path.clone(), 1_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&[root]).unwrap();
+    writer
+        .put_skipped(&[tidemark_core::snapshot::SkipRow {
+            dir_id: 0,
+            name: RawName::new(b"data".to_vec()).unwrap(),
+            reason: tidemark_core::scan::SkipReason::OtherFs,
+        }])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    let snapshot = Snapshot::open(&file).unwrap();
+    let mut config = tidemark_core::config::Config::default();
+    config.general.socket = temp.path().join("unreachable.sock");
+    let context = crate::Context {
+        config,
+        config_path: "/unused".into(),
+        json: false,
+        color: false,
+    };
+    let path = RawPath::new(b"/data".to_vec()).unwrap();
+    let message = crate::cmd::snapshots::missing_path(&context, &path, &snapshot).to_string();
+    assert!(message.contains("no complete snapshot of /data yet"));
+    assert!(message.contains("of / ("));
+    assert!(message.contains("a different filesystem"));
+    assert!(message.contains("run: tidemark scan /data"));
+    assert!(!message.contains("next scheduled scan"));
+}
+
+#[test]
+fn missing_path_message_includes_daemon_schedule_for_configured_root() {
+    use std::io::{BufRead, BufReader, Write};
+    let temp = ::test_support::private_tempdir().unwrap();
+    let socket = temp.path().join("daemon.sock");
+    let listener = match std::os::unix::net::UnixListener::bind(&socket) {
+        Ok(listener) => listener,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            eprintln!("socket unavailable; skipping schedule message test: {error}");
+            return;
+        }
+        Err(error) => panic!("bind fixture socket: {error}"),
+    };
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "scan.status");
+        writeln!(stream, "{}", serde_json::json!({"v": 1, "ok": true, "id": request["id"], "result": [{"root": "/data", "running": null, "last_complete": null, "next_due": 0}], "error": null})).unwrap();
+    });
+    let (_temp, b) = browser(0);
+    let mut config = tidemark_core::config::Config::default();
+    config.general.socket = socket;
+    let context = crate::Context {
+        config,
+        config_path: "/unused".into(),
+        json: false,
+        color: false,
+    };
+    let path = RawPath::new(b"/data".to_vec()).unwrap();
+    let message = crate::cmd::snapshots::missing_path(&context, &path, &b.snapshot).to_string();
+    worker.join().unwrap();
+    assert!(
+        message.contains("next scheduled scan: 1970-01-01 00:00:00Z"),
+        "{message}"
+    );
 }

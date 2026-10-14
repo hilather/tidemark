@@ -427,11 +427,8 @@ impl Browser {
         own.t_files = own.own_files;
         own.t_reclaimable = 0;
         own.newest_mtime = i64::MIN;
-        let before = |row: &(DirRow, Option<i128>)| {
-            let mut pair = [row.clone(), (own.clone(), None)];
-            self.state.order(&mut pair);
-            pair[0].0.name != own.name
-        };
+        let own = (own, None);
+        let before = |row: &(DirRow, Option<i128>)| self.state.compare(row, &own).is_lt();
         let position = self.rows.iter().take_while(|row| before(row)).count();
         let matches = byte_contains(b".", self.state.filter.as_bytes());
         let in_page = if let Some(cursor) = &self.pages.cursor {
@@ -527,6 +524,10 @@ impl Browser {
         }
         Ok(())
     }
+    fn close_pane(&mut self) {
+        self.state.pane = Pane::Main;
+        self.state.selected = 0;
+    }
     fn enter(&mut self) -> anyhow::Result<()> {
         match self.state.pane {
             Pane::Main => {
@@ -535,7 +536,7 @@ impl Browser {
                         &self.snapshot,
                         self.dir.id,
                         &Default::default(),
-                        100,
+                        1_000_000,
                         true,
                     )?;
                     let count = hits.len() as u64;
@@ -776,8 +777,7 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
                 KeyCode::Enter | KeyCode::Right => browser.enter()?,
                 KeyCode::Backspace | KeyCode::Left => {
                     if browser.state.pane != Pane::Main {
-                        browser.state.pane = Pane::Main;
-                        browser.state.selected = 0;
+                        browser.close_pane();
                     } else if let Some(parent) = browser.dir.parent_id {
                         browser.navigate(browser.snapshot.dir(parent)?)?;
                     }
@@ -799,10 +799,9 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
                             .cancel
                             .store(true, std::sync::atomic::Ordering::Release);
                     }
-                    browser.state.pane = Pane::Main;
                     browser.state.filter.clear();
                     browser.boundary(false)?;
-                    browser.state.selected = 0;
+                    browser.close_pane();
                 }
                 _ => {}
             }

@@ -69,17 +69,22 @@ impl State {
         self.pane = Pane::Main;
     }
     pub(crate) fn order(&self, rows: &mut [(DirRow, Option<i128>)]) {
-        rows.sort_by(|a, b| {
-            let order = match self.sort {
-                Sort::Size => b.0.t_disk.cmp(&a.0.t_disk),
-                Sort::Reclaim => b.0.t_reclaimable.cmp(&a.0.t_reclaimable),
-                Sort::Files => b.0.t_files.cmp(&a.0.t_files),
-                Sort::Newest => b.0.newest_mtime.cmp(&a.0.newest_mtime),
-                Sort::Growth => b.1.cmp(&a.1),
-                Sort::Name => a.0.name.cmp(&b.0.name),
-            };
-            order.then_with(|| a.0.name.cmp(&b.0.name))
-        });
+        rows.sort_by(|a, b| self.compare(a, b));
+    }
+    pub(crate) fn compare(
+        &self,
+        a: &(DirRow, Option<i128>),
+        b: &(DirRow, Option<i128>),
+    ) -> std::cmp::Ordering {
+        let order = match self.sort {
+            Sort::Size => b.0.t_disk.cmp(&a.0.t_disk),
+            Sort::Reclaim => b.0.t_reclaimable.cmp(&a.0.t_reclaimable),
+            Sort::Files => b.0.t_files.cmp(&a.0.t_files),
+            Sort::Newest => b.0.newest_mtime.cmp(&a.0.newest_mtime),
+            Sort::Growth => b.1.cmp(&a.1),
+            Sort::Name => a.0.name.cmp(&b.0.name),
+        };
+        order.then_with(|| a.0.name.cmp(&b.0.name))
     }
 }
 #[cfg(test)]

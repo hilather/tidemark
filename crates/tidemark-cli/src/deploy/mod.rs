@@ -524,14 +524,12 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
         sys.is_active(UNIT).and_then(|active| {
             if active {
                 Ok(())
+            } else if sys.is_activating(UNIT)? {
+                Err(io::Error::other("service activating, waiting for start"))
+            } else if sys.is_enabled(UNIT)? {
+                Err(io::Error::other(SERVICE_START_HINT))
             } else {
-                if sys.is_activating(UNIT)? {
-                    Err(io::Error::other("service activating, waiting for start"))
-                } else if sys.is_enabled(UNIT)? {
-                    Err(io::Error::other(SERVICE_START_HINT))
-                } else {
-                    Err(io::Error::other("service is not enabled or running"))
-                }
+                Err(io::Error::other("service is not enabled or running"))
             }
         }),
     )];
@@ -543,7 +541,7 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
         items.push(check(
             "service_start",
             CheckStatus::Warn,
-            SERVICE_START_HINT.into(),
+            SERVICE_START_HINT,
         ));
     }
     let expected = staged
@@ -639,7 +637,16 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
         },
         core_details,
     ));
-    items.push(outcome("api", false, api.ping()));
+    let stopped = items.iter().any(|item| item.detail == SERVICE_START_HINT);
+    items.push(outcome(
+        "api",
+        false,
+        if stopped {
+            Err(io::Error::other("service is not running"))
+        } else {
+            api.ping()
+        },
+    ));
     VerifyResult {
         healthy: items.iter().all(|item| item.status == CheckStatus::Pass),
         items,
@@ -882,7 +889,7 @@ impl RealSystemctl {
     fn status(operation: &str, unit: &str) -> io::Result<bool> {
         let status = Self::wait(
             std::process::Command::new("/usr/bin/systemctl").args([operation, "--quiet", unit]),
-            Duration::from_secs(10),
+            Duration::from_secs(3),
         )?;
         match status.code() {
             Some(0) => Ok(true),

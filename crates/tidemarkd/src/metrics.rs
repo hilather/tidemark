@@ -583,7 +583,7 @@ fn render_source(
 pub fn write_textfile(path: &Path, text: &str) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     write_textfile_inner(path, text).map_err(|error| {
-        if error.to_string().starts_with("metrics textfile directory ") {
+        if error.to_string().starts_with("metrics textfile ") {
             error
         } else {
             std::io::Error::new(

@@ -13,6 +13,7 @@ struct FakeSystemctl {
     queries: Cell<usize>,
     enabled: Cell<bool>,
     active: Cell<bool>,
+    activating: Cell<bool>,
     fail_enable: Cell<bool>,
     refuse_stop: Cell<bool>,
     fail_restart: Cell<bool>,
@@ -26,6 +27,9 @@ impl Systemctl for FakeSystemctl {
     fn is_active(&self, _: &str) -> io::Result<bool> {
         self.queries.set(self.queries.get() + 1);
         Ok(self.active.get())
+    }
+    fn is_activating(&self, _: &str) -> io::Result<bool> {
+        Ok(self.activating.get())
     }
     fn enable(&self, _: &str) -> io::Result<()> {
         self.calls.borrow_mut().push("enable".into());
@@ -431,6 +435,7 @@ fn verify_missing_stale_unhealthy_healthy_and_api_failure() {
 fn verify_timeout_is_bounded() {
     let fixture = Fixture::new();
     fixture.stage();
+    fixture.sys.activating.set(true);
     let start = Instant::now();
     let result = verify(
         &fixture.state,
