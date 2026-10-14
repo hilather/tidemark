@@ -272,7 +272,7 @@ fn publish_tick(
         published = requested_windows(config, mount).len();
     }
     let rows = persistence_rows(rows);
-    let dropped = enqueue_persistence(w, writer, &rows);
+    let dropped = enqueue_persistence(w, writer, rows);
     state.publish_component(watcher_component_at(mount, w, dropped, published, at))
 }
 
@@ -607,7 +607,7 @@ fn flush_completed(
                 .flat_map(|m| m.persisted)
                 .collect(),
         );
-        if enqueue_persistence(watcher, writer, &rows) {
+        if enqueue_persistence(watcher, writer, rows) {
             tracing::warn!(mount, "persistence queue rejected retired watcher minutes");
         }
     }
@@ -733,43 +733,47 @@ fn verify_identity(
 // With the existing 64-message writer channel this producer queues <= 4 MiB.
 const PERSISTENCE_MESSAGE_BYTES: usize = 64 * 1024;
 fn enqueue_persistence(
-    watcher: &Watcher,
+    _watcher: &Watcher,
     writer: &super::tswriter::Sender,
-    rows: &[tidemark_core::live::HotMinute],
+    rows: Vec<tidemark_core::live::HotMinute>,
 ) -> bool {
+    // Move the admitted export, including emergency aggregates, instead of
+    // cloning keys against normal admission. Queue ownership has its own fixed
+    // message byte and channel count bounds. Only bounded vector slots are new.
+    let mut rows = rows.into_iter().peekable();
     let mut dropped = false;
-    let mut start = 0;
-    while start < rows.len() {
-        let mut end = start;
+    while rows.peek().is_some() {
+        let mut chunk = Vec::new();
         let mut bytes = 0;
-        while end < rows.len() && end - start < super::tswriter::MAX_BATCH_ROWS {
-            let r = &rows[end];
+        while let Some(row) = rows.peek() {
             let cost = std::mem::size_of::<tidemark_core::live::HotMinute>()
                 + 128
-                + r.key.len()
-                + r.mount.len()
-                + r.scope.len();
-            if cost > PERSISTENCE_MESSAGE_BYTES.saturating_sub(bytes) {
+                + row.key.len()
+                + row.mount.len()
+                + row.scope.len();
+            if cost > PERSISTENCE_MESSAGE_BYTES {
+                rows.next();
+                dropped = true;
+                continue;
+            }
+            if cost > PERSISTENCE_MESSAGE_BYTES.saturating_sub(bytes)
+                || chunk.len() == super::tswriter::MAX_BATCH_ROWS
+            {
                 break;
             }
+            if chunk.try_reserve(1).is_err() {
+                return true;
+            }
             bytes += cost;
-            end += 1;
+            if let Some(row) = rows.next() {
+                chunk.push(row);
+            }
         }
-        if end == start {
-            dropped = true;
-            start += 1;
-            continue;
-        }
-        // The copy is charged through construction/enqueue. Queue ownership is
-        // separately bounded by the byte limit and the existing channel count cap.
-        if let Some(_copy) = watcher.reserve_key_bytes(bytes) {
+        if !chunk.is_empty() {
             dropped |= writer
-                .try_send(super::tswriter::Message::Hot(rows[start..end].to_vec()))
+                .try_send(super::tswriter::Message::Hot(chunk))
                 .is_err();
-        } else {
-            dropped = true;
         }
-        start = end;
     }
     dropped
 }
@@ -814,6 +818,71 @@ mod tests {
         )
     }
 
+    #[test]
+    fn production_tick_moves_emergency_aggregate_through_full_normal_admission() {
+        let cfg = Config::default();
+        let state = LiveState::new(&cfg, 0);
+        let watcher = activity_watcher(b"/data", 0);
+        let mut history = MinuteHistory::for_watcher(watcher.clone());
+        // Reserve all remaining normal capacity while leaving emergency export
+        // headroom available. Binary search handles conservative container charges.
+        let mut low: usize = 0;
+        let mut high = 64 * 1024 * 1024;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if watcher.reserve_key_bytes(middle).is_some() {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        let _full = watcher.reserve_key_bytes(low).unwrap();
+        assert!(watcher.reserve_key_bytes(1).is_none());
+        let (tx, rx) = crossbeam_channel::bounded(64);
+        publish_tick(
+            "/data",
+            &watcher,
+            &mut history,
+            &cfg,
+            &state,
+            &tx,
+            (false, 120),
+        )
+        .unwrap();
+        let rows: Vec<_> = rx
+            .try_iter()
+            .flat_map(|message| match message {
+                super::super::tswriter::Message::Hot(rows) => rows,
+                _ => panic!("wrong message"),
+            })
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bytes_delta, 82);
+        assert_eq!(rows[0].scope, "dir");
+        assert_eq!(rows[0].key, b"/data");
+        assert!(rows[0].lossy);
+        assert!(!state
+            .view_at(120)
+            .status(120)
+            .unwrap()
+            .components
+            .iter()
+            .find(|c| c.name == "watcher:/data")
+            .unwrap()
+            .detail
+            .contains("persistence_dropped=true"));
+        publish_tick(
+            "/data",
+            &watcher,
+            &mut history,
+            &cfg,
+            &state,
+            &tx,
+            (false, 121),
+        )
+        .unwrap();
+        assert!(rx.is_empty());
+    }
     #[test]
     fn reload_membership_preserves_unchanged_watchers_and_flushes_replacements() {
         use tidemark_core::api::{HotBy, HotParams, HotWindow, NowParams};
@@ -1213,7 +1282,7 @@ mod tests {
             })
             .collect();
         let (tx, rx) = crossbeam_channel::bounded(super::super::tswriter::CHANNEL_CAPACITY);
-        assert!(!enqueue_persistence(&watcher, &tx, &rows));
+        assert!(!enqueue_persistence(&watcher, &tx, rows));
         let mut count = 0;
         for message in rx.try_iter() {
             let super::super::tswriter::Message::Hot(rows) = message else {
