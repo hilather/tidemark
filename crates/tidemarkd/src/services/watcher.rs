@@ -815,6 +815,68 @@ fn persistence_rows(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn combined_mount_window_returns_known_rows_and_names_the_incomplete_mount() {
+        use tidemark_core::api::{HotBy, HotParams, HotWindow};
+        let cfg = Config::default();
+        let state = LiveState::new(&cfg, 0);
+        let a = Arc::new(
+            Watcher::from_injected_events_at(
+                RawPath::new(b"/A".to_vec()).unwrap(),
+                -3600,
+                [(
+                    60,
+                    [b"a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                    14,
+                    None,
+                    (1, 1),
+                )],
+            )
+            .unwrap(),
+        );
+        let b = Arc::new(
+            Watcher::from_injected_events_at(RawPath::new(b"/B".to_vec()).unwrap(), 120, [])
+                .unwrap(),
+        );
+        state
+            .publish(
+                Publication::Watcher(("/A".into(), a)),
+                crate::component("watcher:/A", "ok", "test"),
+            )
+            .unwrap();
+        state
+            .publish(
+                Publication::Watcher(("/B".into(), b)),
+                crate::component("watcher:/B", "ok", "test"),
+            )
+            .unwrap();
+        let p = HotParams {
+            mount: None,
+            window: HotWindow::FiveMinutes,
+            by: HotBy::Dir,
+            limit: 1000,
+        };
+        let rows = state.view_at(120).hot(&p).unwrap();
+        assert_eq!(rows[0].bytes_delta, 14);
+        assert!(rows[0].lossy);
+        let empty_a = Arc::new(
+            Watcher::from_injected_events_at(RawPath::new(b"/A".to_vec()).unwrap(), -3600, [])
+                .unwrap(),
+        );
+        state
+            .publish(
+                Publication::Watcher(("/A".into(), empty_a)),
+                crate::component("watcher:/A", "ok", "test"),
+            )
+            .unwrap();
+        assert!(state.view_at(120).hot(&p).is_none());
+        assert_eq!(
+            state.view_at(120).hot_unavailable_detail(&p),
+            "watch history for /B starts at 00:03 UTC; ask for a window of at most 0 minutes"
+        );
+        assert_eq!(state.view_at(3720).hot(&p), Some(Vec::new()));
+    }
+
+    #[test]
     fn rejected_writer_queue_keeps_persistence_drop_signal() {
         let cfg = Config::default();
         let state = LiveState::new(&cfg, 0);

@@ -1215,13 +1215,19 @@ impl LiveStateView {
             HotBy::Comm => tidemark_live::watch::HotScope::Comm,
         };
         let mut rows = Vec::new();
+        let mut incomplete = false;
         for (mount, w) in &self.data.watchers {
             if p.mount.as_ref().is_none_or(|m| m == mount) {
-                let observed = w.hot_at(self.now, minutes, scope, p.limit.min(MAX_INVENTORY));
-                if observed.is_empty() && !w.history_covers_at(self.now, minutes) {
-                    return None;
-                }
-                rows.extend(observed);
+                incomplete |= !w.history_covers_at(self.now, minutes);
+                rows.extend(w.hot_at(self.now, minutes, scope, p.limit.min(MAX_INVENTORY)));
+            }
+        }
+        if incomplete {
+            if rows.is_empty() {
+                return None;
+            }
+            for row in &mut rows {
+                row.lossy = true;
             }
         }
         rows.sort_by(|a, b| b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key)));
@@ -1230,8 +1236,16 @@ impl LiveStateView {
     }
     /// Explain why a hot window cannot be answered before watcher startup.
     pub fn hot_unavailable_detail(&self, p: &HotParams) -> String {
+        let minutes = match p.window {
+            HotWindow::OneMinute => 1,
+            HotWindow::FiveMinutes => 5,
+            HotWindow::FifteenMinutes => 15,
+            HotWindow::SixtyMinutes => 60,
+        };
         for (mount, watcher) in &self.data.watchers {
-            if p.mount.as_ref().is_none_or(|m| m == mount) {
+            if p.mount.as_ref().is_none_or(|m| m == mount)
+                && !watcher.history_covers_at(self.now, minutes)
+            {
                 if let Some(start) = watcher.history_start() {
                     let available = ((self.now.div_euclid(60) * 60 - start) / 60 + 1).clamp(0, 60);
                     return format!("watch history for {mount} starts at {}; ask for a window of at most {available} minutes", watch_start_label(start));
