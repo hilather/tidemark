@@ -50,7 +50,7 @@ fn fault_scripts_are_guarded_and_valid_shell() {
         if path.file_name().unwrap() == "04-compaction-crash.sh" {
             assert!(text.contains("${TIDEMARK_FAULT_SLOW:-0} != 1"));
             assert!(text.contains(
-                "SKIP: 04-compaction-crash.sh needs TIDEMARK_FAULT_SLOW=1 (about 70 minutes)"
+                "SKIP: 04-compaction-crash.sh needs TIDEMARK_FAULT_SLOW=1 (default 4 hourly phases, about 244 minutes / 4 hours)"
             ));
             assert!(text.find("TIDEMARK_FAULT_SLOW").unwrap() < text.find("setup\n").unwrap());
         }
@@ -241,7 +241,7 @@ with tempfile.TemporaryDirectory() as directory:
         path.write_text(json.dumps(data))
         return str(path)
     def run(mode, *args, good=True):
-        result = subprocess.run([sys.executable, helper, mode, *args], capture_output=True, text=True)
+        result = subprocess.run([sys.executable, helper, mode, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         assert (result.returncode == 0) == good, (mode, args, result.stdout, result.stderr)
         return result.stdout
     for mode in ('fd_mount', 'fd_filesystem', 'dfid_name_mount', 'dfid_name_filesystem', 'failed', 'unknown'):
