@@ -420,9 +420,49 @@ impl Browser {
     fn visible(&self) -> Vec<&(DirRow, Option<i128>)> {
         self.rows.iter().collect()
     }
+    fn own_position(&self) -> usize {
+        let mut own = self.dir.clone();
+        own.name = b".".to_vec();
+        own.t_disk = own.own_charged;
+        own.t_files = own.own_files;
+        own.t_reclaimable = 0;
+        own.newest_mtime = i64::MIN;
+        let before = |row: &(DirRow, Option<i128>)| {
+            let mut pair = [row.clone(), (own.clone(), None)];
+            self.state.order(&mut pair);
+            pair[0].0.name != own.name
+        };
+        let position = self.rows.iter().take_while(|row| before(row)).count();
+        let matches = byte_contains(b".", self.state.filter.as_bytes());
+        let in_page = if let Some(cursor) = &self.pages.cursor {
+            if self.pages.reverse {
+                !before(&(cursor.clone(), None)) && (position > 0 || self.rows.len() < PAGE)
+            } else {
+                before(&(cursor.clone(), None))
+                    && (position < self.rows.len() || self.rows.len() < PAGE)
+            }
+        } else {
+            (position > 0 || self.pages.offset == 0)
+                && (position < self.rows.len() || self.rows.len() < PAGE)
+        };
+        if matches && in_page {
+            position
+        } else {
+            usize::MAX
+        }
+    }
+    fn child_at(&self, selected: usize) -> Option<&(DirRow, Option<i128>)> {
+        let own = self.own_position();
+        if selected == own {
+            None
+        } else {
+            self.rows
+                .get(selected - usize::from(selected > own && own != usize::MAX))
+        }
+    }
     fn count(&self) -> usize {
         match self.state.pane {
-            Pane::Main => self.visible().len() + 1,
+            Pane::Main => self.visible().len() + usize::from(self.own_position() != usize::MAX),
             Pane::Links => self.links.len(),
             Pane::Picker => self.snapshots.len(),
             _ => self.text.lines().count(),
@@ -446,7 +486,7 @@ impl Browser {
         self.load()
     }
     fn pane(&mut self, pane: Pane) -> anyhow::Result<()> {
-        let own = self.state.pane == Pane::Main && self.state.selected == self.rows.len();
+        let own = self.state.pane == Pane::Main && self.state.selected == self.own_position();
         self.state.pane = pane;
         self.state.selected = 0;
         self.text.clear();
@@ -490,7 +530,43 @@ impl Browser {
     fn enter(&mut self) -> anyhow::Result<()> {
         match self.state.pane {
             Pane::Main => {
-                if let Some((row, _)) = self.visible().get(self.state.selected).copied() {
+                if self.state.selected == self.own_position() {
+                    let hits = crate::cmd::files::retained_files(
+                        &self.snapshot,
+                        self.dir.id,
+                        &Default::default(),
+                        100,
+                        true,
+                    )?;
+                    let count = hits.len() as u64;
+                    let bytes = hits
+                        .iter()
+                        .fold(0u64, |sum, hit| sum.saturating_add(hit.row.disk));
+                    self.text = hits
+                        .iter()
+                        .map(|hit| {
+                            format!(
+                                "{}  {}  {}  {}\n",
+                                hit.path
+                                    .as_ref()
+                                    .map(|p| p.display_lossy())
+                                    .unwrap_or_else(|| "[unresolved]".into()),
+                                crate::render::size::bytes(hit.row.disk),
+                                crate::render::size::bytes(hit.row.apparent),
+                                crate::render::size::timestamp(hit.row.mtime)
+                            )
+                        })
+                        .collect();
+                    self.text.push_str(&format!(
+                        "{} other files, {} not individually retained",
+                        self.dir.own_files.saturating_sub(count),
+                        crate::render::size::bytes(self.dir.own_charged.saturating_sub(bytes))
+                    ));
+                    self.state.pane = Pane::Files;
+                    self.state.selected = 0;
+                    return Ok(());
+                }
+                if let Some((row, _)) = self.child_at(self.state.selected) {
                     let row = self.snapshot.dir_by_path(&row.path)?;
                     if let Some(row) = row {
                         self.navigate(row)?;

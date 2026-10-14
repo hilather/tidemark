@@ -97,7 +97,7 @@ fn deterministic_render_at_both_sizes() {
     for (width, height) in [(80, 24), (160, 48)] {
         let first = render(&b, width, height);
         assert_eq!(first, render(&b, width, height));
-        assert!(first.contains("[own files]"));
+        assert!(first.contains(if width >= 160 { "./ (files here)" } else { "." }));
         assert!(first.contains("degraded=false"));
         insta::with_settings!({snapshot_path => "snapshots"}, { insta::assert_snapshot!(format!("main_{width}_{height}"),first); });
     }
@@ -337,7 +337,7 @@ fn global_orders_filter_and_boundaries() {
         assert_eq!(ids, (1..=2500).collect::<Vec<_>>());
         b.boundary(true).unwrap();
         assert_eq!(b.rows.last().unwrap().0.id, 2500);
-        assert_eq!(b.state.selected, b.rows.len());
+        assert_eq!(b.state.selected, b.count().saturating_sub(1));
         b.boundary(false).unwrap();
         assert_eq!(b.rows[0].0.id, 1);
     }
@@ -350,7 +350,7 @@ fn global_orders_filter_and_boundaries() {
     b.state.filter = "no such name".into();
     b.boundary(false).unwrap();
     assert!(b.rows.is_empty());
-    assert_eq!(b.count(), 1);
+    assert_eq!(b.count(), 0);
 }
 
 #[test]
@@ -375,11 +375,14 @@ fn own_files_columns_and_info() {
     b.dir.own_charged = 4096;
     b.dir.own_files = 12;
     let output = render(&b, 160, 48);
-    let line = output.lines().find(|l| l.contains("[own files]")).unwrap();
+    let line = output
+        .lines()
+        .find(|l| l.contains("./ (files here)"))
+        .unwrap();
     assert!(line.contains(&crate::render::size::bytes(4096)));
     assert!(line.contains("12"));
     assert_eq!(line.matches('-').count(), 4);
-    b.state.selected = b.rows.len();
+    b.state.selected = b.own_position();
     b.pane(Pane::Info).unwrap();
     assert!(b.text.contains("own files as charged"));
 }
@@ -605,4 +608,80 @@ fn human_header_and_pane_labels_are_lowercase() {
         assert!(text.contains("main | size | filter"), "{text}");
         assert!(!text.contains("Walk") && !text.contains("Main | Size"));
     }
+}
+
+#[test]
+fn own_row_sorts_and_enter_lists_direct_files() {
+    let (_temp, mut b) = browser(3);
+    b.dir.own_charged = 8192;
+    b.dir.own_files = 12;
+    for sort in [state::Sort::Size, state::Sort::Name, state::Sort::Files] {
+        b.state.sort = sort;
+        b.state.order(&mut b.rows);
+        assert_eq!(b.own_position(), 0);
+    }
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    assert_eq!(b.state.pane, Pane::Files);
+    assert!(b
+        .text
+        .contains("12 other files, 8 KiB not individually retained"));
+}
+
+#[test]
+fn direct_retained_files_filter_before_limit_and_show_utc() {
+    let (_temp, mut b) = browser(1);
+    let temp = ::test_support::private_tempdir().unwrap();
+    let mut rows = vec![b.dir.clone(), b.rows[0].0.clone()];
+    rows[0].own_charged = 12288;
+    rows[0].own_files = 3;
+    let meta = fixture::meta(rows[0].path.clone(), 2_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&rows).unwrap();
+    writer
+        .put_files(&[
+            FileRow {
+                id: 0,
+                dir_id: 1,
+                name: Some(RawName::new(b"child".to_vec()).unwrap()),
+                ino: 1,
+                disk: 16384,
+                apparent: 20000,
+                mtime: 0,
+                nlink: 1,
+            },
+            FileRow {
+                id: 1,
+                dir_id: 0,
+                name: Some(RawName::new(b"root".to_vec()).unwrap()),
+                ino: 2,
+                disk: 8192,
+                apparent: 9000,
+                mtime: 0,
+                nlink: 1,
+            },
+        ])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.dir = b.snapshot.root().unwrap();
+    let direct =
+        crate::cmd::files::retained_files(&b.snapshot, 0, &Default::default(), 1, true).unwrap();
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].row.dir_id, 0);
+    assert_eq!(
+        crate::cmd::files::retained_files(&b.snapshot, 0, &Default::default(), 1, false).unwrap()
+            [0]
+        .row
+        .dir_id,
+        1
+    );
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    assert!(b.text.contains("/fixture/root"));
+    assert!(!b.text.contains("child"));
+    assert!(b.text.contains("1970-01-01 00:00:00Z"));
+    assert!(b
+        .text
+        .contains("2 other files, 4 KiB not individually retained"));
 }

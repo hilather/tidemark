@@ -40,7 +40,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
     );
     let items: Vec<ListItem<'_>> = match b.state.pane {
         Pane::Main => {
-            let name_width = usize::from(area.width).saturating_sub(66).max(12);
+            let name_width = usize::from(area.width).saturating_sub(74).max(12);
             let mut lines = Vec::new();
             for (row, delta) in b.visible() {
                 let name = format!(
@@ -56,10 +56,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
                 let share = (u128::from(row.t_charged) * 5 / u128::from(b.dir.t_charged.max(1)))
                     .min(5) as usize;
                 lines.push(ListItem::new(format!(
-                    "{:<name_width$} {:5} {:>7} {:>7} {:>7} {:>6} {:>10} {}",
+                    "{:<name_width$} {:5} {:>7} {:>7} {:>7} {:>7} {:>6} {:>10} {}",
                     table::shorten(&name, name_width),
                     "#".repeat(share),
                     size::bytes(row.t_disk),
+                    size::bytes(row.t_apparent),
                     size::bytes(row.t_reclaimable),
                     size::bytes(row.t_disk.saturating_sub(row.t_reclaimable)),
                     row.t_files,
@@ -71,16 +72,26 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
             }
             let own_share = (u128::from(b.dir.own_charged) * 5 / u128::from(b.dir.t_charged.max(1)))
                 .min(5) as usize;
-            lines.push(ListItem::new(format!(
-                "{:<name_width$} {:5} {:>7} {:>7} {:>7} {:>6} {:>10} -",
-                "[own files]",
-                "#".repeat(own_share),
-                size::bytes(b.dir.own_charged),
-                "-",
-                "-",
-                b.dir.own_files,
-                "-"
-            )));
+            if b.own_position() != usize::MAX {
+                lines.insert(
+                    b.own_position(),
+                    ListItem::new(format!(
+                        "{:<name_width$} {:5} {:>7} {:>7} {:>7} {:>7} {:>6} {:>10} -",
+                        if name_width >= 15 {
+                            "./ (files here)"
+                        } else {
+                            "."
+                        },
+                        "#".repeat(own_share),
+                        size::bytes(b.dir.own_charged),
+                        size::bytes(b.dir.own_apparent),
+                        "-",
+                        "-",
+                        b.dir.own_files,
+                        "-"
+                    )),
+                );
+            }
             lines
         }
         Pane::Picker => b
@@ -105,7 +116,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
         title
     };
     let title = if b.state.pane == Pane::Main {
-        format!("{title} | Name Share SIZE RECLAIM SHARED FILES NEWEST Δ")
+        format!("{title} | Name Share SIZE APPARENT RECLAIM SHARED FILES NEWEST Δ")
     } else {
         title
     };
