@@ -644,3 +644,7 @@ mod tests {
         handle.join().unwrap().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/tscompact/mod.rs"]
+mod compact_tests;
