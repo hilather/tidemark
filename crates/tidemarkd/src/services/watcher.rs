@@ -30,6 +30,7 @@ fn options(config: &Config, path: &std::path::Path) -> Result<WatcherOptions, Da
             .watch
             .exclude_prefixes
             .iter()
+            .filter(|p| p.starts_with(path) || path.starts_with(p))
             .map(|p| raw(p))
             .collect::<Result<_, _>>()?,
         lru_entries: config.watch.lru_entries,
@@ -72,20 +73,15 @@ pub fn start(
                 while !shutdown.load(Ordering::Acquire) {
                     let (config, generation) = state.config();
                     if previous.as_ref() != Some(&config.watch) {
-                        for (mount, watcher) in &watchers {
-                            watcher.shutdown();
-                            state.remove_watcher(mount);
-                        }
-                        if let Some(old) = &previous {
-                            for path in &old.mounts {
-                                state.remove_component(&format!(
-                                    "watcher:{}",
-                                    path.to_string_lossy()
-                                ));
-                            }
-                        }
-                        minutes.clear();
-                        watchers.clear();
+                        reconcile_settings(
+                            previous.as_ref(),
+                            &config.watch,
+                            &state,
+                            &writer,
+                            &mut watchers,
+                            &mut minutes,
+                            crate::unix_now(),
+                        );
                         crate::watch_fd_budget(if config.watch.enabled {
                             config.watch.mounts.len()
                         } else {
@@ -127,6 +123,7 @@ pub fn start(
                             let mount = RawPath::from_path(&change.path)
                                 .map_err(|e| DaemonError::Config(e.to_string()))?
                                 .display_lossy();
+                            flush_completed(&watchers, &mount, &writer, crate::unix_now());
                             retire_watcher(&state, &mut watchers, &mut minutes, &mount);
                         }
                         let namespace = tidemark_live::watch::namespace_ok();
@@ -596,6 +593,86 @@ fn recover_coordinator(
     Ok(())
 }
 
+fn flush_completed(
+    watchers: &BTreeMap<String, Arc<Watcher>>,
+    mount: &str,
+    writer: &super::tswriter::Sender,
+    at: i64,
+) {
+    if let Some(watcher) = watchers.get(mount) {
+        let rows = persistence_rows(
+            watcher
+                .drain_minutes_at(at, 1000)
+                .into_iter()
+                .flat_map(|m| m.persisted)
+                .collect(),
+        );
+        if enqueue_persistence(watcher, writer, &rows) {
+            tracing::warn!(mount, "persistence queue rejected retired watcher minutes");
+        }
+    }
+}
+
+fn relevant_exclusions<'a>(
+    config: &'a tidemark_core::config::WatchConfig,
+    mount: &str,
+) -> BTreeSet<&'a std::path::PathBuf> {
+    let mount = std::path::Path::new(mount);
+    config
+        .exclude_prefixes
+        .iter()
+        .filter(|path| path.starts_with(mount) || mount.starts_with(path))
+        .collect()
+}
+
+pub(crate) fn same_mount_settings(
+    old: &tidemark_core::config::WatchConfig,
+    configured: &tidemark_core::config::WatchConfig,
+    mount: &str,
+) -> bool {
+    old.enabled == configured.enabled
+        && old.events == configured.events
+        && old.hot_depth == configured.hot_depth
+        && old.lru_entries == configured.lru_entries
+        && relevant_exclusions(old, mount) == relevant_exclusions(configured, mount)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_settings(
+    previous: Option<&tidemark_core::config::WatchConfig>,
+    configured: &tidemark_core::config::WatchConfig,
+    state: &LiveState,
+    writer: &super::tswriter::Sender,
+    watchers: &mut BTreeMap<String, Arc<Watcher>>,
+    minutes: &mut BTreeMap<String, MinuteHistory>,
+    at: i64,
+) {
+    let retired: Vec<_> = watchers
+        .keys()
+        .filter(|mount| {
+            !configured.enabled
+                || previous.is_some_and(|old| !same_mount_settings(old, configured, mount))
+                || !configured
+                    .mounts
+                    .iter()
+                    .any(|path| path.to_string_lossy() == mount.as_str())
+        })
+        .cloned()
+        .collect();
+    for mount in retired {
+        flush_completed(watchers, &mount, writer, at);
+        retire_watcher(state, watchers, minutes, &mount);
+        state.remove_component(&format!("watcher:{mount}"));
+    }
+    if let Some(old) = previous {
+        for path in &old.mounts {
+            if !configured.enabled || !configured.mounts.contains(path) {
+                state.remove_component(&format!("watcher:{}", path.to_string_lossy()));
+            }
+        }
+    }
+}
+
 fn retire_watcher(
     state: &LiveState,
     watchers: &mut BTreeMap<String, Arc<Watcher>>,
@@ -712,6 +789,174 @@ fn persistence_rows(
 
 #[cfg(test)]
 mod tests {
+    fn activity_watcher(mount: &[u8], start: i64) -> Arc<Watcher> {
+        Arc::new(
+            Watcher::from_injected_events(
+                RawPath::new(mount.to_vec()).unwrap(),
+                [
+                    (
+                        start,
+                        [b"a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                        0,
+                        None,
+                        (1, 0),
+                    ),
+                    (
+                        start + 60,
+                        [b"a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                        82,
+                        None,
+                        (1, 1),
+                    ),
+                ],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn reload_membership_preserves_unchanged_watchers_and_flushes_replacements() {
+        use tidemark_core::api::{HotBy, HotParams, HotWindow, NowParams};
+        let mut cfg = Config::default();
+        cfg.watch.mounts = vec!["/A".into(), "/C".into()];
+        let state = LiveState::new(&cfg, 0);
+        let a = activity_watcher(b"/A", 0);
+        state
+            .publish(
+                Publication::Watcher(("/A".into(), a.clone())),
+                crate::component("watcher:/A", "ok", "test"),
+            )
+            .unwrap();
+        let mut watchers = BTreeMap::from([("/A".into(), a.clone())]);
+        let mut histories = BTreeMap::from([("/A".into(), MinuteHistory::for_watcher(a.clone()))]);
+        let (tx, rx) = crossbeam_channel::bounded(64);
+        let queries: Vec<_> = [HotBy::Dir, HotBy::Unit, HotBy::Comm]
+            .into_iter()
+            .flat_map(|by| {
+                [
+                    HotWindow::FiveMinutes,
+                    HotWindow::FifteenMinutes,
+                    HotWindow::SixtyMinutes,
+                ]
+                .map(|window| HotParams {
+                    mount: Some("/A".into()),
+                    by,
+                    window,
+                    limit: 1000,
+                })
+            })
+            .collect();
+        let before: Vec<_> = queries.iter().map(|p| state.view_at(120).hot(p)).collect();
+        let old = cfg.watch.clone();
+        cfg.watch.mounts.reverse();
+        state.replace_config(cfg.clone()).unwrap();
+        reconcile_settings(
+            Some(&old),
+            &cfg.watch,
+            &state,
+            &tx,
+            &mut watchers,
+            &mut histories,
+            120,
+        );
+        assert!(Arc::ptr_eq(&watchers["/A"], &a));
+        assert!(rx.is_empty());
+        let old = cfg.watch.clone();
+        cfg.watch.mounts.push("/B".into());
+        cfg.watch.exclude_prefixes.push("/B/cache".into());
+        state.replace_config(cfg.clone()).unwrap();
+        reconcile_settings(
+            Some(&old),
+            &cfg.watch,
+            &state,
+            &tx,
+            &mut watchers,
+            &mut histories,
+            120,
+        );
+        assert!(Arc::ptr_eq(&watchers["/A"], &a));
+        assert_eq!(
+            before,
+            queries
+                .iter()
+                .map(|p| state.view_at(120).hot(p))
+                .collect::<Vec<_>>()
+        );
+        assert!(rx.is_empty());
+        // The mount-identity path flushes before retiring, then starts independent history.
+        flush_completed(&watchers, "/A", &tx, 120);
+        retire_watcher(&state, &mut watchers, &mut histories, "/A");
+        assert_eq!(
+            rx.try_iter()
+                .map(|message| match message {
+                    super::super::tswriter::Message::Hot(rows) => rows.len(),
+                    _ => 0,
+                })
+                .sum::<usize>(),
+            3
+        );
+        let replacement = activity_watcher(b"/A", 120);
+        state
+            .publish(
+                Publication::Watcher(("/A".into(), replacement.clone())),
+                crate::component("watcher:/A", "ok", "test"),
+            )
+            .unwrap();
+        let view = state.view_at(240);
+        for p in &queries {
+            let rows = view.hot(p).unwrap();
+            assert_eq!(rows[0].bytes_delta, 82);
+            assert!(rows[0].lossy);
+        }
+        let report = view
+            .now(
+                &NowParams {
+                    mount: Some("/A".into()),
+                },
+                240,
+            )
+            .unwrap();
+        assert!(report
+            .degraded
+            .iter()
+            .any(|s| s == "watcher /A: history starts at 00:03 UTC"));
+        assert!(!state
+            .view_at(3720)
+            .now(
+                &NowParams {
+                    mount: Some("/A".into())
+                },
+                3720
+            )
+            .unwrap()
+            .degraded
+            .iter()
+            .any(|s| s.contains("history starts")));
+        // A new daemon and a replacement with no rows have the same unavailable semantics.
+        let empty = Arc::new(
+            Watcher::from_injected_events(
+                RawPath::new(b"/A".to_vec()).unwrap(),
+                [(120, [Vec::new(), Vec::new(), Vec::new()], 0, None, (1, 1))],
+            )
+            .unwrap(),
+        );
+        // Query a scope without events by using a zero result limit.
+        state
+            .publish(
+                Publication::Watcher(("/A".into(), empty)),
+                crate::component("watcher:/A", "ok", "test"),
+            )
+            .unwrap();
+        let p = HotParams {
+            limit: 0,
+            ..queries[1].clone()
+        };
+        assert!(state.view_at(120).hot(&p).is_none());
+        assert_eq!(
+            state.view_at(120).hot_unavailable_detail(&p),
+            "watch history for /A starts at 00:03 UTC; ask for a window of at most 0 minutes"
+        );
+    }
     #[test]
     fn delayed_status_after_drain_does_not_rollback_history() {
         use tidemark_live::watch::HotScope;

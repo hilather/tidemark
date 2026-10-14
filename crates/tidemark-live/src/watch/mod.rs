@@ -806,6 +806,16 @@ impl Watcher {
             mount_fd: Mutex::new(Some(mount_fd)),
         })
     }
+    /// First fully observed minute of this watcher identity.
+    pub fn history_start(&self) -> Option<i64> {
+        self.state.lock().rings.history_start()
+    }
+    /// Whether the requested current-minute window predates this watcher.
+    pub fn history_covers_at(&self, at: i64, minutes: u32) -> bool {
+        self.history_start().is_some_and(|start| {
+            at.div_euclid(60) * 60 - i64::from(minutes.clamp(1, 60) - 1) * 60 >= start
+        })
+    }
     /// Return the reporting mode selected by successful marks.
     pub fn mode(&self) -> WatchMode {
         if self.state.lock().failed {
@@ -832,9 +842,18 @@ impl Watcher {
         scope: HotScope,
         limit: usize,
     ) -> Vec<HotEntry> {
+        let at = state.last_at.map_or(at, |last| last.max(at));
         state.observe_time(at);
         state.rings.advance(at);
-        state.rings.hot(at, window_min, scope, limit)
+        let mut rows = state.rings.hot(at, window_min, scope, limit);
+        if state.rings.history_start().is_some_and(|start| {
+            at.div_euclid(60) * 60 - i64::from(window_min.clamp(1, 60) - 1) * 60 < start
+        }) {
+            for row in &mut rows {
+                row.lossy = true;
+            }
+        }
+        rows
     }
     /// Return each retained completed minute once, with at most top_k rows per scope.
     /// Persistence rows share a drain cursor with [`Self::drain_minutes`]: each row

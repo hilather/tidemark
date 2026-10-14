@@ -155,6 +155,7 @@ pub(super) struct Rings {
     pub dropped: u64,
     overflow_total: u64,
     next_minute: Option<i64>,
+    history_start: Option<i64>,
     rollback_until: Option<i64>,
     last_emitted_end: Option<u64>,
     rows_drained_until: Option<i64>,
@@ -214,10 +215,14 @@ impl Rings {
             dropped: 0,
             overflow_total: 0,
             next_minute: None,
+            history_start: None,
             rollback_until: None,
             last_emitted_end: None,
             rows_drained_until: None,
         }
+    }
+    pub fn history_start(&self) -> Option<i64> {
+        self.history_start
     }
     pub fn budget(&self) -> &Budget {
         &self.budget
@@ -261,6 +266,7 @@ impl Rings {
     pub fn advance(&mut self, now: i64) {
         let minute = now.div_euclid(60) * 60;
         self.next_minute.get_or_insert(minute.saturating_add(60));
+        self.history_start.get_or_insert(minute.saturating_add(60));
         // Completed facts and delivery watermarks survive a clock rollback.
         let rollback = self.buckets.back().is_some_and(|b| b.minute > minute);
         if rollback {

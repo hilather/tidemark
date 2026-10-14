@@ -341,11 +341,16 @@ impl LiveState {
                 .chain(&config.watch.mounts)
                 .any(|p| p.to_string_lossy() == m.as_str())
         });
-        if d.config.watch != config.watch {
-            d.windows.clear();
-        } else {
-            d.windows.retain(|(mount, window), _| {
-                config.alerts.rule.iter().any(|r| {
+        let old_watch = d.config.watch.clone();
+        d.windows.retain(|(mount, window), _| {
+            config.watch.enabled
+                && config
+                    .watch
+                    .mounts
+                    .iter()
+                    .any(|p| p.to_string_lossy() == mount.as_str())
+                && crate::services::watcher::same_mount_settings(&old_watch, &config.watch, mount)
+                && config.alerts.rule.iter().any(|r| {
                     r.enabled
                         && r.mount
                             .as_ref()
@@ -355,8 +360,7 @@ impl LiveState {
                             .and_then(|w| humantime::parse_duration(w).ok())
                             == Some(*window)
                 })
-            });
-        }
+        });
         // Failed startup attempts also have components, even without watcher handles.
         let retired: Vec<_> = d
             .components
@@ -888,6 +892,14 @@ pub fn validate_bounds(c: &Config) -> Result<(), crate::DaemonError> {
     check_len(windows.len(), MAX_WINDOWS)?;
     check_len(c.alerts.rule.len(), MAX_INVENTORY)
 }
+fn watch_start_label(start: i64) -> String {
+    format!(
+        "{:02}:{:02} UTC",
+        start.div_euclid(3600).rem_euclid(24),
+        start.div_euclid(60).rem_euclid(60)
+    )
+}
+
 impl LiveStateView {
     /// Timestamp of a supported exact watcher observation usable at this view's clock.
     /// Completed-minute observations remain usable for 0 through 90 seconds inclusive;
@@ -1061,11 +1073,21 @@ impl LiveStateView {
             .map(|(m, w)| {
                 (
                     m.clone(),
-                    w.hot(5, tidemark_live::watch::HotScope::Dir, MAX_INVENTORY),
+                    w.hot_at(now, 5, tidemark_live::watch::HotScope::Dir, MAX_INVENTORY),
                 )
             })
             .collect();
         let mut degraded = v.data.degraded.clone();
+        for (mount, watcher) in &v.data.watchers {
+            if p.mount.as_ref().is_none_or(|m| m == mount) && !watcher.history_covers_at(now, 60) {
+                if let Some(start) = watcher.history_start() {
+                    degraded.push(format!(
+                        "watcher {mount}: history starts at {}",
+                        watch_start_label(start)
+                    ));
+                }
+            }
+        }
         for (mount, identity) in &v.data.presence {
             if identity.is_none() && p.mount.as_ref().is_none_or(|m| m == mount) {
                 degraded.push(format!("mount not present: {mount}"));
@@ -1109,7 +1131,7 @@ impl LiveStateView {
                     .map(|(m, w)| {
                         (
                             m.clone(),
-                            w.hot(5, tidemark_live::watch::HotScope::Unit, MAX_INVENTORY),
+                            w.hot_at(now, 5, tidemark_live::watch::HotScope::Unit, MAX_INVENTORY),
                         )
                     })
                     .collect(),
@@ -1195,12 +1217,28 @@ impl LiveStateView {
         let mut rows = Vec::new();
         for (mount, w) in &self.data.watchers {
             if p.mount.as_ref().is_none_or(|m| m == mount) {
-                rows.extend(w.hot(minutes, scope, p.limit.min(MAX_INVENTORY)));
+                let observed = w.hot_at(self.now, minutes, scope, p.limit.min(MAX_INVENTORY));
+                if observed.is_empty() && !w.history_covers_at(self.now, minutes) {
+                    return None;
+                }
+                rows.extend(observed);
             }
         }
         rows.sort_by(|a, b| b.bytes_delta.cmp(&a.bytes_delta).then(a.key.cmp(&b.key)));
         rows.truncate(p.limit.min(MAX_INVENTORY));
         Some(rows)
+    }
+    /// Explain why a hot window cannot be answered before watcher startup.
+    pub fn hot_unavailable_detail(&self, p: &HotParams) -> String {
+        for (mount, watcher) in &self.data.watchers {
+            if p.mount.as_ref().is_none_or(|m| m == mount) {
+                if let Some(start) = watcher.history_start() {
+                    let available = ((self.now.div_euclid(60) * 60 - start) / 60 + 1).clamp(0, 60);
+                    return format!("watch history for {mount} starts at {}; ask for a window of at most {available} minutes", watch_start_label(start));
+                }
+            }
+        }
+        "measurement unavailable".into()
     }
     /// Latest report, preserving measured-empty LVM inventory.
     pub fn lvm_report(&self, p: &LvmParams) -> Option<LvmResult> {
