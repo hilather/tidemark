@@ -32,3 +32,14 @@ No manifest, dependency or module declaration changes. `.gitignore` adds only `.
 ## Validation
 
 All Cargo validation uses the pinned 1.98.0 toolchain, offline mode, and a temporary copy of the host Cargo registry (`CARGO_HOME=/tmp/rc-cargo`), following W0-A's cache approach. Long commands use `timeout 1500`. Full transcripts are in the attempt output `library/`; final results will be recorded below before submission. No privileged operations or VM commands were run; VM behavior remains pending guest confirmation.
+
+### Final standalone checks observed
+
+| Command (offline environment, timeout 1500) | Observed result |
+| --- | --- |
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | final rerun exit 0; initial run found an unused test seam, fixed by exercising it in the unit target |
+| `cargo test --workspace --no-fail-fast` | exit 101; sole failing target `tidemarkd --test w6a2s`, sole failing test `retired_watcher_components_and_errors_release_capacity` at line 447 (`left: 2`, `right: 1`), the pre-existing failure identified by the task |
+| `cargo build --workspace --features privileged --tests` | exit 0; compile only, no privileged tests executed |
+
+All added regression cases also passed in the full workspace run. This attempt leaves the pre-existing watcher test and all source paths owned by other tasks untouched. CI completion and clean-tree confirmation are recorded in the final addendum below.
