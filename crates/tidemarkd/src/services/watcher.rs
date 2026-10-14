@@ -583,6 +583,11 @@ impl MinuteHistory {
     }
 }
 fn requested_windows(config: &Config, mount: &str) -> BTreeSet<usize> {
+    let raw = config
+        .watch
+        .mounts
+        .iter()
+        .find(|path| RawPath::from_path(path).is_ok_and(|p| p.display_lossy() == mount));
     config
         .alerts
         .rule
@@ -590,9 +595,7 @@ fn requested_windows(config: &Config, mount: &str) -> BTreeSet<usize> {
         .filter(|r| {
             r.enabled
                 && matches!(r.kind, AlertKind::HotDirGrowth | AlertKind::WatchLossy)
-                && r.mount
-                    .as_ref()
-                    .is_some_and(|p| p.to_string_lossy() == mount)
+                && r.mount.as_ref().is_some_and(|p| Some(p) == raw)
         })
         .filter_map(|r| humantime::parse_duration(r.window.as_deref()?).ok())
         .filter(|w| super::alerts::minute_window(*w))
@@ -636,9 +639,8 @@ fn flush_completed(
 
 fn relevant_exclusions<'a>(
     config: &'a tidemark_core::config::WatchConfig,
-    mount: &str,
+    mount: &std::path::Path,
 ) -> BTreeSet<&'a std::path::PathBuf> {
-    let mount = std::path::Path::new(mount);
     config
         .exclude_prefixes
         .iter()
@@ -649,7 +651,7 @@ fn relevant_exclusions<'a>(
 pub(crate) fn same_mount_settings(
     old: &tidemark_core::config::WatchConfig,
     configured: &tidemark_core::config::WatchConfig,
-    mount: &str,
+    mount: &std::path::Path,
 ) -> bool {
     old.enabled == configured.enabled
         && old.events == configured.events
@@ -669,16 +671,14 @@ fn reconcile_settings(
     at: i64,
 ) {
     let retired: Vec<_> = watchers
-        .keys()
-        .filter(|mount| {
+        .iter()
+        .filter(|(_, watcher)| {
+            let mount = watcher.mount_path().as_path();
             !configured.enabled
                 || previous.is_some_and(|old| !same_mount_settings(old, configured, mount))
-                || !configured
-                    .mounts
-                    .iter()
-                    .any(|path| path.to_string_lossy() == mount.as_str())
+                || !configured.mounts.iter().any(|path| path == mount)
         })
-        .cloned()
+        .map(|(label, _)| label.clone())
         .collect();
     for mount in retired {
         flush_completed(watchers, &mount, writer, at);
@@ -688,7 +688,9 @@ fn reconcile_settings(
     if let Some(old) = previous {
         for path in &old.mounts {
             if !configured.enabled || !configured.mounts.contains(path) {
-                state.remove_component(&format!("watcher:{}", path.to_string_lossy()));
+                if let Ok(raw) = RawPath::from_path(path) {
+                    state.remove_component(&format!("watcher:{}", raw.display_lossy()));
+                }
             }
         }
     }
@@ -1028,6 +1030,96 @@ mod tests {
         )
         .unwrap();
         assert!(rx.is_empty());
+    }
+    #[test]
+    fn reload_preserves_raw_mount_history_and_windows() {
+        use tidemark_core::api::{HotBy, HotParams, HotWindow};
+        for bytes in [b"/data\\archive".as_slice(), b"/data\narchive".as_slice()] {
+            let raw = RawPath::new(bytes.to_vec()).unwrap();
+            let path = raw.as_path().to_path_buf();
+            let label = raw.display_lossy();
+            let mut cfg = Config::default();
+            cfg.watch.mounts = vec![path.clone(), "/other".into()];
+            let mut alert = rule(AlertKind::HotDirGrowth, "1m");
+            alert.mount = Some(path.clone());
+            cfg.alerts.rule = vec![alert];
+            let state = LiveState::new(&cfg, 0);
+            let watcher = activity_watcher(bytes, 0);
+            state
+                .publish(
+                    Publication::Watcher((label.clone(), watcher.clone())),
+                    crate::component(&format!("watcher:{label}"), "ok", "test"),
+                )
+                .unwrap();
+            let mut history = MinuteHistory::for_watcher(watcher.clone());
+            for minute in watcher.drain_minutes_at(120, 1000) {
+                history.push(minute);
+            }
+            assert!(!history.0.is_empty());
+            assert_eq!(history.publish(&label, &cfg, &state).unwrap(), 1);
+            let mut histories = BTreeMap::from([(label.clone(), history)]);
+            let mut watchers = BTreeMap::from([(label.clone(), watcher.clone())]);
+            let (tx, _) = crossbeam_channel::bounded(64);
+            let p = HotParams {
+                mount: Some(label.clone()),
+                by: HotBy::Dir,
+                window: HotWindow::FiveMinutes,
+                limit: 1000,
+            };
+            let before = state.view_at(120).hot(&p).unwrap();
+            let history_before = histories[&label].0.back().unwrap().dirs.clone();
+            for extend in [false, true] {
+                let old = cfg.watch.clone();
+                if extend {
+                    cfg.watch.mounts.push("/new".into());
+                    cfg.watch.exclude_prefixes.push("/new/cache".into());
+                } else {
+                    cfg.watch.mounts.reverse();
+                }
+                state.replace_config(cfg.clone()).unwrap();
+                reconcile_settings(
+                    Some(&old),
+                    &cfg.watch,
+                    &state,
+                    &tx,
+                    &mut watchers,
+                    &mut histories,
+                    120,
+                );
+                assert!(Arc::ptr_eq(&watchers[&label], &watcher));
+                assert_eq!(state.view_at(120).hot(&p).unwrap(), before);
+                assert_eq!(histories[&label].0.back().unwrap().dirs, history_before);
+                assert_eq!(
+                    state
+                        .view_at(120)
+                        .watch_window_at(&label, Duration::from_secs(60)),
+                    Some(120)
+                );
+            }
+            let old = cfg.watch.clone();
+            cfg.watch.exclude_prefixes.push(path.join("cache"));
+            let held = state.view_at(120);
+            state.replace_config(cfg.clone()).unwrap();
+            reconcile_settings(
+                Some(&old),
+                &cfg.watch,
+                &state,
+                &tx,
+                &mut watchers,
+                &mut histories,
+                120,
+            );
+            assert!(watchers.is_empty());
+            assert!(histories.is_empty());
+            assert_eq!(watcher.retired_at(), Some(120));
+            assert!(held.hot(&p).is_none());
+            assert_eq!(
+                state
+                    .view_at(120)
+                    .watch_window_at(&label, Duration::from_secs(60)),
+                None
+            );
+        }
     }
     #[test]
     fn held_mature_view_is_unavailable_after_retirement() {

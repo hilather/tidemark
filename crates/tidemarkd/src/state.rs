@@ -342,19 +342,21 @@ impl LiveState {
                 .any(|p| p.to_string_lossy() == m.as_str())
         });
         let old_watch = d.config.watch.clone();
+        // Map presentation keys back to their configured raw identity once.
         d.windows.retain(|(mount, window), _| {
+            let Some(raw) = old_watch
+                .mounts
+                .iter()
+                .find(|path| RawPath::from_path(path).is_ok_and(|p| p.display_lossy() == *mount))
+            else {
+                return false;
+            };
             config.watch.enabled
-                && config
-                    .watch
-                    .mounts
-                    .iter()
-                    .any(|p| p.to_string_lossy() == mount.as_str())
-                && crate::services::watcher::same_mount_settings(&old_watch, &config.watch, mount)
+                && config.watch.mounts.iter().any(|p| p == raw)
+                && crate::services::watcher::same_mount_settings(&old_watch, &config.watch, raw)
                 && config.alerts.rule.iter().any(|r| {
                     r.enabled
-                        && r.mount
-                            .as_ref()
-                            .is_some_and(|p| p.to_string_lossy() == mount.as_str())
+                        && r.mount.as_ref().is_some_and(|p| p == raw)
                         && r.window
                             .as_deref()
                             .and_then(|w| humantime::parse_duration(w).ok())
@@ -367,11 +369,9 @@ impl LiveState {
             .keys()
             .filter(|name| {
                 name.strip_prefix("watcher:").is_some_and(|mount| {
-                    !config
-                        .watch
-                        .mounts
-                        .iter()
-                        .any(|p| p.to_string_lossy() == mount)
+                    !config.watch.mounts.iter().any(|p| {
+                        RawPath::from_path(p).is_ok_and(|raw| raw.display_lossy() == mount)
+                    })
                 })
             })
             .cloned()
