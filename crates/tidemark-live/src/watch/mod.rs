@@ -309,6 +309,7 @@ impl ReopenErrors {
         self.warned |= warn;
         warn
     }
+    #[cfg(test)]
     fn detail(&self) -> String {
         self.recent
             .iter()
@@ -498,6 +499,14 @@ impl Watcher {
             mount,
             mount_fd: Mutex::new(None),
         })
+    }
+    /// Mark an injected event's missing directory attribution for service tests.
+    #[doc(hidden)]
+    pub fn inject_mapping_failure_at(&self, at: i64, errno: Option<i32>) {
+        let mut state = self.state.lock();
+        state.observe_time(at);
+        state.rings.unmapped(at, errno);
+        state.unmapped_events = state.unmapped_events.saturating_add(1);
     }
     /// Fanotify-free lifecycle seam: an eventfd stands in for the owned group.
     /// Records worker stop and group close in order, using the production shutdown path.
@@ -808,7 +817,21 @@ impl Watcher {
     /// Sum the most recent 1–60 minute buckets and return ranked entries.
     pub fn hot(&self, window_min: u32, scope: HotScope, limit: usize) -> Vec<HotEntry> {
         let mut state = self.state.lock();
-        let at = now();
+        self.hot_at_locked(&mut state, now(), window_min, scope, limit)
+    }
+    /// Inject a query clock for deterministic service regressions.
+    #[doc(hidden)]
+    pub fn hot_at(&self, at: i64, window_min: u32, scope: HotScope, limit: usize) -> Vec<HotEntry> {
+        self.hot_at_locked(&mut self.state.lock(), at, window_min, scope, limit)
+    }
+    fn hot_at_locked(
+        &self,
+        state: &mut State,
+        at: i64,
+        window_min: u32,
+        scope: HotScope,
+        limit: usize,
+    ) -> Vec<HotEntry> {
         state.observe_time(at);
         state.rings.advance(at);
         state.rings.hot(at, window_min, scope, limit)
@@ -833,11 +856,13 @@ impl Watcher {
     /// Recovery, overflow, rollback and cut lists make hot data unavailable (lossy).
     /// Persistence rows share a cursor with [`Self::drain_completed_minutes`]; a row
     /// is handed out once through whichever method drains its minute first. The
-    /// minute facts remain available after the legacy row drain; its key maps are released.
+    /// minute facts and admitted query rows remain available until their buckets expire.
     pub fn drain_minutes(&self, top_k: usize) -> Vec<CompletedMinute> {
         self.drain_minutes_at(now(), top_k)
     }
-    fn drain_minutes_at(&self, at: i64, top_k: usize) -> Vec<CompletedMinute> {
+    /// Inject a completed-minute delivery clock for deterministic service regressions.
+    #[doc(hidden)]
+    pub fn drain_minutes_at(&self, at: i64, top_k: usize) -> Vec<CompletedMinute> {
         let mut state = self.state.lock();
         state.observe_time(at);
         if state.failed || state.recovering {
@@ -934,7 +959,7 @@ impl Watcher {
         state.dirty_bytes -= removed;
         state.rings.budget().release(removed);
         let root_copy = if ancestor || lost {
-            budget::Reservation::new(state.rings.budget(), under.as_bytes().len())
+            budget::Reservation::emergency_payload(state.rings.budget(), under.as_bytes().len())
         } else {
             None
         };
@@ -1034,29 +1059,24 @@ impl Watcher {
         self.state.lock().rings.budget().used()
     }
     /// Explain caps and loss in the retained fifteen-minute history.
-    /// Reports at most eight ring causes with their latest affected UTC minute,
-    /// plus counts for the four most recent distinct handle-reopen errors.
-    /// Truncation diagnostics do not change legacy lossy flags or alert availability.
+    /// Reports one latest occurrence per bounded cause; mapping failures expire
+    /// with the minute and make directory alert windows unavailable.
     pub fn health_detail(&self) -> String {
-        let state = self.state.lock();
-        let mut detail = state.rings.detail(now());
-        if state.reopen_errors.recent[0].is_some() {
-            if !detail.is_empty() {
-                detail.push_str("; ");
-            }
-            detail.push_str(&format!(
-                "unmapped_events={} (reopen failed: {})",
-                state.unmapped_events,
-                state.reopen_errors.detail()
-            ));
-        }
-        detail
+        self.health_detail_at(now())
     }
+    /// Inject a diagnostic clock for deterministic service regressions.
+    #[doc(hidden)]
+    pub fn health_detail_at(&self, at: i64) -> String {
+        self.state.lock().rings.detail(at)
+    }
+
     /// Read counters and the loss indicator for the latest fifteen minute buckets.
     pub fn stats(&self) -> WatchStats {
         self.stats_at(now())
     }
-    fn stats_at(&self, at: i64) -> WatchStats {
+    /// Inject a status clock for deterministic service regressions.
+    #[doc(hidden)]
+    pub fn stats_at(&self, at: i64) -> WatchStats {
         let mut state = self.state.lock();
         state.observe_time(at);
         if state.failed || state.recovering {
@@ -1239,8 +1259,10 @@ struct Processor<'a> {
     handles: fidmode::HandlePaths,
 }
 impl Processor<'_> {
-    fn unmapped_path(&self, state: &Mutex<State>) -> RawPath {
+    fn unmapped_path(&self, at: i64, errno: Option<i32>, state: &Mutex<State>) -> RawPath {
         let mut locked = state.lock();
+        locked.observe_time(at);
+        locked.rings.unmapped(at, errno);
         locked.unmapped_events = locked.unmapped_events.saturating_add(1);
         self.cfg.mount.clone()
     }
@@ -1321,6 +1343,7 @@ impl Processor<'_> {
                 let event_mount = self
                     .filesystem_mount
                     .and_then(|_| identify(&mut self.event_handle, fd.as_fd()).ok());
+                let mut mapping_errno = None;
                 let reopened = if self
                     .filesystem_mount
                     .is_some_and(|watched| event_mount.is_some_and(|id| id != watched))
@@ -1328,6 +1351,7 @@ impl Processor<'_> {
                     match reopen(&mut self.event_handle, mount_fd) {
                         Ok(fd) => Some(fd),
                         Err(error) => {
+                            mapping_errno = error.raw_os_error();
                             let warn = state.lock().reopen_errors.record(&error);
                             if warn {
                                 tracing::warn!(mount = %self.cfg.mount.display_lossy(), %error, "event handle reopen failed");
@@ -1350,7 +1374,7 @@ impl Processor<'_> {
                         if fdmode::mapped_path(event_mount, watched, &p, host_path, &self.cfg.mount)
                             .is_none()
                         {
-                            p = self.unmapped_path(state);
+                            p = self.unmapped_path(at, mapping_errno, state);
                         }
                     }
                     (pid, p, Some(s), created)
@@ -1747,9 +1771,14 @@ mod tests {
         };
         let attribution = AttributionCache::new(std::time::Duration::from_secs(60), 10);
         let mount = std::fs::File::open(temp.path()).unwrap();
-        for success in [false, true] {
+        for (success, errno, provenance) in [
+            (false, 9, true),
+            (false, 116, true),
+            (false, 0, false),
+            (true, 0, true),
+        ] {
             let watcher = Watcher::from_injected_events(cfg.mount.clone(), []).unwrap();
-            let at = now();
+            let at = now().div_euclid(60) * 60 + 60;
             let mut processor = Processor {
                 filesystem_mount: Some(1),
                 event_handle: Default::default(),
@@ -1757,7 +1786,7 @@ mod tests {
                 cfg: &cfg,
                 attribution: &attribution,
                 mount_fd: mount.as_fd(),
-                sizes: fdmode::Sizes::new(10, at),
+                sizes: fdmode::Sizes::new(10, at - 120),
                 paths: fidmode::PathSizes::new(10),
                 handles: fidmode::HandlePaths::new(10),
             };
@@ -1769,30 +1798,57 @@ mod tests {
                 },
                 at,
                 &watcher.state,
-                |_, _| Ok(2),
                 |_, _| {
-                    if success {
-                        Ok(std::fs::File::open(&path).unwrap().into())
+                    if provenance {
+                        Ok(2)
                     } else {
                         Err(io::Error::from_raw_os_error(9))
                     }
                 },
+                |_, _| {
+                    if success {
+                        Ok(std::fs::File::open(&path).unwrap().into())
+                    } else {
+                        Err(io::Error::from_raw_os_error(errno))
+                    }
+                },
             );
-            assert_eq!(watcher.stats().events_total, 1);
+            assert_eq!(watcher.stats_at(at).events_total, 1);
             assert_eq!(watcher.unmapped_events(), u64::from(!success));
-            let detail = watcher.health_detail();
+            let detail = watcher.health_detail_at(at);
             assert_eq!(
-                detail.contains("unmapped_events=1 (reopen failed: EBADF count=1)"),
-                !success
+                detail.contains("unmapped events: 1 (reopen failed:"),
+                !success && provenance
             );
-            let rows = watcher.hot(1, HotScope::Dir, 10);
+            assert_eq!(watcher.stats_at(at).lossy_minutes_15m, u32::from(!success));
+            if !provenance {
+                assert!(detail.contains("no provenance"));
+            }
+            let rows = watcher.hot_at(at, 1, HotScope::Dir, 10);
             assert_eq!(rows.len(), 1);
+            let bytes = rustix::fs::fstat(std::fs::File::open(&path).unwrap().as_fd())
+                .unwrap()
+                .st_blocks
+                * 512;
+            assert_eq!((rows[0].events, rows[0].bytes_delta), (1, bytes));
             let expected = if success {
                 RawPath::from_path(&temp.path().join("directory")).unwrap()
             } else {
                 cfg.mount.clone()
             };
             assert_eq!(rows[0].key.as_slice(), expected.as_bytes());
+            let end = at.div_euclid(60) * 60;
+            let minutes = watcher.drain_minutes_at(end + 120, 1000);
+            assert_eq!(rows[0].lossy, !success);
+            assert_eq!(minutes[0].lossy, !success);
+            assert_eq!(minutes[0].truncated, !success);
+            assert!(minutes[0]
+                .persisted
+                .iter()
+                .all(|row| row.lossy == !success && row.events == 1 && row.bytes_delta == bytes));
+            assert_eq!(watcher.stats_at(end + 15 * 60).lossy_minutes_15m, 0);
+            assert!(watcher.state.lock().rings.detail(end + 15 * 60).is_empty());
+            assert_eq!(watcher.unmapped_events(), u64::from(!success));
         }
     }
     #[test]
@@ -1824,7 +1880,7 @@ mod tests {
         };
         let file = std::fs::File::open(path).unwrap();
         let stat = fdmode::EventStat::from(rustix::fs::fstat(file.as_fd()).unwrap());
-        let fallback = processor.unmapped_path(&watcher.state);
+        let fallback = processor.unmapped_path(at, None, &watcher.state);
         processor.record(
             (0, fallback, Some(stat), at),
             mask::CLOSE_WRITE,
@@ -1951,12 +2007,8 @@ mod tests {
             let minutes = watcher.drain_minutes_at(180, 1000);
             assert_eq!(minutes.len(), 2);
             assert_eq!(minutes[0].started_at, 60);
-            if legacy_first {
-                assert!(minutes[0].dirs.is_empty());
-            } else {
-                assert_eq!(minutes[0].dirs[0].bytes_delta, 2);
-                assert_eq!(minutes[0].dirs[0].top_unit.as_deref(), Some("u"));
-            }
+            assert_eq!(minutes[0].dirs[0].bytes_delta, 2);
+            assert_eq!(minutes[0].dirs[0].top_unit.as_deref(), Some("u"));
             assert_eq!(minutes[0].persisted.len(), if legacy_first { 0 } else { 3 });
             assert!(minutes[1].dirs.is_empty() && minutes[1].persisted.is_empty());
             assert!(!minutes[1].lossy);

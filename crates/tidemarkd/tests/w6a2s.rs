@@ -668,3 +668,91 @@ fn retired_watcher_transport_stops_while_an_old_state_view_is_held() {
     drop(old_view);
     assert!(weak.upgrade().is_none());
 }
+
+#[cfg(feature = "privileged")]
+#[test]
+fn daemon_sigterm_releases_loop_xfs_for_ordinary_unmount() {
+    use std::process::{Child, Command, Stdio};
+    if !rustix::process::geteuid().is_root()
+        || std::env::var("TIDEMARK_DEPLOY_TEST_VM").as_deref() != Ok("1")
+    {
+        eprintln!("SKIP daemon_sigterm_releases_loop_xfs: requires root and TIDEMARK_DEPLOY_TEST_VM=1 in a disposable guest");
+        return;
+    }
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut fs = test_support::xfs::LoopXfs::new(512 * 1024 * 1024, &[], "");
+    let (dir, _) = config();
+    let path = dir.path().join("daemon.toml");
+    let log = dir.path().join("daemon.log");
+    std::fs::write(&path, format!(
+        "[general]\nstate_dir='{}'\nsocket='{}'\n[sampler]\nmounts=['{}']\ninterval='1h'\n[lvm]\nenabled=false\n[watch]\nenabled=true\nmounts=['{}']\n[procscan]\nenabled=false\n[metrics]\ntextfile='{}'\n[[roots]]\npath='{}'\nschedule='off'\n",
+        dir.path().join("state").display(), dir.path().join("api.sock").display(),
+        fs.mountpoint.display(), fs.mountpoint.display(), dir.path().join("metrics.prom").display(),
+        fs.mountpoint.display())).unwrap();
+    let mut child = ChildGuard(
+        Command::new(assert_cmd::cargo::cargo_bin!("tidemarkd"))
+            .arg("--config")
+            .arg(&path)
+            .env("RUST_LOG", "info")
+            .env_remove("NOTIFY_SOCKET")
+            .env_remove("INVOCATION_ID")
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mode = loop {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "daemon exited before watch started"
+        );
+        let text = std::fs::read_to_string(&log).unwrap();
+        if text.contains("daemon ready") {
+            if let Some(line) = text
+                .lines()
+                .find(|line| line.contains("watcher started: mount"))
+            {
+                break line.to_owned();
+            }
+        }
+        assert!(Instant::now() < deadline, "watch startup deadline: {text}");
+        std::thread::park_timeout(Duration::from_millis(50));
+    };
+    eprintln!("guest watcher mode: {mode}");
+    // This is a separate process: its state view cannot be held by this harness.
+    // The retained-view lifecycle is covered by the service-level regression above.
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(child.0.id() as i32).unwrap(),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(exit) = child.0.try_wait().unwrap() {
+            assert!(exit.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "SIGTERM exit exceeded ten seconds"
+        );
+        std::thread::park_timeout(Duration::from_millis(20));
+    }
+    // Fixture cleanup uses ordinary umount, then detaches its owned loop device.
+    // Bound completion from the parent so a busy mount cannot silently pass.
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let cleanup = std::thread::spawn(move || {
+        let _ = tx.send(fs.cleanup());
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("ordinary unmount exceeded ten seconds")
+        .expect("ordinary unmount failed after daemon SIGTERM");
+    cleanup.join().unwrap();
+}

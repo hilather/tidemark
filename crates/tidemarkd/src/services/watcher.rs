@@ -216,24 +216,15 @@ pub fn start(
                         let history = minutes
                             .entry(mount.clone())
                             .or_insert_with(|| MinuteHistory::for_watcher(w.clone()));
-                        let mut published = 0;
-                        let mut rows = Vec::new();
-                        for mut minute in w.drain_minutes(1000) {
-                            rows.append(&mut minute.persisted);
-                            history.push(minute);
-                            published = history.publish(mount, &config, &state)?;
-                        }
-                        if previous_rules != config.alerts.rule {
-                            published = history.publish(mount, &config, &state)?;
-                        }
-                        if published == 0 && !history.0.is_empty() {
-                            published = requested_windows(&config, mount).len();
-                        }
-                        let mut dropped = false;
-                        // Persist top 50 for each minute/scope, retaining the collector's rank.
-                        let rows = persistence_rows(rows);
-                        dropped |= enqueue_persistence(w, &writer, &rows);
-                        state.publish_component(watcher_component(mount, w, dropped, published))?;
+                        publish_tick(
+                            mount,
+                            w,
+                            history,
+                            &config,
+                            &state,
+                            &writer,
+                            (previous_rules != config.alerts.rule, crate::unix_now()),
+                        )?;
                     }
                     previous_rules = config.alerts.rule.clone();
                     crate::wait_service(&state, generation, &shutdown, Duration::from_secs(1));
@@ -260,13 +251,52 @@ pub fn start(
         })
 }
 
+fn publish_tick(
+    mount: &str,
+    w: &Watcher,
+    history: &mut MinuteHistory,
+    config: &Config,
+    state: &LiveState,
+    writer: &super::tswriter::Sender,
+    tick: (bool, i64),
+) -> Result<(), DaemonError> {
+    let (rules_changed, at) = tick;
+    let mut published = 0;
+    let mut rows = Vec::new();
+    for mut minute in w.drain_minutes_at(at, 1000) {
+        rows.append(&mut minute.persisted);
+        history.push(minute);
+        published = history.publish(mount, config, state)?;
+    }
+    if rules_changed {
+        published = history.publish(mount, config, state)?;
+    }
+    if published == 0 && !history.0.is_empty() {
+        published = requested_windows(config, mount).len();
+    }
+    let rows = persistence_rows(rows);
+    let dropped = enqueue_persistence(w, writer, &rows);
+    state.publish_component(watcher_component_at(mount, w, dropped, published, at))
+}
+
+#[cfg(test)]
 fn watcher_component(
     mount: &str,
     watcher: &Watcher,
     dropped: bool,
     published: usize,
 ) -> tidemark_core::api::ComponentState {
-    let stats = watcher.stats();
+    watcher_component_at(mount, watcher, dropped, published, crate::unix_now())
+}
+
+fn watcher_component_at(
+    mount: &str,
+    watcher: &Watcher,
+    dropped: bool,
+    published: usize,
+    at: i64,
+) -> tidemark_core::api::ComponentState {
+    let stats = watcher.stats_at(at);
     let health = if stats.mode == WatchMode::Failed {
         "failed"
     } else if stats.recovering || dropped || stats.lossy_minutes_15m > 0 {
@@ -275,7 +305,7 @@ fn watcher_component(
         "ok"
     };
     let mut detail = format!("mode={} recovering={} overflows_total={} read_errors={} persistence_dropped={dropped}; windows: {published} published", stats.mode, stats.recovering, stats.overflows_total, stats.read_errors);
-    let reasons = watcher.health_detail();
+    let reasons = watcher.health_detail_at(at);
     if !reasons.is_empty() {
         detail.push_str("; ");
         detail.push_str(&reasons);
@@ -682,6 +712,92 @@ fn persistence_rows(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn second_ticks_keep_live_history_and_mapping_loss_expires() {
+        use tidemark_live::{alerts::AlertSource, watch::HotScope};
+        for errno in [None, Some(9), Some(116)] {
+            let mut cfg = Config::default();
+            cfg.alerts.rule = vec![rule(AlertKind::HotDirGrowth, "1m")];
+            let state = LiveState::new(&cfg, 0);
+            let w = Arc::new(
+                Watcher::from_injected_events(
+                    RawPath::new(b"/data".to_vec()).unwrap(),
+                    [
+                        (
+                            0,
+                            [b"/data/a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                            11,
+                            None,
+                            (1, 1),
+                        ),
+                        (
+                            60,
+                            [b"/data/a".to_vec(), b"u".to_vec(), b"c".to_vec()],
+                            71,
+                            None,
+                            (1, 2),
+                        ),
+                    ],
+                )
+                .unwrap(),
+            );
+            let mut history = MinuteHistory::for_watcher(w.clone());
+            let (tx, rx) = crossbeam_channel::bounded(64);
+            for at in 60..120 {
+                publish_tick("/data", &w, &mut history, &cfg, &state, &tx, (false, at)).unwrap();
+            }
+            let before = w.hot_at(120, 5, HotScope::Dir, 1000);
+            publish_tick("/data", &w, &mut history, &cfg, &state, &tx, (false, 120)).unwrap();
+            for scope in [HotScope::Dir, HotScope::Unit, HotScope::Comm] {
+                for window in [5, 15, 60] {
+                    assert_eq!(w.hot_at(120, window, scope, 1000)[0].bytes_delta, 82);
+                }
+            }
+            assert_eq!(before, w.hot_at(120, 5, HotScope::Dir, 1000));
+            assert!(state
+                .view_at(120)
+                .hot_dirs("/data", Duration::from_secs(60))
+                .is_some());
+            let delivered: usize = rx
+                .try_iter()
+                .map(|m| {
+                    if let super::super::tswriter::Message::Hot(rows) = m {
+                        rows.len()
+                    } else {
+                        0
+                    }
+                })
+                .sum();
+            assert_eq!(delivered, 3);
+            publish_tick("/data", &w, &mut history, &cfg, &state, &tx, (false, 121)).unwrap();
+            assert!(rx.is_empty());
+            // A subsequent full minute contains an unmapped event.
+            w.inject_mapping_failure_at(121, errno);
+            publish_tick("/data", &w, &mut history, &cfg, &state, &tx, (false, 180)).unwrap();
+            assert_eq!(
+                watcher_component_at("/data", &w, false, 1, 180).state,
+                "degraded"
+            );
+            assert!(state
+                .view_at(180)
+                .hot_dirs("/data", Duration::from_secs(60))
+                .is_none());
+            assert!(w.health_detail_at(180).contains("unmapped events: 1"));
+            for at in 181..=17 * 60 {
+                publish_tick("/data", &w, &mut history, &cfg, &state, &tx, (false, at)).unwrap();
+            }
+            assert_eq!(
+                watcher_component_at("/data", &w, false, 1, 17 * 60).state,
+                "ok"
+            );
+            assert!(w.health_detail_at(17 * 60).is_empty());
+            assert_eq!(w.unmapped_events(), 1);
+            assert!(state
+                .view_at(17 * 60)
+                .hot_dirs("/data", Duration::from_secs(60))
+                .is_some());
+        }
+    }
     #[test]
     fn namespace_failures_name_the_cause_without_debug_results() {
         assert_eq!(
