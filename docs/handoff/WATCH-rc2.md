@@ -3,6 +3,7 @@
 ## Needs from coordinator
 
 - Run ordinary-user CI at `umask 022` with Unix sockets and user namespaces available; this worker sandbox runs as uid 0 and denies those facilities.
+- Run cargo-deny on an equipped host; local CI explicitly skipped it because it is not installed.
 - Run the existing privileged watcher lifecycle and daemon tests on both Rocky guests. No privileged tests, fault scripts, install scripts, mounts, service changes or LVM operations were executed here.
 
 Status: implementation and evidence candidate; independent verification pending. Attempt: `attempt-e8b3d989877803921a8c308037e7c3a37df29b68e6f73d5c00b2eb7b39db28cd`. Base: `67847fb2afb3ed8510a29e6bc8594e002b5e4d87`. No branch creation, merge, push or release action.
@@ -27,13 +28,16 @@ Hot dispatch parses parameters once and maps None to `DaemonError::Unavailable(v
 
 Watcher membership uses its retained `RawPath` converted to a borrowed Path; relevant exclusions compare raw Path/PathBuf prefixes. Immutable-window retention resolves its existing presentation key to an old configured raw path, then compares raw membership, raw exclusion settings and raw rule mounts. Requested alert-window matching uses the same mapping. Escaping only generates presentation labels, including component removal labels. No new identity map or unbounded collection was added.
 
-`reload_preserves_raw_mount_history_and_windows` runs for `/data\\archive` and `/data` followed by a newline and `archive`. It seeds actual watcher rows, completed-minute history and a published immutable alert window. Reorder and extension with an unrelated exclusion must retain Arc identity, exact hot/history rows and the window timestamp; a relevant exclusion must retire the watcher, clear its minute history/window and invalidate a held hot view. Display-string membership or exclusion comparisons fail these checks.
+`reload_preserves_raw_mount_history_and_windows` runs for `/data\archive` and `/data` followed by a newline and `archive`. It seeds actual watcher rows, completed-minute history and a published immutable alert window. Reorder and extension with an unrelated exclusion must retain Arc identity, exact hot/history rows and the window timestamp; a relevant exclusion must retire the watcher, clear its minute history/window and invalidate a held hot view. Display-string membership or exclusion comparisons fail these checks.
 
-## Shared files, contracts and assumptions
+## Shared files and contracts
 
 - Only assigned paths changed. No manifest, dependency, module declaration, core type, CLI flag, config key, API method or metric name changed.
 - New watcher methods are additive. The crate-private settings helper is called only from the two owned files and now accepts a raw Path.
 - Existing display-keyed service/state maps remain compatible; raw identity is recovered at their label boundary, then used for filesystem comparisons.
+
+## Assumptions
+
 - Retirement is a linearization point: a query that acquires the watcher lock before retirement may return its measurement; one after retirement is unavailable. Retirement is permanent for that watcher instance.
 - Combined requests with any selected retired watcher are unavailable, even if another watcher has rows. Existing startup-only partial answers retain lossy semantics.
 - Synthetic barrier/event tests establish query and service logic, not kernel fanotify behavior or end-to-end socket transport. Boundaries and retirement clocks in regressions are injected.
@@ -48,6 +52,18 @@ These are proposals only; `docs/plan/**` and `docs/security.md` were not edited.
 
 ## Validation
 
-Final command outcomes and test counts are recorded below after completion of the offline validation run. All long commands use `timeout 1500`, the pinned Rust 1.98.0 binaries, `CARGO_NET_OFFLINE=true`, and `umask 022`.
+The offline workspace run reported 942 passed, 0 failed and 14 ignored across 82 target summaries (nested subprocess summaries are excluded). The daemon library reported 121 passed; the live library 95 passed; the final watcher-service subset 23 passed. The full workspace test command exited 0. The 30 reported passing `w6a1` tests include five socket-readiness guards; their central assertions did not execute here. Scoped barrier, dispatch and raw-path assertions have no such guards. All requested local commands completed successfully; outcomes are below. All long commands use `timeout 1500`, the pinned Rust 1.98.0 binaries, `CARGO_NET_OFFLINE=true`, and `umask 022`.
 
 Privileged execution is pending VM. From an equipped coordinator run `cargo xtask vm-test --host <rocky-8.8-guest>` and `cargo xtask vm-test --host <rocky-8.10-guest>`. On each isolated root guest, the focused existing teardown check is `cargo test --offline -p tidemarkd --features privileged --test w6a2s daemon_sigterm_releases_loop_xfs_for_ordinary_unmount -- --exact --nocapture`. Full guest gates establish real fanotify, ordinary unmount, socket and reload behavior; worker tests do not.
+
+| Command | Local result |
+| --- | --- |
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy --offline --workspace --all-targets -- -D warnings` | exit 0, including final rerun |
+| `cargo clippy --offline --workspace --all-targets --features privileged -- -D warnings` | exit 0, including final rerun |
+| `cargo test --offline --workspace --no-fail-fast` | exit 0; 942 passed, 0 failed, 14 ignored |
+| `cargo build --offline --workspace --features privileged --tests` | exit 0; compile only |
+| `tools/ci.sh` | exit 0; 150 owner tags, forbidden-symbol scan, fmt/clippy, strict-ancestry tests, workspace tests and privileged build passed; cargo-deny unavailable/skipped |
+| `bash -n` on six fault scripts, their common shell file and install script | exit 0; eight files checked, none executed |
+
+The final held-view/now regression was rerun after ordering both scope queries before retirement diagnostics. CI then repeated its complete suite against the final code. Command transcripts and parsed workspace counts are in the attempt output `library/`; this note and the worker report are evidence candidates, not VM or release approval. Source diffs contain only the four owned Rust files and this handoff. No new privileged regression was necessary for the socket-free logic; existing privileged lifecycle tests were compiled and remain pending guest execution.
