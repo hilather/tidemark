@@ -8,10 +8,12 @@ use crate::{
 use rusqlite::{params, Connection, OpenFlags};
 use std::os::unix::ffi::OsStrExt;
 use std::{
+    collections::BTreeMap,
+    fs::File,
     fs::{self, OpenOptions},
-    io::Read,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
+    sync::{Mutex, OnceLock},
 };
 use tidemark_core::{config::SampleRetention, live::*, path::RawPath, snapshot::DirRow};
 pub(crate) const SCHEMA: &str = include_str!("../migrations/timeseries-v1.sql");
@@ -20,7 +22,7 @@ pub(crate) const SCHEMA: &str = include_str!("../migrations/timeseries-v1.sql");
 /// Query results are capped at 1,000,000 rows; narrow ranges exceeding that bound.
 /// Writable handles retain a shared writer lease until their SQLite connection closes.
 pub struct TimeSeries {
-    pub(crate) conn: Connection,
+    pub(crate) conn: StoreConnection,
     _lease: Option<crate::lease::WriterLease>,
 }
 /// Counts changed by an idempotent compaction.
@@ -33,7 +35,7 @@ pub struct CompactStats {
 }
 pub(crate) fn open_writer_connection(
     path: &Path,
-) -> Result<(Connection, crate::lease::WriterLease), StoreError> {
+) -> Result<(StoreConnection, crate::lease::WriterLease), StoreError> {
     let parent = crate::state_dir::file_parent(path)?;
     // Inspect before taking shared ownership: migration requires absence of all writers.
     let initialize = match open_connection(path, false, None) {
@@ -65,7 +67,7 @@ pub(crate) fn open_connection(
     path: &Path,
     rw: bool,
     recovery: Option<&crate::lease::RecoveryLease>,
-) -> Result<Connection, StoreError> {
+) -> Result<StoreConnection, StoreError> {
     let parent = crate::state_dir::file_parent(path)?;
     let name = path
         .file_name()
@@ -90,9 +92,7 @@ pub(crate) fn open_connection(
     };
     check()?;
     let existing = directory.check_leaf(name)?;
-    if existing {
-        preflight_header(path)?;
-    }
+
     if rw && !existing {
         recovery
             .ok_or_else(|| {
@@ -101,13 +101,28 @@ pub(crate) fn open_connection(
             .verify(&parent)?;
         directory.open_leaf(name, true, true)?;
     }
+    let header = HeaderGuard::acquire(&directory, name)?;
+    header.preflight()?;
     check()?;
+    if directory.leaf_identity(name)? != header.0 {
+        return Err(StoreError::Invalid(
+            "database replaced during preflight".into(),
+        ));
+    }
     let flags = if rw {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     };
-    let conn = Connection::open_with_flags(path, flags)?;
+    let conn = StoreConnection {
+        conn: Connection::open_with_flags(path, flags)?,
+        _header: header,
+    };
+    if directory.leaf_identity(name)? != conn._header.0 {
+        return Err(StoreError::Invalid(
+            "database replaced during SQLite open".into(),
+        ));
+    }
     // SQLite scratch must not create files outside Tidemark state.
     conn.execute_batch("PRAGMA temp_store=MEMORY;")?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -166,32 +181,106 @@ fn backup_v0(
     }
     Ok(())
 }
-// Inspect only our own state file before SQLite can mutate its sidecars.
-fn preflight_header(path: &Path) -> Result<(), StoreError> {
-    let parent = crate::state_dir::file_parent(path)?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| StoreError::Invalid("database name missing".into()))?;
-    let directory = crate::state_dir::StateDir::open(&parent, false)?;
-    let mut file = directory.open_leaf(name, false, false)?;
-    let mut header = [0; 16];
-    let mut len = 0;
-    while len < header.len() {
-        match file.read(&mut header[len..]) {
-            Ok(0) => break,
-            Ok(n) => len += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
+// Field order is deliberate: SQLite closes before the last independent descriptor.
+// All mutable database connections in the store must use this wrapper.
+pub(crate) struct StoreConnection {
+    conn: Connection,
+    _header: HeaderGuard,
+}
+impl std::ops::Deref for StoreConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+type Identity = (u64, u64);
+struct HeaderEntry {
+    files: Vec<File>,
+    users: usize,
+}
+// Bound concurrent inodes/descriptors, not the number of databases opened over time.
+// Replacements retain the old entry until its last SQLite connection closes.
+const HEADER_DESCRIPTOR_CAP: usize = 256;
+static HEADERS: OnceLock<Mutex<BTreeMap<Identity, HeaderEntry>>> = OnceLock::new();
+fn headers() -> std::sync::MutexGuard<'static, BTreeMap<Identity, HeaderEntry>> {
+    // No user callbacks execute under this lock. Recovering poison retains descriptors.
+    HEADERS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+struct HeaderGuard(Identity);
+impl HeaderGuard {
+    fn acquire(
+        directory: &crate::state_dir::StateDir,
+        name: &std::ffi::OsStr,
+    ) -> Result<Self, StoreError> {
+        let mut registry = headers();
+        let named = directory.leaf_identity(name)?;
+        if let Some(entry) = registry.get_mut(&named) {
+            entry.users += 1;
+            return Ok(Self(named));
+        }
+        if registry
+            .values()
+            .map(|entry| entry.files.len())
+            .sum::<usize>()
+            >= HEADER_DESCRIPTOR_CAP
+        {
+            return Err(StoreError::Invalid(
+                "database header descriptor limit reached (256)".into(),
+            ));
+        }
+        let file = directory.open_leaf(name, false, false)?;
+        let metadata = file.metadata()?;
+        let identity = (metadata.dev(), metadata.ino());
+        // If a concurrent rename selected an already registered inode, retain the extra
+        // descriptor too: closing it here would release that inode's SQLite locks.
+        let entry = registry.entry(identity).or_insert_with(|| HeaderEntry {
+            files: Vec::new(),
+            users: 0,
+        });
+        entry.files.push(file);
+        entry.users += 1;
+        Ok(Self(identity))
+    }
+    fn preflight(&self) -> Result<(), StoreError> {
+        let registry = headers();
+        let entry = registry
+            .get(&self.0)
+            .ok_or_else(|| StoreError::Invalid("missing database header descriptor".into()))?;
+        let file = &entry.files[0];
+        let mut header = [0; 16];
+        let mut len = 0;
+        while len < header.len() {
+            match file.read_at(&mut header[len..], len as u64) {
+                Ok(0) => break,
+                Ok(n) => len += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if len != 0 && (len != header.len() || &header != b"SQLite format 3\0") {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+                Some("invalid timeseries database header".into()),
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+impl Drop for HeaderGuard {
+    fn drop(&mut self) {
+        let mut registry = headers();
+        if let Some(entry) = registry.get_mut(&self.0) {
+            entry.users -= 1;
+            if entry.users == 0 {
+                // Close under the registry lock, before another opener can acquire locks.
+                registry.remove(&self.0);
+            }
         }
     }
-    if len != 0 && (len != header.len() || &header != b"SQLite format 3\0") {
-        return Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
-            Some("invalid timeseries database header".into()),
-        )
-        .into());
-    }
-    Ok(())
 }
 fn migration_v1(conn: &Connection) -> Result<(), StoreError> {
     let tx = conn.unchecked_transaction()?;

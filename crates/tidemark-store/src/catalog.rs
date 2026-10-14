@@ -1,7 +1,7 @@
 //! Owned by: W1-E
 //! Scan catalog shared with the long-lived sample database.
 use crate::{error::sql_u64, reader::Snapshot, StoreError};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, OptionalExtension, Row};
 use std::{
     fs,
     os::unix::ffi::{OsStrExt, OsStringExt},
@@ -58,7 +58,7 @@ pub struct ScanEntry {
 /// Lists are capped at 1,000,000 rows; select a root when exceeding that bound.
 /// Writable handles retain a shared writer lease until their SQLite connection closes.
 pub struct Catalog {
-    conn: Connection,
+    conn: crate::timeseries::StoreConnection,
     _lease: Option<crate::lease::WriterLease>,
     state_dir: PathBuf,
     recovery_files: Vec<PathBuf>,
