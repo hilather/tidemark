@@ -1196,7 +1196,7 @@ impl Watcher {
         self.shutdown();
     }
     /// Stop and join the worker and release the fanotify group and mount descriptor.
-    /// Idempotent; old views keep measurements without keeping the transport alive.
+    /// Idempotent; old views observe retirement without keeping transport alive.
     pub fn shutdown(&self) {
         // Keep this lock through join and descriptor release so every concurrent
         // shutdown caller observes completed teardown before returning.
@@ -1206,7 +1206,7 @@ impl Watcher {
         }
         {
             let mut state = self.state.lock();
-            let at = state.last_at.unwrap_or_else(now);
+            let at = now();
             state.retired_at.get_or_insert(at);
         }
         let signal = self.shutdown.lock().take();

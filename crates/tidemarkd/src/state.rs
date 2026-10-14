@@ -1261,6 +1261,8 @@ impl LiveStateView {
                     );
                 }
             }
+        }
+        for (mount, watcher) in &self.data.watchers {
             if p.mount.as_ref().is_none_or(|m| m == mount)
                 && !watcher.history_covers_at(self.now, minutes)
             {

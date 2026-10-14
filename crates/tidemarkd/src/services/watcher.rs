@@ -857,7 +857,7 @@ mod tests {
             .unwrap();
         state
             .publish(
-                Publication::Watcher(("/B".into(), b)),
+                Publication::Watcher(("/B".into(), b.clone())),
                 crate::component("watcher:/B", "ok", "test"),
             )
             .unwrap();
@@ -886,6 +886,22 @@ mod tests {
             "watch history for /B starts at 00:03 UTC; no complete window yet"
         );
         assert_eq!(state.view_at(3720).hot(&p), Some(Vec::new()));
+        let startup = Arc::new(
+            Watcher::from_injected_events_at(RawPath::new(b"/A".to_vec()).unwrap(), 3720, [])
+                .unwrap(),
+        );
+        state
+            .publish(
+                Publication::Watcher(("/A".into(), startup)),
+                crate::component("watcher:/A", "ok", "test"),
+            )
+            .unwrap();
+        b.retire_at(3720);
+        assert!(state.view_at(3720).hot(&p).is_none());
+        assert_eq!(
+            state.view_at(3720).hot_unavailable_detail(&p),
+            "watcher for /B was replaced at 01:02 UTC"
+        );
     }
 
     #[test]
@@ -1164,7 +1180,9 @@ mod tests {
             .collect();
         let held = state.view_at(3600);
         for p in &queries {
-            assert!(held.hot(p).is_some());
+            let rows = held.hot(p).unwrap();
+            assert_eq!(rows[0].bytes_delta, 82);
+            assert!(!rows[0].lossy);
         }
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let ready = barrier.clone();
