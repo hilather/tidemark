@@ -84,7 +84,7 @@ pub(crate) fn open_connection(
         ] {
             let mut companion = name.to_os_string();
             companion.push(suffix);
-            directory.check_leaf(&companion)?;
+            directory.check_companion(&companion)?;
         }
         Ok(())
     };
@@ -572,7 +572,10 @@ mod query_plan_tests {
             let reader_path = path.clone();
             let reader = std::thread::spawn(move || {
                 let conn = Connection::open(reader_path).unwrap();
-                conn.query_row("SELECT count(*) FROM fs_samples", [], |r| r.get::<_, i64>(0)).unwrap();
+                conn.query_row("SELECT count(*) FROM fs_samples", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
                 ready_tx.send(()).unwrap();
                 close_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 drop(conn);
@@ -581,19 +584,25 @@ mod query_plan_tests {
             ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let inode = std::fs::File::open(tmp.path().join("timeseries.db-shm")).unwrap();
             let mut fired = false;
-            crate::state_dir::STAT_HOOK.with_borrow_mut(|hook| *hook = Some(Box::new(move |name, stat| {
-                if name == OsStr::new("timeseries.db-shm") && !fired {
-                    fired = true;
-                    close_tx.send(()).unwrap();
-                    closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    *stat = rustix::fs::fstat(&inode).unwrap();
-                    assert_eq!(stat.st_nlink, 0, "SQLite must unlink the held SHM inode");
-                }
-            })));
+            crate::state_dir::STAT_HOOK.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move |name, stat| {
+                    if name == OsStr::new("timeseries.db-shm") && !fired {
+                        fired = true;
+                        close_tx.send(()).unwrap();
+                        closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        *stat = rustix::fs::fstat(&inode).unwrap();
+                        assert_eq!(stat.st_nlink, 0, "SQLite must unlink the held SHM inode");
+                    }
+                }))
+            });
             let result = open_connection(&path, false, None);
             crate::state_dir::STAT_HOOK.with_borrow_mut(|hook| *hook = None);
             reader.join().unwrap();
-            assert!(result.is_ok(), "store open after SQLite close: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "store open after SQLite close: {:?}",
+                result.err()
+            );
         }
     }
 

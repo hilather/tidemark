@@ -101,7 +101,10 @@ fn policy(input: PolicyInput, strict: bool) -> Result<bool, &'static str> {
     if mode & 0o022 != 0 && !(role == Role::Ancestor && mode & 0o1000 != 0) {
         return Err("writable by group or others");
     }
-    if role == Role::Leaf && links != 1 {
+    if role == Role::Leaf && links == 0 {
+        return Err("leaf has no hard links (removed during check)");
+    }
+    if role == Role::Leaf && links > 1 {
         return Err("leaf has multiple hard links");
     }
     Ok(matches!(role, Role::StateDirectory | Role::Subdirectory | Role::Leaf) && mode & 0o044 != 0)
@@ -261,9 +264,12 @@ pub fn file_parent(path: &Path) -> io::Result<PathBuf> {
 }
 
 #[cfg(test)]
+type StatHook = Box<dyn FnMut(&OsStr, &mut fs::Stat)>;
+
+#[cfg(test)]
 thread_local! {
     // Model statat holding an inode reference across a concurrent SQLite unlink.
-    pub(crate) static STAT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&OsStr, &mut fs::Stat)>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static STAT_HOOK: std::cell::RefCell<Option<StatHook>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A verified euid-owned directory with no group/world write permissions.
@@ -374,6 +380,14 @@ impl StateDir {
     }
     /// Check a leaf without following it; absence is accepted and returns false.
     pub fn check_leaf(&self, name: &OsStr) -> io::Result<bool> {
+        self.check_named_leaf(name, false, true)
+    }
+    /// Check a SQLite companion, retrying once if lookup observed an unlinked inode.
+    /// Every other trust rule remains mandatory, including on the removed inode.
+    pub(crate) fn check_companion(&self, name: &OsStr) -> io::Result<bool> {
+        self.check_named_leaf(name, true, true)
+    }
+    fn check_named_leaf(&self, name: &OsStr, companion: bool, retry: bool) -> io::Result<bool> {
         self.name(name)?;
         match fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => {
@@ -381,8 +395,20 @@ impl StateDir {
                 let mut stat = stat;
                 #[cfg(test)]
                 STAT_HOOK.with_borrow_mut(|hook| {
-                    if let Some(hook) = hook { hook(name, &mut stat); }
+                    if let Some(hook) = hook {
+                        hook(name, &mut stat);
+                    }
                 });
+                if companion && stat.st_nlink == 0 {
+                    let mut linked = stat;
+                    linked.st_nlink = 1;
+                    self.leaf(name, &linked)?;
+                    return if retry {
+                        self.check_named_leaf(name, true, false)
+                    } else {
+                        Ok(false)
+                    };
+                }
                 self.leaf(name, &stat)?;
                 Ok(true)
             }
@@ -441,6 +467,67 @@ impl StateDir {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
+    #[test]
+    fn removed_companion_keeps_other_rules_and_rechecks_replacement() {
+        let tmp = ::test_support::private_tempdir().unwrap();
+        let state = StateDir::open(tmp.path(), false).unwrap();
+        let name = OsStr::new("timeseries.db-shm");
+        let _file = state.open_leaf(name, true, true).unwrap();
+        STAT_HOOK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(|_, stat| {
+                stat.st_nlink = 0;
+                stat.st_mode |= 0o020;
+            }))
+        });
+        let result = state.check_companion(name);
+        STAT_HOOK.with_borrow_mut(|hook| *hook = None);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("writable by group"));
+        std::fs::hard_link(tmp.path().join(name), tmp.path().join("alias")).unwrap();
+        let mut first = true;
+        STAT_HOOK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move |_, stat| {
+                if first {
+                    first = false;
+                    stat.st_nlink = 0;
+                }
+            }))
+        });
+        let result = state.check_companion(name);
+        STAT_HOOK.with_borrow_mut(|hook| *hook = None);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("multiple hard links"));
+    }
+
+    #[test]
+    fn leaf_link_counts_are_distinct() {
+        let tmp = ::test_support::private_tempdir().unwrap();
+        let state = StateDir::open(tmp.path(), false).unwrap();
+        let name = OsStr::new("leaf");
+        let file = state.open_leaf(name, true, true).unwrap();
+        std::fs::hard_link(tmp.path().join(name), tmp.path().join("alias")).unwrap();
+        let stat = fs::fstat(&file).unwrap();
+        assert_eq!(stat.st_nlink, 2);
+        assert!(state
+            .leaf(name, &stat)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple hard links"));
+        std::fs::remove_file(tmp.path().join(name)).unwrap();
+        std::fs::remove_file(tmp.path().join("alias")).unwrap();
+        let stat = fs::fstat(&file).unwrap();
+        assert_eq!(stat.st_nlink, 0);
+        assert!(state
+            .leaf(name, &stat)
+            .unwrap_err()
+            .to_string()
+            .contains("no hard links"));
+    }
+
     #[test]
     fn readable_storage_warns_once() {
         const CHILD: &str = "TIDEMARK_READABLE_WARNING_CHILD";

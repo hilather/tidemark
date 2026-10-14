@@ -944,11 +944,10 @@ fn scheduling_catalog(
 ) -> Result<Option<Catalog>, DaemonError> {
     match open() {
         Ok(catalog) => Ok(Some(catalog)),
-        Err(error) if crate::store_pressure(&error) => {
+        Err(error) => {
             state.publish_component(component("scheduler", "degraded", error.to_string()))?;
             Ok(None)
         }
-        Err(error) => Err(DaemonError::Store(error.to_string())),
     }
 }
 #[cfg(test)]
@@ -1336,16 +1335,17 @@ fn scheduler(
         shared.failures.lock().retain(|root, retry| {
             !retry.configured || config.roots.iter().any(|r| r.path == root.as_path())
         });
-        shared.state.publish_component(scheduler_health(
-            &shared.failures,
-            "waiting for scheduled scan",
-        ))?;
         let Some(catalog) = scheduling_catalog(&shared.state, || {
             Catalog::open(&shared.state.storage_path(), false)
         })?
         else {
             continue;
         };
+        // Publish recovery only after the new connection has passed admission.
+        shared.state.publish_component(scheduler_health(
+            &shared.failures,
+            "waiting for scheduled scan",
+        ))?;
         for root in &config.roots {
             let raw =
                 RawPath::from_path(&root.path).map_err(|e| DaemonError::Invalid(e.to_string()))?;
@@ -1654,6 +1654,58 @@ mod tests {
                 .is_some()
         );
     }
+    #[test]
+    fn catalog_open_trust_failure_degrades_and_recovers_after_readiness() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ::test_support::private_tempdir().unwrap();
+        drop(Catalog::open(dir.path(), true).unwrap());
+        let mut config = Config::default();
+        config.general.state_dir = dir.path().to_owned();
+        let state = LiveState::new(&config, 0);
+        state
+            .publish_component(component("daemon", "ok", "ready"))
+            .unwrap();
+        let shutdown = Shutdown::default();
+        let (writer, _rx) = bounded(1);
+        let (_control, handle) = start_with_clocks(
+            Arc::new(config),
+            state.clone(),
+            writer,
+            shutdown.clone(),
+            Arc::new(|| 0),
+            Arc::new(crate::unix_now),
+        )
+        .unwrap();
+        let wait = |health: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if state.view().status(0).unwrap().components.iter().any(|c| {
+                    c.name == "scheduler"
+                        && c.state == health
+                        && (health != "degraded" || c.detail.contains("writable by group"))
+                }) {
+                    break;
+                }
+                assert!(!handle.is_finished(), "scheduler exited");
+                assert!(
+                    Instant::now() < deadline,
+                    "scheduler did not become {health}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait("ok");
+        let db = dir.path().join("timeseries.db");
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o620)).unwrap();
+        wait("degraded");
+        assert!(!shutdown.load(Ordering::Acquire));
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+        wait("ok");
+        assert!(!shutdown.load(Ordering::Acquire));
+        shutdown.store(true, Ordering::Release);
+        handle.join().unwrap().unwrap();
+    }
+
     #[test]
     fn retry_sequence_uses_injected_time_and_caps_at_one_hour() {
         let mut now = 100;
