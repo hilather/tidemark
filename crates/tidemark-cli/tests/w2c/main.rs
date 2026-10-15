@@ -657,7 +657,8 @@ fn ancestor_snapshot_missing_path_names_scan_remedy() {
             .unwrap();
         assert_eq!(output.status.code(), Some(5));
         let error = String::from_utf8(output.stderr).unwrap();
-        assert!(error.contains("no complete snapshot of"), "{error}");
+        assert!(error.contains("selected complete snapshot"), "{error}");
+        assert!(!error.contains("no complete snapshot"), "{error}");
         assert!(error.contains("of / ("), "{error}");
         assert!(error.contains(&id), "{error}");
         assert!(error.contains("run: tidemark scan"), "{error}");
