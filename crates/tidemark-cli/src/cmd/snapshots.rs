@@ -364,6 +364,36 @@ pub(crate) fn missing_path(
             }
         }
     }
+    // Search recorded complete snapshots, never infer presence from the live path.
+    if let Ok(catalog) =
+        tidemark_store::catalog::Catalog::open(&context.config.general.state_dir, false)
+    {
+        if let Ok(mut entries) = catalog.list(None) {
+            entries.retain(|entry| {
+                entry.status == "complete"
+                    && entry.started_at > snapshot.meta().started_at
+                    && path.starts_with(&entry.root)
+            });
+            entries.sort_by(|a, b| {
+                b.started_at
+                    .cmp(&a.started_at)
+                    .then_with(|| a.scan_id.cmp(&b.scan_id))
+            });
+            for entry in entries {
+                let Some(file) = entry.file else { continue };
+                let Ok(newer) = tidemark_store::reader::Snapshot::open(&file) else {
+                    continue;
+                };
+                if newer.dir_by_path(path).is_ok_and(|row| row.is_some()) {
+                    detail.push_str(&format!(
+                        "; newer complete snapshot {} contains this path; drop --snapshot or use --snapshot {}",
+                        entry.scan_id, entry.scan_id
+                    ));
+                    return crate::CliError::Precondition(detail);
+                }
+            }
+        }
+    }
     detail.push_str(&format!("; run: tidemark scan {subject}"));
     if context.config.roots.iter().any(|root| {
         tidemark_core::path::RawPath::from_path(&root.path).is_ok_and(|root| root == *path)

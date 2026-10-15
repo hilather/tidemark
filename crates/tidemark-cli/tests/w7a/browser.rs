@@ -1051,7 +1051,7 @@ fn operator_changed_config_recipes_apply_to_running_daemon() {
     assert!(hot.contains("--start-now"));
 }
 
-fn selected_missing_path(partial: bool) -> String {
+fn selected_missing_path(partial: bool, newer_has_path: bool, newer_complete: bool) -> String {
     let state = ::test_support::private_tempdir().unwrap();
     let live = ::test_support::private_tempdir().unwrap();
     std::fs::create_dir(live.path().join("new")).unwrap();
@@ -1072,11 +1072,16 @@ fn selected_missing_path(partial: bool) -> String {
     writer.finish(&old).unwrap();
     let mut newer = fixture::meta(root, 2_000_000);
     newer.scan_id = serde_json::from_str("\"20260102T000000Z-00000000\"").unwrap();
-    row.subtree_end = 1;
+    if !newer_complete {
+        newer.status = tidemark_core::scan::SnapshotStatus::Partial;
+    }
+    row.subtree_end = u32::from(newer_has_path);
     let mut writer = tidemark_store::writer::SnapshotWriter::create(&dir, &newer).unwrap();
-    writer
-        .put_dirs(&[row, fixture::row(1, Some(0), path.as_bytes(), 0)])
-        .unwrap();
+    let mut rows = vec![row];
+    if newer_has_path {
+        rows.push(fixture::row(1, Some(0), path.as_bytes(), 0));
+    }
+    writer.put_dirs(&rows).unwrap();
     writer.finish(&newer).unwrap();
     let catalog = tidemark_store::catalog::Catalog::open(state.path(), true).unwrap();
     catalog.rebuild_from_files().unwrap();
@@ -1090,7 +1095,10 @@ fn selected_missing_path(partial: bool) -> String {
     };
     let (_, latest) =
         crate::cmd::snapshots::select(&context, Some(&live.path().join("new")), None).unwrap();
-    assert!(latest.dir_by_path(&path).unwrap().is_some());
+    assert_eq!(
+        latest.dir_by_path(&path).unwrap().is_some(),
+        newer_has_path && newer_complete
+    );
     let (_, selected) = crate::cmd::snapshots::select(
         &context,
         Some(&live.path().join("new")),
@@ -1103,14 +1111,24 @@ fn selected_missing_path(partial: bool) -> String {
 
 #[test]
 fn missing_path_explicit_old_snapshot_does_not_deny_newer_evidence() {
-    let message = selected_missing_path(false);
+    let message = selected_missing_path(false, true, true);
     assert!(message.contains("selected complete snapshot"));
     assert!(!message.contains("no complete snapshot"), "{message}");
+    assert!(
+        message.contains("newer complete snapshot 20260102T000000Z-00000000"),
+        "{message}"
+    );
+    assert!(message.contains("drop --snapshot"), "{message}");
+    assert!(
+        message.contains("--snapshot 20260102T000000Z-00000000"),
+        "{message}"
+    );
+    assert!(!message.contains("run: tidemark scan"), "{message}");
 }
 
 #[test]
 fn missing_path_partial_snapshot_is_labelled_partial() {
-    let message = selected_missing_path(true);
+    let message = selected_missing_path(true, true, true);
     assert!(message.contains("selected partial snapshot"), "{message}");
     assert!(!message.contains("selected complete snapshot"));
 }
@@ -1573,3 +1591,11 @@ fn post_tui_files_pane_fits_80_columns() {
     assert!(rendered.contains("common ancestor"), "{rendered}");
 }
 
+#[test]
+fn post_tui_missing_path_keeps_scan_remedy_without_complete_evidence() {
+    for (has_path, complete) in [(false, true), (true, false)] {
+        let message = selected_missing_path(false, has_path, complete);
+        assert!(message.contains("run: tidemark scan"), "{message}");
+        assert!(!message.contains("drop --snapshot"), "{message}");
+    }
+}
