@@ -261,6 +261,8 @@ min_free_pct   = 5
 
 Add `Config::from_toml_bytes(bytes: &[u8]) -> Result<Config, CoreError>` in `tidemark-core`. It shares `Config::load`'s bounded UTF-8/TOML parsing, default merge and error precedence (`MAX_CONFIG_BYTES = 1 MiB`). The daemon hashes the bytes it actually loaded, and stage parses, installs and hashes one bounded no-follow read rather than reopening the pathname (`W4-B-fix2.md`).
 
+A root with no completed scan in the catalog starts its first scan at service start or when added by reload, unless `schedule = "off"`. This first scan bypasses the daily time and window (the "scans only START inside this local-time window" restriction applies to later scans), using the configured throttle profile. Failed first scans follow retry backoff without waiting for the window; after completion, normal schedule and window rules apply. Existing root order and host scan concurrency apply.
+
 ### Effective config contracts (SCR-003)
 
 `ConfigIssue { field: String, message: String }` reports validation errors at dotted field locations. Config/table structs deny unknown fields; paths use `PathBuf`, sizes `ByteSize`, ordinary durations `Duration` with humantime serde, bounded counts `u32`/`usize`, percentages/latencies `f64`. Root mode/link_instances use enums. Root `throttle: String` may name `gentle`, `normal`, `max` or a configured custom profile. `throttle.profiles: BTreeMap<String, ThrottleProfile>` merges overrides with gentle/normal defaults; reject a profile definition named `max` with an actionable error (reserved `NoopGate` selector).

@@ -108,7 +108,7 @@ fn due_scan_waits_and_window_wraps() {
         ("2026-01-02T03:00:00Z", "2026-01-02T23:00:00Z"),
     ] {
         assert_eq!(
-            next_run_in_timezone(&s, Some(&w), None, ts(now), &Utc).unwrap(),
+            next_run_in_timezone(&s, Some(&w), Some(ts(now) - 3600), ts(now), &Utc).unwrap(),
             Some(ts(expected))
         );
     }
@@ -161,12 +161,26 @@ fn windows_across_both_transitions() {
     let s = parse_schedule("every 1h").unwrap();
     let gap = parse_window("02:30-03:30").unwrap();
     assert_eq!(
-        next_run_in_timezone(&s, Some(&gap), None, ts("2026-03-08T06:00:00Z"), &Eastern).unwrap(),
+        next_run_in_timezone(
+            &s,
+            Some(&gap),
+            Some(ts("2026-03-08T05:00:00Z")),
+            ts("2026-03-08T06:00:00Z"),
+            &Eastern
+        )
+        .unwrap(),
         Some(ts("2026-03-08T07:00:00Z"))
     );
     let fold = parse_window("01:15-01:45").unwrap();
     assert_eq!(
-        next_run_in_timezone(&s, Some(&fold), None, ts("2026-11-01T05:50:00Z"), &Eastern).unwrap(),
+        next_run_in_timezone(
+            &s,
+            Some(&fold),
+            Some(ts("2026-11-01T04:50:00Z")),
+            ts("2026-11-01T05:50:00Z"),
+            &Eastern
+        )
+        .unwrap(),
         Some(ts("2026-11-01T06:15:00Z"))
     );
 }
@@ -183,9 +197,40 @@ fn invalid_clock_is_fallible() {
     assert!(next_run_in_timezone(
         &parse_schedule("daily 00:00").unwrap(),
         None,
-        None,
+        Some(i64::MAX),
         i64::MAX,
         &Utc
     )
     .is_err());
+}
+
+#[test]
+fn first_scan_ignores_cadence_and_window_except_off() {
+    let now = ts("2026-01-01T12:00:00Z");
+    let window = parse_window("00:00-06:00").unwrap();
+    for schedule in ["every 6h", "daily 03:30", "off"] {
+        assert_eq!(
+            next_run_in_timezone(
+                &parse_schedule(schedule).unwrap(),
+                Some(&window),
+                None,
+                now,
+                &Utc
+            )
+            .unwrap(),
+            if schedule == "off" { None } else { Some(now) },
+            "{schedule}"
+        );
+    }
+    assert_eq!(
+        next_run_in_timezone(
+            &parse_schedule("every 6h").unwrap(),
+            Some(&window),
+            Some(now - 86400),
+            now,
+            &Utc
+        )
+        .unwrap(),
+        Some(ts("2026-01-02T00:00:00Z"))
+    );
 }

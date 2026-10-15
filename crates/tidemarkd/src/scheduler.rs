@@ -141,7 +141,8 @@ pub fn next_run(
 ) -> Result<Option<i64>, DaemonError> {
     next_run_in_timezone(schedule, window, last_complete, now, &Local)
 }
-/// Explicit-zone scheduling seam. Overdue scans catch up immediately; windows
+/// Explicit-zone scheduling seam. Non-off roots without a completed scan are due
+/// immediately, regardless of cadence or window. Overdue later scans catch up; windows
 /// are checked in wall time across both DST transitions. Daily gaps run at the
 /// first valid minute afterwards, and folds use the first occurrence only.
 pub fn next_run_in_timezone<T: TimeZone>(
@@ -151,6 +152,12 @@ pub fn next_run_in_timezone<T: TimeZone>(
     now: i64,
     tz: &T,
 ) -> Result<Option<i64>, DaemonError> {
+    if *schedule == Schedule::Off {
+        return Ok(None);
+    }
+    if last_complete.is_none() {
+        return Ok(Some(now));
+    }
     let due = match schedule {
         Schedule::Off => return Ok(None),
         Schedule::Every(n) => last_complete
@@ -174,6 +181,14 @@ pub fn next_run_in_timezone<T: TimeZone>(
             candidate.max(now)
         }
     };
+    next_in_window(window, due, tz)
+}
+
+fn next_in_window<T: TimeZone>(
+    window: Option<&Window>,
+    due: i64,
+    tz: &T,
+) -> Result<Option<i64>, DaemonError> {
     let Some(window) = window else {
         return Ok(Some(due));
     };
@@ -1386,12 +1401,12 @@ fn scheduler(
             };
             let due = if let Some(deadline) = operational_due {
                 // Windows remain calendar-based even when cadence uses elapsed time.
-                next_run(
-                    &schedule,
-                    window.as_ref(),
-                    None,
-                    now.saturating_add(deadline.saturating_sub(elapsed).max(0)),
-                )?
+                let target = now.saturating_add(deadline.saturating_sub(elapsed).max(0));
+                if last_finished.is_some() {
+                    next_in_window(window.as_ref(), target, &Local)?
+                } else {
+                    next_run(&schedule, window.as_ref(), None, target)?
+                }
             } else {
                 next_run(&schedule, window.as_ref(), last_finished, now)?
             };
