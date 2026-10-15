@@ -177,7 +177,7 @@ fn source_from_read(
 /// Status ping boundary used by verification.
 pub trait ApiPing {
     /// Contact the daemon's status method.
-    fn ping(&self) -> io::Result<()>;
+    fn ping(&self) -> io::Result<tidemark_core::api::StatusResult>;
 }
 /// Options internal to staging; no frozen CLI flags are added.
 #[derive(Debug, Clone, Default)]
@@ -588,40 +588,38 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
             )
         },
     ));
-    let components = firstboot
+    let stopped = items.iter().any(|item| item.detail == SERVICE_START_HINT);
+    let status = if stopped {
+        Err(io::Error::other("service is not running"))
+    } else {
+        api.ping()
+    };
+    // Only a live status response can certify current component health. A stored
+    // firstboot report is still config-hash evidence, never live health evidence.
+    let components = status
         .as_ref()
         .ok()
-        .and_then(|value| value.get("components"))
-        .and_then(|v| v.as_array());
-    let healthy = firstboot
-        .as_ref()
-        .ok()
-        .and_then(|value| value.get("healthy"))
-        .and_then(|v| v.as_bool())
-        == Some(true)
-        && ["sampler", "scheduler", "api", "tswriter"]
-            .iter()
-            .all(|name| {
-                let mut matching = components.into_iter().flatten().filter(|component| {
-                    component.get("name").and_then(|v| v.as_str()) == Some(*name)
-                });
-                matching.next().is_some_and(|component| {
-                    component.get("state").and_then(|v| v.as_str()) == Some("ok")
-                }) && matching.next().is_none()
-            });
+        .map(|value| value.components.as_slice());
+    let healthy = ["sampler", "scheduler", "api", "tswriter"]
+        .iter()
+        .all(|name| {
+            let mut matching = components
+                .into_iter()
+                .flatten()
+                .filter(|component| component.name == *name);
+            matching
+                .next()
+                .is_some_and(|component| component.state == "ok")
+                && matching.next().is_none()
+        });
     let core_details = ["sampler", "scheduler", "api", "tswriter"]
         .iter()
         .map(|name| {
             let states: Vec<_> = components
                 .into_iter()
                 .flatten()
-                .filter(|component| component.get("name").and_then(|v| v.as_str()) == Some(*name))
-                .map(|component| {
-                    component
-                        .get("state")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("invalid")
-                })
+                .filter(|component| component.name == *name)
+                .map(|component| component.state.as_str())
                 .collect();
             format!(
                 "{name}={}",
@@ -643,16 +641,18 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
         },
         core_details,
     ));
-    let stopped = items.iter().any(|item| item.detail == SERVICE_START_HINT);
-    items.push(outcome(
-        "api",
-        false,
-        if stopped {
-            Err(io::Error::other("service is not running"))
-        } else {
-            api.ping()
-        },
-    ));
+    if status.is_err() {
+        let start = firstboot
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("daemon_started_at"))
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unknown".into());
+        if let Some(item) = items.iter_mut().find(|item| item.name == "core_components") {
+            item.detail = format!("current daemon health unavailable; firstboot report describes daemon_started_at={start}; stored health cannot certify this start");
+        }
+    }
+    items.push(outcome("api", false, status.map(|_| ())));
     VerifyResult {
         healthy: items.iter().all(|item| item.status == CheckStatus::Pass),
         items,

@@ -268,9 +268,22 @@ impl Fixture {
 }
 struct Ping(bool);
 impl ApiPing for Ping {
-    fn ping(&self) -> io::Result<()> {
+    fn ping(&self) -> io::Result<tidemark_core::api::StatusResult> {
         if self.0 {
-            Ok(())
+            Ok(tidemark_core::api::StatusResult {
+                version: "test".into(),
+                uptime_s: 120,
+                components: ["sampler", "scheduler", "api", "tswriter"]
+                    .into_iter()
+                    .map(|name| tidemark_core::api::ComponentState {
+                        name: name.into(),
+                        state: "ok".into(),
+                        detail: String::new(),
+                    })
+                    .collect(),
+                watch_modes: vec![],
+                last_errors: vec![],
+            })
         } else {
             Err(io::Error::other("API unavailable"))
         }
@@ -408,7 +421,7 @@ fn verify_missing_stale_unhealthy_healthy_and_api_failure() {
     );
     fixture.report(&record.config_sha256, false);
     assert!(
-        !verify(&fixture.state, Duration::ZERO, &fixture.sys, &Ping(true))
+        verify(&fixture.state, Duration::ZERO, &fixture.sys, &Ping(true))
             .unwrap()
             .healthy
     );
@@ -444,7 +457,7 @@ fn verify_missing_stale_unhealthy_healthy_and_api_failure() {
     )
     .unwrap();
     assert!(
-        !verify(&fixture.state, Duration::ZERO, &fixture.sys, &Ping(true))
+        verify(&fixture.state, Duration::ZERO, &fixture.sys, &Ping(true))
             .unwrap()
             .healthy
     );
@@ -1761,4 +1774,85 @@ fn verify_activation_between_probes_does_not_report_stopped() {
             .status,
         CheckStatus::Pass
     );
+}
+
+#[test]
+fn verify_uses_current_status_instead_of_old_unhealthy_report() {
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.sys.active.set(true);
+    fixture.report(&record.config_sha256, false);
+    assert!(
+        verify(&fixture.state, Duration::ZERO, &fixture.sys, &Ping(true))
+            .unwrap()
+            .healthy
+    );
+}
+
+struct ComponentPing(bool);
+impl ApiPing for ComponentPing {
+    fn ping(&self) -> io::Result<tidemark_core::api::StatusResult> {
+        let mut status = Ping(true).ping()?;
+        if !self.0 {
+            status.components[0].state = "degraded".into();
+        }
+        Ok(status)
+    }
+}
+
+#[test]
+fn verify_live_components_override_stored_components_for_any_start() {
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.sys.active.set(true);
+    for start in [1, 100] {
+        for stored_healthy in [false, true] {
+            fixture.report(&record.config_sha256, stored_healthy);
+            let path = fixture.state.join("deploy/firstboot.json");
+            let mut report = read_json(&path).unwrap();
+            report["daemon_started_at"] = start.into();
+            fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+            for live_healthy in [false, true] {
+                let result = verify(
+                    &fixture.state,
+                    Duration::ZERO,
+                    &fixture.sys,
+                    &ComponentPing(live_healthy),
+                )
+                .unwrap();
+                assert_eq!(result.healthy, live_healthy);
+            }
+        }
+    }
+    let result = verify(&fixture.state, Duration::ZERO, &fixture.sys, &Ping(false)).unwrap();
+    assert!(result
+        .items
+        .iter()
+        .any(|item| item.detail.contains("daemon_started_at=100")));
+}
+
+#[test]
+fn verify_wait_rechecks_live_health() {
+    struct Recovering(Cell<usize>);
+    impl ApiPing for Recovering {
+        fn ping(&self) -> io::Result<tidemark_core::api::StatusResult> {
+            let calls = self.0.get();
+            self.0.set(calls + 1);
+            ComponentPing(calls > 0).ping()
+        }
+    }
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.sys.active.set(true);
+    fixture.report(&record.config_sha256, false);
+    let api = Recovering(Cell::new(0));
+    let result = verify(
+        &fixture.state,
+        Duration::from_millis(20),
+        &fixture.sys,
+        &api,
+    )
+    .unwrap();
+    assert!(result.healthy);
+    assert_eq!(api.0.get(), 2);
 }
