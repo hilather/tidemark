@@ -470,18 +470,24 @@ fn verify_timeout_is_bounded() {
     let fixture = Fixture::new();
     fixture.stage();
     fixture.sys.activating.set(true);
-    let start = Instant::now();
-    let result = verify(
+    let clock = FakeVerifyClock::default();
+    let result = verify_with_timing(
         &fixture.state,
-        Duration::from_millis(20),
+        Duration::from_secs(2),
         &fixture.sys,
         &Ping(false),
+        VerifyTiming {
+            grace: Duration::from_secs(10),
+            interval: Duration::from_millis(500),
+            normal_interval: Duration::from_secs(5),
+        },
+        &clock,
     )
     .unwrap();
     assert!(!result.healthy);
-    assert!(start.elapsed() >= Duration::from_millis(20));
-    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(clock.now(), Duration::from_secs(2));
 }
+
 #[test]
 fn purge_missing_marker_config_mismatch_and_replaced_symlink_leave_state_untouched() {
     for case in ["marker", "config", "symlink"] {
@@ -2035,4 +2041,122 @@ fn verify_socket_zero_budget_expires_before_connect() {
         api.status_with_budget(Duration::ZERO).unwrap_err().kind(),
         io::ErrorKind::TimedOut
     );
+}
+
+#[test]
+fn verify_sampler_then_timeout_keeps_history() {
+    struct TimeoutAfterProgress<'a>(Cell<usize>, &'a FakeVerifyClock);
+    impl ApiPing for TimeoutAfterProgress<'_> {
+        fn ping(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+            panic!("verify must propagate its remaining budget")
+        }
+        fn status_with_budget(
+            &self,
+            budget: Duration,
+        ) -> io::Result<tidemark_core::api::StatusResult> {
+            let call = self.0.get();
+            self.0.set(call + 1);
+            if call > 0 {
+                assert_eq!(budget, Duration::from_millis(400));
+                self.1.sleep(budget);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "status budget expired",
+                ));
+            }
+            assert_eq!(budget, Duration::from_secs(1));
+            self.1.sleep(Duration::from_millis(100));
+            let mut status = Ping(true).status()?;
+            status.components[0].state = "degraded".into();
+            status.components[0].detail = "measurement pass in progress".into();
+            Ok(status)
+        }
+    }
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.sys.active.set(true);
+    fixture.report(&record.config_sha256, true);
+    let clock = FakeVerifyClock::default();
+    let api = TimeoutAfterProgress(Cell::new(0), &clock);
+    let result = verify_with_timing(
+        &fixture.state,
+        Duration::ZERO,
+        &fixture.sys,
+        &api,
+        VerifyTiming {
+            grace: Duration::from_secs(1),
+            interval: Duration::from_millis(500),
+            normal_interval: Duration::from_secs(5),
+        },
+        &clock,
+    )
+    .unwrap();
+    assert!(!result.healthy);
+    assert_eq!(clock.now(), Duration::from_secs(1));
+    assert_eq!(api.0.get(), 2);
+    assert!(result
+        .items
+        .iter()
+        .any(|i| i.name == "api" && i.detail.contains("status budget expired")));
+    assert!(result.items.iter().any(|i| i.name == "core_components"
+        && i.detail.contains("last status 900 ms ago:")
+        && i.detail
+            .contains("sampler=degraded (measurement pass in progress)")));
+}
+
+#[test]
+fn verify_retry_probe_floor() {
+    struct Recovering(Cell<usize>);
+    impl ApiPing for Recovering {
+        fn ping(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+            let call = self.0.get();
+            self.0.set(call + 1);
+            let mut status = Ping(true).status()?;
+            if call == 0 {
+                status.components[0].state = "degraded".into();
+                status.components[0].detail = "measurement pass in progress".into();
+            }
+            Ok(status)
+        }
+    }
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.sys.active.set(true);
+    fixture.report(&record.config_sha256, true);
+    for (budget_ms, calls, healthy) in [(1249, 1, false), (1250, 2, true)] {
+        let api = Recovering(Cell::new(0));
+        let clock = FakeVerifyClock::default();
+        let result = verify_with_timing(
+            &fixture.state,
+            Duration::ZERO,
+            &fixture.sys,
+            &api,
+            VerifyTiming {
+                grace: Duration::from_millis(budget_ms),
+                interval: Duration::from_secs(1),
+                normal_interval: Duration::from_secs(5),
+            },
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(result.healthy, healthy);
+        assert_eq!(api.0.get(), calls);
+        assert_eq!(clock.now(), Duration::from_secs(1));
+        if !healthy {
+            assert!(result
+                .items
+                .iter()
+                .any(|i| i.name == "core_components" && i.detail.contains("sampler=degraded")));
+            assert!(!result
+                .items
+                .iter()
+                .any(|i| i.detail.contains("last status")));
+        }
+    }
 }

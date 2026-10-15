@@ -560,16 +560,43 @@ fn verify_with_timing(
     let started = clock.now();
     // An explicit wait owns the whole budget: grace never extends it.
     let budget = if wait.is_zero() { timing.grace } else { wait };
+    let mut previous = None;
+    let mut sampler_observed_at = None;
     loop {
-        let (result, transient) = verify_poll(
+        let (mut result, transient) = verify_poll(
             state_dir,
             sys,
             api,
             budget.saturating_sub(clock.now().saturating_sub(started)),
             clock,
+            previous.as_ref(),
         );
+        let now = clock.now();
+        let api_failed = result
+            .items
+            .iter()
+            .any(|item| item.name == "api" && item.status == CheckStatus::Fail);
+        if transient {
+            sampler_observed_at = Some(now);
+        } else if api_failed {
+            if let Some(observed_at) = sampler_observed_at {
+                if let Some(item) = result
+                    .items
+                    .iter_mut()
+                    .find(|item| item.name == "core_components")
+                {
+                    item.detail.push_str(&format!(
+                        "; last status {} ms ago: sampler=degraded (measurement pass in progress)",
+                        now.saturating_sub(observed_at).as_millis()
+                    ));
+                }
+            }
+        } else {
+            // A newer successful status supersedes the earlier routine sampler state.
+            sampler_observed_at = None;
+        }
         if result.healthy
-            || clock.now().saturating_sub(started) >= budget
+            || budget.saturating_sub(clock.now().saturating_sub(started)) < VERIFY_PROBE_FLOOR
             || (wait.is_zero() && !transient)
             || result
                 .items
@@ -584,11 +611,14 @@ fn verify_with_timing(
             timing.normal_interval
         };
         clock.sleep(delay.min(budget.saturating_sub(clock.now().saturating_sub(started))));
-        if clock.now().saturating_sub(started) >= budget {
+        if budget.saturating_sub(clock.now().saturating_sub(started)) < VERIFY_PROBE_FLOOR {
             return Ok(result);
         }
+        previous = Some(result);
     }
 }
+// Retry only with enough allowance for a useful connect + exchange.
+const VERIFY_PROBE_FLOOR: Duration = Duration::from_millis(250);
 const SERVICE_START_HINT: &str = "the service is enabled but not running: if start-limit-hit, first run 'systemctl reset-failed tidemarkd'; then start it with 'systemctl start tidemarkd' (or reboot), or stage with --start-now";
 #[cfg(test)]
 fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> VerifyResult {
@@ -598,6 +628,7 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
         api,
         Duration::from_secs(10),
         &WallClock(Instant::now()),
+        None,
     )
     .0
 }
@@ -607,6 +638,7 @@ fn verify_poll(
     api: &dyn ApiPing,
     budget: Duration,
     clock: &dyn VerifyClock,
+    previous: Option<&VerifyResult>,
 ) -> (VerifyResult, bool) {
     let poll_started = clock.now();
     let staged = read_json(&state_dir.join("deploy/staged.json"));
@@ -682,10 +714,17 @@ fn verify_poll(
         },
     ));
     let stopped = items.iter().any(|item| item.detail == SERVICE_START_HINT);
+    let remaining = budget.saturating_sub(clock.now().saturating_sub(poll_started));
+    // Service/file probes may consume the useful budget after the loop's check.
+    if remaining < VERIFY_PROBE_FLOOR {
+        if let Some(previous) = previous {
+            return (previous.clone(), false);
+        }
+    }
     let status = if stopped {
         Err(io::Error::other("service is not running"))
     } else {
-        api.status_with_budget(budget.saturating_sub(clock.now().saturating_sub(poll_started)))
+        api.status_with_budget(remaining)
     };
     // Only a live status response can certify current component health. A stored
     // firstboot report is still config-hash evidence, never live health evidence.
