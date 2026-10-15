@@ -526,7 +526,13 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
                 Ok(())
             } else if sys.is_activating(UNIT)? {
                 Err(io::Error::other("service activating, waiting for start"))
+            } else if sys.is_active(UNIT)? {
+                // Activation can complete between the first two state probes.
+                Ok(())
+            } else if sys.is_activating(UNIT)? {
+                Err(io::Error::other("service activating, waiting for start"))
             } else if sys.is_enabled(UNIT)? {
+                // Only two inactive, non-activating observations justify giving up early.
                 Err(io::Error::other(SERVICE_START_HINT))
             } else {
                 Err(io::Error::other("service is not enabled or running"))

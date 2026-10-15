@@ -14,6 +14,7 @@ struct FakeSystemctl {
     enabled: Cell<bool>,
     active: Cell<bool>,
     activating: Cell<bool>,
+    activate_between_probes: Cell<bool>,
     fail_enable: Cell<bool>,
     refuse_stop: Cell<bool>,
     fail_restart: Cell<bool>,
@@ -29,6 +30,10 @@ impl Systemctl for FakeSystemctl {
         Ok(self.active.get())
     }
     fn is_activating(&self, _: &str) -> io::Result<bool> {
+        if self.activate_between_probes.replace(false) {
+            self.active.set(true);
+            self.activating.set(false);
+        }
         Ok(self.activating.get())
     }
     fn enable(&self, _: &str) -> io::Result<()> {
@@ -1733,4 +1738,27 @@ fn purge_absent_state_still_stops_service_and_preserves_stop_refusal() {
             assert!(!f.sys.enabled.get());
         }
     }
+}
+
+#[test]
+fn verify_activation_between_probes_does_not_report_stopped() {
+    let fixture = Fixture::new();
+    fixture.stage();
+    fixture.sys.activating.set(true);
+    fixture.sys.activate_between_probes.set(true);
+    let result = verify_once(&fixture.state, &fixture.sys, &Ping(true));
+    assert_eq!(result.items[0].status, CheckStatus::Pass);
+    assert!(!result
+        .items
+        .iter()
+        .any(|item| item.detail == SERVICE_START_HINT));
+    assert_eq!(
+        result
+            .items
+            .iter()
+            .find(|item| item.name == "api")
+            .unwrap()
+            .status,
+        CheckStatus::Pass
+    );
 }
