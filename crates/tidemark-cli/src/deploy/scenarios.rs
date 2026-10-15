@@ -407,13 +407,16 @@ struct FakeSocket {
 }
 impl ApiPing for FakeSocket {
     fn ping(&self) -> io::Result<()> {
+        self.status().map(|_| ())
+    }
+    fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
         let mut slot = self.stream.borrow_mut();
         let Some(stream) = slot.as_mut() else {
             return SocketPing {
                 socket: self.absent.clone(),
                 timeout: Duration::from_secs(10),
             }
-            .ping();
+            .status();
         };
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -431,13 +434,13 @@ impl ApiPing for FakeSocket {
         if response.v != 1 || response.id != "verify" || !response.ok {
             return Err(io::Error::other("fake status API unhealthy"));
         }
-        let _: tidemark_core::api::StatusResult = serde_json::from_value(
+        let status: tidemark_core::api::StatusResult = serde_json::from_value(
             response
                 .result
                 .ok_or_else(|| io::Error::other("missing status result"))?,
         )
         .map_err(io::Error::other)?;
-        Ok(())
+        Ok(status)
     }
 }
 
@@ -551,6 +554,9 @@ fn run_row(row: &Row) {
         };
         let server = thread::spawn(move || {
             stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             let mut line = String::new();
@@ -560,7 +566,7 @@ fn run_row(row: &Row) {
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(request["method"], "status");
             let response = if healthy {
-                serde_json::json!({"v":1,"id":request["id"],"ok":true,"result":{"version":"fake","uptime_s":120,"components":[],"watch_modes":[],"last_errors":[]}})
+                serde_json::json!({"v":1,"id":request["id"],"ok":true,"result":{"version":"fake","uptime_s":120,"components":[{"name":"sampler","state":"ok","detail":""},{"name":"scheduler","state":"ok","detail":""},{"name":"api","state":"ok","detail":""},{"name":"tswriter","state":"ok","detail":""}],"watch_modes":[],"last_errors":[]}})
             } else {
                 serde_json::json!({"v":1,"id":request["id"],"ok":false,"error":{"code":"unavailable","message":"injected unhealthy API"}})
             };
