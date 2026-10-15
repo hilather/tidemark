@@ -622,7 +622,7 @@ impl Browser {
                     );
                     // Representatives, entry counts and LCA charges are distinct quantities.
                     self.text.push_str(&format!(
-                        "{count} retained representatives listed; {} file entries here\ncharged to this directory: {}\n(includes directory blocks and hard-linked files whose links share this directory as common ancestor)",
+                        "{count} retained representatives listed; {} file entries here\ncharged to this directory: {}\n(includes directory blocks and hard-linked files\nwhose links share this directory as common ancestor)",
                         snapshot_dir.own_files,
                         crate::render::size::bytes(snapshot_dir.own_charged)
                     ));

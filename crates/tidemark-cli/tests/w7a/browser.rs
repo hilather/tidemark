@@ -1552,3 +1552,24 @@ fn post_tui_disjoint_traversals_all_sorts() {
         }
     }
 }
+
+#[test]
+fn post_tui_files_pane_fits_80_columns() {
+    let (_temp, mut b) = browser(0);
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    let rendered = render(&b, 80, 24);
+    let title = rendered.lines().nth(4).unwrap();
+    assert!(
+        title.contains(&b.snapshot.meta().scan_id.to_string()),
+        "{title}"
+    );
+    assert!(
+        title.contains(&crate::render::size::timestamp(
+            b.snapshot.meta().finished_at
+        )),
+        "{title}"
+    );
+    assert!(rendered.contains("common ancestor"), "{rendered}");
+}
+

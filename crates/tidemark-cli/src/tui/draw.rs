@@ -112,7 +112,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
     };
     let title = if b.state.pane == Pane::Files {
         format!(
-            "{title} | snapshot {} at {}",
+            "Files | snapshot {} at {}",
             meta.scan_id,
             size::timestamp(meta.finished_at)
         )
