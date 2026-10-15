@@ -980,3 +980,22 @@ fn live_refresh_from_later_page_restores_own_row() {
     }
     assert_eq!(own_rows, 1);
 }
+
+#[test]
+fn operator_changed_config_recipes_apply_to_running_daemon() {
+    let guide = include_str!("../../../../docs/operator-guide.md");
+    let metrics = guide
+        .split("Prometheus textfile export is off by default")
+        .nth(1)
+        .unwrap();
+    let recipe = metrics.split("Tidemark writes Prometheus").next().unwrap();
+    assert!(recipe.contains("sudo tidemark deploy stage --from ./tidemark.toml --start-now"));
+    let hot = guide
+        .split("An unwatched path exits 5")
+        .nth(1)
+        .unwrap()
+        .split("<!--")
+        .next()
+        .unwrap();
+    assert!(hot.contains("--start-now"));
+}
