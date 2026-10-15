@@ -624,7 +624,9 @@ fn own_row_sorts_and_enter_lists_direct_files() {
     b.enter().unwrap();
     assert_eq!(b.state.pane, Pane::Files);
     // Sorting uses the displayed directory; details use its immutable snapshot row.
-    assert!(b.text.contains("1 other file, 0 B not individually retained"));
+    assert!(b
+        .text
+        .contains("1 other file, 0 B not individually retained"));
 }
 
 #[test]
