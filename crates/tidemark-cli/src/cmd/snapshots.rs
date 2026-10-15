@@ -275,7 +275,7 @@ pub(crate) fn remove_snapshot(
             .context(format!("remove snapshot: {}", super::display_path(file)))),
     }
 }
-/// Resolve a canonical live query path and select a containing complete snapshot.
+/// Resolve a canonical live path; select an explicit snapshot or the latest containing complete one.
 pub(crate) fn select(
     context: &crate::Context,
     path: Option<&std::path::Path>,
@@ -336,7 +336,12 @@ pub(crate) fn missing_path(
     snapshot: &tidemark_store::reader::Snapshot,
 ) -> crate::CliError {
     let subject = path.display_lossy();
-    let mut detail = format!("no complete snapshot of {subject} yet; the selected complete snapshot covering it is of {} ({}), which does not contain {subject}", snapshot.meta().root.display_lossy(), snapshot.meta().scan_id);
+    let mut detail = format!(
+        "the selected {} snapshot of {} ({}) does not contain {subject}",
+        crate::render::enum_label(snapshot.meta().status),
+        snapshot.meta().root.display_lossy(),
+        snapshot.meta().scan_id
+    );
     if let Ok(root) = snapshot.root() {
         if let Ok(skipped) = snapshot.skipped_under(root.id) {
             for skip in skipped {

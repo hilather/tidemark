@@ -623,10 +623,10 @@ fn own_row_sorts_and_enter_lists_direct_files() {
     b.state.selected = b.own_position();
     b.enter().unwrap();
     assert_eq!(b.state.pane, Pane::Files);
-    assert!(b.text.contains(&format!(
-        "12 other files, {} not individually retained",
-        crate::render::size::bytes(8192)
-    )));
+    // Sorting uses the displayed directory; details use its immutable snapshot row.
+    assert!(b
+        .text
+        .contains("1 other file, 0 B not individually retained"));
 }
 
 #[test]
@@ -772,7 +772,7 @@ fn missing_path_message_names_recorded_filesystem_boundary() {
     };
     let path = RawPath::new(b"/data".to_vec()).unwrap();
     let message = crate::cmd::snapshots::missing_path(&context, &path, &snapshot).to_string();
-    assert!(message.contains("no complete snapshot of /data yet"));
+    assert!(message.contains("selected complete snapshot"));
     assert!(message.contains("of / ("));
     assert!(message.contains("a different filesystem"));
     assert!(message.contains("run: tidemark scan /data"));
@@ -798,9 +798,16 @@ fn missing_path_message_includes_daemon_schedule_for_configured_root() {
         Err(error) => panic!("bind fixture socket: {error}"),
     };
     let worker = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_schedule_before(
+            &listener,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let mut request = String::new();
         BufReader::new(&stream).read_line(&mut request).unwrap();
@@ -839,4 +846,337 @@ fn end_includes_own_row_at_an_exact_page_boundary() {
     b.page(true).unwrap();
     assert_eq!(b.pages.offset, 0);
     assert_eq!(b.own_position(), 0);
+}
+
+#[test]
+fn own_files_hardlink_remainder_is_unknown() {
+    // top_files=1 retains only shared (8 MiB), charged at /r, not /r/a.
+    let (_temp, mut b) = browser(0);
+    let temp = ::test_support::private_tempdir().unwrap();
+    let mut rows = vec![
+        fixture::row(0, None, b"/r", 9 * 1024 * 1024),
+        fixture::row(1, Some(0), b"/r/a", 9 * 1024 * 1024),
+        fixture::row(2, Some(0), b"/r/b", 8 * 1024 * 1024),
+    ];
+    rows[0].subtree_end = 2;
+    rows[0].own_files = 0;
+    rows[0].own_charged = 8 * 1024 * 1024;
+    rows[0].t_files = 3;
+    rows[0].t_inodes = 2;
+    rows[0].t_dirs = 3;
+    rows[0].t_reclaimable = 9 * 1024 * 1024;
+    // The unretained /r/a/small is a single-link 1 MiB file.
+    rows[1].own_files = 2;
+    rows[1].own_charged = 1024 * 1024;
+    rows[1].t_charged = 1024 * 1024;
+    rows[1].t_files = 2;
+    rows[1].t_inodes = 2;
+    rows[1].t_reclaimable = 1024 * 1024;
+    rows[2].own_charged = 0;
+    rows[2].t_charged = 0;
+    rows[2].t_reclaimable = 0;
+    for row in &mut rows {
+        row.own_apparent = row.own_charged;
+        row.age0 = row.t_charged;
+    }
+    let meta = fixture::meta(rows[0].path.clone(), 2_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&rows).unwrap();
+    writer
+        .put_link_sets(&[LinkSetRow {
+            ino: 42,
+            nlink: 2,
+            found: 2,
+            complete: true,
+            disk: 8 * 1024 * 1024,
+            apparent: 8 * 1024 * 1024,
+            mtime: 0,
+            lca_dir_id: 0,
+        }])
+        .unwrap();
+    writer
+        .put_link_instances(&[1, 2].map(|dir_id| LinkInstanceRow {
+            ino: 42,
+            dir_id,
+            name: Some(RawName::new(b"shared".to_vec()).unwrap()),
+        }))
+        .unwrap();
+    writer
+        .put_files(&[FileRow {
+            id: 0,
+            dir_id: 1,
+            name: Some(RawName::new(b"shared".to_vec()).unwrap()),
+            ino: 42,
+            disk: 8 * 1024 * 1024,
+            apparent: 8 * 1024 * 1024,
+            mtime: 0,
+            nlink: 2,
+        }])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.navigate(b.snapshot.dir(1).unwrap()).unwrap();
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    assert!(
+        b.text
+            .contains("1 other file; size not individually retained unknown"),
+        "{}",
+        b.text
+    );
+    assert!(b.text.contains("[hard links]"));
+}
+
+#[test]
+fn own_files_after_refresh_use_snapshot_observation() {
+    let (_temp, mut b) = browser(0);
+    let temp = ::test_support::private_tempdir().unwrap();
+    let mut root = b.dir.clone();
+    root.own_files = 1;
+    root.own_charged = 8 * 1024 * 1024;
+    let meta = fixture::meta(root.path.clone(), 2_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&[root.clone()]).unwrap();
+    writer
+        .put_files(&[FileRow {
+            id: 0,
+            dir_id: 0,
+            name: Some(RawName::new(b"A".to_vec()).unwrap()),
+            ino: 42,
+            disk: 8 * 1024 * 1024,
+            apparent: 8 * 1024 * 1024,
+            mtime: 0,
+            nlink: 1,
+        }])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.dir = root.clone();
+    // A was deleted and replaced by B (16 MiB). Deliver the live scan result.
+    root.own_charged = 16 * 1024 * 1024;
+    install_refresh(&mut b, root, vec![]);
+    assert_eq!(b.dir.own_charged, 16 * 1024 * 1024);
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    assert!(b.text.contains("/fixture/A"));
+    assert!(!b.text.contains("/fixture/B"));
+    assert!(
+        b.text
+            .contains("0 other files, 0 B not individually retained"),
+        "{}",
+        b.text
+    );
+    assert!(b.text.contains(&meta.scan_id.to_string()));
+    assert!(b
+        .text
+        .contains(&crate::render::size::timestamp(meta.finished_at)));
+    assert!(b.text.contains("does not include changes since"));
+    for width in [80, 160] {
+        let screen = render(&b, width, 48);
+        assert!(screen.contains(&crate::render::size::timestamp(meta.finished_at)));
+        assert!(screen.contains("does not include changes since this snapshot"));
+        assert!(!screen.contains("live (Δ snapshot)"));
+        assert!(!screen.contains("live values; delta"));
+    }
+}
+
+fn install_refresh(b: &mut Browser, root: DirRow, children: Vec<(DirRow, Option<i128>)>) {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+    });
+    tx.send(Ok(LiveResult {
+        root,
+        children,
+        sort: b.state.sort,
+        growth: Default::default(),
+    }))
+    .unwrap();
+    b.poll_refresh().unwrap();
+}
+
+#[test]
+fn live_refresh_from_later_page_restores_own_row() {
+    let (_temp, mut b) = browser(2500);
+    b.state.sort = state::Sort::Name;
+    b.boundary(false).unwrap();
+    b.page(false).unwrap();
+    assert!(b.pages.cursor.is_some());
+    let children = (1..=2500)
+        .map(|id| {
+            (
+                fixture::row(id, Some(0), format!("/fixture/{id:08}").as_bytes(), 4096),
+                None,
+            )
+        })
+        .collect();
+    let root = b.dir.clone();
+    install_refresh(&mut b, root, children);
+    assert_eq!(b.pages.offset, 0);
+    assert_eq!(b.own_position(), 0);
+    assert!(b.pages.cursor.is_none());
+    assert!(!b.pages.reverse);
+    let mut own_rows = 0;
+    loop {
+        own_rows += usize::from(b.own_position() != usize::MAX);
+        if b.rows.len() < PAGE {
+            break;
+        }
+        b.page(false).unwrap();
+    }
+    assert_eq!(own_rows, 1);
+}
+
+#[test]
+fn operator_changed_config_recipes_apply_to_running_daemon() {
+    let guide = include_str!("../../../../docs/operator-guide.md");
+    let metrics = guide
+        .split("Prometheus textfile export is off by default")
+        .nth(1)
+        .unwrap();
+    let recipe = metrics.split("Tidemark writes Prometheus").next().unwrap();
+    assert!(recipe.contains("sudo tidemark deploy stage --from ./tidemark.toml --start-now"));
+    let hot = guide
+        .split("An unwatched path exits 5")
+        .nth(1)
+        .unwrap()
+        .split("<!--")
+        .next()
+        .unwrap();
+    assert!(hot.contains("--start-now"));
+}
+
+fn selected_missing_path(partial: bool) -> String {
+    let state = ::test_support::private_tempdir().unwrap();
+    let live = ::test_support::private_tempdir().unwrap();
+    std::fs::create_dir(live.path().join("new")).unwrap();
+    let root = RawPath::from_path(live.path()).unwrap();
+    let path = RawPath::from_path(&live.path().join("new")).unwrap();
+    let mut old = fixture::meta(root.clone(), 1_000_000);
+    if partial {
+        old.status = tidemark_core::scan::SnapshotStatus::Partial;
+    }
+    let dir = state
+        .path()
+        .join("snapshots")
+        .join(tidemark_store::catalog::root_slug(&root));
+    let mut row = fixture::row(0, None, root.as_bytes(), 0);
+    row.subtree_end = 0;
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(&dir, &old).unwrap();
+    writer.put_dirs(&[row.clone()]).unwrap();
+    writer.finish(&old).unwrap();
+    let mut newer = fixture::meta(root, 2_000_000);
+    newer.scan_id = serde_json::from_str("\"20260102T000000Z-00000000\"").unwrap();
+    row.subtree_end = 1;
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(&dir, &newer).unwrap();
+    writer
+        .put_dirs(&[row, fixture::row(1, Some(0), path.as_bytes(), 0)])
+        .unwrap();
+    writer.finish(&newer).unwrap();
+    let catalog = tidemark_store::catalog::Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let mut config = tidemark_core::config::Config::default();
+    config.general.state_dir = state.path().to_path_buf();
+    let context = crate::Context {
+        config,
+        config_path: "/unused".into(),
+        json: false,
+        color: false,
+    };
+    let (_, latest) =
+        crate::cmd::snapshots::select(&context, Some(&live.path().join("new")), None).unwrap();
+    assert!(latest.dir_by_path(&path).unwrap().is_some());
+    let (_, selected) = crate::cmd::snapshots::select(
+        &context,
+        Some(&live.path().join("new")),
+        Some(&old.scan_id.to_string()),
+    )
+    .unwrap();
+    assert_eq!(selected.meta().status, old.status);
+    crate::cmd::snapshots::missing_path(&context, &path, &selected).to_string()
+}
+
+#[test]
+fn missing_path_explicit_old_snapshot_does_not_deny_newer_evidence() {
+    let message = selected_missing_path(false);
+    assert!(message.contains("selected complete snapshot"));
+    assert!(!message.contains("no complete snapshot"), "{message}");
+}
+
+#[test]
+fn missing_path_partial_snapshot_is_labelled_partial() {
+    let message = selected_missing_path(true);
+    assert!(message.contains("selected partial snapshot"), "{message}");
+    assert!(!message.contains("selected complete snapshot"));
+}
+
+#[test]
+fn operator_upgrade_explains_metrics_defaults_and_stale_export() {
+    let upgrade = include_str!("../../../../docs/operator-guide.md")
+        .split("## Upgrade or remove")
+        .nth(1)
+        .unwrap();
+    for required in [
+        "omitted",
+        "textfile",
+        "explicit",
+        "tidemark.prom",
+        "node_exporter",
+        "node_textfile_mtime_seconds",
+        "delete",
+    ] {
+        assert!(
+            upgrade.contains(required),
+            "upgrade guidance missing {required}"
+        );
+    }
+}
+
+fn accept_schedule_before(
+    listener: &std::os::unix::net::UnixListener,
+    deadline: std::time::Instant,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    listener.set_nonblocking(true)?;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return Ok(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "schedule fixture accept deadline",
+                    ));
+                }
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[test]
+fn schedule_socket_accept_without_client_has_deadline() {
+    let temp = ::test_support::private_tempdir().unwrap();
+    let listener = match std::os::unix::net::UnixListener::bind(temp.path().join("no-client.sock"))
+    {
+        Ok(listener) => listener,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            eprintln!("socket unavailable; skipping accept deadline test: {error}");
+            return;
+        }
+        Err(error) => panic!("bind fixture socket: {error}"),
+    };
+    let start = std::time::Instant::now();
+    let error = accept_schedule_before(&listener, start + std::time::Duration::from_millis(30))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
 }
