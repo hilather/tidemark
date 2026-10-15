@@ -1526,3 +1526,22 @@ fn progress_rate_unit_matches_rounded_display() {
         assert!(tidemark_cli::render::scan_progress::format_progress(&progress).contains(expected));
     }
 }
+
+#[test]
+fn status_shows_metrics_disabled_plainly() {
+    let context = tidemark_cli::Context {
+        config: tidemark_core::config::Config::default(),
+        config_path: "/fixture".into(),
+        json: false,
+        color: false,
+    };
+    let report = serde_json::from_value(serde_json::json!({"version":"fixture","uptime_s":1,"components":[{"name":"metrics","state":"disabled","detail":"not configured: metrics textfile path is empty"}],"watch_modes":[],"last_errors":[]})).unwrap();
+    let mut out = Vec::new();
+    tidemark_cli::render::status::write_width(&report, &[], &context, false, 100, &mut out)
+        .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("metrics    disabled  not configured: metrics textfile path is empty"),
+        "{text}"
+    );
+}

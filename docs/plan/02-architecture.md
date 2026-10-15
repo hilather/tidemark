@@ -141,7 +141,7 @@ Shared state is `Arc<RwLock<LiveState>>` with small critical sections. Cross-thr
 └── tmp/                             scratch
 /run/tidemark/                      runtime directory (0700 root:root)
 /run/tidemark/api.sock               API socket (0600 root:root)
-/var/lib/node_exporter/textfile_collector/tidemark.prom   metrics (configurable)
+/var/lib/node_exporter/textfile_collector/tidemark.prom   metrics (optional, off by default; configurable)
 ```
 
 `root-slug` is the root path with `/` replaced by `_`, so `/data` becomes `_data` and `/` becomes `_` (`_` inside names is escaped as `%5F`, so the mapping is injective; W1-E `root_slug` is normative). `scan_id` is `YYYYMMDDTHHMMSSZ-<8 hex>`.

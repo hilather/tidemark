@@ -60,6 +60,7 @@ fn exact_normative_unit_and_config() {
     assert_eq!(config, block("## 3.", "toml"));
     let parsed: toml::Value = toml::from_str(&config).unwrap();
     assert!(parsed["metrics"].get("listen").is_none());
+    assert_eq!(parsed["metrics"]["textfile"].as_str(), Some(""));
     assert!(parsed["alerts"].get("webhook").is_none());
     assert!(!config.contains("socket_group"));
     assert_eq!(
@@ -442,7 +443,11 @@ fn upgrade_fixture_options_and_drift() {
         read("tests/install/upgrade-config/tidemark.toml"),
         format!(
             "{}# upgrade fixture 0.1.1\n",
-            read("packaging/config/tidemark.toml")
+            // Preserve the historical enabled destination in the upgrade fixture.
+            read("packaging/config/tidemark.toml").replace(
+                "textfile              = \"\"   # off; for node_exporter's textfile collector e.g. \"/var/lib/node_exporter/textfile_collector/tidemark.prom\"",
+                "textfile              = \"/var/lib/node_exporter/textfile_collector/tidemark.prom\"   # \"\" = disabled",
+            )
         )
     );
 }

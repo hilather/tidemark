@@ -112,3 +112,30 @@ fn exporter_preserves_live_socket() {
     assert!(tidemarkd::metrics::write_textfile(&path, "metric 1\n").is_err());
     assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
 }
+
+#[test]
+fn check_config_accepts_metrics_disabled_by_default() {
+    let dir = ::test_support::private_tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    for metrics in [
+        "",
+        "[metrics]\ninterval='30s'\n",
+        "[metrics]\ntextfile=''\n",
+    ] {
+        std::fs::write(
+            &path,
+            format!(
+                "[general]\nstate_dir='{}'\nsocket='{}'\n{metrics}",
+                dir.path().join("state").display(),
+                dir.path().join("api.sock").display()
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_tidemarkd"))
+            .args(["--check-config", "--config"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+}

@@ -228,7 +228,7 @@ open_writers     = true
 exclude_prefixes = []
 
 [metrics]
-textfile              = "/var/lib/node_exporter/textfile_collector/tidemark.prom"   # "" = disabled
+textfile              = ""   # off; for node_exporter's textfile collector e.g. "/var/lib/node_exporter/textfile_collector/tidemark.prom"
 interval              = "60s"
 dir_metrics_depth     = 2
 max_series_per_metric = 500
