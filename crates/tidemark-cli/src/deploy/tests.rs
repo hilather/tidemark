@@ -1855,13 +1855,7 @@ fn verify_wait_rechecks_live_health() {
     fixture.sys.active.set(true);
     fixture.report(&record.config_sha256, false);
     let api = Recovering(Cell::new(0));
-    let result = verify(
-        &fixture.state,
-        Duration::from_secs(10),
-        &fixture.sys,
-        &api,
-    )
-    .unwrap();
+    let result = verify(&fixture.state, Duration::from_secs(10), &fixture.sys, &api).unwrap();
     assert!(result.healthy);
     assert_eq!(api.0.get(), 2);
 }
