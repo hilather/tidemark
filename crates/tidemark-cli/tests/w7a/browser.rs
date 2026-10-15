@@ -772,7 +772,7 @@ fn missing_path_message_names_recorded_filesystem_boundary() {
     };
     let path = RawPath::new(b"/data".to_vec()).unwrap();
     let message = crate::cmd::snapshots::missing_path(&context, &path, &snapshot).to_string();
-    assert!(message.contains("no complete snapshot of /data yet"));
+    assert!(message.contains("selected complete snapshot"));
     assert!(message.contains("of / ("));
     assert!(message.contains("a different filesystem"));
     assert!(message.contains("run: tidemark scan /data"));
@@ -998,4 +998,68 @@ fn operator_changed_config_recipes_apply_to_running_daemon() {
         .next()
         .unwrap();
     assert!(hot.contains("--start-now"));
+}
+
+fn selected_missing_path(partial: bool) -> String {
+    let state = ::test_support::private_tempdir().unwrap();
+    let live = ::test_support::private_tempdir().unwrap();
+    std::fs::create_dir(live.path().join("new")).unwrap();
+    let root = RawPath::from_path(live.path()).unwrap();
+    let path = RawPath::from_path(&live.path().join("new")).unwrap();
+    let mut old = fixture::meta(root.clone(), 1_000_000);
+    if partial {
+        old.status = tidemark_core::scan::SnapshotStatus::Partial;
+    }
+    let dir = state
+        .path()
+        .join("snapshots")
+        .join(tidemark_store::catalog::root_slug(&root));
+    let mut row = fixture::row(0, None, root.as_bytes(), 0);
+    row.subtree_end = 0;
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(&dir, &old).unwrap();
+    writer.put_dirs(&[row.clone()]).unwrap();
+    writer.finish(&old).unwrap();
+    let mut newer = fixture::meta(root, 2_000_000);
+    newer.scan_id = serde_json::from_str("\"20260102T000000Z-00000000\"").unwrap();
+    row.subtree_end = 1;
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(&dir, &newer).unwrap();
+    writer
+        .put_dirs(&[row, fixture::row(1, Some(0), path.as_bytes(), 0)])
+        .unwrap();
+    writer.finish(&newer).unwrap();
+    let catalog = tidemark_store::catalog::Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let mut config = tidemark_core::config::Config::default();
+    config.general.state_dir = state.path().to_path_buf();
+    let context = crate::Context {
+        config,
+        config_path: "/unused".into(),
+        json: false,
+        color: false,
+    };
+    let (_, latest) =
+        crate::cmd::snapshots::select(&context, Some(&live.path().join("new")), None).unwrap();
+    assert!(latest.dir_by_path(&path).unwrap().is_some());
+    let (_, selected) = crate::cmd::snapshots::select(
+        &context,
+        Some(&live.path().join("new")),
+        Some(&old.scan_id.to_string()),
+    )
+    .unwrap();
+    assert_eq!(selected.meta().status, old.status);
+    crate::cmd::snapshots::missing_path(&context, &path, &selected).to_string()
+}
+
+#[test]
+fn missing_path_explicit_old_snapshot_does_not_deny_newer_evidence() {
+    let message = selected_missing_path(false);
+    assert!(message.contains("selected complete snapshot"));
+    assert!(!message.contains("no complete snapshot"), "{message}");
+}
+
+#[test]
+fn missing_path_partial_snapshot_is_labelled_partial() {
+    let message = selected_missing_path(true);
+    assert!(message.contains("selected partial snapshot"), "{message}");
+    assert!(!message.contains("selected complete snapshot"));
 }
