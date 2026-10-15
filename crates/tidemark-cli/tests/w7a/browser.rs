@@ -1465,7 +1465,8 @@ fn post_tui_disjoint_traversals_all_sorts() {
         state::Sort::Name,
         state::Sort::Growth,
     ] {
-        for count in [2500, 2000] {
+        for rank in [0, 999, 1000, 2000, 2500] {
+            let count = 2500;
             for live in [false, true] {
                 let (_temp, mut b) = browser(count);
                 b.state.sort = sort;
@@ -1475,7 +1476,7 @@ fn post_tui_disjoint_traversals_all_sorts() {
                 root.own_files = 1;
                 let mut rows = vec![root];
                 for id in 1..=count {
-                    let before = id <= 750;
+                    let before = id <= rank;
                     let mut row = fixture::row(
                         id,
                         Some(0),
@@ -1509,6 +1510,35 @@ fn post_tui_disjoint_traversals_all_sorts() {
                         .collect();
                     let root = b.dir.clone();
                     install_refresh(&mut b, root, children);
+                }
+                for reverse in [false, true] {
+                    b.boundary(reverse).unwrap();
+                    for _ in 0..3 {
+                        let own_rank = if sort == state::Sort::Growth {
+                            count
+                        } else {
+                            rank
+                        } as usize;
+                        let expected = own_rank >= b.pages.offset
+                            && (own_rank < b.pages.offset + b.rows.len()
+                                || b.pages.offset + b.rows.len() == count as usize);
+                        assert_eq!(b.own_position() != usize::MAX, expected,
+                            "membership {sort:?} rank={rank} live={live} offset={} reverse={reverse}", b.pages.offset);
+                        if b.pages.offset > 0 {
+                            let offset = b.pages.offset;
+                            b.state.selected = 0;
+                            let first = b.child_at(0).map(|r| r.0.id).unwrap_or(0);
+                            b.page(true).unwrap();
+                            b.state.selected = b.count() - 1;
+                            let previous =
+                                b.child_at(b.state.selected).map(|r| r.0.id).unwrap_or(0);
+                            assert_ne!(first, previous, "Up must move one row");
+                            b.page(false).unwrap();
+                            assert_eq!(b.pages.offset, offset);
+                            assert_eq!(b.child_at(0).map(|r| r.0.id).unwrap_or(0), first);
+                        }
+                        b.page(reverse).unwrap();
+                    }
                 }
                 let mut forward = Vec::new();
                 b.boundary(false).unwrap();
