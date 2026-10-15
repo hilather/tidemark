@@ -186,6 +186,9 @@ impl Browser {
         let previous_offset = self.pages.offset;
         let previous_selection = self.state.selected;
         if self.pages.live.is_some() || self.state.sort == state::Sort::Growth {
+            if reverse && self.pages.offset == 0 {
+                return Ok(());
+            }
             if reverse {
                 self.pages.offset = self.pages.offset.saturating_sub(PAGE);
             } else if self.rows.len() == PAGE {
@@ -463,7 +466,16 @@ impl Browser {
         let matches = byte_contains(b".", self.state.filter.as_bytes());
         let at_beginning = self.pages.offset == 0;
         let at_end = self.pages.offset.saturating_add(self.rows.len()) >= self.pages.total;
-        let in_page = if let Some(cursor) = &self.pages.cursor {
+        let in_page = if let Some(live) = &self.pages.live {
+            // Live rows use offset slices, so keyset cursors cannot delimit them.
+            let rank = live
+                .iter()
+                .filter(|(row, _)| byte_contains(&row.name, self.state.filter.as_bytes()))
+                .take_while(|row| before(row))
+                .count();
+            rank >= self.pages.offset
+                && (rank < self.pages.offset.saturating_add(self.rows.len()) || at_end)
+        } else if let Some(cursor) = &self.pages.cursor {
             if self.pages.reverse {
                 !before(&(cursor.clone(), None)) && (position > 0 || at_beginning)
             } else {
@@ -502,6 +514,7 @@ impl Browser {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         self.pages = Pages::default();
+        self.message.clear();
         self.state.filter.clear();
         if self.state.sort == state::Sort::Growth
             && self.snapshot.children_count(dir.id, b"")? > 10_000
@@ -571,10 +584,6 @@ impl Browser {
                         true,
                     )?;
                     let count = hits.len() as u64;
-                    let has_hard_links = hits.iter().any(|hit| hit.row.nlink > 1);
-                    let bytes = hits
-                        .iter()
-                        .fold(0u64, |sum, hit| sum.saturating_add(hit.row.disk));
                     self.text = format!(
                         "Snapshot {} at {}\ndoes not include changes since this snapshot\nPATH  SIZE  APPARENT  MTIME UTC\n",
                         self.snapshot.meta().scan_id,
@@ -602,22 +611,12 @@ impl Browser {
                             })
                             .collect::<String>(),
                     );
-                    let remaining = snapshot_dir.own_files.saturating_sub(count);
-                    if has_hard_links {
-                        // File rows identify representatives, not where link sets are charged.
-                        self.text.push_str(&format!(
-                            "{remaining} other {}; size not individually retained unknown (hard links may be charged elsewhere)",
-                            crate::render::unit(remaining, "file", "files")
-                        ));
-                    } else {
-                        self.text.push_str(&format!(
-                            "{remaining} other {}, {} not individually retained",
-                            crate::render::unit(remaining, "file", "files"),
-                            crate::render::size::bytes(
-                                snapshot_dir.own_charged.saturating_sub(bytes)
-                            )
-                        ));
-                    }
+                    // Representatives, entry counts and LCA charges are distinct quantities.
+                    self.text.push_str(&format!(
+                        "{count} retained representatives listed; {} file entries here\ncharged to this directory: {}\n(includes directory blocks and hard-linked files whose links share this directory as common ancestor)",
+                        snapshot_dir.own_files,
+                        crate::render::size::bytes(snapshot_dir.own_charged)
+                    ));
                     self.state.pane = Pane::Files;
                     self.state.selected = 0;
                     return Ok(());
