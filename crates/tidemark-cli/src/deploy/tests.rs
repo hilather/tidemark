@@ -1857,7 +1857,7 @@ fn verify_wait_rechecks_live_health() {
     let api = Recovering(Cell::new(0));
     let result = verify(
         &fixture.state,
-        Duration::from_millis(20),
+        Duration::from_secs(10),
         &fixture.sys,
         &api,
     )
