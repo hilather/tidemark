@@ -626,7 +626,7 @@ fn own_row_sorts_and_enter_lists_direct_files() {
     // Sorting uses the displayed directory; details use its immutable snapshot row.
     assert!(b
         .text
-        .contains("1 other file, 0 B not individually retained"));
+        .contains("0 retained representatives listed; 1 file entries here"));
 }
 
 #[test]
@@ -1238,15 +1238,70 @@ fn own_files_snapshot_totals_cover_remainder_counterexamples() {
         rows[0].own_files = 0;
         rows[0].own_charged = 8 * 1024 * 1024;
         rows[1].own_files = 2;
-        rows[1].own_charged = 16 * 1024 * 1024;
+        rows[1].own_charged = 1024 * 1024;
         rows[2].own_files = 1;
         rows[2].own_charged = 0;
+        if case == "unretained shared plus large" {
+            rows[1].own_charged = 16 * 1024 * 1024;
+        } else if case == "threshold retention" {
+            rows[1].own_files = 1;
+            rows[1].own_charged = 0;
+        } else if case == "directory blocks" {
+            rows[0].own_charged = 0;
+            rows[1].dir_disk = 4096;
+            rows[2].own_files = 0;
+        }
         rows[viewed].own_files = own_files;
         rows[viewed].own_charged = charged;
+        let shared = if case == "directory blocks" {
+            0
+        } else {
+            8 * 1024 * 1024
+        };
+        for row in rows.iter_mut().skip(1) {
+            row.t_charged = row.own_charged;
+            row.t_disk = row.own_charged + shared;
+            row.t_files = row.own_files;
+            row.t_inodes = row.own_files;
+            row.t_reclaimable = row.own_charged;
+        }
+        rows[0].t_charged = rows.iter().map(|r| r.own_charged).sum();
+        rows[0].t_disk = rows[0].t_charged;
+        rows[0].t_files = rows.iter().map(|r| r.own_files).sum();
+        rows[0].t_inodes = rows[0].t_files - u64::from(shared > 0);
+        rows[0].t_reclaimable = rows[0].t_charged;
+        rows[0].t_dirs = 3;
+        for row in &mut rows {
+            row.own_apparent = row.own_charged;
+            row.t_apparent = row.t_disk;
+            row.age0 = row.t_charged;
+        }
         let meta = fixture::meta(rows[0].path.clone(), 2_000_000);
         let mut writer =
             tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
         writer.put_dirs(&rows).unwrap();
+        if shared > 0 {
+            let ino = if nlink == 1 { 43 } else { 42 };
+            writer
+                .put_link_sets(&[LinkSetRow {
+                    ino,
+                    nlink: 2,
+                    found: 2,
+                    complete: true,
+                    disk: shared,
+                    apparent: shared,
+                    mtime: 0,
+                    lca_dir_id: 0,
+                }])
+                .unwrap();
+            writer
+                .put_link_instances(&[1, 2].map(|dir_id| LinkInstanceRow {
+                    ino,
+                    dir_id,
+                    name: Some(RawName::new(b"shared".to_vec()).unwrap()),
+                }))
+                .unwrap();
+        }
         let mut files = vec![FileRow {
             id: 0,
             dir_id: retained_dir,
@@ -1294,4 +1349,90 @@ fn own_files_snapshot_totals_cover_remainder_counterexamples() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+#[test]
+fn live_reverse_boundary_keeps_own_row_for_every_sort() {
+    let mut failures = Vec::new();
+    for sort in [
+        state::Sort::Size,
+        state::Sort::Reclaim,
+        state::Sort::Files,
+        state::Sort::Newest,
+        state::Sort::Name,
+    ] {
+        for (count, rank) in [(1, 1), (2500, 0), (2500, 1000), (2500, 1250), (2500, 2500)] {
+            let (_temp, mut b) = browser(count);
+            b.state.sort = sort;
+            let children = (1..=count)
+                .map(|id| {
+                    let before = id <= rank;
+                    let prefix = if before { '!' } else { 'z' };
+                    let mut row = fixture::row(
+                        id,
+                        Some(0),
+                        format!("/fixture/{prefix}{id:08}").as_bytes(),
+                        if before { 4096 } else { 0 },
+                    );
+                    row.t_reclaimable = if before { 4096 } else { 0 };
+                    row.newest_mtime = if before { 100 } else { i64::MIN };
+                    row.t_files = if before { 2 } else { 0 };
+                    (row, None)
+                })
+                .collect();
+            let mut root = b.dir.clone();
+            root.own_files = 1;
+            root.own_charged = 2048;
+            install_refresh(&mut b, root, children);
+            let initial = b.own_position();
+            assert_eq!(
+                initial,
+                if rank < PAGE as u32 || count == 1 {
+                    rank as usize
+                } else {
+                    usize::MAX
+                }
+            );
+            // PgUp and Up on the first selected child both call page(true).
+            for _ in 0..2 {
+                b.state.selected = 0;
+                b.page(true).unwrap();
+                if b.own_position() != initial || b.pages.cursor.is_some() {
+                    failures.push(format!(
+                        "{sort:?}, {count}: no-op reverse changed own position {initial} to {}",
+                        b.own_position()
+                    ));
+                }
+            }
+            let mut forward_own = usize::from(b.own_position() != usize::MAX);
+            while b.rows.len() == PAGE {
+                b.page(false).unwrap();
+                forward_own += usize::from(b.own_position() != usize::MAX);
+            }
+            let mut reverse_own = usize::from(b.own_position() != usize::MAX);
+            while b.pages.offset > 0 {
+                b.page(true).unwrap();
+                reverse_own += usize::from(b.own_position() != usize::MAX);
+            }
+            if forward_own != 1 || reverse_own != 1 {
+                failures.push(format!("{sort:?}, {count}: own occurrences forward={forward_own}, reverse={reverse_own}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn navigation_after_refresh_clears_live_footer() {
+    let (_temp, mut b) = browser(1);
+    let root = b.dir.clone();
+    let children = b.rows.clone();
+    install_refresh(&mut b, root, children);
+    assert!(render(&b, 160, 24).contains("live values; delta against snapshot"));
+    b.state.selected = (0..b.count()).find(|&i| b.child_at(i).is_some()).unwrap();
+    b.enter().unwrap();
+    assert_eq!(b.dir.id, 1);
+    assert!(b.pages.live.is_none());
+    assert!(!render(&b, 160, 24).contains("live values; delta against snapshot"));
+    b.navigate(b.snapshot.dir(0).unwrap()).unwrap();
+    assert!(!render(&b, 160, 24).contains("live values; delta against snapshot"));
 }

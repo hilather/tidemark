@@ -186,6 +186,9 @@ impl Browser {
         let previous_offset = self.pages.offset;
         let previous_selection = self.state.selected;
         if self.pages.live.is_some() || self.state.sort == state::Sort::Growth {
+            if reverse && self.pages.offset == 0 {
+                return Ok(());
+            }
             if reverse {
                 self.pages.offset = self.pages.offset.saturating_sub(PAGE);
             } else if self.rows.len() == PAGE {
@@ -463,7 +466,16 @@ impl Browser {
         let matches = byte_contains(b".", self.state.filter.as_bytes());
         let at_beginning = self.pages.offset == 0;
         let at_end = self.pages.offset.saturating_add(self.rows.len()) >= self.pages.total;
-        let in_page = if let Some(cursor) = &self.pages.cursor {
+        let in_page = if let Some(live) = &self.pages.live {
+            // Live rows use offset slices, so keyset cursors cannot delimit them.
+            let rank = live
+                .iter()
+                .filter(|(row, _)| byte_contains(&row.name, self.state.filter.as_bytes()))
+                .take_while(|row| before(row))
+                .count();
+            rank >= self.pages.offset
+                && (rank < self.pages.offset.saturating_add(self.rows.len()) || at_end)
+        } else if let Some(cursor) = &self.pages.cursor {
             if self.pages.reverse {
                 !before(&(cursor.clone(), None)) && (position > 0 || at_beginning)
             } else {
@@ -502,6 +514,7 @@ impl Browser {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         self.pages = Pages::default();
+        self.message.clear();
         self.state.filter.clear();
         if self.state.sort == state::Sort::Growth
             && self.snapshot.children_count(dir.id, b"")? > 10_000
