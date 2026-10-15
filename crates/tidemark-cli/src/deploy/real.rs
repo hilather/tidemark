@@ -178,7 +178,10 @@ pub struct SocketPing {
     pub timeout: Duration,
 }
 impl ApiPing for SocketPing {
-    fn ping(&self) -> io::Result<tidemark_core::api::StatusResult> {
+    fn ping(&self) -> io::Result<()> {
+        self.status().map(|_| ())
+    }
+    fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
         let mut client =
             crate::client::Client::connect(&self.socket, self.timeout).map_err(io::Error::other)?;
         client

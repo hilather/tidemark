@@ -406,14 +406,17 @@ struct FakeSocket {
     absent: PathBuf,
 }
 impl ApiPing for FakeSocket {
-    fn ping(&self) -> io::Result<tidemark_core::api::StatusResult> {
+    fn ping(&self) -> io::Result<()> {
+        self.status().map(|_| ())
+    }
+    fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
         let mut slot = self.stream.borrow_mut();
         let Some(stream) = slot.as_mut() else {
             return SocketPing {
                 socket: self.absent.clone(),
                 timeout: Duration::from_secs(10),
             }
-            .ping();
+            .status();
         };
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;

@@ -268,7 +268,10 @@ impl Fixture {
 }
 struct Ping(bool);
 impl ApiPing for Ping {
-    fn ping(&self) -> io::Result<tidemark_core::api::StatusResult> {
+    fn ping(&self) -> io::Result<()> {
+        self.status().map(|_| ())
+    }
+    fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
         if self.0 {
             Ok(tidemark_core::api::StatusResult {
                 version: "test".into(),
@@ -1791,8 +1794,11 @@ fn verify_uses_current_status_instead_of_old_unhealthy_report() {
 
 struct ComponentPing(bool);
 impl ApiPing for ComponentPing {
-    fn ping(&self) -> io::Result<tidemark_core::api::StatusResult> {
-        let mut status = Ping(true).ping()?;
+    fn ping(&self) -> io::Result<()> {
+        self.status().map(|_| ())
+    }
+    fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+        let mut status = Ping(true).status()?;
         if !self.0 {
             status.components[0].state = "degraded".into();
         }
@@ -1835,10 +1841,13 @@ fn verify_live_components_override_stored_components_for_any_start() {
 fn verify_wait_rechecks_live_health() {
     struct Recovering(Cell<usize>);
     impl ApiPing for Recovering {
-        fn ping(&self) -> io::Result<tidemark_core::api::StatusResult> {
+        fn ping(&self) -> io::Result<()> {
+            self.status().map(|_| ())
+        }
+        fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
             let calls = self.0.get();
             self.0.set(calls + 1);
-            ComponentPing(calls > 0).ping()
+            ComponentPing(calls > 0).status()
         }
     }
     let fixture = Fixture::new();
@@ -1855,4 +1864,27 @@ fn verify_wait_rechecks_live_health() {
     .unwrap();
     assert!(result.healthy);
     assert_eq!(api.0.get(), 2);
+}
+
+#[test]
+fn stopped_service_hint_covers_start_limit() {
+    let fixture = Fixture::new();
+    fixture.stage();
+    let result = verify(
+        &fixture.state,
+        Duration::from_secs(60),
+        &fixture.sys,
+        &Ping(false),
+    )
+    .unwrap();
+    let hint = &result
+        .items
+        .iter()
+        .find(|item| item.name == "service_start")
+        .unwrap()
+        .detail;
+    assert!(
+        hint.find("systemctl reset-failed tidemarkd").unwrap()
+            < hint.find("systemctl start tidemarkd").unwrap()
+    );
 }

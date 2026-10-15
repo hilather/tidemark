@@ -177,7 +177,15 @@ fn source_from_read(
 /// Status ping boundary used by verification.
 pub trait ApiPing {
     /// Contact the daemon's status method.
-    fn ping(&self) -> io::Result<tidemark_core::api::StatusResult>;
+    fn ping(&self) -> io::Result<()>;
+    /// Return current component health. A reachability-only adapter cannot
+    /// certify health and defaults to unavailable.
+    fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+        self.ping()?;
+        Err(io::Error::other(
+            "current status unavailable from ping-only adapter",
+        ))
+    }
 }
 /// Options internal to staging; no frozen CLI flags are added.
 #[derive(Debug, Clone, Default)]
@@ -514,7 +522,7 @@ pub fn verify(
         std::thread::sleep(Duration::from_secs(5).min(wait.saturating_sub(started.elapsed())));
     }
 }
-const SERVICE_START_HINT: &str = "the service is enabled but not running: start it with 'systemctl start tidemarkd' (or reboot), or stage with --start-now";
+const SERVICE_START_HINT: &str = "the service is enabled but not running: if start-limit-hit, first run 'systemctl reset-failed tidemarkd'; then start it with 'systemctl start tidemarkd' (or reboot), or stage with --start-now";
 fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> VerifyResult {
     let staged = read_json(&state_dir.join("deploy/staged.json"));
     let firstboot = read_json(&state_dir.join("deploy/firstboot.json"));
@@ -592,7 +600,7 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
     let status = if stopped {
         Err(io::Error::other("service is not running"))
     } else {
-        api.ping()
+        api.status()
     };
     // Only a live status response can certify current component health. A stored
     // firstboot report is still config-hash evidence, never live health evidence.
