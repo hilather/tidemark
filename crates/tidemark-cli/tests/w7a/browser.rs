@@ -798,9 +798,16 @@ fn missing_path_message_includes_daemon_schedule_for_configured_root() {
         Err(error) => panic!("bind fixture socket: {error}"),
     };
     let worker = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_schedule_before(
+            &listener,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let mut request = String::new();
         BufReader::new(&stream).read_line(&mut request).unwrap();
@@ -1084,4 +1091,51 @@ fn operator_upgrade_explains_metrics_defaults_and_stale_export() {
             "upgrade guidance missing {required}"
         );
     }
+}
+
+fn accept_schedule_before(
+    listener: &std::os::unix::net::UnixListener,
+    deadline: std::time::Instant,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    listener.set_nonblocking(true)?;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return Ok(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "schedule fixture accept deadline",
+                    ));
+                }
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[test]
+fn schedule_socket_accept_without_client_has_deadline() {
+    let temp = ::test_support::private_tempdir().unwrap();
+    let listener = match std::os::unix::net::UnixListener::bind(temp.path().join("no-client.sock"))
+    {
+        Ok(listener) => listener,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            eprintln!("socket unavailable; skipping accept deadline test: {error}");
+            return;
+        }
+        Err(error) => panic!("bind fixture socket: {error}"),
+    };
+    let start = std::time::Instant::now();
+    let error = accept_schedule_before(&listener, start + std::time::Duration::from_millis(30))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
 }
