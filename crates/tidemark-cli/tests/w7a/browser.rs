@@ -1554,6 +1554,15 @@ fn post_tui_disjoint_traversals_all_sorts() {
                             b.page(false).unwrap();
                             assert_eq!(b.pages.offset, offset);
                             assert_eq!(b.child_at(0).map(|r| r.0.id).unwrap_or(0), first);
+                            // Down from the previous page's last row, then Up,
+                            // must return to that same adjacent logical row.
+                            b.page(true).unwrap();
+                            b.state.selected = b.count() - 1;
+                            assert_eq!(
+                                b.child_at(b.state.selected).map(|r| r.0.id).unwrap_or(0),
+                                previous
+                            );
+                            b.page(false).unwrap();
                         }
                         b.page(reverse).unwrap();
                     }
