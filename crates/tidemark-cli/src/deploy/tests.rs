@@ -1837,6 +1837,21 @@ fn verify_live_components_override_stored_components_for_any_start() {
         .any(|item| item.detail.contains("daemon_started_at=100")));
 }
 
+#[derive(Default)]
+struct FakeVerifyClock(Cell<Duration>);
+impl VerifyClock for FakeVerifyClock {
+    fn now(&self) -> Duration {
+        self.0.get()
+    }
+    fn sleep(&self, duration: Duration) {
+        self.0.set(self.0.get() + duration);
+        assert!(
+            self.0.get() <= Duration::from_secs(30),
+            "poll loop ignored fake deadline"
+        );
+    }
+}
+
 #[test]
 fn verify_wait_rechecks_live_health() {
     struct Recovering(Cell<usize>);
@@ -1860,9 +1875,12 @@ fn verify_wait_rechecks_live_health() {
         Duration::from_secs(10),
         &fixture.sys,
         &api,
-        Duration::from_secs(10),
-        Duration::from_millis(2),
-        Duration::from_millis(2),
+        VerifyTiming {
+            grace: Duration::from_secs(10),
+            interval: Duration::from_secs(1),
+            normal_interval: Duration::from_secs(1),
+        },
+        &FakeVerifyClock::default(),
     )
     .unwrap();
     assert!(result.healthy);
@@ -1934,7 +1952,7 @@ fn verify_sampler_grace_sequences() {
             false,
             0,
             true,
-            true,
+            2,
         ),
         (
             false,
@@ -1943,9 +1961,9 @@ fn verify_sampler_grace_sequences() {
             false,
             0,
             false,
-            true,
+            3,
         ),
-        (false, "measurement failed", false, false, 0, false, false),
+        (false, "measurement failed", false, false, 0, false, 1),
         (
             false,
             "measurement pass in progress",
@@ -1953,7 +1971,7 @@ fn verify_sampler_grace_sequences() {
             false,
             0,
             false,
-            false,
+            1,
         ),
         (
             false,
@@ -1962,17 +1980,17 @@ fn verify_sampler_grace_sequences() {
             true,
             0,
             false,
-            false,
+            1,
         ),
-        (true, "measurement failed", false, false, 100, true, true),
+        (true, "measurement failed", false, false, 3000, true, 2),
         (
             false,
             "measurement pass in progress",
             false,
             false,
-            20,
+            2000,
             false,
-            true,
+            2,
         ),
     ] {
         let api = Sequence {
@@ -1982,24 +2000,22 @@ fn verify_sampler_grace_sequences() {
             other_bad,
             duplicate,
         };
-        let started = Instant::now();
+        let clock = FakeVerifyClock::default();
         let result = verify_with_timing(
             &fixture.state,
             Duration::from_millis(wait),
             &fixture.sys,
             &api,
-            if wait == 0 {
-                Duration::from_millis(100)
-            } else {
-                Duration::from_secs(10)
+            VerifyTiming {
+                grace: Duration::from_secs(3),
+                interval: Duration::from_secs(1),
+                normal_interval: Duration::from_secs(1),
             },
-            Duration::from_millis(2),
-            Duration::from_millis(2),
+            &clock,
         )
         .unwrap();
         assert_eq!(result.healthy, healthy);
-        assert_eq!(api.calls.get() > 1, retries);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(api.calls.get(), retries);
         if !healthy {
             assert!(result
                 .items

@@ -519,10 +519,33 @@ pub fn verify(
         wait,
         sys,
         api,
-        Duration::from_secs(10),
-        Duration::from_millis(500),
-        Duration::from_secs(5),
+        VerifyTiming {
+            grace: Duration::from_secs(10),
+            interval: Duration::from_millis(500),
+            normal_interval: Duration::from_secs(5),
+        },
+        &WallClock(Instant::now()),
     )
+}
+
+// Monotonic time and sleeping share a seam so policy tests never wait on a runner.
+trait VerifyClock {
+    fn now(&self) -> Duration;
+    fn sleep(&self, duration: Duration);
+}
+struct WallClock(Instant);
+impl VerifyClock for WallClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+struct VerifyTiming {
+    grace: Duration,
+    interval: Duration,
+    normal_interval: Duration,
 }
 
 fn verify_with_timing(
@@ -530,23 +553,23 @@ fn verify_with_timing(
     wait: Duration,
     sys: &dyn Systemctl,
     api: &dyn ApiPing,
-    grace: Duration,
-    interval: Duration,
-    normal_interval: Duration,
+    timing: VerifyTiming,
+    clock: &dyn VerifyClock,
 ) -> Result<VerifyResult, DeployError> {
     state_guard(state_dir, None)?;
-    let started = Instant::now();
+    let started = clock.now();
     // An explicit wait owns the whole budget: grace never extends it.
-    let budget = if wait.is_zero() { grace } else { wait };
+    let budget = if wait.is_zero() { timing.grace } else { wait };
     loop {
         let (result, transient) = verify_poll(
             state_dir,
             sys,
             api,
-            budget.saturating_sub(started.elapsed()),
+            budget.saturating_sub(clock.now().saturating_sub(started)),
+            clock,
         );
         if result.healthy
-            || started.elapsed() >= budget
+            || clock.now().saturating_sub(started) >= budget
             || (wait.is_zero() && !transient)
             || result
                 .items
@@ -555,9 +578,13 @@ fn verify_with_timing(
         {
             return Ok(result);
         }
-        let delay = if transient { interval } else { normal_interval };
-        std::thread::sleep(delay.min(budget.saturating_sub(started.elapsed())));
-        if started.elapsed() >= budget {
+        let delay = if transient {
+            timing.interval
+        } else {
+            timing.normal_interval
+        };
+        clock.sleep(delay.min(budget.saturating_sub(clock.now().saturating_sub(started))));
+        if clock.now().saturating_sub(started) >= budget {
             return Ok(result);
         }
     }
@@ -565,15 +592,23 @@ fn verify_with_timing(
 const SERVICE_START_HINT: &str = "the service is enabled but not running: if start-limit-hit, first run 'systemctl reset-failed tidemarkd'; then start it with 'systemctl start tidemarkd' (or reboot), or stage with --start-now";
 #[cfg(test)]
 fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> VerifyResult {
-    verify_poll(state_dir, sys, api, Duration::from_secs(10)).0
+    verify_poll(
+        state_dir,
+        sys,
+        api,
+        Duration::from_secs(10),
+        &WallClock(Instant::now()),
+    )
+    .0
 }
 fn verify_poll(
     state_dir: &Path,
     sys: &dyn Systemctl,
     api: &dyn ApiPing,
     budget: Duration,
+    clock: &dyn VerifyClock,
 ) -> (VerifyResult, bool) {
-    let poll_started = Instant::now();
+    let poll_started = clock.now();
     let staged = read_json(&state_dir.join("deploy/staged.json"));
     let firstboot = read_json(&state_dir.join("deploy/firstboot.json"));
     let mut items = vec![outcome(
@@ -650,7 +685,7 @@ fn verify_poll(
     let status = if stopped {
         Err(io::Error::other("service is not running"))
     } else {
-        api.status_with_budget(budget.saturating_sub(poll_started.elapsed()))
+        api.status_with_budget(budget.saturating_sub(clock.now().saturating_sub(poll_started)))
     };
     // Only a live status response can certify current component health. A stored
     // firstboot report is still config-hash evidence, never live health evidence.
