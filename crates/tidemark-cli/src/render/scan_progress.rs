@@ -53,7 +53,7 @@ impl Display {
 /// Stable progress text with escaped values supplied by the scanner.
 pub fn format_progress(p: &Progress) -> String {
     format!(
-        "{}: {} dirs, {} entries, {} errors, {} races; rate {:.0} units/s; elapsed {:.0}s; ETA {}",
+        "{}: {} {dirs}, {} {entries}, {} {errors}, {} {races}; rate {:.0} {rate_unit}/s; elapsed {:.0}s; ETA {}",
         p.phase,
         p.dirs,
         p.entries,
@@ -64,6 +64,7 @@ pub fn format_progress(p: &Progress) -> String {
         p.eta
             .map(|d| format!("{:.0}s", d.as_secs_f64()))
             .unwrap_or_else(|| "unknown".into())
+        ,dirs = super::unit(p.dirs,"dir","dirs"), entries = super::unit(p.entries,"entry","entries"), errors = super::unit(p.errors,"error","errors"), races = super::unit(p.races,"race","races"), rate_unit = if p.rate.round_ties_even() == 1.0 { "unit" } else { "units" }
     )
 }
 /// Write a final summary or a versioned machine document.
@@ -121,6 +122,6 @@ mod tests {
         let size = buf.len();
         d.write(&p, &mut buf).unwrap();
         assert_eq!(buf.len(), size);
-        insta::assert_snapshot!(String::from_utf8(buf).unwrap(), @"walk: 1 dirs, 2 entries, 0 errors, 0 races; rate 0 units/s; elapsed 10s; ETA unknown");
+        insta::assert_snapshot!(String::from_utf8(buf).unwrap(), @"walk: 1 dir, 2 entries, 0 errors, 0 races; rate 0 units/s; elapsed 10s; ETA unknown");
     }
 }

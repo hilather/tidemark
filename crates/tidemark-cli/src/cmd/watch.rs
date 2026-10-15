@@ -99,8 +99,9 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 }
                 if stats.mode == tidemark_live::watch::WatchMode::Failed {
                     anyhow::bail!(
-                        "watch worker failed after {} transport errors",
-                        stats.read_errors
+                        "watch worker failed after {} transport {}",
+                        stats.read_errors,
+                        crate::render::unit(stats.read_errors, "error", "errors")
                     );
                 }
             }
@@ -129,12 +130,13 @@ fn render_minute(
     } else {
         writeln!(
             output,
-            "{}  {}  {}  ({} events{})",
+            "{}  {}  {}  ({} {events}{})",
             crate::render::size::timestamp(row.ts),
             signed_bytes(row.bytes_delta),
             tidemark_core::path::display_lossy_bytes(&row.key),
             row.events,
-            if row.lossy { ", lossy" } else { "" }
+            if row.lossy { ", lossy" } else { "" },
+            events = crate::render::unit(row.events, "event", "events")
         )?;
     }
     Ok(())
@@ -190,7 +192,11 @@ fn render_omitted(count: u64, json: bool, output: &mut impl std::io::Write) -> a
             output,
         )?;
     } else {
-        writeln!(output, "{count} events omitted")?;
+        writeln!(
+            output,
+            "{count} {} omitted",
+            crate::render::unit(count, "event", "events")
+        )?;
     }
     Ok(())
 }

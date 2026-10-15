@@ -110,13 +110,20 @@ tidemark now - fixture - 2026-10-12 22:52:56Z
 /data used 47.7 MiB / 954 MiB (5.0%)  7.92 GiB/h (15m)  full in ~3m 9s (1h trend)
   lvm n/a
   hot dirs (5m) /data/hot  +47.7 MiB  2 files  writer.service
-  hot dirs (5m) /bad\xFF  +1 B  1 files  ?
+  hot dirs (5m) /bad\xFF  +1 B  1 file  ?
   writers (5m) other.service +100 B
   deleted-but-open 0 B (0 files)
 last scan /data 2026-10-12 22:52:56Z (0s ago, walk, 5ms)
 ```
 
 `hot` reports observed allocated-byte changes at close-write events, not all bytes written or exact directory totals. `LOSSY=true` means observations were lost; use a scan for totals. Windows are `1m`, `5m`, `15m`, `60m`. Across minutes, FILES sums per-minute distinct counts: one file touched in two minutes can count twice. TOP UNIT is an approximate leader when many units write the same directory; `?` means attribution is unavailable. Processes that write and exit within a fraction of a second commonly appear as `?`.
+
+`hot --mount` requires a mount in the daemon's effective `[watch].mounts` list.
+An unwatched path exits 5 (Precondition), names the path and watch list, and tells
+which `deploy stage --from <file>` command to run after updating the configuration.
+`--json` keeps the `tidemark.hot.v1` envelope and returns an `error` object with the
+existing API `code` and `message` fields. A watched mount with a complete activity
+window and no writes still produces an empty result and exits 0.
 
 <!-- Sample rendered from example_now() hot rows in crates/tidemark-cli/tests/w6a3.rs, width 100. -->
 ```text
@@ -377,6 +384,11 @@ sudo dnf remove tidemark
 ```
 
 Unstage stops and disables the service, keeping state. RPM erase also stops/disables and keeps `/var/lib/tidemark`; edited config may remain as `.rpmsave`. For deliberately approved deletion of Tidemark's own retained state, `sudo tidemark deploy unstage --purge-state --yes` is available. Unstage/purge remain available when storage would be ineligible for stage. No monitored application data is removed. Keep incident evidence before purging.
+
+`deploy unstage --purge-state --yes` treats an already absent state directory as
+nothing to purge, prints its path, and still stops and disables the service. An
+existing directory must pass all ownership, permission, marker, configuration,
+mount, and writer checks before deletion.
 
 ## Watcher visibility and symbolic-link limits
 

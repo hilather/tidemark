@@ -215,7 +215,11 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 )?;
             } else {
                 use std::io::Write;
-                writeln!(out, "Rebuilt catalog: {count} snapshots")?;
+                writeln!(
+                    out,
+                    "Rebuilt catalog: {count} {}",
+                    crate::render::unit(count as u64, "snapshot", "snapshots")
+                )?;
             }
         }
     }

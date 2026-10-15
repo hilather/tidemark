@@ -728,7 +728,7 @@ pub fn unstage(
         .map_err(|e| DeployError::Guard(e.to_string()))?;
     files::optional_at(deploy.as_ref(), "firstboot.json")
         .map_err(|e| DeployError::Guard(e.to_string()))?;
-    let guarded = if purge_state {
+    let guarded = if purge_state && state.is_some() {
         Some(purge_guard(state_dir)?)
     } else {
         None

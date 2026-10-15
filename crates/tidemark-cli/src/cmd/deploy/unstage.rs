@@ -19,6 +19,8 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     }
     crate::deploy::state_guard(&context.config.general.state_dir, Some(&context.config))
         .map_err(|e| crate::CliError::Precondition(e.to_string()))?;
+    let absent = args.purge_state
+        && matches!(std::fs::symlink_metadata(&context.config.general.state_dir), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
     match crate::deploy::unstage(
         &context.config.general.state_dir,
         args.purge_state,
@@ -30,5 +32,31 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         }
         Err(error) => return Err(error.into()),
     }
+    if absent {
+        absent_message(
+            &context.config.general.state_dir,
+            &mut std::io::stderr().lock(),
+        )?;
+    }
     super::render::unstaged(context.json)
+}
+
+fn absent_message(path: &std::path::Path, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "state directory {} already absent; nothing to purge",
+        super::super::display_path(path)
+    )
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn absent_purge_message_names_directory() {
+        let mut output = Vec::new();
+        super::absent_message(std::path::Path::new("/var/lib/tidemark"), &mut output).unwrap();
+        assert_eq!(
+            output,
+            b"state directory /var/lib/tidemark already absent; nothing to purge\n"
+        );
+    }
 }

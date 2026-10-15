@@ -266,6 +266,9 @@ pub(crate) fn dispatch_controlled(
             "now" => value(available(view.now(&params(request)?, now))?),
             "hot" => {
                 let p = params(request)?;
+                if let Some(detail) = view.hot_unwatched_detail(&p) {
+                    return Err(DaemonError::Unavailable(detail));
+                }
                 value(
                     view.hot(&p)
                         .ok_or_else(|| DaemonError::Unavailable(view.hot_unavailable_detail(&p)))?,
@@ -1000,10 +1003,55 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     #[test]
+    fn hot_unwatched_mount_is_distinct_from_watched_idle_mount() {
+        let mut config = tidemark_core::config::Config::default();
+        config.watch.mounts = vec!["/A".into()];
+        let state = crate::state::LiveState::new(&config, 0);
+        state
+            .publish(
+                crate::state::Publication::Watcher((
+                    "/A".into(),
+                    Arc::new(
+                        tidemark_live::watch::Watcher::from_injected_events_at(
+                            tidemark_core::path::RawPath::new(b"/A".to_vec()).unwrap(),
+                            0,
+                            [],
+                        )
+                        .unwrap(),
+                    ),
+                )),
+                crate::component("watcher:/A", "ok", "test"),
+            )
+            .unwrap();
+        let context = Context {
+            state,
+            scans: Default::default(),
+            reload: Arc::new(|| unreachable!()),
+        };
+        for (mount, watched) in [("/A", true), ("/B", false), ("/A/subdir", false)] {
+            let request = Request {
+                v: 1,
+                id: "mount".into(),
+                method: "hot".into(),
+                params: serde_json::json!({"mount":mount,"by":"dir","window":"1m","limit":10}),
+            };
+            let response = dispatch(&request, 0, &context, 120).unwrap();
+            assert_eq!(response.ok, watched);
+            if watched {
+                assert_eq!(response.result.unwrap(), serde_json::json!([]));
+            } else {
+                let error = response.error.unwrap();
+                assert_eq!(error.code, ApiErrorCode::Unavailable);
+                assert_eq!(error.message, format!("unavailable: {mount} is not watched (watch.mounts = [\"/A\"]); add it to [watch].mounts and run: tidemark deploy stage --from <file>"));
+            }
+        }
+    }
+    #[test]
     fn hot_dispatch_reports_startup_and_replacement_boundaries() {
         use tidemark_core::path::RawPath;
         use tidemark_live::watch::Watcher;
-        let config = tidemark_core::config::Config::default();
+        let mut config = tidemark_core::config::Config::default();
+        config.watch.mounts = vec!["/A".into()];
         let state = crate::state::LiveState::new(&config, 0);
         let context = Context {
             state: state.clone(),
@@ -1032,7 +1080,7 @@ mod tests {
                 (start, "no complete window yet".to_string()),
                 (
                     start + 60,
-                    "ask for a window of at most 1 minutes".to_string(),
+                    "ask for a window of at most 1 minute".to_string(),
                 ),
             ] {
                 let response = dispatch(&request, 0, &context, at).unwrap();
