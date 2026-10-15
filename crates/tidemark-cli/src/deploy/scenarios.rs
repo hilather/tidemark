@@ -554,6 +554,9 @@ fn run_row(row: &Row) {
         };
         let server = thread::spawn(move || {
             stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             let mut line = String::new();
