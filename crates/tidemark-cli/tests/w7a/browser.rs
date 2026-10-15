@@ -859,11 +859,48 @@ fn own_files_hardlink_remainder_is_unknown() {
         fixture::row(2, Some(0), b"/r/b", 8 * 1024 * 1024),
     ];
     rows[0].subtree_end = 2;
+    rows[0].own_files = 0;
+    rows[0].own_charged = 8 * 1024 * 1024;
+    rows[0].t_files = 3;
+    rows[0].t_inodes = 2;
+    rows[0].t_dirs = 3;
+    rows[0].t_reclaimable = 9 * 1024 * 1024;
+    // The unretained /r/a/small is a single-link 1 MiB file.
     rows[1].own_files = 2;
     rows[1].own_charged = 1024 * 1024;
+    rows[1].t_charged = 1024 * 1024;
+    rows[1].t_files = 2;
+    rows[1].t_inodes = 2;
+    rows[1].t_reclaimable = 1024 * 1024;
+    rows[2].own_charged = 0;
+    rows[2].t_charged = 0;
+    rows[2].t_reclaimable = 0;
+    for row in &mut rows {
+        row.own_apparent = row.own_charged;
+        row.age0 = row.t_charged;
+    }
     let meta = fixture::meta(rows[0].path.clone(), 2_000_000);
     let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
     writer.put_dirs(&rows).unwrap();
+    writer
+        .put_link_sets(&[LinkSetRow {
+            ino: 42,
+            nlink: 2,
+            found: 2,
+            complete: true,
+            disk: 8 * 1024 * 1024,
+            apparent: 8 * 1024 * 1024,
+            mtime: 0,
+            lca_dir_id: 0,
+        }])
+        .unwrap();
+    writer
+        .put_link_instances(&[1, 2].map(|dir_id| LinkInstanceRow {
+            ino: 42,
+            dir_id,
+            name: Some(RawName::new(b"shared".to_vec()).unwrap()),
+        }))
+        .unwrap();
     writer
         .put_files(&[FileRow {
             id: 0,
