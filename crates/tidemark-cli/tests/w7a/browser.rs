@@ -682,9 +682,12 @@ fn direct_retained_files_filter_before_limit_and_show_utc() {
     assert!(b.text.contains("/fixture/root"));
     assert!(!b.text.contains("child"));
     assert!(b.text.contains("1970-01-01 00:00:00Z"));
+    assert!(b
+        .text
+        .contains("1 retained representatives listed; 3 file entries here"));
     assert!(b.text.contains(&format!(
-        "2 other files, {} not individually retained",
-        crate::render::size::bytes(4096)
+        "charged to this directory: {}",
+        crate::render::size::bytes(12288)
     )));
 }
 
@@ -849,7 +852,7 @@ fn end_includes_own_row_at_an_exact_page_boundary() {
 }
 
 #[test]
-fn own_files_hardlink_remainder_is_unknown() {
+fn own_files_hardlink_totals_are_separate() {
     // top_files=1 retains only shared (8 MiB), charged at /r, not /r/a.
     let (_temp, mut b) = browser(0);
     let temp = ::test_support::private_tempdir().unwrap();
@@ -920,7 +923,7 @@ fn own_files_hardlink_remainder_is_unknown() {
     b.enter().unwrap();
     assert!(
         b.text
-            .contains("1 other file; size not individually retained unknown"),
+            .contains("1 retained representatives listed; 2 file entries here"),
         "{}",
         b.text
     );
@@ -962,7 +965,7 @@ fn own_files_after_refresh_use_snapshot_observation() {
     assert!(!b.text.contains("/fixture/B"));
     assert!(
         b.text
-            .contains("0 other files, 0 B not individually retained"),
+            .contains("1 retained representatives listed; 1 file entries here"),
         "{}",
         b.text
     );
@@ -1179,4 +1182,116 @@ fn schedule_socket_accept_without_client_has_deadline() {
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+// RC3-fix2: each case isolates an unsupported remainder from the re-review.
+#[test]
+fn own_files_snapshot_totals_cover_remainder_counterexamples() {
+    let mut failures = Vec::new();
+    for (case, viewed, own_files, charged, retained_dir, retained_disk, nlink) in [
+        (
+            "unretained shared plus large",
+            1,
+            2,
+            16 * 1024 * 1024,
+            1,
+            16 * 1024 * 1024,
+            1,
+        ),
+        ("representative in sibling", 2, 1, 0, 1, 8 * 1024 * 1024, 2),
+        (
+            "LCA without direct files",
+            0,
+            0,
+            8 * 1024 * 1024,
+            1,
+            8 * 1024 * 1024,
+            2,
+        ),
+        (
+            "directory blocks",
+            1,
+            1,
+            1024 * 1024 + 4096,
+            1,
+            1024 * 1024,
+            1,
+        ),
+        (
+            "threshold retention",
+            2,
+            2,
+            1024 * 1024,
+            1,
+            8 * 1024 * 1024,
+            2,
+        ),
+    ] {
+        let (_temp, mut b) = browser(0);
+        let temp = ::test_support::private_tempdir().unwrap();
+        let mut rows = vec![
+            fixture::row(0, None, b"/r", 24 * 1024 * 1024),
+            fixture::row(1, Some(0), b"/r/a", 24 * 1024 * 1024),
+            fixture::row(2, Some(0), b"/r/b", 8 * 1024 * 1024),
+        ];
+        rows[0].subtree_end = 2;
+        rows[0].own_files = 0;
+        rows[0].own_charged = 8 * 1024 * 1024;
+        rows[1].own_files = 2;
+        rows[1].own_charged = 16 * 1024 * 1024;
+        rows[2].own_files = 1;
+        rows[2].own_charged = 0;
+        rows[viewed].own_files = own_files;
+        rows[viewed].own_charged = charged;
+        let meta = fixture::meta(rows[0].path.clone(), 2_000_000);
+        let mut writer =
+            tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+        writer.put_dirs(&rows).unwrap();
+        let mut files = vec![FileRow {
+            id: 0,
+            dir_id: retained_dir,
+            name: Some(RawName::new(b"retained".to_vec()).unwrap()),
+            ino: 42,
+            disk: retained_disk,
+            apparent: retained_disk,
+            mtime: 0,
+            nlink,
+        }];
+        if case == "threshold retention" {
+            // top_files=0, threshold=1 MiB retains both inode candidates.
+            files.push(FileRow {
+                id: 1,
+                dir_id: 2,
+                name: Some(RawName::new(b"small".to_vec()).unwrap()),
+                ino: 43,
+                disk: 1024 * 1024,
+                apparent: 1024 * 1024,
+                mtime: 0,
+                nlink: 1,
+            });
+        }
+        writer.put_files(&files).unwrap();
+        let file = writer.finish(&meta).unwrap();
+        b.snapshot = Snapshot::open(&file).unwrap();
+        b.navigate(b.snapshot.dir(viewed as u32).unwrap()).unwrap();
+        b.state.selected = b.own_position();
+        b.enter().unwrap();
+        let listed = files.iter().filter(|f| f.dir_id == viewed as u32).count();
+        let expected =
+            format!("{listed} retained representatives listed; {own_files} file entries here");
+        let charge = format!(
+            "charged to this directory: {}",
+            crate::render::size::bytes(charged)
+        );
+        if b.text.contains("not individually retained")
+            || !b.text.contains(&expected)
+            || !b.text.contains(&charge)
+        {
+            failures.push(format!("{case}: {}", b.text));
+        }
+        if nlink > 1 && listed > 0 && retained_dir == viewed as u32 {
+            assert!(b.text.contains("[hard links]"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
