@@ -948,3 +948,35 @@ fn install_refresh(b: &mut Browser, root: DirRow, children: Vec<(DirRow, Option<
     .unwrap();
     b.poll_refresh().unwrap();
 }
+
+#[test]
+fn live_refresh_from_later_page_restores_own_row() {
+    let (_temp, mut b) = browser(2500);
+    b.state.sort = state::Sort::Name;
+    b.boundary(false).unwrap();
+    b.page(false).unwrap();
+    assert!(b.pages.cursor.is_some());
+    let children = (1..=2500)
+        .map(|id| {
+            (
+                fixture::row(id, Some(0), format!("/fixture/{id:08}").as_bytes(), 4096),
+                None,
+            )
+        })
+        .collect();
+    let root = b.dir.clone();
+    install_refresh(&mut b, root, children);
+    assert_eq!(b.pages.offset, 0);
+    assert_eq!(b.own_position(), 0);
+    assert!(b.pages.cursor.is_none());
+    assert!(!b.pages.reverse);
+    let mut own_rows = 0;
+    loop {
+        own_rows += usize::from(b.own_position() != usize::MAX);
+        if b.rows.len() < PAGE {
+            break;
+        }
+        b.page(false).unwrap();
+    }
+    assert_eq!(own_rows, 1);
+}

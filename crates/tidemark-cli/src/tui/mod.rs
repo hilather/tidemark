@@ -406,6 +406,8 @@ impl Browser {
         self.pages.live_order = Some(rows.sort);
         self.pages.live_growth = rows.growth;
         self.pages.offset = 0;
+        self.pages.cursor = None;
+        self.pages.reverse = false;
         self.load()?;
         self.message = if growth_unavailable {
             "live values; delta against snapshot; growth exceeds 10,000 children, showing name"
