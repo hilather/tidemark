@@ -110,7 +110,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
             })
             .collect(),
     };
-    let title = if b.pages.live.is_some() {
+    let title = if b.state.pane == Pane::Files {
+        format!(
+            "{title} | snapshot {} at {}",
+            meta.scan_id,
+            size::timestamp(meta.finished_at)
+        )
+    } else if b.pages.live.is_some() {
         format!("{title} | live (Δ snapshot)")
     } else {
         title
@@ -129,7 +135,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
     frame.render_widget(
         Paragraph::new(format!(
             "{}\nq quit | ? help | PgDn next page | {}",
-            b.message,
+            if b.state.pane == Pane::Files {
+                "Snapshot files; does not include changes since snapshot"
+            } else {
+                &b.message
+            },
             if b.state.editing {
                 "type filter, Enter finish"
             } else {

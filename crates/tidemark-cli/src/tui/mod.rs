@@ -406,6 +406,8 @@ impl Browser {
         self.pages.live_order = Some(rows.sort);
         self.pages.live_growth = rows.growth;
         self.pages.offset = 0;
+        self.pages.cursor = None;
+        self.pages.reverse = false;
         self.load()?;
         self.message = if growth_unavailable {
             "live values; delta against snapshot; growth exceeds 10,000 children, showing name"
@@ -560,6 +562,7 @@ impl Browser {
         match self.state.pane {
             Pane::Main => {
                 if self.state.selected == self.own_position() {
+                    let snapshot_dir = self.snapshot.dir(self.dir.id)?;
                     let hits = crate::cmd::files::retained_files(
                         &self.snapshot,
                         self.dir.id,
@@ -568,37 +571,53 @@ impl Browser {
                         true,
                     )?;
                     let count = hits.len() as u64;
+                    let has_hard_links = hits.iter().any(|hit| hit.row.nlink > 1);
                     let bytes = hits
                         .iter()
                         .fold(0u64, |sum, hit| sum.saturating_add(hit.row.disk));
-                    self.text = "PATH  SIZE  APPARENT  MTIME UTC\n".into();
+                    self.text = format!(
+                        "Snapshot {} at {}\ndoes not include changes since this snapshot\nPATH  SIZE  APPARENT  MTIME UTC\n",
+                        self.snapshot.meta().scan_id,
+                        crate::render::size::timestamp(self.snapshot.meta().finished_at)
+                    );
                     self.text.push_str(
                         &hits
                             .iter()
                             .map(|hit| {
                                 format!(
-                                    "{}  {}  {}  {}\n",
+                                    "{}  {}  {}  {}{}\n",
                                     hit.path
                                         .as_ref()
                                         .map(|p| p.display_lossy())
                                         .unwrap_or_else(|| "[unresolved]".into()),
                                     crate::render::size::bytes(hit.row.disk),
                                     crate::render::size::bytes(hit.row.apparent),
-                                    crate::render::size::timestamp(hit.row.mtime)
+                                    crate::render::size::timestamp(hit.row.mtime),
+                                    if hit.row.nlink > 1 {
+                                        " [hard links]"
+                                    } else {
+                                        ""
+                                    }
                                 )
                             })
                             .collect::<String>(),
                     );
-                    self.text.push_str(&format!(
-                        "{} other {files}, {} not individually retained",
-                        self.dir.own_files.saturating_sub(count),
-                        crate::render::size::bytes(self.dir.own_charged.saturating_sub(bytes)),
-                        files = crate::render::unit(
-                            self.dir.own_files.saturating_sub(count),
-                            "file",
-                            "files"
-                        )
-                    ));
+                    let remaining = snapshot_dir.own_files.saturating_sub(count);
+                    if has_hard_links {
+                        // File rows identify representatives, not where link sets are charged.
+                        self.text.push_str(&format!(
+                            "{remaining} other {}; size not individually retained unknown (hard links may be charged elsewhere)",
+                            crate::render::unit(remaining, "file", "files")
+                        ));
+                    } else {
+                        self.text.push_str(&format!(
+                            "{remaining} other {}, {} not individually retained",
+                            crate::render::unit(remaining, "file", "files"),
+                            crate::render::size::bytes(
+                                snapshot_dir.own_charged.saturating_sub(bytes)
+                            )
+                        ));
+                    }
                     self.state.pane = Pane::Files;
                     self.state.selected = 0;
                     return Ok(());
