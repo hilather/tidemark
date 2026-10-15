@@ -182,8 +182,20 @@ impl ApiPing for SocketPing {
         self.status().map(|_| ())
     }
     fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+        self.status_with_budget(self.timeout.saturating_mul(2))
+    }
+    fn status_with_budget(&self, budget: Duration) -> io::Result<tidemark_core::api::StatusResult> {
+        // Connect and exchange each have their own deadline. Splitting the
+        // remaining budget bounds their sum without changing the wire client.
+        let timeout = self.timeout.min(budget / 2);
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "verification deadline expired",
+            ));
+        }
         let mut client =
-            crate::client::Client::connect(&self.socket, self.timeout).map_err(io::Error::other)?;
+            crate::client::Client::connect(&self.socket, timeout).map_err(io::Error::other)?;
         client
             .call::<_, tidemark_core::api::StatusResult>(
                 "status",
