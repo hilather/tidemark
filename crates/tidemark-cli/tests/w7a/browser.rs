@@ -840,3 +840,45 @@ fn end_includes_own_row_at_an_exact_page_boundary() {
     assert_eq!(b.pages.offset, 0);
     assert_eq!(b.own_position(), 0);
 }
+
+#[test]
+fn own_files_hardlink_remainder_is_unknown() {
+    // top_files=1 retains only shared (8 MiB), charged at /r, not /r/a.
+    let (_temp, mut b) = browser(0);
+    let temp = ::test_support::private_tempdir().unwrap();
+    let mut rows = vec![
+        fixture::row(0, None, b"/r", 9 * 1024 * 1024),
+        fixture::row(1, Some(0), b"/r/a", 9 * 1024 * 1024),
+        fixture::row(2, Some(0), b"/r/b", 8 * 1024 * 1024),
+    ];
+    rows[0].subtree_end = 2;
+    rows[1].own_files = 2;
+    rows[1].own_charged = 1024 * 1024;
+    let meta = fixture::meta(rows[0].path.clone(), 2_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&rows).unwrap();
+    writer
+        .put_files(&[FileRow {
+            id: 0,
+            dir_id: 1,
+            name: Some(RawName::new(b"shared".to_vec()).unwrap()),
+            ino: 42,
+            disk: 8 * 1024 * 1024,
+            apparent: 8 * 1024 * 1024,
+            mtime: 0,
+            nlink: 2,
+        }])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.navigate(b.snapshot.dir(1).unwrap()).unwrap();
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    assert!(
+        b.text
+            .contains("1 other file; size not individually retained unknown"),
+        "{}",
+        b.text
+    );
+    assert!(b.text.contains("[hard links]"));
+}

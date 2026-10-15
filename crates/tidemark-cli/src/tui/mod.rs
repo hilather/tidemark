@@ -568,6 +568,7 @@ impl Browser {
                         true,
                     )?;
                     let count = hits.len() as u64;
+                    let has_hard_links = hits.iter().any(|hit| hit.row.nlink > 1);
                     let bytes = hits
                         .iter()
                         .fold(0u64, |sum, hit| sum.saturating_add(hit.row.disk));
@@ -577,28 +578,37 @@ impl Browser {
                             .iter()
                             .map(|hit| {
                                 format!(
-                                    "{}  {}  {}  {}\n",
+                                    "{}  {}  {}  {}{}\n",
                                     hit.path
                                         .as_ref()
                                         .map(|p| p.display_lossy())
                                         .unwrap_or_else(|| "[unresolved]".into()),
                                     crate::render::size::bytes(hit.row.disk),
                                     crate::render::size::bytes(hit.row.apparent),
-                                    crate::render::size::timestamp(hit.row.mtime)
+                                    crate::render::size::timestamp(hit.row.mtime),
+                                    if hit.row.nlink > 1 {
+                                        " [hard links]"
+                                    } else {
+                                        ""
+                                    }
                                 )
                             })
                             .collect::<String>(),
                     );
-                    self.text.push_str(&format!(
-                        "{} other {files}, {} not individually retained",
-                        self.dir.own_files.saturating_sub(count),
-                        crate::render::size::bytes(self.dir.own_charged.saturating_sub(bytes)),
-                        files = crate::render::unit(
-                            self.dir.own_files.saturating_sub(count),
-                            "file",
-                            "files"
-                        )
-                    ));
+                    let remaining = self.dir.own_files.saturating_sub(count);
+                    if has_hard_links {
+                        // File rows identify representatives, not where link sets are charged.
+                        self.text.push_str(&format!(
+                            "{remaining} other {}; size not individually retained unknown (hard links may be charged elsewhere)",
+                            crate::render::unit(remaining, "file", "files")
+                        ));
+                    } else {
+                        self.text.push_str(&format!(
+                            "{remaining} other {}, {} not individually retained",
+                            crate::render::unit(remaining, "file", "files"),
+                            crate::render::size::bytes(self.dir.own_charged.saturating_sub(bytes))
+                        ));
+                    }
                     self.state.pane = Pane::Files;
                     self.state.selected = 0;
                     return Ok(());
