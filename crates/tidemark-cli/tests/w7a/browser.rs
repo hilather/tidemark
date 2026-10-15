@@ -1588,7 +1588,14 @@ fn post_tui_files_pane_fits_80_columns() {
         )),
         "{title}"
     );
-    assert!(rendered.contains("common ancestor"), "{rendered}");
+    assert!(
+        rendered.contains("(includes directory blocks and hard-linked files"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("whose links share this directory as common ancestor)"),
+        "{rendered}"
+    );
 }
 
 #[test]
