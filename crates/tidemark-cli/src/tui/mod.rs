@@ -560,6 +560,7 @@ impl Browser {
         match self.state.pane {
             Pane::Main => {
                 if self.state.selected == self.own_position() {
+                    let snapshot_dir = self.snapshot.dir(self.dir.id)?;
                     let hits = crate::cmd::files::retained_files(
                         &self.snapshot,
                         self.dir.id,
@@ -572,7 +573,11 @@ impl Browser {
                     let bytes = hits
                         .iter()
                         .fold(0u64, |sum, hit| sum.saturating_add(hit.row.disk));
-                    self.text = "PATH  SIZE  APPARENT  MTIME UTC\n".into();
+                    self.text = format!(
+                        "Snapshot {} at {}; does not include changes since\nPATH  SIZE  APPARENT  MTIME UTC\n",
+                        self.snapshot.meta().scan_id,
+                        crate::render::size::timestamp(self.snapshot.meta().finished_at)
+                    );
                     self.text.push_str(
                         &hits
                             .iter()
@@ -595,7 +600,7 @@ impl Browser {
                             })
                             .collect::<String>(),
                     );
-                    let remaining = self.dir.own_files.saturating_sub(count);
+                    let remaining = snapshot_dir.own_files.saturating_sub(count);
                     if has_hard_links {
                         // File rows identify representatives, not where link sets are charged.
                         self.text.push_str(&format!(
@@ -606,7 +611,9 @@ impl Browser {
                         self.text.push_str(&format!(
                             "{remaining} other {}, {} not individually retained",
                             crate::render::unit(remaining, "file", "files"),
-                            crate::render::size::bytes(self.dir.own_charged.saturating_sub(bytes))
+                            crate::render::size::bytes(
+                                snapshot_dir.own_charged.saturating_sub(bytes)
+                            )
                         ));
                     }
                     self.state.pane = Pane::Files;

@@ -882,3 +882,69 @@ fn own_files_hardlink_remainder_is_unknown() {
     );
     assert!(b.text.contains("[hard links]"));
 }
+
+#[test]
+fn own_files_after_refresh_use_snapshot_observation() {
+    let (_temp, mut b) = browser(0);
+    let temp = ::test_support::private_tempdir().unwrap();
+    let mut root = b.dir.clone();
+    root.own_files = 1;
+    root.own_charged = 8 * 1024 * 1024;
+    let meta = fixture::meta(root.path.clone(), 2_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&[root.clone()]).unwrap();
+    writer
+        .put_files(&[FileRow {
+            id: 0,
+            dir_id: 0,
+            name: Some(RawName::new(b"A".to_vec()).unwrap()),
+            ino: 42,
+            disk: 8 * 1024 * 1024,
+            apparent: 8 * 1024 * 1024,
+            mtime: 0,
+            nlink: 1,
+        }])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.dir = root.clone();
+    // A was deleted and replaced by B (16 MiB). Deliver the live scan result.
+    root.own_charged = 16 * 1024 * 1024;
+    install_refresh(&mut b, root, vec![]);
+    assert_eq!(b.dir.own_charged, 16 * 1024 * 1024);
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    assert!(b.text.contains("/fixture/A"));
+    assert!(!b.text.contains("/fixture/B"));
+    assert!(
+        b.text
+            .contains("0 other files, 0 B not individually retained"),
+        "{}",
+        b.text
+    );
+    assert!(b.text.contains(&meta.scan_id.to_string()));
+    assert!(b
+        .text
+        .contains(&crate::render::size::timestamp(meta.finished_at)));
+    assert!(b.text.contains("does not include changes since"));
+    let screen = render(&b, 160, 48);
+    assert!(!screen.contains("live (Δ snapshot)"));
+    assert!(!screen.contains("live values; delta"));
+}
+
+fn install_refresh(b: &mut Browser, root: DirRow, children: Vec<(DirRow, Option<i128>)>) {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+    });
+    tx.send(Ok(LiveResult {
+        root,
+        children,
+        sort: b.state.sort,
+        growth: Default::default(),
+    }))
+    .unwrap();
+    b.poll_refresh().unwrap();
+}
