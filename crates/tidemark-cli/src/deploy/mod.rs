@@ -178,6 +178,14 @@ fn source_from_read(
 pub trait ApiPing {
     /// Contact the daemon's status method.
     fn ping(&self) -> io::Result<()>;
+    /// Return status within a polling budget. Production adapters must bound
+    /// all socket work by this budget; in-memory adapters may use the default.
+    fn status_with_budget(
+        &self,
+        _budget: Duration,
+    ) -> io::Result<tidemark_core::api::StatusResult> {
+        self.status()
+    }
     /// Return current component health. A reachability-only adapter cannot
     /// certify health and defaults to unavailable.
     fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
@@ -499,19 +507,47 @@ fn restore_at(
     }
 }
 
-/// Poll all required verification items every five seconds, up to the requested deadline.
+/// Poll required checks, allowing a bounded grace for a routine sampler pass.
 pub fn verify(
     state_dir: &Path,
     wait: Duration,
     sys: &dyn Systemctl,
     api: &dyn ApiPing,
 ) -> Result<VerifyResult, DeployError> {
+    verify_with_timing(
+        state_dir,
+        wait,
+        sys,
+        api,
+        Duration::from_secs(10),
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+    )
+}
+
+fn verify_with_timing(
+    state_dir: &Path,
+    wait: Duration,
+    sys: &dyn Systemctl,
+    api: &dyn ApiPing,
+    grace: Duration,
+    interval: Duration,
+    normal_interval: Duration,
+) -> Result<VerifyResult, DeployError> {
     state_guard(state_dir, None)?;
     let started = Instant::now();
+    // An explicit wait owns the whole budget: grace never extends it.
+    let budget = if wait.is_zero() { grace } else { wait };
     loop {
-        let result = verify_once(state_dir, sys, api);
+        let (result, transient) = verify_poll(
+            state_dir,
+            sys,
+            api,
+            budget.saturating_sub(started.elapsed()),
+        );
         if result.healthy
-            || started.elapsed() >= wait
+            || started.elapsed() >= budget
+            || (wait.is_zero() && !transient)
             || result
                 .items
                 .iter()
@@ -519,11 +555,25 @@ pub fn verify(
         {
             return Ok(result);
         }
-        std::thread::sleep(Duration::from_secs(5).min(wait.saturating_sub(started.elapsed())));
+        let delay = if transient { interval } else { normal_interval };
+        std::thread::sleep(delay.min(budget.saturating_sub(started.elapsed())));
+        if started.elapsed() >= budget {
+            return Ok(result);
+        }
     }
 }
 const SERVICE_START_HINT: &str = "the service is enabled but not running: if start-limit-hit, first run 'systemctl reset-failed tidemarkd'; then start it with 'systemctl start tidemarkd' (or reboot), or stage with --start-now";
+#[cfg(test)]
 fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> VerifyResult {
+    verify_poll(state_dir, sys, api, Duration::from_secs(10)).0
+}
+fn verify_poll(
+    state_dir: &Path,
+    sys: &dyn Systemctl,
+    api: &dyn ApiPing,
+    budget: Duration,
+) -> (VerifyResult, bool) {
+    let poll_started = Instant::now();
     let staged = read_json(&state_dir.join("deploy/staged.json"));
     let firstboot = read_json(&state_dir.join("deploy/firstboot.json"));
     let mut items = vec![outcome(
@@ -600,7 +650,7 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
     let status = if stopped {
         Err(io::Error::other("service is not running"))
     } else {
-        api.status()
+        api.status_with_budget(budget.saturating_sub(poll_started.elapsed()))
     };
     // Only a live status response can certify current component health. A stored
     // firstboot report is still config-hash evidence, never live health evidence.
@@ -619,6 +669,18 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
                 .next()
                 .is_some_and(|component| component.state == "ok")
                 && matching.next().is_none()
+        });
+    let transient_core = ["sampler", "scheduler", "api", "tswriter"]
+        .iter()
+        .all(|name| {
+            let mut matching = components.into_iter().flatten().filter(|c| c.name == *name);
+            matching.next().is_some_and(|c| {
+                if *name == "sampler" {
+                    c.state == "degraded" && c.detail == "measurement pass in progress"
+                } else {
+                    c.state == "ok"
+                }
+            }) && matching.next().is_none()
         });
     let core_details = ["sampler", "scheduler", "api", "tswriter"]
         .iter()
@@ -661,12 +723,19 @@ fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> Veri
         }
     }
     items.push(outcome("api", false, status.map(|_| ())));
-    VerifyResult {
-        healthy: items.iter().all(|item| item.status == CheckStatus::Pass),
-        items,
-        firstboot: firstboot.ok(),
-        staged: staged.ok(),
-    }
+    let transient = transient_core
+        && items
+            .iter()
+            .all(|item| item.name == "core_components" || item.status == CheckStatus::Pass);
+    (
+        VerifyResult {
+            healthy: items.iter().all(|item| item.status == CheckStatus::Pass),
+            items,
+            firstboot: firstboot.ok(),
+            staged: staged.ok(),
+        },
+        transient,
+    )
 }
 fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
     files::read(path)

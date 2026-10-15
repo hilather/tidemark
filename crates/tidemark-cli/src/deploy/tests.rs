@@ -1855,7 +1855,16 @@ fn verify_wait_rechecks_live_health() {
     fixture.sys.active.set(true);
     fixture.report(&record.config_sha256, false);
     let api = Recovering(Cell::new(0));
-    let result = verify(&fixture.state, Duration::from_secs(10), &fixture.sys, &api).unwrap();
+    let result = verify_with_timing(
+        &fixture.state,
+        Duration::from_secs(10),
+        &fixture.sys,
+        &api,
+        Duration::from_secs(10),
+        Duration::from_millis(2),
+        Duration::from_millis(2),
+    )
+    .unwrap();
     assert!(result.healthy);
     assert_eq!(api.0.get(), 2);
 }
@@ -1880,5 +1889,134 @@ fn stopped_service_hint_covers_start_limit() {
     assert!(
         hint.find("systemctl reset-failed tidemarkd").unwrap()
             < hint.find("systemctl start tidemarkd").unwrap()
+    );
+}
+
+#[test]
+fn verify_sampler_grace_sequences() {
+    struct Sequence {
+        calls: Cell<usize>,
+        recover: bool,
+        detail: &'static str,
+        other_bad: bool,
+        duplicate: bool,
+    }
+    impl ApiPing for Sequence {
+        fn ping(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            let mut status = Ping(true).status()?;
+            if !self.recover || call == 0 {
+                status.components[0].state = "degraded".into();
+                status.components[0].detail = self.detail.into();
+            }
+            if self.other_bad {
+                status.components[1].state = "error".into();
+            }
+            if self.duplicate {
+                status.components.push(status.components[0].clone());
+            }
+            Ok(status)
+        }
+    }
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.sys.active.set(true);
+    fixture.report(&record.config_sha256, true);
+    for (recover, detail, other_bad, duplicate, wait, healthy, retries) in [
+        (
+            true,
+            "measurement pass in progress",
+            false,
+            false,
+            0,
+            true,
+            true,
+        ),
+        (
+            false,
+            "measurement pass in progress",
+            false,
+            false,
+            0,
+            false,
+            true,
+        ),
+        (false, "measurement failed", false, false, 0, false, false),
+        (
+            false,
+            "measurement pass in progress",
+            true,
+            false,
+            0,
+            false,
+            false,
+        ),
+        (
+            false,
+            "measurement pass in progress",
+            false,
+            true,
+            0,
+            false,
+            false,
+        ),
+        (true, "measurement failed", false, false, 100, true, true),
+        (
+            false,
+            "measurement pass in progress",
+            false,
+            false,
+            20,
+            false,
+            true,
+        ),
+    ] {
+        let api = Sequence {
+            calls: Cell::new(0),
+            recover,
+            detail,
+            other_bad,
+            duplicate,
+        };
+        let started = Instant::now();
+        let result = verify_with_timing(
+            &fixture.state,
+            Duration::from_millis(wait),
+            &fixture.sys,
+            &api,
+            if wait == 0 {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(10)
+            },
+            Duration::from_millis(2),
+            Duration::from_millis(2),
+        )
+        .unwrap();
+        assert_eq!(result.healthy, healthy);
+        assert_eq!(api.calls.get() > 1, retries);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        if !healthy {
+            assert!(result
+                .items
+                .iter()
+                .any(|i| i.name == "core_components" && i.detail.contains("sampler=degraded")));
+        }
+    }
+}
+
+#[test]
+fn verify_socket_zero_budget_expires_before_connect() {
+    let api = SocketPing {
+        socket: PathBuf::from("/unavailable-verifier-test-socket"),
+        timeout: Duration::from_secs(10),
+    };
+    assert_eq!(
+        api.status_with_budget(Duration::ZERO).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
     );
 }
