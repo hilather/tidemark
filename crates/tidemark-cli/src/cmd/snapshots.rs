@@ -275,6 +275,9 @@ pub(crate) fn remove_snapshot(
             .context(format!("remove snapshot: {}", super::display_path(file)))),
     }
 }
+// Bound diagnostic snapshot opens independently of the million-row catalog cap.
+const REMEDY_CANDIDATE_LIMIT: usize = 20;
+
 // Keep diagnostic advice aligned with implicit selection, including root specificity.
 fn default_entry<'a>(
     entries: &'a [tidemark_store::catalog::ScanEntry],
@@ -391,7 +394,7 @@ pub(crate) fn missing_path(
                     .cmp(&a.started_at)
                     .then_with(|| a.scan_id.cmp(&b.scan_id))
             });
-            for entry in entries {
+            for entry in entries.into_iter().take(REMEDY_CANDIDATE_LIMIT) {
                 let Some(file) = entry.file else { continue };
                 let Ok(newer) = tidemark_store::reader::Snapshot::open(&file) else {
                     continue;

@@ -1532,7 +1532,25 @@ fn post_tui_disjoint_traversals_all_sorts() {
                             b.state.selected = b.count() - 1;
                             let previous =
                                 b.child_at(b.state.selected).map(|r| r.0.id).unwrap_or(0);
-                            assert_ne!(first, previous, "Up must move one row");
+                            let own_rank = if sort == state::Sort::Growth {
+                                count
+                            } else {
+                                rank
+                            };
+                            let mut logical = (1..=count).collect::<Vec<_>>();
+                            logical.insert(own_rank as usize, 0);
+                            let first_rank = logical.iter().position(|&id| id == first).unwrap();
+                            assert_eq!(
+                                previous,
+                                logical[first_rank - 1],
+                                "Up must move exactly one row"
+                            );
+                            assert_eq!(
+                                b.own_position() != usize::MAX,
+                                own_rank as usize >= b.pages.offset
+                                    && ((own_rank as usize) < b.pages.offset + b.rows.len()
+                                        || b.pages.offset + b.rows.len() == count as usize)
+                            );
                             b.page(false).unwrap();
                             assert_eq!(b.pages.offset, offset);
                             assert_eq!(b.child_at(0).map(|r| r.0.id).unwrap_or(0), first);
@@ -1695,4 +1713,11 @@ fn post_tui2_remedy_requires_working_default() {
         );
         assert!(!message.contains("drop --snapshot"), "{message}");
     }
+}
+
+#[test]
+fn post_tui2_remedy_search_is_capped() {
+    let message = remedy_catalog_case(false, 25);
+    assert!(message.contains("run: tidemark scan"), "{message}");
+    assert!(!message.contains("contains this path"), "{message}");
 }
