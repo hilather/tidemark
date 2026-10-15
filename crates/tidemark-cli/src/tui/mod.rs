@@ -576,7 +576,7 @@ impl Browser {
                         .iter()
                         .fold(0u64, |sum, hit| sum.saturating_add(hit.row.disk));
                     self.text = format!(
-                        "Snapshot {} at {}; does not include changes since\nPATH  SIZE  APPARENT  MTIME UTC\n",
+                        "Snapshot {} at {}\ndoes not include changes since this snapshot\nPATH  SIZE  APPARENT  MTIME UTC\n",
                         self.snapshot.meta().scan_id,
                         crate::render::size::timestamp(self.snapshot.meta().finished_at)
                     );

@@ -971,9 +971,13 @@ fn own_files_after_refresh_use_snapshot_observation() {
         .text
         .contains(&crate::render::size::timestamp(meta.finished_at)));
     assert!(b.text.contains("does not include changes since"));
-    let screen = render(&b, 160, 48);
-    assert!(!screen.contains("live (Δ snapshot)"));
-    assert!(!screen.contains("live values; delta"));
+    for width in [80, 160] {
+        let screen = render(&b, width, 48);
+        assert!(screen.contains(&crate::render::size::timestamp(meta.finished_at)));
+        assert!(screen.contains("does not include changes since this snapshot"));
+        assert!(!screen.contains("live (Δ snapshot)"));
+        assert!(!screen.contains("live values; delta"));
+    }
 }
 
 fn install_refresh(b: &mut Browser, root: DirRow, children: Vec<(DirRow, Option<i128>)>) {
