@@ -60,6 +60,19 @@ impl Harness {
         monotonic: tidemarkd::Clock,
         root_count: usize,
     ) -> Self {
+        Self::with_window(
+            schedule, throttle, nested, clock, monotonic, root_count, None,
+        )
+    }
+    fn with_window(
+        schedule: &str,
+        throttle: &str,
+        nested: bool,
+        clock: tidemarkd::Clock,
+        monotonic: tidemarkd::Clock,
+        root_count: usize,
+        window: Option<String>,
+    ) -> Self {
         let root = ::test_support::private_tempdir().unwrap();
         std::fs::create_dir(root.path().join("child")).unwrap();
         std::fs::write(root.path().join("child/file"), b"fixture").unwrap();
@@ -80,7 +93,7 @@ impl Harness {
         cfg.roots = vec![RootConfig {
             path: root.path().to_owned(),
             schedule: schedule.into(),
-            window: None,
+            window,
             mode: RootMode::Walk,
             throttle: throttle.into(),
             ..RootConfig::default()
@@ -943,4 +956,145 @@ fn successful_cadence_survives_wall_steps() {
     elapsed.store(3, Ordering::Release);
     wait(|| status().next_due == Some(base - 7200 + remaining - 2 + 3600));
     assert_eq!(status().last_complete.unwrap().scan_id, id);
+}
+
+// Pick a window outside the injected instant in any host zone. No process TZ
+// mutation or wall-clock reading is needed, and the assertion is zone independent.
+fn outside_window(now: i64) -> String {
+    use chrono::{TimeZone, Timelike};
+    let local = chrono::Local.timestamp_opt(now, 0).unwrap();
+    let start = (local.hour() * 60 + local.minute() + 60) % 1440;
+    let end = (start + 1) % 1440;
+    format!(
+        "{:02}:{:02}-{:02}:{:02}",
+        start / 60,
+        start % 60,
+        end / 60,
+        end % 60
+    )
+}
+
+#[test]
+fn never_scanned_roots_start_immediately_outside_window() {
+    for schedule in ["every 6h", "daily 03:30"] {
+        let now = 1_767_268_800;
+        let h = Harness::with_window(
+            schedule,
+            "gentle",
+            false,
+            Arc::new(move || now),
+            Arc::new(|| 0),
+            1,
+            Some(outside_window(now)),
+        );
+        wait(|| {
+            h.control
+                .status(&ScanStatusParams {
+                    root: Some(h.root()),
+                })
+                .unwrap()
+                .iter()
+                .any(|s| s.last_complete.is_some())
+        });
+        h.idle();
+        assert_eq!(h.state.config().0.roots[0].throttle, "gentle");
+    }
+}
+
+#[test]
+fn reload_adds_never_scanned_root_due_immediately_and_retries_outside_window() {
+    use std::sync::atomic::AtomicI64;
+    let now = 1_767_268_800;
+    let elapsed = Arc::new(AtomicI64::new(0));
+    let mono = elapsed.clone();
+    let h = Harness::with_clocks(
+        "off",
+        "max",
+        false,
+        Arc::new(move || now),
+        Arc::new(move || mono.load(Ordering::Acquire)),
+    );
+    let path = h.cfg.roots[0].path.join("added");
+    let raw = RawPath::from_path(&path).unwrap();
+    let mut cfg = h.cfg.clone();
+    let mut added = cfg.roots[0].clone();
+    added.path = path.clone();
+    added.schedule = "daily 03:30".into();
+    added.window = Some(outside_window(now));
+    cfg.roots.push(added);
+    h.state.replace_config(cfg).unwrap();
+    let status = || {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(raw.clone()),
+            })
+            .unwrap()
+    };
+    // The missing root proves that admission happened immediately and retry uses
+    // elapsed time rather than waiting for the daily time or window.
+    wait(|| status().iter().any(|s| s.next_due == Some(now + 30)));
+    std::fs::create_dir(&path).unwrap();
+    elapsed.store(29, Ordering::Release);
+    wait(|| status().iter().any(|s| s.next_due == Some(now + 1)));
+    assert!(status().iter().all(|s| s.last_complete.is_none()));
+    elapsed.store(30, Ordering::Release);
+    wait(|| status().iter().any(|s| s.last_complete.is_some()));
+    assert!(h
+        .control
+        .status(&ScanStatusParams {
+            root: Some(h.root())
+        })
+        .unwrap()
+        .iter()
+        .all(|s| s.last_complete.is_none()));
+}
+
+#[test]
+fn completed_root_still_waits_for_window_with_elapsed_cadence() {
+    use std::sync::atomic::AtomicI64;
+    let now = 1_767_268_800;
+    let elapsed = Arc::new(AtomicI64::new(0));
+    let mono = elapsed.clone();
+    let h = Harness::with_clocks(
+        "off",
+        "max",
+        false,
+        Arc::new(move || now),
+        Arc::new(move || mono.load(Ordering::Acquire)),
+    );
+    h.control.start(&h.params()).unwrap();
+    let status = || {
+        h.control
+            .status(&ScanStatusParams {
+                root: Some(h.root()),
+            })
+            .unwrap()
+    };
+    wait(|| {
+        status()
+            .iter()
+            .any(|s| s.last_complete.is_some() && s.running.is_none())
+    });
+    let id = status()[0].last_complete.as_ref().unwrap().scan_id.clone();
+    let mut cfg = h.cfg.clone();
+    cfg.roots[0].schedule = "every 1s".into();
+    cfg.roots[0].window = Some(outside_window(now));
+    h.state.replace_config(cfg).unwrap();
+    wait(|| {
+        status()
+            .iter()
+            .any(|s| s.next_due.is_some_and(|due| due > now + 1))
+    });
+    elapsed.store(2, Ordering::Release);
+    wait(|| {
+        h.state
+            .view()
+            .status(now)
+            .unwrap()
+            .components
+            .iter()
+            .any(|c| c.name == "scheduler" && c.detail == "waiting for scheduled scan")
+    });
+    assert!(status()[0].next_due.unwrap() > now + 1);
+    assert_eq!(status()[0].last_complete.as_ref().unwrap().scan_id, id);
 }
