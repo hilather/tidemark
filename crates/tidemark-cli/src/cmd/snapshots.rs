@@ -275,6 +275,27 @@ pub(crate) fn remove_snapshot(
             .context(format!("remove snapshot: {}", super::display_path(file)))),
     }
 }
+// Bound diagnostic snapshot opens independently of the million-row catalog cap.
+const REMEDY_CANDIDATE_LIMIT: usize = 20;
+
+// Keep diagnostic advice aligned with implicit selection, including root specificity.
+fn default_entry<'a>(
+    entries: &'a [tidemark_store::catalog::ScanEntry],
+    path: &tidemark_core::path::RawPath,
+) -> Option<&'a tidemark_store::catalog::ScanEntry> {
+    entries
+        .iter()
+        .filter(|e| e.status == "complete" && path.starts_with(&e.root))
+        .max_by(|a, b| {
+            a.root
+                .as_bytes()
+                .len()
+                .cmp(&b.root.as_bytes().len())
+                .then_with(|| a.started_at.cmp(&b.started_at))
+                .then_with(|| a.scan_id.cmp(&b.scan_id))
+        })
+}
+
 /// Resolve a canonical live path; select an explicit snapshot or the latest containing complete one.
 pub(crate) fn select(
     context: &crate::Context,
@@ -298,17 +319,10 @@ pub(crate) fn select(
         catalog.get(id)?
     } else {
         let entries = catalog.list(None)?;
+        let selected = default_entry(&entries, &path).map(|entry| entry.scan_id.clone());
         entries
             .into_iter()
-            .filter(|e| e.status == "complete" && path.starts_with(&e.root))
-            .max_by(|a, b| {
-                a.root
-                    .as_bytes()
-                    .len()
-                    .cmp(&b.root.as_bytes().len())
-                    .then_with(|| a.started_at.cmp(&b.started_at))
-                    .then_with(|| a.scan_id.cmp(&b.scan_id))
-            })
+            .find(|entry| Some(&entry.scan_id) == selected.as_ref())
     }
     .ok_or_else(|| {
         crate::CliError::Precondition("no matching snapshot; run tidemark scan first".into())
@@ -369,6 +383,7 @@ pub(crate) fn missing_path(
         tidemark_store::catalog::Catalog::open(&context.config.general.state_dir, false)
     {
         if let Ok(mut entries) = catalog.list(None) {
+            let default_id = default_entry(&entries, path).map(|entry| entry.scan_id.clone());
             entries.retain(|entry| {
                 entry.status == "complete"
                     && entry.started_at > snapshot.meta().started_at
@@ -379,16 +394,19 @@ pub(crate) fn missing_path(
                     .cmp(&a.started_at)
                     .then_with(|| a.scan_id.cmp(&b.scan_id))
             });
-            for entry in entries {
+            for entry in entries.into_iter().take(REMEDY_CANDIDATE_LIMIT) {
                 let Some(file) = entry.file else { continue };
                 let Ok(newer) = tidemark_store::reader::Snapshot::open(&file) else {
                     continue;
                 };
                 if newer.dir_by_path(path).is_ok_and(|row| row.is_some()) {
                     detail.push_str(&format!(
-                        "; newer complete snapshot {} contains this path; drop --snapshot or use --snapshot {}",
+                        "; newer complete snapshot {} contains this path; use --snapshot {}",
                         entry.scan_id, entry.scan_id
                     ));
+                    if default_id.as_ref() == Some(&entry.scan_id) {
+                        detail.push_str(" or drop --snapshot");
+                    }
                     return crate::CliError::Precondition(detail);
                 }
             }
