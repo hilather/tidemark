@@ -788,8 +788,7 @@ mod tests;
 mod disabled_tests {
     #[test]
     fn disabled_exporter_reports_why_without_reconciling_snapshots() {
-        let mut config = tidemark_core::config::Config::default();
-        config.metrics.textfile = Default::default();
+        let config = tidemark_core::config::Config::default();
         let state = crate::state::LiveState::new(&config, 0);
         let shutdown = crate::Shutdown::default();
         let handle =

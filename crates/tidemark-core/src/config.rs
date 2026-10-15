@@ -294,7 +294,7 @@ pub struct MetricsConfig {
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
-            textfile: PathBuf::from("/var/lib/node_exporter/textfile_collector/tidemark.prom"),
+            textfile: PathBuf::new(),
             interval: Duration::from_secs(60),
             dir_metrics_depth: 2,
             max_series_per_metric: 500,

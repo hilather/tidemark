@@ -113,3 +113,19 @@ fn byte_parser_agrees_with_loader() {
         }
     }
 }
+
+#[test]
+fn metrics_textfile_is_disabled_by_default_and_when_omitted() {
+    assert!(Config::default().metrics.textfile.as_os_str().is_empty());
+    for contents in [
+        "",
+        "[metrics]\ninterval = '30s'\n",
+        include_str!("example.toml"),
+    ] {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        let config = Config::load(file.path()).unwrap();
+        assert!(config.metrics.textfile.as_os_str().is_empty());
+        assert!(config.validate().is_empty());
+    }
+}
