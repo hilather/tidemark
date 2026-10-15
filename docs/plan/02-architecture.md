@@ -185,7 +185,7 @@ Tidemark ships as an RPM through the existing hotfix pipeline:
    - `tidemark deploy stage --from <file>` runs pre-flight checks. On any blocking failure it changes nothing and exits non-zero.
    - On success, it installs the config (backing up any previous one) and runs `systemctl enable tidemarkd` **without starting it**.
    - It records `deploy/staged.json`.
-2. **Next reboot:** the service starts, samples immediately, starts the watchers, writes `deploy/firstboot.json` (component health), and schedules the first scans in their windows.
+2. **Next reboot:** the service starts, samples immediately, starts the watchers, writes `deploy/firstboot.json` (component health), and starts first scans of never-scanned roots immediately unless their schedule is `off`, at each root's throttle profile. Later scans follow their schedule and window.
 3. **After the reboot:** `tidemark deploy verify [--wait 5m]` returns 0 when the first-boot report is healthy, for the pipeline's post-reboot check.
 4. **Back-out:** `tidemark deploy unstage` (stop and disable, keep data) or `dnf remove tidemark`.
 
