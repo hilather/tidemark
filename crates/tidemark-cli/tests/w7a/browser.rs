@@ -1636,3 +1636,63 @@ fn post_tui_missing_path_keeps_scan_remedy_without_complete_evidence() {
         assert!(!message.contains("drop --snapshot"), "{message}");
     }
 }
+
+fn remedy_catalog_case(broad: bool, count: i64) -> String {
+    let state = ::test_support::private_tempdir().unwrap();
+    let live = ::test_support::private_tempdir().unwrap();
+    let subject = live.path().join("data/new");
+    std::fs::create_dir_all(&subject).unwrap();
+    let narrow = RawPath::from_path(&live.path().join("data")).unwrap();
+    let path = RawPath::from_path(&subject).unwrap();
+    let mut ids = Vec::new();
+    for index in 0..count {
+        let root = if broad && index == 1 {
+            RawPath::new(b"/".to_vec()).unwrap()
+        } else {
+            narrow.clone()
+        };
+        let mut meta = fixture::meta(root.clone(), 1_000_000 + index * 100);
+        meta.scan_id =
+            serde_json::from_str(&format!("\"20260101T000000Z-{:08}\"", index + 1)).unwrap();
+        let dir = state
+            .path()
+            .join("snapshots")
+            .join(tidemark_store::catalog::root_slug(&root));
+        let mut rows = vec![fixture::row(0, None, root.as_bytes(), 0)];
+        rows[0].subtree_end = u32::from(index == 1);
+        if index == 1 {
+            rows.push(fixture::row(1, Some(0), path.as_bytes(), 0));
+        }
+        let mut writer = tidemark_store::writer::SnapshotWriter::create(&dir, &meta).unwrap();
+        writer.put_dirs(&rows).unwrap();
+        writer.finish(&meta).unwrap();
+        ids.push(meta.scan_id.to_string());
+    }
+    let catalog = tidemark_store::catalog::Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let mut config = tidemark_core::config::Config::default();
+    config.general.state_dir = state.path().to_path_buf();
+    let context = crate::Context {
+        config,
+        config_path: "/unused".into(),
+        json: false,
+        color: false,
+    };
+    let (_, default) = crate::cmd::snapshots::select(&context, Some(&subject), None).unwrap();
+    assert_eq!(default.meta().scan_id.to_string(), ids[count as usize - 1]);
+    assert!(default.dir_by_path(&path).unwrap().is_none());
+    let (_, old) = crate::cmd::snapshots::select(&context, Some(&subject), Some(&ids[0])).unwrap();
+    crate::cmd::snapshots::missing_path(&context, &path, &old).to_string()
+}
+
+#[test]
+fn post_tui2_remedy_requires_working_default() {
+    for broad in [false, true] {
+        let message = remedy_catalog_case(broad, 3);
+        assert!(
+            message.contains("use --snapshot 20260101T000000Z-00000002"),
+            "{message}"
+        );
+        assert!(!message.contains("drop --snapshot"), "{message}");
+    }
+}
