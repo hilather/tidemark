@@ -384,6 +384,18 @@ sudo journalctl -u tidemarkd --since '-5 minutes' --no-pager
 
 Substitute the approved newer RPM. An upgrade restarts a running daemon, leaves a stopped one stopped and preserves enablement. Edited config is retained; compare any `.rpmnew` with your controlled config, validate changes and reload. Take [before/after baselines](pilot/README.md) around the upgrade.
 
+For the rc2 → rc3 metrics default change, a retained config that omitted
+`[metrics] textfile` now means export is off after the next restart or reload.
+An explicit nonempty destination keeps working. To keep exporting, set that
+explicit destination in your controlled candidate and apply it with
+`sudo tidemark deploy stage --from ./tidemark.toml --start-now`.
+Turning export off leaves the last `tidemark.prom` in the collector directory;
+node_exporter continues serving that stale file. If disabling export, delete
+that file from the configured collector directory after the change takes effect.
+When checking freshness, inspect its mtime or `node_textfile_mtime_seconds`;
+continued scrape success alone does not show that Tidemark is still exporting.
+
+
 ```sh
 sudo tidemark deploy unstage
 sudo dnf remove tidemark

@@ -1063,3 +1063,25 @@ fn missing_path_partial_snapshot_is_labelled_partial() {
     assert!(message.contains("selected partial snapshot"), "{message}");
     assert!(!message.contains("selected complete snapshot"));
 }
+
+#[test]
+fn operator_upgrade_explains_metrics_defaults_and_stale_export() {
+    let upgrade = include_str!("../../../../docs/operator-guide.md")
+        .split("## Upgrade or remove")
+        .nth(1)
+        .unwrap();
+    for required in [
+        "omitted",
+        "textfile",
+        "explicit",
+        "tidemark.prom",
+        "node_exporter",
+        "node_textfile_mtime_seconds",
+        "delete",
+    ] {
+        assert!(
+            upgrade.contains(required),
+            "upgrade guidance missing {required}"
+        );
+    }
+}
