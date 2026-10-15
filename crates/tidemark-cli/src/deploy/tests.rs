@@ -419,6 +419,19 @@ fn verify_missing_stale_unhealthy_healthy_and_api_failure() {
             .healthy
     );
     let mut report = read_json(&fixture.state.join("deploy/firstboot.json")).unwrap();
+    report["components"].as_array_mut().unwrap().push(
+        serde_json::json!({"name":"metrics","state":"disabled","detail":"not configured: metrics textfile path is empty"}),
+    );
+    fs::write(
+        fixture.state.join("deploy/firstboot.json"),
+        serde_json::to_vec(&report).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        verify(&fixture.state, Duration::ZERO, &fixture.sys, &Ping(true))
+            .unwrap()
+            .healthy
+    );
     report["components"][0]["state"] = "degraded".into();
     fs::write(
         fixture.state.join("deploy/firstboot.json"),

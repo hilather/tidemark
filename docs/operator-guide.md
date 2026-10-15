@@ -55,7 +55,7 @@ mounts = ["/", "/data"]
 events = ["close_write"]
 
 [metrics]
-textfile = "/var/lib/node_exporter/textfile_collector/tidemark.prom"
+textfile = "" # off by default
 interval = "60s"
 dir_metrics_depth = 2
 max_series_per_metric = 500
@@ -315,12 +315,12 @@ Invalid reload preserves prior daemon configuration and reports warnings. `statu
 
 ## Metrics and monitoring
 
-Tidemark writes Prometheus text exposition to `[metrics].textfile`, normally `/var/lib/node_exporter/textfile_collector/tidemark.prom`, every 60s. Provision that collector directory using your node_exporter deployment, and enable its textfile collector for the same directory. Confirm exporter access without loosening Tidemark's root-only config, socket or snapshot permissions. Prometheus scrapes **node_exporter**, never Tidemark.
+Prometheus textfile export is off by default (`[metrics] textfile = ""`); `tidemark status` shows metrics as `disabled`, which does not make deployment unhealthy. To enable export, set `textfile` to a file in node_exporter's textfile collector directory, for example `/var/lib/node_exporter/textfile_collector/tidemark.prom`, in your controlled `./tidemark.toml` candidate, then re-stage with `sudo tidemark deploy stage --from ./tidemark.toml`. The collector directory must already exist; provision it using your node_exporter deployment and enable its textfile collector for the same directory. Tidemark writes Prometheus text exposition every 60s when enabled. Confirm exporter access without loosening Tidemark's root-only config, socket or snapshot permissions. Prometheus scrapes **node_exporter**, never Tidemark.
 
 Import the supplied [Grafana dashboard](../packaging/grafana/tidemark.json) and load [Prometheus rules](../packaging/prometheus/tidemark-alerts.yml) through your monitoring change process. They cover time-to-full, thin-pool data/metadata, phantom bytes, stale scans, watcher overflows, availability and active Tidemark alerts. Start with a non-paging destination during the pilot.
 <!-- gap: dashboard and rules exist in packaging/ but this checkout's RPM asset list does not install them; obtain them from the matching release source bundle. -->
 
-Check collector output and monitoring freshness:
+After enabling export, check collector output and monitoring freshness:
 
 ```sh
 sudo tidemark status
