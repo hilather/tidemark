@@ -148,7 +148,12 @@ impl Browser {
                 self.state.sort != state::Sort::Name,
                 self.pages.cursor.as_ref(),
                 self.pages.reverse,
-                PAGE,
+                if self.pages.reverse && self.pages.cursor.is_none() {
+                    // End uses the same aligned final slice as forward traversal.
+                    self.pages.total.saturating_sub(self.pages.offset).min(PAGE)
+                } else {
+                    PAGE
+                },
                 self.state.filter.as_bytes(),
             )?;
             if self.pages.reverse {
@@ -170,7 +175,11 @@ impl Browser {
             self.snapshot
                 .children_count(self.dir.id, self.state.filter.as_bytes())? as usize
         };
-        self.pages.offset = if end { count.saturating_sub(PAGE) } else { 0 };
+        self.pages.offset = if end {
+            count.saturating_sub(1) / PAGE * PAGE
+        } else {
+            0
+        };
         self.load()?;
         if end {
             self.state.selected = self.count().saturating_sub(1);

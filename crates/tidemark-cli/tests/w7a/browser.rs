@@ -1436,3 +1436,119 @@ fn navigation_after_refresh_clears_live_footer() {
     b.navigate(b.snapshot.dir(0).unwrap()).unwrap();
     assert!(!render(&b, 160, 24).contains("live values; delta against snapshot"));
 }
+
+#[test]
+fn post_tui_disjoint_traversals_all_sorts() {
+    for sort in [
+        state::Sort::Size,
+        state::Sort::Reclaim,
+        state::Sort::Files,
+        state::Sort::Newest,
+        state::Sort::Name,
+        state::Sort::Growth,
+    ] {
+        for count in [2500, 2000] {
+            for live in [false, true] {
+                let (_temp, mut b) = browser(count);
+                b.state.sort = sort;
+                // Own rank 750 reproduces the review's overlap for every numeric/name sort.
+                let mut root = b.dir.clone();
+                root.own_charged = 2048;
+                root.own_files = 1;
+                let mut rows = vec![root];
+                for id in 1..=count {
+                    let before = id <= 750;
+                    let mut row = fixture::row(
+                        id,
+                        Some(0),
+                        format!("/fixture/{}{id:08}", if before { '!' } else { 'z' }).as_bytes(),
+                        if before { 4096 } else { 0 },
+                    );
+                    row.t_files = if before { 2 } else { 0 };
+                    row.t_reclaimable = if before { 4096 } else { 0 };
+                    row.newest_mtime = i64::MIN;
+                    rows.push(row);
+                }
+                let temp = ::test_support::private_tempdir().unwrap();
+                let file = fixture::snapshot(temp.path(), &rows, 1_000_000);
+                b.snapshot = Snapshot::open(&file).unwrap();
+                b.dir = b.snapshot.root().unwrap();
+                if live {
+                    let children = b
+                        .snapshot
+                        .children_page(
+                            0,
+                            tidemark_core::snapshot::SortKey::Name,
+                            false,
+                            None,
+                            false,
+                            10000,
+                            b"",
+                        )
+                        .unwrap()
+                        .into_iter()
+                        .map(|r| (r, None))
+                        .collect();
+                    let root = b.dir.clone();
+                    install_refresh(&mut b, root, children);
+                }
+                let mut forward = Vec::new();
+                b.boundary(false).unwrap();
+                for _ in 0..count + 10 {
+                    forward.push(b.child_at(b.state.selected).map(|r| r.0.id).unwrap_or(0));
+                    if b.state.selected + 1 == b.count() {
+                        let offset = b.pages.offset;
+                        b.page(false).unwrap();
+                        if offset == b.pages.offset {
+                            break;
+                        }
+                    } else {
+                        b.state.move_by(1, b.count());
+                    }
+                }
+                let mut backward = Vec::new();
+                b.boundary(true).unwrap();
+                for _ in 0..count + 10 {
+                    backward.push(b.child_at(b.state.selected).map(|r| r.0.id).unwrap_or(0));
+                    if b.state.selected == 0 {
+                        let offset = b.pages.offset;
+                        b.page(true).unwrap();
+                        if offset == b.pages.offset {
+                            break;
+                        }
+                        b.state.selected = b.count().saturating_sub(1);
+                    } else {
+                        b.state.move_by(-1, b.count());
+                    }
+                }
+                backward.reverse();
+                assert_eq!(
+                    forward, backward,
+                    "one-row boundary movement {sort:?} live={live}"
+                );
+                assert_eq!(forward.len(), count as usize + 1);
+                for reverse in [true, false] {
+                    b.boundary(reverse).unwrap();
+                    let mut seen = Vec::new();
+                    let mut own = 0;
+                    for _ in 0..10 {
+                        seen.extend(b.rows.iter().map(|r| r.0.id));
+                        own += usize::from(b.own_position() != usize::MAX);
+                        let offset = b.pages.offset;
+                        b.page(reverse).unwrap();
+                        if offset == b.pages.offset {
+                            break;
+                        }
+                    }
+                    seen.sort_unstable();
+                    assert_eq!(
+                        seen,
+                        (1..=count).collect::<Vec<_>>(),
+                        "{sort:?} live={live} reverse={reverse}"
+                    );
+                    assert_eq!(own, 1, "{sort:?} live={live} reverse={reverse}");
+                }
+            }
+        }
+    }
+}
