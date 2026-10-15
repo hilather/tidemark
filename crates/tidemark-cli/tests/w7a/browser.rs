@@ -623,10 +623,8 @@ fn own_row_sorts_and_enter_lists_direct_files() {
     b.state.selected = b.own_position();
     b.enter().unwrap();
     assert_eq!(b.state.pane, Pane::Files);
-    assert!(b.text.contains(&format!(
-        "12 other files, {} not individually retained",
-        crate::render::size::bytes(8192)
-    )));
+    // Sorting uses the displayed directory; details use its immutable snapshot row.
+    assert!(b.text.contains("1 other file, 0 B not individually retained"));
 }
 
 #[test]
