@@ -531,8 +531,8 @@ impl Browser {
                     self.text.push_str(&format!("{}\n",escape(format!("{error:?}").as_bytes())));
                 }
                 if let Ok(report)=tidemark_store::links::link_report(&self.snapshot,&r.path,None,0) {
-                    self.text.push_str(&format!("Link totals: {} sets, {} instances, {} bytes; incomplete {}\n",
-                        report.totals.sets,report.totals.instances,report.totals.disk,report.totals.incomplete_sets));
+                    self.text.push_str(&format!("Link totals: {} {sets}, {} {instances}, {} {bytes}; incomplete {}\n",
+                        report.totals.sets,report.totals.instances,report.totals.disk,report.totals.incomplete_sets, sets=crate::render::unit(report.totals.sets,"set","sets"), instances=crate::render::unit(report.totals.instances,"instance","instances"), bytes=crate::render::unit(report.totals.disk,"byte","bytes")));
                 } else { self.text.push_str("Link totals unavailable (instance storage required)\n"); }
             }
             Pane::Files => {
@@ -544,8 +544,8 @@ impl Browser {
             Pane::Links => {
                 let hits=self.snapshot.link_sets_under(self.dir.id,&Default::default(),100)?;
                 self.links=hits.iter().map(|h|h.row.ino).collect();
-                self.text=hits.iter().map(|h|format!("{} {} H {} instances {}\n",h.row.ino,
-                    crate::render::size::bytes(h.row.disk),h.instance_count,h.lca_path.display_lossy())).collect();
+                self.text=hits.iter().map(|h|format!("{} {} H {} {instances} {}\n",h.row.ino,
+                    crate::render::size::bytes(h.row.disk),h.instance_count,h.lca_path.display_lossy(),instances=crate::render::unit(h.instance_count,"instance","instances"))).collect();
             }
             Pane::Help => self.text="Arrows move / descend / ascend; Enter descends\nPgDn next page; PgUp previous page; Home/End whole directory\ns sort: size/reclaim/files/newest/growth/name\ni info; l links (Enter instances); f files; p snapshots\n/ filter children; Escape clear/close pane; ? help; q quit\nRead-only browser: no delete, move, open or shell actions\nPages contain at most 1,000 direct children.\nR live refresh; Esc cancels; growth limited to 10,000 children.".into(),
             _ => {}
@@ -590,9 +590,14 @@ impl Browser {
                             .collect::<String>(),
                     );
                     self.text.push_str(&format!(
-                        "{} other files, {} not individually retained",
+                        "{} other {files}, {} not individually retained",
                         self.dir.own_files.saturating_sub(count),
-                        crate::render::size::bytes(self.dir.own_charged.saturating_sub(bytes))
+                        crate::render::size::bytes(self.dir.own_charged.saturating_sub(bytes)),
+                        files = crate::render::unit(
+                            self.dir.own_files.saturating_sub(count),
+                            "file",
+                            "files"
+                        )
                     ));
                     self.state.pane = Pane::Files;
                     self.state.selected = 0;

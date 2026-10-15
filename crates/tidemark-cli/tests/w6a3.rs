@@ -597,7 +597,7 @@ fn now_uses_report_rates_hot_directories_units_and_utc() {
         assert!(text.contains("full in ~3m 9s (1h trend)"), "{text}");
         assert!(text.contains("hot dirs (5m) /data/hot") && text.contains("writer.service"));
         assert!(
-            text.contains("/bad\\xFF") && text.contains("1 files  ?"),
+            text.contains("/bad\\xFF") && text.contains("1 file  ?"),
             "{text}"
         );
     }
@@ -1417,5 +1417,112 @@ fn daemon_lvm_numbers_are_percentages_and_unknowns_without_sockets() {
             let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
             assert_eq!(doc["data"], serde_json::to_value(&report).unwrap());
         }
+    }
+}
+
+#[test]
+fn hot_unwatched_mount_is_precondition_in_text_and_json() {
+    if !socket_available() {
+        return;
+    }
+    for json in [false, true] {
+        let dir = test_support::private_tempdir().unwrap();
+        let p = config(&dir);
+        let listener = UnixListener::bind(dir.path().join("api.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let message = format!("{} is not watched (watch.mounts = [\"/\"]); add it to [watch].mounts and run: tidemark deploy stage --from <file>", dir.path().display());
+        let reply = message.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fake daemon accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).unwrap();
+            let request: Request = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, "hot");
+            serde_json::to_writer(stream.get_mut(), &serde_json::json!({"v":1,"id":request.id,"ok":false,"error":{"code":"unavailable","message":format!("unavailable: {reply}")}})).unwrap();
+            stream.get_mut().write_all(b"\n").unwrap();
+        });
+        let mut args = vec!["hot", "--mount", dir.path().to_str().unwrap()];
+        if json {
+            args.insert(0, "--json");
+        }
+        let out = cli(&p, &args);
+        server.join().unwrap();
+        assert_eq!(out.status.code(), Some(5));
+        if json {
+            let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert!(doc["data"]["error"]["code"] == "unavailable", "{doc}");
+            assert!(doc.to_string().contains("is not watched"), "{doc}");
+        } else {
+            assert_eq!(
+                String::from_utf8(out.stderr).unwrap(),
+                format!(
+                    "hot: {}: {message}\n",
+                    dir.path().join("api.sock").display()
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn progress_unit_words_follow_displayed_counts() {
+    for count in [0, 1, 2] {
+        let progress = tidemark_scan::progress::Progress {
+            phase: "walk",
+            dirs: count,
+            entries: count,
+            errors: count,
+            races: count,
+            rate: count as f64,
+            elapsed: std::time::Duration::from_secs(1),
+            eta: None,
+        };
+        let text = tidemark_cli::render::scan_progress::format_progress(&progress);
+        let expected = if count == 1 {
+            "walk: 1 dir, 1 entry, 1 error, 1 race; rate 1 unit/s; elapsed 1s; ETA unknown"
+        } else if count == 0 {
+            "walk: 0 dirs, 0 entries, 0 errors, 0 races; rate 0 units/s; elapsed 1s; ETA unknown"
+        } else {
+            "walk: 2 dirs, 2 entries, 2 errors, 2 races; rate 2 units/s; elapsed 1s; ETA unknown"
+        };
+        assert_eq!(text, expected);
+    }
+}
+
+#[test]
+fn progress_rate_unit_matches_rounded_display() {
+    for (rate, expected) in [
+        (0.5, "rate 0 units/s"),
+        (1.0, "rate 1 unit/s"),
+        (1.4, "rate 1 unit/s"),
+        (1.5, "rate 2 units/s"),
+    ] {
+        let progress = tidemark_scan::progress::Progress {
+            phase: "walk",
+            dirs: 0,
+            entries: 0,
+            errors: 0,
+            races: 0,
+            rate,
+            elapsed: Default::default(),
+            eta: None,
+        };
+        assert!(tidemark_cli::render::scan_progress::format_progress(&progress).contains(expected));
     }
 }

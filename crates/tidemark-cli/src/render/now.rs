@@ -40,22 +40,25 @@ pub fn phantom_width(
     for r in rows {
         writeln!(
             out,
-            "{}: {} bytes in {} deleted open files",
+            "{}: {} {byte_unit} in {} deleted open {file_unit}",
             crate::render::table::shorten(&escape(&r.mount), width / 2),
             r.total_bytes,
-            r.files
+            r.files,
+            byte_unit = super::unit(r.total_bytes, "byte", "bytes"),
+            file_unit = super::unit(r.files, "file", "files")
         )?;
         let mut holders: Vec<_> = r.holders.iter().collect();
         holders.sort_by(|a, b| (&a.path, a.pid).cmp(&(&b.path, b.pid)));
         for h in holders {
             writeln!(
                 out,
-                "  {} {} {} {} {} bytes",
+                "  {} {} {} {} {} {byte_unit}",
                 h.pid,
                 tidemark_core::path::display_lossy_bytes(h.comm.as_bytes()),
                 crate::render::table::shorten(&escape(h.unit.as_deref().unwrap_or("?")), width / 2),
                 crate::render::table::shorten(&bytes_display(&h.path), width / 2),
-                h.bytes
+                h.bytes,
+                byte_unit = super::unit(h.bytes, "byte", "bytes")
             )?;
         }
     }
@@ -100,8 +103,16 @@ pub fn writers_width(
             escape(&r.comm),
             escape(r.unit.as_deref().unwrap_or("?")),
             bytes_display(&r.path),
-            format!("+{} bytes", r.growth),
-            format!("{} bytes allocated", r.disk),
+            format!(
+                "+{} {}",
+                r.growth,
+                super::unit(r.growth.unsigned_abs(), "byte", "bytes")
+            ),
+            format!(
+                "{} {} allocated",
+                r.disk,
+                super::unit(r.disk, "byte", "bytes")
+            ),
         ]);
     }
     out.write_all(crate::render::table::aligned_wrapped(&table, width, &[0, 3, 4]).as_bytes())?;
@@ -255,12 +266,13 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
         });
         for entry in &m.hot_dirs_5m {
             lines.push(format!(
-                "  hot dirs (5m) {}  {}  {} files  {}{}",
+                "  hot dirs (5m) {}  {}  {} {file_unit}  {}{}",
                 bytes_display(&entry.key),
                 signed_bytes(entry.bytes_delta),
                 entry.files,
                 path(entry.top_unit.as_deref().unwrap_or("?")),
-                if entry.lossy { " [lossy]" } else { "" }
+                if entry.lossy { " [lossy]" } else { "" },
+                file_unit = super::unit(entry.files, "file", "files")
             ));
         }
         if !m.writers_5m.is_empty() {
@@ -283,9 +295,10 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
             lines.push("  deleted-but-open not measured".into());
         } else {
             lines.push(format!(
-                "  deleted-but-open {} ({} files)",
+                "  deleted-but-open {} ({} {file_unit})",
                 fmt_bytes(m.phantom.total_bytes),
-                m.phantom.files
+                m.phantom.files,
+                file_unit = super::unit(m.phantom.files, "file", "files")
             ));
         }
         for h in &m.phantom.holders {
@@ -326,10 +339,12 @@ pub fn render_text(r: &tidemark_core::live::NowReport, width: usize) -> String {
         ));
         if let Some(p) = &s.running {
             lines.push(format!(
-                "  running {}: {} dirs, {} entries",
+                "  running {}: {} {dir_unit}, {} {entry_unit}",
                 escape(&p.phase.to_ascii_lowercase()),
                 p.dirs,
-                p.entries
+                p.entries,
+                dir_unit = super::unit(p.dirs, "dir", "dirs"),
+                entry_unit = super::unit(p.entries, "entry", "entries")
             ));
         }
     }

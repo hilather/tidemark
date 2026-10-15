@@ -67,3 +67,12 @@ pub mod status;
 pub fn enum_label(value: impl std::fmt::Debug) -> String {
     format!("{value:?}").to_ascii_lowercase()
 }
+
+/// Select the unit noun for a displayed count; zero uses the plural.
+pub fn unit(count: u64, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 {
+        singular
+    } else {
+        plural
+    }
+}
