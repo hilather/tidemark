@@ -1692,3 +1692,32 @@ fn staged_inactive_verify_returns_with_start_hint_without_waiting() {
         .iter()
         .any(|item| item.detail == SERVICE_START_HINT));
 }
+
+#[test]
+fn purge_absent_state_still_stops_service_and_preserves_stop_refusal() {
+    for refuse in [false, true] {
+        let f = Fixture::new();
+        assert!(!f.state.exists());
+        f.sys.active.set(true);
+        f.sys.enabled.set(true);
+        f.sys.refuse_stop.set(refuse);
+        let result = unstage(&f.state, true, &f.sys);
+        assert_eq!(result.is_ok(), !refuse);
+        assert!(!f.state.exists());
+        assert!(f
+            .sys
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == "disable_now"));
+        if refuse {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("service is still active"));
+        } else {
+            assert!(!f.sys.active.get());
+            assert!(!f.sys.enabled.get());
+        }
+    }
+}

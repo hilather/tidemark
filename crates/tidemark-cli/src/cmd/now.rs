@@ -41,33 +41,33 @@ pub(crate) fn call<P: serde::Serialize, R: serde::de::DeserializeOwned>(
 ) -> anyhow::Result<R> {
     client
         .call(method, params)
-        .map_err(|e| {
-            use crate::client::ClientError;
-            use tidemark_core::api::ApiErrorCode;
-            match e {
-                ClientError::Unavailable => crate::CliError::Unavailable(
-                    "daemon unavailable — is tidemarkd running? (systemctl status tidemarkd)"
-                        .into(),
-                )
+        .map_err(|error| call_error(error, method))
+}
+pub(crate) fn call_error(e: crate::client::ClientError, method: &str) -> anyhow::Error {
+    let error: anyhow::Error = {
+        use crate::client::ClientError;
+        use tidemark_core::api::ApiErrorCode;
+        match e {
+            ClientError::Unavailable => crate::CliError::Unavailable(
+                "daemon unavailable — is tidemarkd running? (systemctl status tidemarkd)".into(),
+            )
+            .into(),
+            ClientError::Remote(error) => match error.code {
+                ApiErrorCode::BadRequest => crate::CliError::Configuration(error.message).into(),
+                ApiErrorCode::Forbidden => crate::CliError::Precondition(format!(
+                    "{}\n{}",
+                    error.message,
+                    crate::ACCESS_HINT
+                ))
                 .into(),
-                ClientError::Remote(error) => match error.code {
-                    ApiErrorCode::BadRequest => {
-                        crate::CliError::Configuration(error.message).into()
-                    }
-                    ApiErrorCode::Forbidden => crate::CliError::Precondition(format!(
-                        "{}\n{}",
-                        error.message,
-                        crate::ACCESS_HINT
-                    ))
-                    .into(),
-                    ApiErrorCode::Unavailable => crate::CliError::Unavailable(error.message).into(),
-                    ApiErrorCode::Busy => crate::CliError::Precondition(error.message).into(),
-                    _ => anyhow::anyhow!("daemon error: {}", error.message),
-                },
-                e => anyhow::Error::new(e),
-            }
-        })
-        .with_context(|| format!("daemon request {method}"))
+                ApiErrorCode::Unavailable => crate::CliError::Unavailable(error.message).into(),
+                ApiErrorCode::Busy => crate::CliError::Precondition(error.message).into(),
+                _ => anyhow::anyhow!("daemon error: {}", error.message),
+            },
+            e => anyhow::Error::new(e),
+        }
+    };
+    error.context(format!("daemon request {method}"))
 }
 pub(crate) fn mount(path: Option<&std::path::Path>) -> anyhow::Result<Option<String>> {
     path.map(|p| {

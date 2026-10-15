@@ -48,14 +48,20 @@ pub fn report(
         )?;
         writeln!(
             out,
-            "Incomplete: {} sets, {} pinned bytes",
-            t.incomplete_sets, t.incomplete_disk
+            "Incomplete: {} {sets}, {} pinned {bytes}",
+            t.incomplete_sets,
+            t.incomplete_disk,
+            sets = super::unit(t.incomplete_sets, "set", "sets"),
+            bytes = super::unit(t.incomplete_disk, "byte", "bytes")
         )?;
         if regions.is_some() {
             writeln!(
                 out,
-                "Crossing: {} sets, {} bytes",
-                t.crossing.sets, t.crossing.disk
+                "Crossing: {} {sets}, {} {bytes}",
+                t.crossing.sets,
+                t.crossing.disk,
+                sets = super::unit(t.crossing.sets, "set", "sets"),
+                bytes = super::unit(t.crossing.disk, "byte", "bytes")
             )?;
             for s in &report.crossing {
                 let names: Vec<_> = s
@@ -68,7 +74,7 @@ pub fn report(
                     .collect();
                 writeln!(
                     out,
-                    "inode {}: {} bytes, {}/{} links, {}{}",
+                    "inode {}: {} {bytes}, {}/{} {links}, {}{}",
                     s.ino,
                     s.disk,
                     s.found,
@@ -78,13 +84,15 @@ pub fn report(
                         " (incomplete: links outside scan)"
                     } else {
                         ""
-                    }
+                    },
+                    bytes = super::unit(s.disk, "byte", "bytes"),
+                    links = super::unit(u64::from(s.nlink), "link", "links")
                 )?;
             }
             for p in &report.region_pairs {
                 writeln!(
                     out,
-                    "{} ↔ {}: {} sets, {} bytes",
+                    "{} ↔ {}: {} {sets}, {} {bytes}",
                     p.a.as_ref()
                         .map(RawPath::display_lossy)
                         .unwrap_or_else(|| "(outside regions)".into()),
@@ -92,29 +100,44 @@ pub fn report(
                         .map(RawPath::display_lossy)
                         .unwrap_or_else(|| "(outside regions)".into()),
                     p.sets,
-                    p.disk
+                    p.disk,
+                    sets = super::unit(p.sets, "set", "sets"),
+                    bytes = super::unit(p.disk, "byte", "bytes")
                 )?;
             }
         }
         writeln!(out, "Pinned directories:")?;
         for (p, b, s) in &report.incomplete_top_dirs {
-            writeln!(out, "{b} bytes, {s} sets  {}", p.display_lossy())?;
+            writeln!(
+                out,
+                "{b} {}, {s} {}  {}",
+                super::unit(*b, "byte", "bytes"),
+                super::unit(*s, "set", "sets"),
+                p.display_lossy()
+            )?;
         }
         writeln!(out, "Largest link sets:")?;
         for s in &report.largest_sets {
             writeln!(
                 out,
-                "inode {}: {} bytes, {}/{} links, LCA {}",
+                "inode {}: {} {bytes}, {}/{} {links}, LCA {}",
                 s.row.ino,
                 s.row.disk,
                 s.row.found,
                 s.row.nlink,
-                s.lca_path.display_lossy()
+                s.lca_path.display_lossy(),
+                bytes = super::unit(s.row.disk, "byte", "bytes"),
+                links = super::unit(u64::from(s.row.nlink), "link", "links")
             )?;
         }
         writeln!(out, "Most shared directories:")?;
         for (p, b, d) in &report.most_shared_dirs {
-            writeln!(out, "{b} shared / {d} bytes  {}", p.display_lossy())?;
+            writeln!(
+                out,
+                "{b} shared / {d} {}  {}",
+                super::unit(*d, "byte", "bytes"),
+                p.display_lossy()
+            )?;
         }
         for (ino, p, status) in paths {
             writeln!(out, "inode {ino}: {} ({status})", p.display_lossy())?;

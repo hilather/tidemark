@@ -1205,6 +1205,32 @@ impl LiveStateView {
             .next_back()
             .is_some_and(|last| last.ts.saturating_sub(first.ts) >= 300)
     }
+    /// Explain a requested mount outside the daemon's effective watch configuration.
+    pub fn hot_unwatched_detail(&self, p: &HotParams) -> Option<String> {
+        let mount = p.mount.as_ref()?;
+        if self
+            .data
+            .config
+            .watch
+            .mounts
+            .iter()
+            .any(|path| path.as_path() == std::path::Path::new(mount))
+            && self.data.presence.get(mount) != Some(&None)
+        {
+            return None;
+        }
+        let mounts: Vec<_> = self
+            .data
+            .config
+            .watch
+            .mounts
+            .iter()
+            .map(|path| {
+                tidemark_core::path::display_lossy_bytes(path.as_os_str().as_encoded_bytes())
+            })
+            .collect();
+        Some(format!("{mount} is not watched (watch.mounts = {mounts:?}); add it to [watch].mounts and run: tidemark deploy stage --from <file>"))
+    }
     /// Bounded API hot list; integral API windows map exactly to watcher minutes.
     pub fn hot(&self, p: &HotParams) -> Option<Vec<HotEntry>> {
         if self.data.watchers.is_empty() {
@@ -1274,7 +1300,7 @@ impl LiveStateView {
                             watch_start_label(start)
                         );
                     }
-                    return format!("watch history for {mount} starts at {}; ask for a window of at most {available} minutes", watch_start_label(start));
+                    return format!("watch history for {mount} starts at {}; ask for a window of at most {available} {}", watch_start_label(start), if available == 1 { "minute" } else { "minutes" });
                 }
             }
         }
