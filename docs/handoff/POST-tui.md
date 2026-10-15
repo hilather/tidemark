@@ -42,13 +42,11 @@ All long commands use `timeout 1500`; Cargo uses the host cache offline with the
 | `cargo test --offline --workspace --no-fail-fast` | exit 0 | `library/cargo-tests.log` |
 | `cargo build --offline --workspace --features privileged --tests` | exit 0; executables only | `library/cargo-privileged.log` |
 | `RUSTDOCFLAGS='-D warnings' cargo doc --offline --workspace --no-deps` | exit 0 | `library/cargo-doc.log` |
-
 | `CARGO_NET_OFFLINE=true tools/ci.sh` | exit 0; all available checks passed; cargo-deny unavailable | `library/tools/ci.sh-ci.log` |
 
 Workspace harness summaries total 998 passed, 0 failed, 14 ignored (includes subprocess harness output; not a unique-test count). The CLI library reports 140 passed, 0 failed, 1 scale ignored. Targeted paging and render runs each report 1 passed; targeted missing-path coverage reports 6 passed. The CI repeat also reports 140 CLI library passes and passes all three new regressions, including the strengthened full-explanation assertions. Its strict-ancestry feature check reports 2 passed.
 
 No privileged runtime tests were added: these changes concern browser state, rendering and snapshot diagnostics. Existing privileged suites compile; runtime validation remains pending VM. The uid 1000/socket-enabled and Ubuntu gates were not run here.
-
 
 ## Final state
 
