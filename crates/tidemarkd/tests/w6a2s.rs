@@ -212,7 +212,8 @@ fn watcher_final_drop_joins_worker_on_vm() {
     let before = threads();
     let worker = watcher::start(Arc::new(cfg.clone()), state.clone(), tx, stop.clone()).unwrap();
     wait(|| state.view_at(0).watch_stats().is_some_and(|s| s.len() == 1));
-    assert_eq!(threads(), before + 1);
+    // Publishing the watcher can precede the worker setting its comm.
+    wait(|| threads() == before + 1);
     cfg.watch.enabled = false;
     state.replace_config(cfg.clone()).unwrap();
     wait(|| state.view_at(0).watch_stats().is_none_or(|s| s.is_empty()));
