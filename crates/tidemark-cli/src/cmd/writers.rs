@@ -30,19 +30,21 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             std::time::Duration::from_secs(11),
         ) {
             Ok(mut client) => {
+                let params = tidemark_core::api::WritersParams {
+                    mount: super::now::mount(
+                        args.mount.as_deref(),
+                        "writers",
+                        context.json,
+                        &mut std::io::stdout().lock(),
+                    )?,
+                    window: args.window.unwrap_or(std::time::Duration::from_secs(60)),
+                };
                 let rows: tidemark_core::api::WritersResult = super::now::mount_call(
                     &mut client,
                     "writers",
                     context,
-                    &tidemark_core::api::WritersParams {
-                        mount: super::now::mount(
-                            args.mount.as_deref(),
-                            "writers",
-                            context.json,
-                            &mut std::io::stdout().lock(),
-                        )?,
-                        window: args.window.unwrap_or(std::time::Duration::from_secs(60)),
-                    },
+                    params.mount.as_deref(),
+                    &params,
                 )?;
                 return crate::render::now::writers(
                     &rows,
