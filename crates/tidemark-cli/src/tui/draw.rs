@@ -658,8 +658,11 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
                     super::escape(b.state.filter.as_bytes())
                 )
             };
+            // The block keeps the whole table. Blank lines put the sentence on the middle row.
+            let inner = area.height.saturating_sub(2);
+            let pad = usize::from(inner.saturating_sub(1) / 2);
             frame.render_widget(
-                Paragraph::new(text)
+                Paragraph::new(format!("{}{text}", "\n".repeat(pad)))
                     .centered()
                     .block(pane_block(b.theme, depth_title(b, usize::from(area.width)))),
                 area,
@@ -1030,21 +1033,35 @@ pub(super) fn depth_title(b: &Browser, width: usize) -> Line<'static> {
         let path = table::shorten(&path, budget);
         return Line::from(clip_cols(&format!("{prefix}{path}{suffix}"), width));
     }
-    // The filter borrows width. Sort and the live marker stay; the path
-    // shortens only once the filter body no longer fits beside them.
+    // Sort and the live marker stay. A long path shortens before the filter is dropped.
+    // A path that still fits beside a non-empty filter keeps its full text.
     let filter = super::escape(b.state.filter.as_bytes());
     let overhead = table::display_width(&format!(" {} filter \"\"", glyphs.sep));
-    let with_path = table::display_width(&prefix)
-        + table::display_width(&path)
+    let fixed = table::display_width(&prefix)
         + table::display_width(&sort_part)
         + table::display_width(&live);
-    let (path_shown, body_budget) = if with_path + overhead <= width {
-        (path, width - with_path - overhead)
+    let available = width.saturating_sub(fixed);
+    let (path_shown, body_budget) = if available <= overhead {
+        (table::shorten(&path, available), 0)
     } else {
-        let fixed = table::display_width(&prefix)
-            + table::display_width(&sort_part)
-            + table::display_width(&live);
-        (table::shorten(&path, width.saturating_sub(fixed)), 0)
+        let room = available - overhead;
+        let path_natural = table::display_width(&path);
+        let body_natural = table::display_width(&filter);
+        let mut body_budget = body_natural.min(room);
+        let mut path_budget = room - body_budget;
+        if path_natural < room && path_budget < path_natural {
+            path_budget = path_natural;
+            body_budget = room - path_natural;
+        }
+        // Both are too long for the row. Keep a short path and leave the filter the rest.
+        if path_budget == 0 && path_natural > 0 && body_budget > 1 {
+            let floor = 8.min(room.saturating_sub(1));
+            if floor > 0 {
+                path_budget = floor;
+                body_budget = room - floor;
+            }
+        }
+        (table::shorten(&path, path_budget), body_budget)
     };
     let body = table::shorten(&filter, body_budget);
     let filter_part = if body.is_empty() {

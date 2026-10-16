@@ -171,7 +171,8 @@ fn basic(role: Role) -> Color {
 
 fn basic_strata(index: usize) -> Color {
     match index {
-        0 => Color::White,
+        // Reset, not White: Basic has no foam, and White paints the newest bar as a solid block.
+        0 => Color::Reset,
         1 | 2 => Color::Cyan,
         3 | 4 => Color::Blue,
         _ => Color::DarkGray,

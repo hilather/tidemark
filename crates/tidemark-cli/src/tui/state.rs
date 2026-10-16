@@ -57,10 +57,19 @@ impl State {
         }
     }
     pub(crate) fn move_by(&mut self, amount: isize, count: usize) {
-        self.selected = self
-            .selected
-            .saturating_add_signed(amount)
-            .min(count.saturating_sub(1));
+        if count == 0 {
+            self.selected = 0;
+            return;
+        }
+        self.selected = self.selected.saturating_add_signed(amount).min(count - 1);
+    }
+    /// Last row, or 0 when the list has nothing to select.
+    pub(crate) fn end_index(count: usize) -> usize {
+        if count == 0 {
+            0
+        } else {
+            count - 1
+        }
     }
     pub(crate) fn reset(&mut self, start: u32) {
         self.selected = 0;
@@ -95,6 +104,14 @@ mod tests {
         let mut s = State::new(1);
         s.move_by(-1, 0);
         assert_eq!(s.selected, 0);
+        s.selected = 7;
+        s.move_by(1, 0);
+        assert_eq!(s.selected, 0);
+        s.selected = 7;
+        s.move_by(-3, 0);
+        assert_eq!(s.selected, 0);
+        assert_eq!(State::end_index(0), 0);
+        assert_eq!(State::end_index(3), 2);
         s.move_by(999, 3);
         assert_eq!(s.selected, 2);
         s.move_by(-999, 3);

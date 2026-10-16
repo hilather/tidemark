@@ -205,7 +205,7 @@ impl Browser {
         };
         self.load()?;
         if end {
-            self.state.selected = self.count().saturating_sub(1);
+            self.state.selected = State::end_index(self.count());
         }
         Ok(())
     }
@@ -938,10 +938,10 @@ impl Browser {
         }
         Ok(())
     }
+    /// Back to the depth table on the row the panels were naming. The page stays loaded.
     fn close_pane(&mut self) {
         self.state.pane = Pane::Main;
-        self.state.selected = 0;
-        self.main_selected = self.state.selected;
+        self.state.selected = self.main_selected;
     }
     fn enter(&mut self) -> anyhow::Result<()> {
         match self.state.pane {
@@ -1072,11 +1072,11 @@ impl Browser {
                 KeyCode::Home | KeyCode::End if self.state.pane == Pane::Instances => {
                     self.instance_page(code == KeyCode::End, true)?;
                     if code == KeyCode::End {
-                        self.state.selected = self.count().saturating_sub(1);
+                        self.state.selected = State::end_index(self.count());
                     }
                 }
                 KeyCode::Home => self.state.selected = 0,
-                KeyCode::End => self.state.selected = self.count().saturating_sub(1),
+                KeyCode::End => self.state.selected = State::end_index(self.count()),
                 KeyCode::PageDown | KeyCode::PageUp
                     if matches!(self.state.pane, Pane::Main | Pane::Instances) =>
                 {
@@ -1087,9 +1087,8 @@ impl Browser {
                 KeyCode::Enter | KeyCode::Right => self.enter()?,
                 KeyCode::Backspace | KeyCode::Left => {
                     if self.state.pane != Pane::Main {
-                        // Close first so the reload is a Main seek and cannot write the old offset back.
+                        // The filter is unchanged, so the loaded page is still valid.
                         self.close_pane();
-                        self.seek_boundary(false)?;
                     } else if let Some(parent) = self.dir.parent_id {
                         self.navigate(self.snapshot.dir(parent)?)?;
                     }
