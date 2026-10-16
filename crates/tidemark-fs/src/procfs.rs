@@ -278,6 +278,8 @@ pub struct OpenFile {
     /// Octal fdinfo open flags, if requested and available.
     pub flags: Option<u32>,
 }
+type DescriptorObservation = (fs::Metadata, Vec<u8>, Option<u32>);
+
 // Keep flags inside the metadata validation interval. The callbacks allow
 // deterministic descriptor-reuse interleavings without kernel timing races.
 fn read_descriptor(
@@ -286,7 +288,7 @@ fn read_descriptor(
     mut metadata_read: impl FnMut() -> io::Result<fs::Metadata>,
     target_read: impl FnOnce() -> io::Result<Vec<u8>>,
     flags_read: impl FnOnce() -> io::Result<u32>,
-) -> io::Result<Option<(fs::Metadata, Vec<u8>, Option<u32>)>> {
+) -> io::Result<Option<DescriptorObservation>> {
     let Some(metadata) = per_fd(metadata_read())? else {
         return Ok(None);
     };
