@@ -277,118 +277,6 @@ pub struct OpenFile {
     /// Octal fdinfo open flags, if requested and available.
     pub flags: Option<u32>,
 }
-// Cache lifetime is one inventory. Namespace and mount vectors share its byte
-// budget; growth admits both old and new buffers before allocating.
-struct MountNamespace {
-    key: (u64, u64),
-    mounts: Vec<(u64, DevId)>,
-}
-fn reserve_cache<T>(values: &mut Vec<T>, inventory: &mut Inventory) -> io::Result<()> {
-    if values.len() < values.capacity() {
-        return Ok(());
-    }
-    let before = inventory.bytes();
-    let old = values.capacity() * std::mem::size_of::<T>();
-    let grow = values.capacity().max(16);
-    let new = (values.capacity() + grow) * std::mem::size_of::<T>();
-    if before.saturating_add(new) > inventory.limit {
-        return Err(budget_error(inventory.files.len(), before));
-    }
-    values
-        .try_reserve_exact(grow)
-        .map_err(|_| budget_error(inventory.files.len(), before))?;
-    inventory.scratch += values.capacity() * std::mem::size_of::<T>() - old;
-    if inventory.bytes() > inventory.limit {
-        return Err(budget_error(inventory.files.len(), inventory.bytes()));
-    }
-    Ok(())
-}
-fn parse_mnt_id(fdinfo: &str) -> Option<u64> {
-    fdinfo
-        .lines()
-        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
-}
-fn parse_mount_device(line: &str) -> Option<(u64, DevId)> {
-    let mut fields = line.split_ascii_whitespace();
-    let id = fields.next()?.parse().ok()?;
-    fields.next()?.parse::<u64>().ok()?;
-    let (major, minor) = fields.next()?.split_once(':')?;
-    let major = major.parse::<u32>().ok()?;
-    let minor = minor.parse::<u32>().ok()?;
-    // Root, mount point and options precede optional fields and the separator.
-    fields.next()?;
-    fields.next()?;
-    fields.next()?;
-    fields.find(|field| *field == "-")?;
-    fields.next()?;
-    fields.next()?;
-    fields.next()?;
-    Some((id, libc::makedev(major, minor)))
-}
-// Transient lookup failures discard the fd. Other unavailable mappings fall
-// back to stat; resource shortages must propagate for daemon retries.
-fn mapping_read<T>(result: io::Result<T>) -> io::Result<Option<Option<T>>> {
-    match result {
-        Ok(value) => Ok(Some(Some(value))),
-        Err(error) if transient(&error) => Ok(None),
-        Err(error) => per_fd::<T>(Err(error)).map(Some),
-    }
-}
-fn process_mounts(
-    pid: u32,
-    cache: &mut Vec<MountNamespace>,
-    inventory: &mut Inventory,
-) -> io::Result<Option<Option<usize>>> {
-    let Some(key) = mapping_read(fs::metadata(format!("/proc/{pid}/ns/mnt")))? else {
-        return Ok(None);
-    };
-    let Some(key) = key else {
-        return Ok(Some(None));
-    };
-    let key = (key.dev(), key.ino());
-    if let Some(index) = cache.iter().position(|entry| entry.key == key) {
-        return Ok(Some(Some(index)));
-    }
-    let Some(data) = mapping_read(text(format!("/proc/{pid}/mountinfo")))? else {
-        return Ok(None);
-    };
-    let Some(data) = data else {
-        return Ok(Some(None));
-    };
-    let mut mounts = Vec::new();
-    for line in data.lines() {
-        if let Some(entry) = parse_mount_device(line) {
-            reserve_cache(&mut mounts, inventory)?;
-            mounts.push(entry);
-        }
-    }
-    mounts.sort_unstable();
-    reserve_cache(cache, inventory)?;
-    let index = cache.len();
-    cache.push(MountNamespace { key, mounts });
-    Ok(Some(Some(index)))
-}
-fn mapped_device(mounts: &[(u64, DevId)], id: u64) -> Option<DevId> {
-    mounts
-        .binary_search_by_key(&id, |entry| entry.0)
-        .ok()
-        .map(|index| mounts[index].1)
-}
-
-fn stat_on_watched_mount<T>(
-    fdinfo: &str,
-    mounts: Option<&[(u64, DevId)]>,
-    devs: &[DevId],
-    stat: impl FnOnce() -> io::Result<T>,
-) -> io::Result<Option<T>> {
-    if let Some(device) = mounts.and_then(|map| mapped_device(map, parse_mnt_id(fdinfo)?)) {
-        if !devs.contains(&device) {
-            return Ok(None);
-        }
-    }
-    per_fd(stat())
-}
-
 /// Collect regular-file metadata on selected devices, including unlinked open files.
 /// Procfs does no disk I/O, so Gate charging and O_NOATIME do not apply.
 /// Procfs fd magic links are stat-ed intentionally; readlink text is never followed
@@ -401,11 +289,8 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
         files: Vec::new(),
         paths: 0,
         limit: MAX_INVENTORY_BYTES,
-        // Reserve for bounded proc text and its lossy UTF-8 conversion,
-        // including simultaneous fdinfo and mountinfo buffers.
-        scratch: ID_SCRATCH_BYTES + 8 * MAX_PROC_TEXT as usize,
+        scratch: ID_SCRATCH_BYTES,
     };
-    let mut mount_cache = Vec::new();
     let pids = list_pids()?;
     for pid in pids {
         let start = match read_starttime(pid) {
@@ -418,18 +303,10 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
             Err(e) if transient(&e) => continue,
             Err(e) => return Err(e),
         };
-        let Some(mounts) = process_mounts(pid, &mut mount_cache, &mut inventory)? else {
-            continue;
-        };
         let base = inventory.files.len();
         for fd in fds {
-            let Some(fdinfo) = per_fd(text(format!("/proc/{pid}/fdinfo/{fd}")))? else {
-                continue;
-            };
-            let map = mounts.map(|index| mount_cache[index].mounts.as_slice());
             let path = format!("/proc/{pid}/fd/{fd}");
-            let Some(metadata) = stat_on_watched_mount(&fdinfo, map, devs, || fs::metadata(&path))?
-            else {
+            let Some(metadata) = per_fd(fs::metadata(&path))? else {
                 continue;
             };
             if !metadata.is_file() || !devs.contains(&metadata.dev()) {
@@ -439,7 +316,7 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
                 continue;
             };
             let flags = if want_flags {
-                let Some(flags) = per_fd(parse_fdinfo_flags(&fdinfo).ok_or_else(invalid))? else {
+                let Some(flags) = per_fd(read_fdinfo_flags(pid, fd))? else {
                     continue;
                 };
                 Some(flags)
@@ -447,12 +324,7 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
                 None
             };
             // Reject descriptor reuse detectable by inode/device changes during the reads.
-            let Some(check_info) = per_fd(text(format!("/proc/{pid}/fdinfo/{fd}")))? else {
-                continue;
-            };
-            let Some(check) =
-                stat_on_watched_mount(&check_info, map, devs, || fs::metadata(&path))?
-            else {
+            let Some(check) = per_fd(fs::metadata(&path))? else {
                 continue;
             };
             if metadata.dev() != check.dev() || metadata.ino() != check.ino() {
@@ -484,109 +356,6 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn prefilter_never_stats_known_unwatched_devices_and_falls_back() {
-        let map = [(5, libc::makedev(8, 1))];
-        let devs = [libc::makedev(8, 2)];
-        assert!(
-            stat_on_watched_mount::<()>("mnt_id: 5", Some(&map), &devs, || panic!(
-                "unwatched stat"
-            ))
-            .unwrap()
-            .is_none()
-        );
-        for info in ["mnt_id: 6", "mnt_id: invalid", ""] {
-            assert_eq!(
-                stat_on_watched_mount(info, Some(&map), &devs, || Ok(42)).unwrap(),
-                Some(42)
-            );
-        }
-        assert_eq!(
-            stat_on_watched_mount("mnt_id: 5", None, &devs, || Ok(42)).unwrap(),
-            Some(42)
-        );
-        assert_eq!(
-            stat_on_watched_mount("mnt_id: 5", Some(&map), &[map[0].1], || Ok(42)).unwrap(),
-            Some(42)
-        );
-        assert!(stat_on_watched_mount::<()>("", None, &devs, || Err(
-            io::Error::from_raw_os_error(libc::ENOTCONN)
-        ))
-        .unwrap()
-        .is_none());
-    }
-    #[test]
-    fn mount_parsers_and_missing_mapping() {
-        assert_eq!(
-            parse_mnt_id("pos: 0\nflags: 0100002\nmnt_id:\t123\n"),
-            Some(123)
-        );
-        for text in [
-            "",
-            "mnt_id: -1",
-            "mnt_id: nope",
-            "mnt_id: 18446744073709551616",
-        ] {
-            assert_eq!(parse_mnt_id(text), None);
-        }
-        let device = libc::makedev(259, 65537);
-        let line = r"123 1 259:65537 / /space\040here rw shared:4 master:2 - xfs /dev/test rw";
-        assert_eq!(parse_mount_device(line), Some((123, device)));
-        assert_eq!(
-            parse_mount_device("12 1 8:1 / / rw - xfs /dev/a rw"),
-            Some((12, libc::makedev(8, 1)))
-        );
-        for line in [
-            "",
-            "bad 1 8:1 / / rw - xfs a rw",
-            "1 2 nope / / rw - xfs a rw",
-            "1 2 8:1",
-            "1 2 8:1 / / rw",
-        ] {
-            assert_eq!(parse_mount_device(line), None);
-        }
-        assert_eq!(mapped_device(&[(123, device)], 123), Some(device));
-        assert_eq!(mapped_device(&[(123, device)], 999), None);
-        // The same mount id in two namespaces must retain distinct devices.
-        assert_ne!(
-            mapped_device(&[(123, device)], 123),
-            mapped_device(&[(123, 7)], 123)
-        );
-    }
-    #[test]
-    fn cache_growth_is_budgeted_and_mapping_errors_preserve_retry() {
-        let mut inventory = Inventory {
-            files: Vec::new(),
-            paths: 0,
-            scratch: 0,
-            limit: 1,
-        };
-        let mut values: Vec<MountNamespace> = Vec::new();
-        let error = reserve_cache(&mut values, &mut inventory).unwrap_err();
-        assert!(error.get_ref().unwrap().is::<InventoryBudgetExceeded>());
-        assert_eq!(values.capacity(), 0);
-        inventory.limit = 4096;
-        reserve_cache(&mut values, &mut inventory).unwrap();
-        assert_eq!(
-            inventory.bytes(),
-            values.capacity() * std::mem::size_of::<MountNamespace>()
-        );
-        assert!(
-            mapping_read::<()>(Err(io::Error::from_raw_os_error(libc::ENOENT)))
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            mapping_read::<()>(Err(io::Error::from_raw_os_error(libc::EIO))).unwrap(),
-            Some(None)
-        );
-        assert_eq!(
-            mapping_read::<()>(Err(io::Error::from_raw_os_error(libc::EMFILE)))
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EMFILE)
-        );
-    }
     #[test]
     fn injected_descriptor_errors_skip_or_abort() {
         for errno in [
