@@ -314,6 +314,23 @@ fn read_descriptor(
     Ok(Some((metadata, target, flags)))
 }
 
+// Revalidate identity after collecting this process's descriptors. Resource
+// failures must reach the caller rather than produce a partial inventory.
+fn finish_process(
+    inventory: &mut Inventory,
+    base: usize,
+    start: u64,
+    final_start: io::Result<u64>,
+) -> io::Result<()> {
+    match final_start {
+        Ok(observed) if observed == start => {}
+        Ok(_) => inventory.truncate(base),
+        Err(error) if transient(&error) => inventory.truncate(base),
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
 /// Collect regular-file metadata on selected devices, including unlinked open files.
 /// Procfs does no disk I/O, so Gate charging and O_NOATIME do not apply.
 /// Procfs fd magic links are stat-ed intentionally; readlink text is never followed
@@ -369,9 +386,7 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
                 flags,
             })?;
         }
-        if read_starttime(pid).ok() != Some(start) {
-            inventory.truncate(base);
-        }
+        finish_process(&mut inventory, base, start, read_starttime(pid))?;
     }
     Ok(inventory.files)
 }

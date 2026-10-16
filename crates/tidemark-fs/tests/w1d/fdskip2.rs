@@ -88,3 +88,74 @@ fn typed_and_raw_out_of_memory_abort() {
         );
     }
 }
+
+#[test]
+fn final_starttime_errors_discard_only_transient_processes() {
+    fn inventory() -> Inventory {
+        let mut result = Inventory {
+            files: Vec::new(),
+            paths: 0,
+            limit: MAX_INVENTORY_BYTES,
+            scratch: ID_SCRATCH_BYTES,
+        };
+        for pid in [1, 2] {
+            result
+                .push(OpenFile {
+                    pid,
+                    starttime: 42,
+                    fd: 3,
+                    target: b"held".to_vec(),
+                    dev: 1,
+                    ino: 1,
+                    nlink: 1,
+                    size: 0,
+                    disk: 0,
+                    flags: None,
+                })
+                .unwrap();
+        }
+        result
+    }
+    for errno in [
+        libc::EMFILE,
+        libc::ENFILE,
+        libc::ENOMEM,
+        libc::EIO,
+        libc::EINVAL,
+    ] {
+        let mut records = inventory();
+        let error = finish_process(
+            &mut records,
+            1,
+            42,
+            Err(io::Error::from_raw_os_error(errno)),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(errno));
+    }
+    let mut records = inventory();
+    assert_eq!(
+        finish_process(&mut records, 1, 42, Err(io::ErrorKind::OutOfMemory.into()))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::OutOfMemory
+    );
+    for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EPERM] {
+        let mut records = inventory();
+        finish_process(
+            &mut records,
+            1,
+            42,
+            Err(io::Error::from_raw_os_error(errno)),
+        )
+        .unwrap();
+        assert_eq!(records.files.len(), 1);
+        assert_eq!(records.files[0].pid, 1);
+        assert_eq!(records.paths, records.files[0].target.capacity());
+    }
+    for (observed, retained) in [(42, 2), (43, 1)] {
+        let mut records = inventory();
+        finish_process(&mut records, 1, 42, Ok(observed)).unwrap();
+        assert_eq!(records.files.len(), retained);
+    }
+}
