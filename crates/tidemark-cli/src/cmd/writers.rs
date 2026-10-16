@@ -30,9 +30,10 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             std::time::Duration::from_secs(11),
         ) {
             Ok(mut client) => {
-                let rows: tidemark_core::api::WritersResult = super::now::call(
+                let rows: tidemark_core::api::WritersResult = super::now::mount_call(
                     &mut client,
                     "writers",
+                    context,
                     &tidemark_core::api::WritersParams {
                         mount: super::now::mount(args.mount.as_deref())?,
                         window: args.window.unwrap_or(std::time::Duration::from_secs(60)),

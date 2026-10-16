@@ -38,30 +38,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     };
     let mut client = super::now::connect(context)?;
     let rows: Vec<tidemark_core::live::HotEntry> =
-        client.call("hot", &params).map_err(|error| {
-            if let crate::client::ClientError::Remote(remote) = &error {
-                if remote.code == tidemark_core::api::ApiErrorCode::Unavailable
-                    && remote.message.contains(" is not watched (watch.mounts = ")
-                {
-                    if context.json {
-                        if let Err(write_error) = crate::render::json(
-                            "tidemark.hot.v1",
-                            serde_json::json!({"error": remote}),
-                            &mut std::io::stdout().lock(),
-                        ) {
-                            return write_error;
-                        }
-                    }
-                    return anyhow::Error::from(crate::CliError::Precondition(
-                        remote
-                            .message
-                            .trim_start_matches("unavailable: ")
-                            .to_owned(),
-                    ));
-                }
-            }
-            super::now::call_error(error, "hot")
-        })?;
+        super::now::mount_call(&mut client, "hot", context, &params)?;
     crate::render::hot::write_grouped(
         &rows,
         context.json,
