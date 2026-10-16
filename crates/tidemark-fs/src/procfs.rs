@@ -134,6 +134,22 @@ fn transient(e: &io::Error) -> bool {
         Some(libc::ENOENT | libc::ESRCH | libc::EACCES | libc::EPERM)
     )
 }
+// A descriptor can point at a broken remote filesystem. Only resource
+// shortages invalidate the inventory and require the caller to retry.
+fn per_fd<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOMEM | libc::EMFILE | libc::ENFILE)
+            ) =>
+        {
+            Err(error)
+        }
+        Err(_) => Ok(None),
+    }
+}
 /// Enumerate numeric process IDs, sorted numerically.
 pub fn list_pids() -> io::Result<Vec<u32>> {
     ids("/proc")
@@ -290,33 +306,26 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
         let base = inventory.files.len();
         for fd in fds {
             let path = format!("/proc/{pid}/fd/{fd}");
-            let metadata = match fs::metadata(&path) {
-                Ok(m) => m,
-                Err(e) if transient(&e) => continue,
-                Err(e) => return Err(e),
+            let Some(metadata) = per_fd(fs::metadata(&path))? else {
+                continue;
             };
             if !metadata.is_file() || !devs.contains(&metadata.dev()) {
                 continue;
             }
-            let target = match read_fd_target(pid, fd) {
-                Ok(t) => t,
-                Err(e) if transient(&e) => continue,
-                Err(e) => return Err(e),
+            let Some(target) = per_fd(read_fd_target(pid, fd))? else {
+                continue;
             };
             let flags = if want_flags {
-                match read_fdinfo_flags(pid, fd) {
-                    Ok(f) => Some(f),
-                    Err(e) if transient(&e) => continue,
-                    Err(_) => None,
-                }
+                let Some(flags) = per_fd(read_fdinfo_flags(pid, fd))? else {
+                    continue;
+                };
+                Some(flags)
             } else {
                 None
             };
             // Reject descriptor reuse detectable by inode/device changes during the reads.
-            let check = match fs::metadata(&path) {
-                Ok(m) => m,
-                Err(e) if transient(&e) => continue,
-                Err(e) => return Err(e),
+            let Some(check) = per_fd(fs::metadata(&path))? else {
+                continue;
             };
             if metadata.dev() != check.dev() || metadata.ino() != check.ino() {
                 continue;
@@ -347,6 +356,30 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn injected_descriptor_errors_skip_or_abort() {
+        for errno in [
+            libc::ENOTCONN,
+            libc::EIO,
+            libc::ESTALE,
+            libc::ENOENT,
+            libc::EPERM,
+        ] {
+            assert!(per_fd::<()>(Err(io::Error::from_raw_os_error(errno)))
+                .unwrap()
+                .is_none());
+        }
+        for errno in [libc::ENOMEM, libc::EMFILE, libc::ENFILE] {
+            assert_eq!(
+                per_fd::<()>(Err(io::Error::from_raw_os_error(errno)))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(errno)
+            );
+        }
+        assert_eq!(per_fd(Ok(42)).unwrap(), Some(42));
+        assert!(!transient(&io::Error::from_raw_os_error(libc::EIO)));
+    }
     #[test]
     #[allow(clippy::unwrap_used)]
     fn starttime_single_read_and_oversize_failure() {
