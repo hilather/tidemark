@@ -798,11 +798,14 @@ fn verify_poll(
                 .collect();
             match matching.as_slice() {
                 [] => format!("{name}=missing"),
-                [component] if component.state != "ok" => format!(
-                    "{name}={} ({})",
-                    component.state,
-                    core_reason(&component.detail)
-                ),
+                [component] if component.state != "ok" => {
+                    let reason = core_reason(&component.detail);
+                    if reason.trim().is_empty() {
+                        format!("{name}={}", component.state)
+                    } else {
+                        format!("{name}={} ({reason})", component.state)
+                    }
+                }
                 _ => format!(
                     "{name}={}",
                     matching
