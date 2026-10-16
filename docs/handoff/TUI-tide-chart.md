@@ -18,14 +18,14 @@ The nine-row chart has five plot rows, two label rows, and two borders. Its box 
 
 The captured `projects/` and `logs/` rows inherited the generic test helper’s `newest_mtime: 100` (100 Unix seconds after the epoch), because `series()` never replaced it. The exporter copied those rows unchanged into the visual snapshot databases. The renderer therefore correctly interpreted the bad fixture value as 1970; this was not a seconds/milliseconds/nanoseconds conversion bug or a swapped field.
 
-The minimal root fix is in `crates/tidemark-cli/tests/w7a/tide_chart.rs::series`: set deterministic `newest_mtime` near each snapshot’s start time and a distinct, earlier directory `mtime`. The generic test helper remains unchanged for tests that deliberately use small timestamps. In `tui/draw.rs::fmt_when`, zero and the empty-maximum sentinel `i64::MIN` now render as `-`. No production fix outside `tui/` was needed.
+The minimal root fix is in `crates/tidemark-cli/tests/w7a/tide_chart.rs::series`: set deterministic `newest_mtime` near each snapshot’s start time and a distinct, earlier directory `mtime`. The generic test helper remains unchanged for tests that deliberately use small timestamps. In the NEWEST cell only (`tui/draw.rs::fmt_newest`), zero and the empty-maximum sentinel `i64::MIN` render as `-`. The shared `fmt_when` is unchanged, so a real time-0 file in Files or the picker still shows `1970-01-01` (Keystone review 5553170718). No production fix outside `tui/` was needed.
 
 Trace checked end to end:
 
 - `tidemark-fs/src/walk/worker.rs` reads `stx_mtime.tv_sec`; `tidemark-scan/src/agg/mod.rs` rolls up the maximum and writes `DirRow.newest_mtime`.
 - `tidemark-store/src/writer.rs` writes that field to `dirs.newest_mtime`; `reader.rs::dir_row` reads column 32 back into the same field, without conversion. The storage contract specifies Unix seconds.
 - `tidemark-cli/src/live_rows.rs` returns the aggregator’s `VecSink` rows. `tui/mod.rs::start_refresh` retains whole child rows, and `poll_refresh` installs them without changing timestamps. Snapshot paging likewise retains the stored `DirRow`.
-- `tui/draw.rs::data_row` passes `row.newest_mtime` directly to `fmt_when`; UTC formatting needs no timezone or unit correction.
+- `tui/draw.rs::data_row` passes `row.newest_mtime` to `fmt_newest` (which defers to `fmt_when` for every set time); UTC formatting needs no timezone or unit correction.
 
 Both new `newest_*` regressions were run before the fix and failed: the fixture round-trip returned `100` instead of `1760024600`, and zero rendered `01-01 00:00` instead of `-`. Both pass after the fix. They check saved values, distinguish subtree newest from directory mtime, verify known dates and refreshed timestamps, and test zero/missing rendering in both saved and live rows. The existing real refresh test now independently compares NEWEST with filesystem `MetadataExt::mtime()` maxima before snapshot publication and after refresh, then checks the table output. This covers actual stat/aggregation units as well as fixture wiring.
 

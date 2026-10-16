@@ -1894,14 +1894,44 @@ fn token_end_column(line: &str, token: &str) -> Option<usize> {
 }
 
 #[test]
-fn fmt_when_uses_the_utc_year_and_dashes_unknown_timestamps() {
+fn fmt_when_uses_the_utc_year_and_keeps_epoch_dates() {
     let now = 1_781_524_800;
     assert_eq!(draw::fmt_when(now, now), "06-15 12:00");
     assert_eq!(draw::fmt_when(100, 1_000_100), "01-01 00:01");
-    assert_eq!(draw::fmt_when(0, now), "-");
-    assert_eq!(draw::fmt_when(i64::MIN, now), "-");
+    assert_eq!(draw::fmt_when(0, now), "1970-01-01");
     assert_eq!(draw::fmt_when(100, now), "1970-01-01");
     assert_eq!(draw::fmt_when(-1, now), "1969-12-31");
+}
+
+#[test]
+fn fmt_newest_dashes_only_unset_maxima() {
+    let now = 1_781_524_800;
+    assert_eq!(draw::fmt_newest(0, now), "-");
+    assert_eq!(draw::fmt_newest(i64::MIN, now), "-");
+    assert_eq!(draw::fmt_newest(100, now), "1970-01-01");
+    assert_eq!(draw::fmt_newest(now, now), "06-15 12:00");
+}
+
+#[test]
+fn files_pane_shows_a_time_zero_file_as_the_epoch_date() {
+    let now = 1_781_524_800;
+    let hit = tidemark_core::snapshot::FileHit {
+        row: FileRow {
+            id: 0,
+            dir_id: 0,
+            name: Some(RawName::new(b"epoch".to_vec()).unwrap()),
+            ino: 7,
+            disk: 4096,
+            apparent: 4096,
+            mtime: 0,
+            nlink: 1,
+        },
+        path: Some(RawPath::new(b"/fixture/epoch".to_vec()).unwrap()),
+    };
+    let text = files_text(&[hit], now);
+    let line = text.lines().find(|l| l.contains("/fixture/epoch")).unwrap();
+    assert!(line.contains("1970-01-01"), "{line}");
+    assert!(!line.split_whitespace().any(|w| w == "-"), "{line}");
 }
 
 #[test]

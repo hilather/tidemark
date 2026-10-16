@@ -36,9 +36,6 @@ pub(super) fn civil(ts: i64) -> (i64, i64, i64, i64, i64) {
 /// `MM-DD HH:MM` in the same UTC year as `now`, otherwise `YYYY-MM-DD`.
 /// Zero and the empty-maximum sentinel have no useful timestamp to display.
 pub(super) fn fmt_when(ts: i64, now: i64) -> String {
-    if ts == 0 || ts == i64::MIN {
-        return "-".into();
-    }
     let (year, month, day, hour, minute) = civil(ts);
     let (now_year, _, _, _, _) = civil(now);
     if year == now_year {
@@ -46,6 +43,15 @@ pub(super) fn fmt_when(ts: i64, now: i64) -> String {
     } else {
         format!("{year:04}-{month:02}-{day:02}")
     }
+}
+
+/// NEWEST cell: an unset subtree maximum (0, or the empty-maximum sentinel
+/// `i64::MIN`) renders as `-`; every other time goes through [`fmt_when`].
+pub(super) fn fmt_newest(ts: i64, now: i64) -> String {
+    if ts == 0 || ts == i64::MIN {
+        return "-".into();
+    }
+    fmt_when(ts, now)
 }
 
 /// Compact age: `35s`, `1m 39s`, `9h 47m`, or `3d 4h`.
@@ -930,7 +936,7 @@ fn data_row(
     cells.push(Cell::from(right_text(if own {
         "-".into()
     } else {
-        fmt_when(row.newest_mtime, b.now)
+        fmt_newest(row.newest_mtime, b.now)
     })));
     cells.push(Cell::from(if own {
         right_text("-".into())
