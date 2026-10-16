@@ -140,10 +140,11 @@ fn per_fd<T>(result: io::Result<T>) -> io::Result<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::ENOMEM | libc::EMFILE | libc::ENFILE)
-            ) =>
+            if error.kind() == io::ErrorKind::OutOfMemory
+                || matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOMEM | libc::EMFILE | libc::ENFILE)
+                ) =>
         {
             Err(error)
         }

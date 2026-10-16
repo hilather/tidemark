@@ -69,3 +69,22 @@ fn flags_are_optional_and_inode_replacement_is_rejected() {
     .unwrap()
     .is_none());
 }
+
+#[test]
+fn typed_and_raw_out_of_memory_abort() {
+    let allocation_error = Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err();
+    let typed: io::Error = allocation_error.into();
+    assert_eq!(typed.kind(), io::ErrorKind::OutOfMemory);
+    assert_eq!(typed.raw_os_error(), None);
+    let error = per_fd::<()>(Err(typed)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+    assert_eq!(error.raw_os_error(), None);
+    for errno in [libc::ENOMEM, libc::EMFILE, libc::ENFILE] {
+        assert_eq!(
+            per_fd::<()>(Err(io::Error::from_raw_os_error(errno)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(errno)
+        );
+    }
+}
