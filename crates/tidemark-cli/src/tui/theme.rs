@@ -22,6 +22,7 @@ pub(super) enum Role {
     Bg,
     Deep,
     Edge,
+    Wave,
     Text,
     Dim,
     Teal,
@@ -160,7 +161,7 @@ impl Theme {
 fn basic(role: Role) -> Color {
     match role {
         Role::Bg => Color::Reset,
-        Role::Deep | Role::Edge | Role::Sea => Color::Blue,
+        Role::Deep | Role::Edge | Role::Sea | Role::Wave => Color::Blue,
         Role::Text => Color::Reset,
         Role::Dim => Color::DarkGray,
         Role::Teal | Role::Foam => Color::Cyan,
@@ -183,7 +184,7 @@ fn indexed(role: Role) -> u8 {
     match role {
         Role::Bg => 233,
         Role::Deep => 17,
-        Role::Edge => 23,
+        Role::Edge | Role::Wave => 23,
         Role::Text => 195,
         Role::Dim => 66,
         Role::Teal => 37,
@@ -201,6 +202,7 @@ fn rgb(role: Role) -> Color {
         Role::Bg => (0x07, 0x15, 0x26),
         Role::Deep => (0x0d, 0x22, 0x38),
         Role::Edge => (0x1d, 0x3d, 0x57),
+        Role::Wave => (0x12, 0x3a, 0x5a),
         Role::Text => (0xcf, 0xe8, 0xef),
         Role::Dim => (0x6f, 0x93, 0xa6),
         Role::Teal => (0x2e, 0xc4, 0xb6),

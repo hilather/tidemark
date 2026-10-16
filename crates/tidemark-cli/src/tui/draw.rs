@@ -9,9 +9,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Bar, BarChart, Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState,
-    },
+    widgets::{Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState},
     Frame,
 };
 use tidemark_core::snapshot::DirRow;
@@ -36,6 +34,7 @@ pub(super) fn civil(ts: i64) -> (i64, i64, i64, i64, i64) {
 }
 
 /// `MM-DD HH:MM` in the same UTC year as `now`, otherwise `YYYY-MM-DD`.
+/// Zero and the empty-maximum sentinel have no useful timestamp to display.
 pub(super) fn fmt_when(ts: i64, now: i64) -> String {
     let (year, month, day, hour, minute) = civil(ts);
     let (now_year, _, _, _, _) = civil(now);
@@ -44,6 +43,15 @@ pub(super) fn fmt_when(ts: i64, now: i64) -> String {
     } else {
         format!("{year:04}-{month:02}-{day:02}")
     }
+}
+
+/// NEWEST cell: an unset subtree maximum (0, or the empty-maximum sentinel
+/// `i64::MIN`) renders as `-`; every other time goes through [`fmt_when`].
+pub(super) fn fmt_newest(ts: i64, now: i64) -> String {
+    if ts == 0 || ts == i64::MIN {
+        return "-".into();
+    }
+    fmt_when(ts, now)
 }
 
 /// Compact age: `35s`, `1m 39s`, `9h 47m`, or `3d 4h`.
@@ -194,23 +202,6 @@ fn split_cells(weights: &[u64], seats: usize) -> Vec<usize> {
     floors
 }
 
-/// Shift bar heights until `max * bar_height * 8` fits in `u64`, keeping the ratio.
-pub(super) fn fit_bar_values(values: &mut [u64], bar_height: u16) {
-    let height = u128::from(bar_height);
-    if height == 0 {
-        return;
-    }
-    loop {
-        let max = values.iter().copied().max().unwrap_or(0);
-        if max == 0 || u128::from(max) * height * 8 <= u128::from(u64::MAX) {
-            return;
-        }
-        for value in values.iter_mut() {
-            *value >>= 1;
-        }
-    }
-}
-
 pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
     let area = frame.area();
     paint_background(frame, area, b.theme);
@@ -219,10 +210,26 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
         return;
     }
     let show_panels = area.height >= 30;
-    let show_chart = chart_allowed(b, area);
+    let show_chart = chart_allowed(area);
     let footer_height = footer_height(b, usize::from(area.width));
     let chunks = regions(area, show_chart, show_panels, footer_height);
     let mut index = 0;
+    if show_chart {
+        let motif = if b.theme.glyphs.unicode {
+            "▁▂▃▄▃▂▁ "
+        } else {
+            "~~~ ~~~ "
+        };
+        frame.render_widget(
+            on_background(
+                b.theme,
+                Line::from(motif.repeat(usize::from(area.width).div_ceil(8)))
+                    .style(style_fg(b.theme, Role::Wave)),
+            ),
+            chunks[index],
+        );
+        index += 1;
+    }
     frame.render_widget(
         on_background(b.theme, header_line(b, usize::from(area.width))),
         chunks[index],
@@ -248,6 +255,18 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
         chunks[index],
     );
     index += 1;
+    if show_chart {
+        let rule = if b.theme.glyphs.unicode { "▔" } else { "-" };
+        frame.render_widget(
+            on_background(
+                b.theme,
+                Line::from(rule.repeat(usize::from(area.width)))
+                    .style(style_fg(b.theme, Role::Wave)),
+            ),
+            chunks[index],
+        );
+        index += 1;
+    }
     let message = clip_cols(&message_line(b), usize::from(area.width));
     frame.render_widget(
         on_background(b.theme, Line::from(message).style(base_style(b.theme))),
@@ -305,7 +324,11 @@ fn draw_too_small(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
 }
 
 fn regions(area: Rect, chart: bool, panels: bool, footer: u16) -> std::rc::Rc<[Rect]> {
-    let mut constraints = vec![Constraint::Length(1)];
+    let mut constraints = Vec::new();
+    if chart {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1));
     if chart {
         constraints.push(Constraint::Length(9));
     }
@@ -315,14 +338,15 @@ fn regions(area: Rect, chart: bool, panels: bool, footer: u16) -> std::rc::Rc<[R
         constraints.push(Constraint::Length(11));
     }
     constraints.push(Constraint::Length(footer));
+    if chart {
+        constraints.push(Constraint::Length(1));
+    }
     constraints.push(Constraint::Length(1));
     Layout::vertical(constraints).split(area)
 }
 
-fn chart_allowed(b: &Browser, area: Rect) -> bool {
-    area.width >= 100
-        && area.height >= 34
-        && b.snapshots.iter().filter(|row| row.3.is_some()).count() >= 2
+fn chart_allowed(area: Rect) -> bool {
+    area.width >= 100 && area.height >= 34
 }
 
 fn base_style(theme: Theme) -> Style {
@@ -368,8 +392,16 @@ fn header_line(b: &Browser, width: usize) -> Line<'static> {
         meta.scan_id, glyphs.sep, glyphs.sep, glyphs.sep
     );
     let high = high_water_text(&b.snapshots);
-    let right = format!("high-water {high}");
+    let mut high_label = "| root high-water ";
+    let mut right = format!("{high_label}{high}");
     let path = b.dir.path.display_lossy();
+    if fit_header(width, &identity, &right, &path, glyphs)
+        .1
+        .is_none()
+    {
+        high_label = "hw ";
+        right = format!("{high_label}{high}");
+    }
     let (show_brand, path) = fit_header(width, &identity, &right, &path, glyphs);
     let mut spans = Vec::new();
     if show_brand {
@@ -405,7 +437,10 @@ fn header_line(b: &Browser, width: usize) -> Line<'static> {
         .sum::<usize>();
     let gap = width.saturating_sub(used + header_cols(&right));
     spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(Span::styled("high-water ".to_string(), dim_style(theme)));
+    spans.push(Span::styled(
+        high_label.to_string(),
+        style_fg(theme, Role::Dim),
+    ));
     spans.push(Span::styled(
         high,
         style_fg(theme, Role::Sand).add_modifier(Modifier::BOLD),
@@ -901,7 +936,7 @@ fn data_row(
     cells.push(Cell::from(right_text(if own {
         "-".into()
     } else {
-        fmt_when(row.newest_mtime, b.now)
+        fmt_newest(row.newest_mtime, b.now)
     })));
     cells.push(Cell::from(if own {
         right_text("-".into())
@@ -1093,110 +1128,299 @@ fn live_suffix(b: &Browser) -> String {
     }
 }
 
-fn draw_chart(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
-    let inner = area.width.saturating_sub(2);
-    let Some((bar_width, window)) = chart_window(&b.snapshots, inner) else {
-        return;
+/// Exact zero-based eighth-cell scaling, clamped even if a caller supplies a smaller maximum.
+pub(super) fn eighths(value: u64, maximum: u64, height: u16) -> u16 {
+    if maximum == 0 {
+        return 0;
+    }
+    let limit = u128::from(height) * 8;
+    u16::try_from((u128::from(value) * limit / u128::from(maximum)).min(limit)).unwrap_or(u16::MAX)
+}
+
+/// One shallow, symmetric crest across the 16-column bar, bounded by its true top.
+pub(super) fn crest(fill: u16, column: u16) -> u16 {
+    let inset = match column.min(15) {
+        0..=1 | 14..=15 => 2,
+        2..=5 | 10..=13 => 1,
+        _ => 0,
     };
-    let meta = b.snapshot.meta();
-    let open_id = meta.scan_id.as_str();
-    let floor = window.iter().filter_map(|row| row.3).min().unwrap_or(0) / 10 * 9;
-    let mut values: Vec<u64> = window
+    fill.saturating_sub(inset).max(1).min(fill)
+}
+
+struct ChartSample<'a> {
+    id: Option<&'a str>,
+    started: i64,
+    sample: Option<super::history::Sample>,
+    current: bool,
+    live: bool,
+}
+
+fn draw_chart(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
+    use super::history::Sample;
+    // Mock coordinates: box at column 1; first bar at column 4, stride 19.
+    let area = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(2),
+        ..area
+    };
+    let (subject, whole) = b.subject();
+    let live_at = b.pages.live.as_ref().and(b.pages.live_at);
+    let mut samples: Vec<_> = b
+        .history
+        .window
         .iter()
-        .map(|row| row.3.unwrap_or(0).saturating_sub(floor))
-        .collect();
-    // BarChart scales by eight ticks per cell. Keep that product inside u64.
-    fit_bar_values(&mut values, 6);
-    let bars: Vec<Bar<'_>> = window
-        .iter()
-        .zip(values)
-        .map(|(row, value)| {
-            let disk = row.3.unwrap_or(0);
-            let (month, day, hour) = chart_stamp(row.2);
-            // Date only. The size is `text_value`, so a narrow bar never cuts it.
-            let label = format!("{month:02}-{day:02} {hour:02}h");
-            let role = if row.0 == open_id {
-                Role::Foam
-            } else {
-                Role::Teal
-            };
-            Bar::default()
-                .value(value)
-                .text_value(size::bytes(disk))
-                .label(label)
-                .style(style_fg(b.theme, role))
+        .enumerate()
+        .map(|(index, entry)| ChartSample {
+            id: Some(entry.id.as_str()),
+            started: entry.started,
+            sample: b.history.samples.get(index).copied().flatten(),
+            current: entry.id == b.snapshot.meta().scan_id.as_str(),
+            live: false,
         })
         .collect();
-    let left = format!(
-        "tide {} root total by snapshot {} axis from {}",
-        b.theme.glyphs.sep,
-        b.theme.glyphs.sep,
-        size::bytes(floor)
-    );
-    let mut block = pane_block(b.theme, Line::from(left));
-    if let Some(delta) = chart_delta(b, &window) {
-        block = block.title_top(Line::from(delta_title(b.theme, delta)).right_aligned());
+    let insufficient_history = samples.len() < 2;
+    if let Some(started) = live_at.filter(|_| !insufficient_history) {
+        samples.push(ChartSample {
+            id: None,
+            started,
+            sample: Some(Sample::Known(subject.t_disk)),
+            current: false,
+            live: true,
+        });
     }
-    let chart = BarChart::new(bars)
-        .block(block)
-        .bar_width(bar_width)
-        .bar_gap(3);
-    frame.render_widget(chart, area);
-}
-
-fn chart_window(snapshots: &[CatalogRow], inner_width: u16) -> Option<(u16, Vec<&CatalogRow>)> {
-    let mut window: Vec<&CatalogRow> = snapshots.iter().filter(|row| row.3.is_some()).collect();
-    window.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-    window.truncate(7);
-    window.reverse();
-    loop {
-        let count = u16::try_from(window.len()).unwrap_or(0);
-        if count < 2 {
-            return None;
-        }
-        let gaps = 3 * count.saturating_sub(1);
-        if inner_width <= gaps {
-            window.remove(0);
-            continue;
-        }
-        let bar_width = ((inner_width - gaps) / count).min(16);
-        if bar_width < 12 {
-            window.remove(0);
-            continue;
-        }
-        return Some((bar_width, window));
-    }
-}
-
-fn chart_stamp(ts: i64) -> (i64, i64, i64) {
-    let (_, month, day, hour, _) = civil(ts);
-    (month, day, hour)
-}
-
-fn chart_delta(b: &Browser, window: &[&CatalogRow]) -> Option<i128> {
-    let meta = b.snapshot.meta();
-    let open_id = meta.scan_id.as_str();
-    // Both bars have to be on the chart. The previous snapshot can be the one
-    // just outside the newest-seven window while the open snapshot is still drawn.
-    let open = window.iter().find(|row| row.0 == open_id)?.3?;
-    let previous = super::previous_complete(&b.snapshots, meta.started_at, open_id)?;
-    if !window.iter().any(|row| row.0 == previous.0) {
-        return None;
-    }
-    let older = previous.3?;
-    Some(i128::from(open) - i128::from(older))
-}
-
-fn delta_title(theme: Theme, delta: i128) -> String {
-    let signed = crate::render::tree::signed_bytes(delta);
-    let mark = delta_mark(theme.glyphs);
-    if delta > 0 {
-        format!("{mark} {signed} since previous {}", theme.glyphs.rise)
-    } else if delta < 0 {
-        format!("{mark} {signed} since previous {}", theme.glyphs.ebb)
+    let count = usize::from(area.width.saturating_sub(3) / 19).min(super::history::SAMPLES);
+    let displayed = &samples[samples.len().saturating_sub(count)..];
+    let delta = chart_delta(b, displayed);
+    let delta_label = delta.map(|value| {
+        let glyph = if value > 0 {
+            b.theme.glyphs.rise
+        } else if value < 0 {
+            b.theme.glyphs.ebb
+        } else {
+            ""
+        };
+        let context = if live_at.is_some() {
+            "vs snapshot"
+        } else {
+            "since previous"
+        };
+        let role = if value > 0 {
+            Role::Coral
+        } else if value < 0 {
+            Role::Teal
+        } else {
+            Role::Dim
+        };
+        Line::from(Span::styled(
+            format!(
+                " {} {} {context} {glyph} ",
+                delta_mark(b.theme.glyphs),
+                crate::render::tree::signed_bytes(value)
+            ),
+            style_fg(b.theme, role),
+        ))
+    });
+    let delta_width = delta_label.as_ref().map_or(0, |label| {
+        label
+            .spans
+            .iter()
+            .map(|span| table::display_width(&span.content))
+            .sum::<usize>()
+    });
+    let context = if whole {
+        format!(" {} whole directory", b.theme.glyphs.sep)
     } else {
-        format!("{mark} {signed} since previous")
+        String::new()
+    };
+    let suffix = format!(
+        " {} disk {}{context}{}",
+        b.theme.glyphs.sep,
+        size::bytes(subject.t_disk),
+        if live_at.is_some() { " / live" } else { "" }
+    );
+    let prefix = format!("tide {} ", b.theme.glyphs.sep);
+    let budget = usize::from(area.width).saturating_sub(
+        delta_width + table::display_width(&prefix) + table::display_width(&suffix) + 3,
+    );
+    let title = format!(
+        "{prefix}{}{suffix}",
+        table::shorten(&subject.path.display_lossy(), budget)
+    );
+    let mut block = pane_block(b.theme, Line::from(title));
+    if !b.theme.glyphs.unicode {
+        block = block.border_set(ratatui::symbols::border::Set {
+            top_left: "+",
+            top_right: "+",
+            bottom_left: "+",
+            bottom_right: "+",
+            vertical_left: "|",
+            vertical_right: "|",
+            horizontal_top: "-",
+            horizontal_bottom: "-",
+        });
     }
+    if let Some(label) = delta_label {
+        block = block.title_top(label.right_aligned());
+    }
+    if let Some(reason) = displayed.iter().find_map(|s| match s.sample {
+        Some(Sample::Unavailable(reason)) => Some(reason),
+        _ => None,
+    }) {
+        block = block.title_bottom(
+            Line::from(format!(" n/a: {reason} "))
+                .style(dim_style(b.theme))
+                .right_aligned(),
+        );
+    } else if displayed
+        .iter()
+        .any(|s| s.sample == Some(Sample::MissingPath))
+    {
+        block = block.title_bottom(
+            Line::from(" absent path ")
+                .style(dim_style(b.theme))
+                .right_aligned(),
+        );
+    }
+    frame.render_widget(block, area);
+    if insufficient_history {
+        let text = format!(
+            "Insufficient history · {} disk",
+            size::bytes(subject.t_disk)
+        );
+        let text = if b.theme.glyphs.unicode {
+            text
+        } else {
+            text.replace('·', ".")
+        };
+        frame.render_widget(
+            on_background(b.theme, text),
+            Rect {
+                x: area.x + 3,
+                y: area.y + 2,
+                width: area.width.saturating_sub(6),
+                height: 1,
+            },
+        );
+        return;
+    }
+    let height = area.height.saturating_sub(4);
+    let maximum = displayed
+        .iter()
+        .filter_map(|s| s.sample.and_then(Sample::value))
+        .max()
+        .unwrap_or(0);
+    if height == 0 {
+        return;
+    }
+    // Zero stays at the foot of the plot, separate from the value labels/border.
+    frame.buffer_mut()[(area.x + 1, area.y + height)]
+        .set_symbol("0")
+        .set_style(dim_style(b.theme));
+    let baseline = chart_baseline(b, displayed);
+    for (index, sample) in displayed.iter().enumerate() {
+        let x = area.x + 3 + u16::try_from(index).unwrap_or(0) * 19;
+        let value = sample.sample.and_then(Sample::value);
+        let e = eighths(value.unwrap_or(0), maximum, height);
+        let latest = index + 1 == displayed.len();
+        let color = if latest { Role::Foam } else { Role::Teal };
+        for row in 0..e.div_ceil(8) {
+            let fill = (e - row * 8).min(8);
+            let top = row + 1 == e.div_ceil(8);
+            let y = area.y + height - row;
+            for column in 0..16 {
+                let level = if top { crest(fill, column) } else { fill };
+                let glyph = if b.theme.glyphs.unicode {
+                    [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"][usize::from(level)]
+                } else if level < 4 {
+                    "."
+                } else if top {
+                    "~"
+                } else {
+                    "#"
+                };
+                let mut style = style_fg(b.theme, color);
+                if latest && matches!(b.theme.level, Level::Basic | Level::Mono) {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                frame.buffer_mut()[(x + column, y)]
+                    .set_symbol(glyph)
+                    .set_style(style);
+            }
+        }
+        if latest {
+            if let Some(previous) = baseline {
+                let previous_eighths = eighths(previous, maximum, height);
+                // A side tick leaves the crest intact, including when the baseline
+                // is above a declining endpoint. Zero occupies the bottom plot row.
+                let y = area.y + height - previous_eighths.saturating_sub(1) / 8;
+                frame.buffer_mut()[(x - 1, y)]
+                    .set_symbol(if b.theme.glyphs.unicode { "─" } else { "-" })
+                    .set_style(dim_style(b.theme));
+            }
+        }
+        let (_, month, day, hour, _) = civil(sample.started);
+        let marker = if sample.live {
+            if b.theme.glyphs.unicode {
+                "◆"
+            } else {
+                "+"
+            }
+        } else if sample.current {
+            b.theme.glyphs.open
+        } else {
+            ""
+        };
+        let stamp = if sample.live {
+            format!("{marker} live")
+        } else if sample.current {
+            format!("{marker} {month:02}-{day:02} {hour:02}h")
+        } else {
+            format!("{month:02}-{day:02} {hour:02}h")
+        };
+        let label = match sample.sample {
+            Some(Sample::Known(value)) => size::bytes(value),
+            Some(Sample::MissingPath) => if b.theme.glyphs.unicode { "—" } else { "-" }.into(),
+            Some(Sample::Unavailable(_)) => "n/a".into(),
+            None => if b.theme.glyphs.unicode { "…" } else { "..." }.into(),
+        };
+        let style = if latest {
+            key_style(b.theme)
+        } else {
+            style_fg(b.theme, Role::Dim)
+        };
+        for (offset, text) in [stamp, label].into_iter().enumerate() {
+            frame.render_widget(
+                Paragraph::new(text)
+                    .centered()
+                    .style(base_style(b.theme).patch(style)),
+                Rect {
+                    x,
+                    y: area.y + height + 1 + offset as u16,
+                    width: 16,
+                    height: 1,
+                },
+            );
+        }
+    }
+}
+
+fn chart_delta(b: &Browser, samples: &[ChartSample<'_>]) -> Option<i128> {
+    let latest = samples.last()?.sample?.value()?;
+    Some(i128::from(latest) - i128::from(chart_baseline(b, samples)?))
+}
+
+/// Use the same known, displayed predecessor for both the tick and delta.
+fn chart_baseline(b: &Browser, samples: &[ChartSample<'_>]) -> Option<u64> {
+    if samples.last()?.live {
+        return samples.iter().find(|s| s.current)?.sample?.value();
+    }
+    let meta = b.snapshot.meta();
+    let previous = super::previous_complete(&b.snapshots, meta.started_at, meta.scan_id.as_str())?;
+    samples
+        .iter()
+        .find(|s| s.id == Some(previous.0.as_str()))?
+        .sample?
+        .value()
 }
 
 fn draw_panels(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
@@ -1207,6 +1431,11 @@ fn draw_panels(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
         strata_paragraph(b, &label, &row, usize::from(chunks[0].width)),
         chunks[0],
     );
+    let label = if matches!(row, PanelRow::Own) {
+        format!("{} (files here)", b.dir.path.display_lossy())
+    } else {
+        label
+    };
     let soundings_width = usize::from(chunks[1].width);
     frame.render_widget(
         soundings_paragraph(
@@ -1551,7 +1780,11 @@ fn render_list(
 
 pub(super) fn list_title(b: &Browser, width: usize) -> Line<'static> {
     let glyphs = b.theme.glyphs;
-    let path = b.dir.path.display_lossy();
+    let path = if b.state.pane == Pane::Info {
+        b.subject().0.path.display_lossy()
+    } else {
+        b.dir.path.display_lossy()
+    };
     if b.state.pane == Pane::Files {
         let meta = b.snapshot.meta();
         let suffix = if b.refresh.is_some() || b.pages.live.is_some() {

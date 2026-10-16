@@ -2,6 +2,7 @@
 //! Bounded snapshot browser, input driver and terminal restoration.
 
 mod draw;
+mod history;
 mod state;
 mod terminal;
 mod theme;
@@ -13,7 +14,7 @@ use tidemark_store::reader::Snapshot;
 const PAGE: usize = 1_000;
 // Match the store query ceiling; never retain an unlimited live child cache.
 const MAX_LIVE_CHILDREN: usize = 1_000_000;
-/// Catalog row kept for the picker and the tide chart: id, file, start, root total.
+/// Catalog row kept for the picker and root high-water: id, file, start, root total.
 pub(super) type CatalogRow = (String, std::path::PathBuf, i64, Option<u64>);
 #[derive(Default)]
 struct Pages {
@@ -27,6 +28,7 @@ struct Pages {
     inode: Option<u64>,
     live: Option<Vec<(DirRow, Option<i128>)>>,
     live_order: Option<state::Sort>,
+    live_at: Option<i64>,
     live_growth: std::collections::HashMap<u32, Option<i128>>,
 }
 struct LiveResult {
@@ -62,6 +64,12 @@ struct Browser {
     snapshots: Vec<CatalogRow>,
     message: String,
     now: i64,
+    clock: i64,
+    history: history::History,
+    history_refresh: bool,
+    data_revision: u64,
+    info_subject: Option<(tidemark_core::path::RawPath, u64)>,
+    info_error: Option<String>,
     pages: Pages,
     refresh: Option<Refresh>,
     theme: theme::Theme,
@@ -458,6 +466,9 @@ impl Browser {
         let growth_unavailable =
             rows.children.len() > 10_000 && self.state.sort == state::Sort::Growth;
         self.pages.live = Some(rows.children);
+        self.pages.live_at = Some(self.clock);
+        self.history_refresh = true;
+        self.data_revision += 1;
         self.pages.live_order = Some(rows.sort);
         self.pages.live_growth = rows.growth;
         self.pages.offset = 0;
@@ -853,6 +864,7 @@ impl Browser {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         self.pages = Pages::default();
+        self.data_revision += 1;
         self.message.clear();
         self.state.filter.clear();
         if self.state.sort == state::Sort::Growth
@@ -864,15 +876,67 @@ impl Browser {
         self.dir = dir;
         self.load()
     }
-    fn pane(&mut self, pane: Pane) -> anyhow::Result<()> {
-        let own = self.state.pane == Pane::Main && self.state.selected == self.own_position();
-        self.state.pane = pane;
-        self.state.selected = 0;
-        self.text.clear();
-        match pane {
-            Pane::Info => {
-                let r = &self.dir;
-                self.text = format!(
+    /// Highlighted Main row, preserved while another pane owns the list cursor.
+    fn subject(&self) -> (&DirRow, bool) {
+        match self.child_at(self.main_selected) {
+            Some((row, _)) => (row, false),
+            None => (&self.dir, true),
+        }
+    }
+
+    /// Event-loop preparation only; drawing never opens or queries history/Info.
+    fn prepare(&mut self, width: u16, height: u16) -> anyhow::Result<()> {
+        self.history
+            .prepare_window(self.snapshot.meta(), &self.snapshot_file, &self.snapshots);
+        let (row, _) = self.subject();
+        let seed = self.pages.live.is_none().then_some(row.t_disk);
+        let key = history::Key {
+            root: self.snapshot.meta().root.clone(),
+            path: row.path.clone(),
+            window: self.history.window.clone(),
+            fs_uuid: self.snapshot.meta().fs_uuid.clone(),
+        };
+        self.history.update(
+            key,
+            seed,
+            width >= 100 && height >= 34,
+            std::mem::take(&mut self.history_refresh),
+            self.clock,
+        );
+        if self.state.pane == Pane::Info {
+            self.prepare_info()?;
+        }
+        Ok(())
+    }
+
+    /// Keep read failures visible and retryable on the next frame.
+    fn prepare_frame(&mut self, width: u16, height: u16) {
+        match self.prepare(width, height) {
+            Err(error) => {
+                self.message = escape(error.to_string().as_bytes());
+                self.info_error = Some(self.message.clone());
+            }
+            Ok(()) if self.state.pane == Pane::Info => {
+                // Recovery must preserve any message that replaced this Info error.
+                if self.info_error.take().as_ref() == Some(&self.message) {
+                    self.message.clear();
+                }
+            }
+            Ok(()) => {}
+        }
+    }
+
+    fn prepare_info(&mut self) -> anyhow::Result<()> {
+        let (r, _) = self.subject();
+        if self
+            .info_subject
+            .as_ref()
+            .is_some_and(|(path, revision)| path == &r.path && *revision == self.data_revision)
+        {
+            return Ok(());
+        }
+        let r = r.clone();
+        let mut text = format!(
                     "{}\nFiles {}  Inodes {}  Directories {}\nDisk {}  Reclaim {}  Shared {}\nAge histogram (charged bytes):\n<1d {}  1-7d {}  7-30d {}\n30-90d {}  90-365d {}  >=365d {}\nErrors {}\n",
                     r.path.display_lossy(),
                     r.t_files,
@@ -889,39 +953,48 @@ impl Browser {
                     crate::render::size::bytes(r.age5),
                     r.t_errors
                 );
-                if own {
-                    self.text
-                        .push_str("[own files]: the directory’s own files as charged\n");
-                }
-                for (key, value) in self.snapshot.annotations(r.id)? {
-                    self.text.push_str(&format!(
-                        "{}: {}\n",
-                        escape(key.as_bytes()),
-                        escape(value.as_bytes())
-                    ));
-                }
-                for error in self.snapshot.errors_under(r.id, 100)? {
-                    self.text
-                        .push_str(&format!("{}\n", escape(format!("{error:?}").as_bytes())));
-                }
-                if let Ok(report) =
-                    tidemark_store::links::link_report(&self.snapshot, &r.path, None, 0)
-                {
-                    self.text.push_str(&format!(
-                        "Link totals: {} {sets}, {} {instances}, {}; incomplete {}\n",
-                        report.totals.sets,
-                        report.totals.instances,
-                        crate::render::size::bytes(report.totals.disk),
-                        report.totals.incomplete_sets,
-                        sets = crate::render::unit(report.totals.sets, "set", "sets"),
-                        instances =
-                            crate::render::unit(report.totals.instances, "instance", "instances"),
-                    ));
-                } else {
-                    self.text
-                        .push_str("Link totals unavailable (instance storage required)\n");
-                }
+        // Live directory ids belong to a different tree. Resolve saved metadata by bytes.
+        if let Some(saved) = self.snapshot.dir_by_path(&r.path)? {
+            for (key, value) in self.snapshot.annotations(saved.id)? {
+                text.push_str(&format!(
+                    "{}: {}\n",
+                    escape(key.as_bytes()),
+                    escape(value.as_bytes())
+                ));
             }
+            for error in self.snapshot.errors_under(saved.id, 100)? {
+                text.push_str(&format!("{}\n", escape(format!("{error:?}").as_bytes())));
+            }
+            if let Ok(report) = tidemark_store::links::link_report(&self.snapshot, &r.path, None, 0)
+            {
+                text.push_str(&format!(
+                    "Link totals: {} {sets}, {} {instances}, {}; incomplete {}\n",
+                    report.totals.sets,
+                    report.totals.instances,
+                    crate::render::size::bytes(report.totals.disk),
+                    report.totals.incomplete_sets,
+                    sets = crate::render::unit(report.totals.sets, "set", "sets"),
+                    instances =
+                        crate::render::unit(report.totals.instances, "instance", "instances"),
+                ));
+            } else {
+                text.push_str("Link totals unavailable (instance storage required)\n");
+            }
+        }
+        self.text = text;
+        self.info_subject = Some((r.path.clone(), self.data_revision));
+        Ok(())
+    }
+    fn pane(&mut self, pane: Pane) -> anyhow::Result<()> {
+        if self.state.pane == Pane::Main {
+            self.main_selected = self.state.selected;
+        }
+        self.info_subject = None;
+        self.state.pane = pane;
+        self.state.selected = 0;
+        self.text.clear();
+        match pane {
+            Pane::Info => self.prepare_info()?,
             Pane::Files => {
                 let hits = self.snapshot.subtree_files(self.dir.id, &Default::default(), 100)?;
                 self.text = files_text(&hits, self.now);
@@ -1022,14 +1095,17 @@ impl Browser {
                         let started = snapshot.meta().started_at;
                         let open_id = snapshot.meta().scan_id.to_string();
                         let old = previous_complete(&self.snapshots, started, &open_id)
-                            .map(|(_, previous, _, _)| Snapshot::open(previous))
-                            .transpose()?;
+                            .and_then(|(_, previous, _, _)| Snapshot::open(previous).ok());
                         self.snapshot_file = file;
                         self.snapshot = snapshot;
                         self.old = old;
                         self.navigate(dir)?;
-                        self.message =
-                            "Snapshot switched; comparing with preceding complete snapshot".into();
+                        self.message = if self.old.is_some() {
+                            "Snapshot switched; comparing with preceding complete snapshot"
+                        } else {
+                            "Snapshot switched; preceding comparison unavailable"
+                        }
+                        .into();
                     } else {
                         self.message = "Path absent in selected snapshot".into();
                     }
@@ -1311,8 +1387,7 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         .filter_map(|e| e.file.map(|file| (e.scan_id, file, e.started_at, e.t_disk)))
         .collect::<Vec<_>>();
     let old = previous_complete(&snapshots, open_started, &open_id)
-        .map(|(_, file, _, _)| Snapshot::open(file))
-        .transpose()?;
+        .and_then(|(_, file, _, _)| Snapshot::open(file).ok());
     let colorterm = std::env::var("COLORTERM").ok();
     let term = std::env::var("TERM").ok();
     let lang = locale_lang();
@@ -1336,6 +1411,12 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         snapshots,
         message: "Sort and filter apply to whole directory".into(),
         now: tidemark_core::time::unix_now(),
+        clock: tidemark_core::time::unix_now(),
+        history: history::History::default(),
+        history_refresh: false,
+        data_revision: 0,
+        info_subject: None,
+        info_error: None,
         pages: Pages::default(),
         refresh: None,
         theme,
@@ -1347,7 +1428,10 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     loop {
+        browser.clock = tidemark_core::time::unix_now();
         browser.poll_refresh()?;
+        let size = terminal.size()?;
+        browser.prepare_frame(size.width, size.height);
         if browser.state.pane == Pane::Main {
             browser.deltas(
                 usize::from(terminal.size()?.height),
@@ -1398,6 +1482,7 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
             Err(error) => browser.message = escape(error.to_string().as_bytes()),
         }
     }
+    browser.history.cancel();
     drop(terminal);
     drop(guard);
     Ok(())
