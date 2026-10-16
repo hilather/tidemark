@@ -1412,14 +1412,27 @@ fn purge_writer_child() {
     let catalog = tidemark_store::catalog::Catalog::open(&state, true).unwrap();
     let series =
         tidemark_store::timeseries::TimeSeries::open(&state.join("timeseries.db"), true).unwrap();
-    // Keep live writer ownership while finishing all SQLite close/checkpoint work
-    // before the parent snapshots every file, including any database sidecars.
-    let _writer = tidemark_store::lease::WriterLease::acquire(&state).unwrap();
-    drop(series);
-    drop(catalog);
+    // Catalog and TimeSeries share timeseries.db. Commit real sample data before
+    // readiness so the parent protects a live WAL and shared-memory index.
+    series
+        .insert_fs(&[tidemark_core::live::FsSample {
+            ts: 1_700_000_000,
+            mount: "/purge-test".into(),
+            size: 100,
+            used: 40,
+            avail: 60,
+            inodes: 10,
+            inodes_used: 4,
+        }])
+        .unwrap();
+    // SQLite's default checkpoint runs on commit (or last-connection close),
+    // not on a timer: https://sqlite.org/wal.html#automatic_checkpoint.
+    // Keep both handles idle and open across the parent's complete comparison.
     fs::write(state.join("ready.tmp"), b"ready").unwrap();
     fs::rename(state.join("ready.tmp"), state.join("ready")).unwrap();
     std::thread::sleep(Duration::from_secs(60));
+    drop(series);
+    drop(catalog);
 }
 #[test]
 fn purge_refuses_live_writer_without_changing_bytes_or_inodes() {
@@ -1449,6 +1462,15 @@ fn purge_refuses_live_writer_without_changing_bytes_or_inodes() {
         }
         let bytes = meta.is_file().then(|| fs::read(&path).unwrap());
         originals.push((path, meta.ino(), bytes));
+    }
+    for name in ["timeseries.db-wal", "timeseries.db-shm"] {
+        let path = f.state.join(name);
+        assert!(
+            originals
+                .iter()
+                .any(|(p, _, bytes)| p == &path && bytes.as_ref().is_some_and(|b| !b.is_empty())),
+            "live writer sidecar missing or empty: {name}"
+        );
     }
     let error = unstage(&f.state, true, &f.sys).unwrap_err();
     assert!(matches!(error, DeployError::Guard(_)));
