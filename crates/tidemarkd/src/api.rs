@@ -1063,6 +1063,10 @@ mod tests {
     }
 
     #[test]
+    fn hot_rejects_unwatched_mount() {
+        reject_unwatched_mount("hot");
+    }
+    #[test]
     fn phantom_rejects_unwatched_mount() {
         reject_unwatched_mount("phantom");
     }
@@ -1100,12 +1104,23 @@ mod tests {
             if method != "writers" {
                 request.params.as_object_mut().unwrap().remove("window");
             }
+            if method == "hot" {
+                request.params =
+                    serde_json::json!({"mount": mount, "window": "1m", "by": "dir", "limit": 10});
+            }
             let response = dispatch(&request, 0, &context, 120).unwrap();
             let error = response
                 .error
                 .unwrap_or_else(|| panic!("{method} accepted {mount}"));
             assert_eq!(error.code, ApiErrorCode::Unavailable);
-            assert_eq!(error.message, format!("unavailable: {mount} is not watched (watch.mounts = [\"/A\"]); add it to [watch].mounts and run: tidemark deploy stage --from <file>"), "{method}");
+            if mount == "/A" {
+                assert_eq!(
+                    error.message, "unavailable: mount not present: /A",
+                    "{method}"
+                );
+            } else {
+                assert_eq!(error.message, format!("unavailable: {mount} is not watched (watch.mounts = [\"/A\"]); add it to [watch].mounts and run: tidemark deploy stage --from <file>"), "{method}");
+            }
         }
     }
 
