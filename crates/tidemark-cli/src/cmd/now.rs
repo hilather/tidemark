@@ -190,6 +190,37 @@ impl Drop for Interrupt {
 #[cfg(test)]
 mod mount_filter_tests {
     #[test]
+    fn daemon_mount_diagnostic_lines() {
+        use clap::Parser;
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let config = tidemark_core::config::Config::default();
+        for method in ["phantom", "writers", "lvm", "now", "hot"] {
+            let cli =
+                crate::cli::Cli::try_parse_from(["tidemark", method, "--mount", "/B"]).unwrap();
+            let prefix = super::super::error_context(&cli.command, &config, temp.path());
+            let error = super::mount_call_error(
+                crate::client::ClientError::Remote(tidemark_core::api::ApiError {
+                    code: tidemark_core::api::ApiErrorCode::Unavailable,
+                    message: "unavailable: /B is not watched (watch.mounts = [\"/A\"]); add it to [watch].mounts and run: tidemark deploy stage --from <file>".into(),
+                }), method, false, &mut Vec::new(),
+            );
+            println!("{prefix}: {error:#}");
+            let cli = crate::cli::Cli::try_parse_from([
+                std::ffi::OsStr::new("tidemark"),
+                std::ffi::OsStr::new(method),
+                std::ffi::OsStr::new("--mount"),
+                missing.as_os_str(),
+            ])
+            .unwrap();
+            let prefix = super::super::error_context(&cli.command, &config, temp.path());
+            let error = super::mount(Some(&missing), method, false, &mut Vec::new()).unwrap_err();
+            println!("{prefix}: {error:#}");
+            assert_eq!(crate::command_error(error).exit_code(), 5);
+        }
+    }
+
+    #[test]
     fn missing_mount_is_a_precondition() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing");

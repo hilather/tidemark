@@ -86,19 +86,23 @@ pub(crate) fn error_context(
         Command::Lvm(_) => ("lvm", Some(config.general.socket.as_path())),
         Command::Phantom(a) => (
             "phantom",
-            Some(a.mount.as_deref().unwrap_or(if a.direct {
-                std::path::Path::new("/proc")
+            Some(if a.direct {
+                a.mount
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("/proc"))
             } else {
                 config.general.socket.as_path()
-            })),
+            }),
         ),
         Command::Writers(a) => (
             "writers",
-            Some(a.mount.as_deref().unwrap_or(if a.direct {
-                std::path::Path::new("/proc")
+            Some(if a.direct {
+                a.mount
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("/proc"))
             } else {
                 config.general.socket.as_path()
-            })),
+            }),
         ),
         Command::Alerts(_) => ("alerts", Some(config.general.socket.as_path())),
         Command::Status(_) => ("status", Some(config.general.socket.as_path())),
@@ -114,11 +118,81 @@ pub(crate) fn error_context(
 mod context_tests {
     use clap::Parser;
     #[test]
+    fn fallback_errors_name_the_direct_subject() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let mut config = tidemark_core::config::Config::default();
+        config.general.socket = temp.path().join("absent.sock");
+        config.watch.mounts = vec![missing.clone()];
+        let context = crate::Context {
+            config,
+            config_path: temp.path().join("config"),
+            json: false,
+            color: false,
+        };
+        for mount in [None, Some(missing.clone())] {
+            let subject =
+                super::display_path(mount.as_deref().unwrap_or(std::path::Path::new("/proc")));
+            let phantom = super::phantom::run(
+                &super::phantom::Args {
+                    mount: mount.clone(),
+                    direct: false,
+                },
+                &context,
+            )
+            .unwrap_err();
+            let writers = super::writers::run(
+                &super::writers::Args {
+                    mount,
+                    direct: false,
+                    window: None,
+                    interval: std::time::Duration::ZERO,
+                },
+                &context,
+            )
+            .unwrap_err();
+            for (method, error) in [("phantom", phantom), ("writers", writers)] {
+                assert!(
+                    format!("{error:#}")
+                        .starts_with(&format!("direct fallback: {method}: {subject}: ")),
+                    "{method}: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_mount_contexts_are_consistent() {
+        let config = tidemark_core::config::Config::default();
+        for method in ["phantom", "writers", "lvm", "now", "hot"] {
+            for mount in [None, Some("/B")] {
+                let mut args = vec!["tidemark", method];
+                if let Some(mount) = mount {
+                    args.extend(["--mount", mount]);
+                }
+                let cli = crate::cli::Cli::try_parse_from(args).unwrap();
+                assert_eq!(
+                    super::error_context(&cli.command, &config, std::path::Path::new("/config")),
+                    format!("{method}: {}", super::display_path(&config.general.socket))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn direct_and_deployment_contexts_name_the_input_subject() {
         let config = tidemark_core::config::Config::default();
         for (args, expected) in [
             (vec!["tidemark", "writers", "--direct"], "writers: /proc"),
             (vec!["tidemark", "phantom", "--direct"], "phantom: /proc"),
+            (
+                vec!["tidemark", "phantom", "--direct", "--mount", "/B"],
+                "phantom: /B",
+            ),
+            (
+                vec!["tidemark", "writers", "--direct", "--mount", "/B"],
+                "writers: /B",
+            ),
             (
                 vec!["tidemark", "deploy", "stage", "--from", "/tmp/source.toml"],
                 "deploy stage: /tmp/source.toml",

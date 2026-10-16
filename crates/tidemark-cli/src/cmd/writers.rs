@@ -58,7 +58,16 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     direct: true,
                     interval: args.interval,
                 };
-                return run(&direct, context);
+                return run(&direct, context).with_context(|| {
+                    format!(
+                        "direct fallback: writers: {}",
+                        super::display_path(
+                            args.mount
+                                .as_deref()
+                                .unwrap_or_else(|| std::path::Path::new("/proc"))
+                        )
+                    )
+                });
             }
         }
     }
