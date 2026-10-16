@@ -1306,6 +1306,13 @@ impl LiveStateView {
         }
         "measurement unavailable".into()
     }
+    pub(crate) fn lvm_unavailable_detail(&self) -> String {
+        if !self.data.config.lvm.enabled {
+            "lvm report not configured: disabled by config".into()
+        } else {
+            "measurement unavailable".into()
+        }
+    }
     /// Latest report, preserving measured-empty LVM inventory.
     pub fn lvm_report(&self, p: &LvmParams) -> Option<LvmResult> {
         let mut r = self.data.lvm.clone()?;

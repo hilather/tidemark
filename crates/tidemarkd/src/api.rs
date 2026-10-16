@@ -285,7 +285,10 @@ pub(crate) fn dispatch_controlled(
                 if let Some(detail) = view.unwatched_mount_detail(p.mount.as_deref()) {
                     return Err(DaemonError::Unavailable(detail));
                 }
-                value(available(view.lvm_report(&p))?)
+                value(
+                    view.lvm_report(&p)
+                        .ok_or_else(|| DaemonError::Unavailable(view.lvm_unavailable_detail()))?,
+                )
             }
             "phantom" => {
                 let p: PhantomParams = params(request)?;
@@ -1027,6 +1030,38 @@ mod fuzz_seams;
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn lvm_disabled_and_pending_have_distinct_reasons() {
+        for enabled in [false, true] {
+            let mut config = tidemark_core::config::Config::default();
+            config.lvm.enabled = enabled;
+            config.watch.mounts = vec!["/A".into()];
+            let context = Context {
+                state: crate::state::LiveState::new(&config, 0),
+                scans: Default::default(),
+                reload: Arc::new(|| unreachable!()),
+            };
+            for mount in [None, Some("/A")] {
+                let request = Request {
+                    v: 1,
+                    id: "lvm-reason".into(),
+                    method: "lvm".into(),
+                    params: serde_json::json!({"mount": mount}),
+                };
+                let error = dispatch(&request, 0, &context, 120).unwrap().error.unwrap();
+                assert_eq!(error.code, ApiErrorCode::Unavailable);
+                assert_eq!(
+                    error.message,
+                    if enabled {
+                        "unavailable: measurement unavailable"
+                    } else {
+                        "unavailable: lvm report not configured: disabled by config"
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn phantom_rejects_unwatched_mount() {
         reject_unwatched_mount("phantom");

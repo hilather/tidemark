@@ -22,7 +22,12 @@ pub struct Args {
 pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     use tidemark_core::api::{HotBy, HotParams, HotWindow};
     let params = HotParams {
-        mount: super::now::mount(args.mount.as_deref())?,
+        mount: super::now::mount(
+            args.mount.as_deref(),
+            "hot",
+            context.json,
+            &mut std::io::stdout().lock(),
+        )?,
         window: match args.window.as_deref().unwrap_or("5m") {
             "1m" => HotWindow::OneMinute,
             "15m" => HotWindow::FifteenMinutes,

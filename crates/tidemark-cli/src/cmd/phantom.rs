@@ -28,7 +28,12 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     "phantom",
                     context,
                     &tidemark_core::api::PhantomParams {
-                        mount: super::now::mount(args.mount.as_deref())?,
+                        mount: super::now::mount(
+                            args.mount.as_deref(),
+                            "phantom",
+                            context.json,
+                            &mut std::io::stdout().lock(),
+                        )?,
                     },
                 )?;
                 return crate::render::now::phantom(
