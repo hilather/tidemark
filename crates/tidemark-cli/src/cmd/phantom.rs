@@ -48,7 +48,16 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     mount: args.mount.clone(),
                     direct: true,
                 };
-                return run(&direct, context);
+                return run(&direct, context).with_context(|| {
+                    format!(
+                        "direct fallback: phantom: {}",
+                        super::display_path(
+                            args.mount
+                                .as_deref()
+                                .unwrap_or_else(|| std::path::Path::new("/proc"))
+                        )
+                    )
+                });
             }
         }
     }
