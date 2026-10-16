@@ -299,6 +299,31 @@ mod mount_filter_tests {
     }
 
     #[test]
+    fn absent_mount_is_unavailable_in_text_and_json_for_all_methods() {
+        for method in ["hot", "now", "phantom", "writers", "lvm"] {
+            for json in [false, true] {
+                let remote = tidemark_core::api::ApiError {
+                    code: tidemark_core::api::ApiErrorCode::Unavailable,
+                    message: "unavailable: mount not present: /A".into(),
+                };
+                let mut output = Vec::new();
+                let error = super::mount_call_error(
+                    crate::client::ClientError::Remote(remote),
+                    method,
+                    json,
+                    &mut output,
+                );
+                assert_eq!(
+                    format!("{error:#}"),
+                    format!("daemon request {method}: unavailable: mount not present: /A")
+                );
+                assert_eq!(crate::command_error(error).exit_code(), 4);
+                assert!(output.is_empty(), "{method} json={json}");
+            }
+        }
+    }
+
+    #[test]
     fn phantom_unwatched_mapping_in_text_and_json() {
         let message = "/B is not watched (watch.mounts = [\"/A\"]); add it to [watch].mounts and run: tidemark deploy stage --from <file>";
         for method in ["phantom", "writers", "lvm", "now", "hot"] {

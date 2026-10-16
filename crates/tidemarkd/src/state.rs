@@ -1205,7 +1205,7 @@ impl LiveStateView {
             .next_back()
             .is_some_and(|last| last.ts.saturating_sub(first.ts) >= 300)
     }
-    /// Explain a requested mount outside the daemon's effective watch configuration.
+    /// Explain an unconfigured or absent requested mount for API admission.
     pub fn unwatched_mount_detail(&self, mount: Option<&str>) -> Option<String> {
         let mount = mount?;
         if self
@@ -1215,9 +1215,9 @@ impl LiveStateView {
             .mounts
             .iter()
             .any(|path| path.as_path() == std::path::Path::new(mount))
-            && self.data.presence.get(mount) != Some(&None)
         {
-            return None;
+            return (self.data.presence.get(mount) == Some(&None))
+                .then(|| format!("mount not present: {mount}"));
         }
         let mounts: Vec<_> = self
             .data
