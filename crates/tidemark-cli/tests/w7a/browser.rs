@@ -1730,3 +1730,93 @@ fn post_tui2_remedy_search_is_capped() {
     assert!(message.contains("run: tidemark scan"), "{message}");
     assert!(!message.contains("contains this path"), "{message}");
 }
+
+#[test]
+fn post_tuititle_full_legend_at_80_columns() {
+    let mut failures = Vec::new();
+    for sort in [
+        state::Sort::Size,
+        state::Sort::Reclaim,
+        state::Sort::Files,
+        state::Sort::Newest,
+        state::Sort::Growth,
+        state::Sort::Name,
+    ] {
+        for live in [false, true] {
+            for filter in [String::new(), "x".repeat(60)] {
+                let (_temp, mut b) = browser(3);
+                b.state.sort = sort;
+                if live {
+                    let root = b.dir.clone();
+                    let children = b.rows.clone();
+                    install_refresh(&mut b, root, children);
+                }
+                b.state.filter = filter.clone();
+                let screen = render(&b, 80, 24);
+                let legend = "Name Share SIZE APPARENT RECLAIM SHARED FILES NEWEST Δ";
+                if screen.matches(legend).count() != 1 {
+                    failures.push(format!(
+                        "{sort:?} live={live} filter={}\n{screen}",
+                        filter.len()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn post_tuititle_filter_budget_preserves_status_and_wide_text() {
+    for sort in [
+        state::Sort::Size,
+        state::Sort::Reclaim,
+        state::Sort::Files,
+        state::Sort::Newest,
+        state::Sort::Growth,
+        state::Sort::Name,
+    ] {
+        for live in [false, true] {
+            for filter in ["x".repeat(60), "界\\\n".repeat(10)] {
+                let (_temp, mut b) = browser(3);
+                b.state.sort = sort;
+                if live {
+                    let root = b.dir.clone();
+                    let children = b.rows.clone();
+                    install_refresh(&mut b, root, children);
+                }
+                b.state.filter = filter.clone();
+                for editing in [false, true] {
+                    b.state.editing = editing;
+                    for width in [80, 160] {
+                        let screen = render(&b, width, 24);
+                        let title = screen.lines().nth(4).unwrap();
+                        assert!(
+                            title.contains(&format!(
+                                "main | {} | filter ",
+                                crate::render::enum_label(sort)
+                            )),
+                            "{title}"
+                        );
+                        assert_eq!(title.contains(" | live (Δ snapshot)"), live, "{title}");
+                        if width == 80 {
+                            assert!(title.contains("..."), "{title}");
+                        } else {
+                            // The screen helper serializes the blank continuation cell
+                            // after each double-width character as an extra space.
+                            let displayed = super::escape(filter.as_bytes()).replace('界', "界 ");
+                            assert!(title.contains(&displayed), "{title}");
+                        }
+                        assert_eq!(
+                            screen
+                                .matches("Name Share SIZE APPARENT RECLAIM SHARED FILES NEWEST Δ")
+                                .count(),
+                            1
+                        );
+                        assert_eq!(b.state.filter, filter);
+                    }
+                }
+            }
+        }
+    }
+}
