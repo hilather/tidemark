@@ -18,6 +18,7 @@ pub(super) type CatalogRow = (String, std::path::PathBuf, i64, Option<u64>);
 #[derive(Default)]
 struct Pages {
     cursor: Option<DirRow>,
+    lower: Option<DirRow>,
     reverse: bool,
     growth: Option<Vec<(DirRow, Option<i128>)>>,
     offset: usize,
@@ -143,23 +144,29 @@ impl Browser {
                 .collect();
         } else {
             let sort = self.snapshot_sort_key();
+            let limit = if self.pages.reverse && self.pages.cursor.is_none() {
+                self.pages.total.saturating_sub(self.pages.offset).min(PAGE)
+            } else {
+                PAGE
+            };
             let mut rows = self.snapshot.children_page(
                 self.dir.id,
                 sort,
                 self.state.sort != state::Sort::Name,
                 self.pages.cursor.as_ref(),
                 self.pages.reverse,
-                if self.pages.reverse && self.pages.cursor.is_none() {
-                    // End uses the same aligned final slice as forward traversal.
-                    self.pages.total.saturating_sub(self.pages.offset).min(PAGE)
-                } else {
-                    PAGE
-                },
+                limit + usize::from(self.pages.reverse),
                 self.state.filter.as_bytes(),
             )?;
-            if self.pages.reverse {
+            self.pages.lower = if self.pages.reverse {
+                // One look-behind child fixes page membership even when own rank
+                // equals the first child rank, without a whole-directory rank query.
+                let lower = if rows.len() > limit { rows.pop() } else { None };
                 rows.reverse();
-            }
+                lower
+            } else {
+                self.pages.cursor.clone()
+            };
             self.rows = rows.into_iter().map(|r| (r, None)).collect();
         }
         self.state.selected = 0;
@@ -211,6 +218,7 @@ impl Browser {
     }
     fn turn_page(&mut self, reverse: bool) -> anyhow::Result<()> {
         let previous_cursor = self.pages.cursor.clone();
+        let previous_lower = self.pages.lower.clone();
         let previous_reverse = self.pages.reverse;
         let previous_offset = self.pages.offset;
         let previous_selection = self.state.selected;
@@ -248,6 +256,7 @@ impl Browser {
         if self.rows.is_empty() {
             self.pages.offset = previous_offset;
             self.pages.cursor = previous_cursor;
+            self.pages.lower = previous_lower;
             self.pages.reverse = previous_reverse;
             self.state.selected = previous_selection;
             self.rows = previous;
@@ -785,7 +794,6 @@ impl Browser {
         let before = |row: &(DirRow, Option<i128>)| self.state.compare(row, &own).is_lt();
         let position = self.rows.iter().take_while(|row| before(row)).count();
         let matches = byte_contains(b".", self.state.filter.as_bytes());
-        let at_beginning = self.pages.offset == 0;
         let at_end = self.pages.offset.saturating_add(self.rows.len()) >= self.pages.total;
         let in_page = if let Some(live) = &self.pages.live {
             // Live rows use offset slices, so keyset cursors cannot delimit them.
@@ -796,14 +804,12 @@ impl Browser {
                 .count();
             rank >= self.pages.offset
                 && (rank < self.pages.offset.saturating_add(self.rows.len()) || at_end)
-        } else if let Some(cursor) = &self.pages.cursor {
-            if self.pages.reverse {
-                !before(&(cursor.clone(), None)) && (position > 0 || at_beginning)
-            } else {
-                before(&(cursor.clone(), None)) && (position < self.rows.len() || at_end)
-            }
         } else {
-            (position > 0 || at_beginning) && (position < self.rows.len() || at_end)
+            self.pages
+                .lower
+                .as_ref()
+                .is_none_or(|row| before(&(row.clone(), None)))
+                && (position < self.rows.len() || at_end)
         };
         if matches && in_page {
             position

@@ -1205,9 +1205,9 @@ impl LiveStateView {
             .next_back()
             .is_some_and(|last| last.ts.saturating_sub(first.ts) >= 300)
     }
-    /// Explain a requested mount outside the daemon's effective watch configuration.
-    pub fn hot_unwatched_detail(&self, p: &HotParams) -> Option<String> {
-        let mount = p.mount.as_ref()?;
+    /// Explain an unconfigured or absent requested mount for API admission.
+    pub fn unwatched_mount_detail(&self, mount: Option<&str>) -> Option<String> {
+        let mount = mount?;
         if self
             .data
             .config
@@ -1215,9 +1215,9 @@ impl LiveStateView {
             .mounts
             .iter()
             .any(|path| path.as_path() == std::path::Path::new(mount))
-            && self.data.presence.get(mount) != Some(&None)
         {
-            return None;
+            return (self.data.presence.get(mount) == Some(&None))
+                .then(|| format!("mount not present: {mount}"));
         }
         let mounts: Vec<_> = self
             .data
@@ -1305,6 +1305,13 @@ impl LiveStateView {
             }
         }
         "measurement unavailable".into()
+    }
+    pub(crate) fn lvm_unavailable_detail(&self) -> String {
+        if !self.data.config.lvm.enabled {
+            "lvm report not configured: disabled by config".into()
+        } else {
+            "measurement unavailable".into()
+        }
     }
     /// Latest report, preserving measured-empty LVM inventory.
     pub fn lvm_report(&self, p: &LvmParams) -> Option<LvmResult> {

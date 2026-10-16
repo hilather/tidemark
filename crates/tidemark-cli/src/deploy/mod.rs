@@ -241,6 +241,28 @@ fn check(name: &'static str, status: CheckStatus, detail: impl Into<String>) -> 
         detail: detail.into(),
     }
 }
+// Bound the escaped reason, including the ellipsis, to 200 UTF-8 bytes.
+// Escape one scalar at a time to avoid allocating proportional to daemon input,
+// and retain whole scalars/control-byte tokens when truncating.
+fn core_reason(detail: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut output = String::with_capacity(LIMIT);
+    let mut truncated_end = 0;
+    for ch in detail.chars() {
+        let mut bytes = [0; 4];
+        let token = crate::render::table::diagnostic(ch.encode_utf8(&mut bytes));
+        if output.len() + token.len() > LIMIT {
+            output.truncate(truncated_end);
+            output.push('…');
+            break;
+        }
+        output.push_str(&token);
+        if output.len() <= LIMIT - '…'.len_utf8() {
+            truncated_end = output.len();
+        }
+    }
+    output
+}
 fn io_detail(error: &io::Error) -> String {
     if error.kind() == io::ErrorKind::PermissionDenied {
         format!("{error}; {}", crate::ACCESS_HINT)
@@ -519,10 +541,33 @@ pub fn verify(
         wait,
         sys,
         api,
-        Duration::from_secs(10),
-        Duration::from_millis(500),
-        Duration::from_secs(5),
+        VerifyTiming {
+            grace: Duration::from_secs(10),
+            interval: Duration::from_millis(500),
+            normal_interval: Duration::from_secs(5),
+        },
+        &WallClock(Instant::now()),
     )
+}
+
+// Monotonic time and sleeping share a seam so policy tests never wait on a runner.
+trait VerifyClock {
+    fn now(&self) -> Duration;
+    fn sleep(&self, duration: Duration);
+}
+struct WallClock(Instant);
+impl VerifyClock for WallClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+struct VerifyTiming {
+    grace: Duration,
+    interval: Duration,
+    normal_interval: Duration,
 }
 
 fn verify_with_timing(
@@ -530,23 +575,50 @@ fn verify_with_timing(
     wait: Duration,
     sys: &dyn Systemctl,
     api: &dyn ApiPing,
-    grace: Duration,
-    interval: Duration,
-    normal_interval: Duration,
+    timing: VerifyTiming,
+    clock: &dyn VerifyClock,
 ) -> Result<VerifyResult, DeployError> {
     state_guard(state_dir, None)?;
-    let started = Instant::now();
+    let started = clock.now();
     // An explicit wait owns the whole budget: grace never extends it.
-    let budget = if wait.is_zero() { grace } else { wait };
+    let budget = if wait.is_zero() { timing.grace } else { wait };
+    let mut previous = None;
+    let mut sampler_observed_at = None;
     loop {
-        let (result, transient) = verify_poll(
+        let (mut result, transient) = verify_poll(
             state_dir,
             sys,
             api,
-            budget.saturating_sub(started.elapsed()),
+            budget.saturating_sub(clock.now().saturating_sub(started)),
+            clock,
+            previous.as_ref(),
         );
+        let now = clock.now();
+        let api_failed = result
+            .items
+            .iter()
+            .any(|item| item.name == "api" && item.status == CheckStatus::Fail);
+        if transient {
+            sampler_observed_at = Some(now);
+        } else if api_failed {
+            if let Some(observed_at) = sampler_observed_at {
+                if let Some(item) = result
+                    .items
+                    .iter_mut()
+                    .find(|item| item.name == "core_components")
+                {
+                    item.detail.push_str(&format!(
+                        "; last status {} ms ago: sampler=degraded (measurement pass in progress)",
+                        now.saturating_sub(observed_at).as_millis()
+                    ));
+                }
+            }
+        } else {
+            // A newer successful status supersedes the earlier routine sampler state.
+            sampler_observed_at = None;
+        }
         if result.healthy
-            || started.elapsed() >= budget
+            || budget.saturating_sub(clock.now().saturating_sub(started)) < VERIFY_PROBE_FLOOR
             || (wait.is_zero() && !transient)
             || result
                 .items
@@ -555,25 +627,42 @@ fn verify_with_timing(
         {
             return Ok(result);
         }
-        let delay = if transient { interval } else { normal_interval };
-        std::thread::sleep(delay.min(budget.saturating_sub(started.elapsed())));
-        if started.elapsed() >= budget {
+        let delay = if transient {
+            timing.interval
+        } else {
+            timing.normal_interval
+        };
+        clock.sleep(delay.min(budget.saturating_sub(clock.now().saturating_sub(started))));
+        if budget.saturating_sub(clock.now().saturating_sub(started)) < VERIFY_PROBE_FLOOR {
             return Ok(result);
         }
+        previous = Some(result);
     }
 }
+// Retry only with enough allowance for a useful connect + exchange.
+const VERIFY_PROBE_FLOOR: Duration = Duration::from_millis(250);
 const SERVICE_START_HINT: &str = "the service is enabled but not running: if start-limit-hit, first run 'systemctl reset-failed tidemarkd'; then start it with 'systemctl start tidemarkd' (or reboot), or stage with --start-now";
 #[cfg(test)]
 fn verify_once(state_dir: &Path, sys: &dyn Systemctl, api: &dyn ApiPing) -> VerifyResult {
-    verify_poll(state_dir, sys, api, Duration::from_secs(10)).0
+    verify_poll(
+        state_dir,
+        sys,
+        api,
+        Duration::from_secs(10),
+        &WallClock(Instant::now()),
+        None,
+    )
+    .0
 }
 fn verify_poll(
     state_dir: &Path,
     sys: &dyn Systemctl,
     api: &dyn ApiPing,
     budget: Duration,
+    clock: &dyn VerifyClock,
+    previous: Option<&VerifyResult>,
 ) -> (VerifyResult, bool) {
-    let poll_started = Instant::now();
+    let poll_started = clock.now();
     let staged = read_json(&state_dir.join("deploy/staged.json"));
     let firstboot = read_json(&state_dir.join("deploy/firstboot.json"));
     let mut items = vec![outcome(
@@ -647,10 +736,27 @@ fn verify_poll(
         },
     ));
     let stopped = items.iter().any(|item| item.detail == SERVICE_START_HINT);
-    let status = if stopped {
+    let remaining = budget.saturating_sub(clock.now().saturating_sub(poll_started));
+    // Service/file probes may consume the useful budget after the loop's check.
+    // Keep their fresh evidence even when another API request cannot be made.
+    let skipped = remaining < VERIFY_PROBE_FLOOR && previous.is_some();
+    let status = if skipped {
+        let history = previous
+            .and_then(|result| result.items.iter().find(|item| item.name == "api"))
+            .map(|item| {
+                format!(
+                    "; historical API observation: {:?} ({})",
+                    item.status, item.detail
+                )
+            })
+            .unwrap_or_default();
+        Err(io::Error::other(format!(
+            "API request skipped: remaining allowance below 250 ms{history}"
+        )))
+    } else if stopped {
         Err(io::Error::other("service is not running"))
     } else {
-        api.status_with_budget(budget.saturating_sub(poll_started.elapsed()))
+        api.status_with_budget(remaining)
     };
     // Only a live status response can certify current component health. A stored
     // firstboot report is still config-hash evidence, never live health evidence.
@@ -685,20 +791,30 @@ fn verify_poll(
     let core_details = ["sampler", "scheduler", "api", "tswriter"]
         .iter()
         .map(|name| {
-            let states: Vec<_> = components
+            let matching: Vec<_> = components
                 .into_iter()
                 .flatten()
                 .filter(|component| component.name == *name)
-                .map(|component| component.state.as_str())
                 .collect();
-            format!(
-                "{name}={}",
-                if states.is_empty() {
-                    "missing".into()
-                } else {
-                    states.join(",")
+            match matching.as_slice() {
+                [] => format!("{name}=missing"),
+                [component] if component.state != "ok" => {
+                    let reason = core_reason(&component.detail);
+                    if reason.trim().is_empty() {
+                        format!("{name}={}", component.state)
+                    } else {
+                        format!("{name}={} ({reason})", component.state)
+                    }
                 }
-            )
+                _ => format!(
+                    "{name}={}",
+                    matching
+                        .iter()
+                        .map(|component| component.state.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            }
         })
         .collect::<Vec<_>>()
         .join("; ");
@@ -720,6 +836,19 @@ fn verify_poll(
             .unwrap_or_else(|| "unknown".into());
         if let Some(item) = items.iter_mut().find(|item| item.name == "core_components") {
             item.detail = format!("current daemon health unavailable; firstboot report describes daemon_started_at={start}; stored health cannot certify this start");
+            if skipped {
+                if let Some(core) = previous.and_then(|result| {
+                    result
+                        .items
+                        .iter()
+                        .find(|item| item.name == "core_components")
+                }) {
+                    item.detail.push_str(&format!(
+                        "; historical core observation: {:?} ({})",
+                        core.status, core.detail
+                    ));
+                }
+            }
         }
     }
     items.push(outcome("api", false, status.map(|_| ())));

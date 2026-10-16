@@ -30,13 +30,21 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             std::time::Duration::from_secs(11),
         ) {
             Ok(mut client) => {
-                let rows: tidemark_core::api::WritersResult = super::now::call(
+                let params = tidemark_core::api::WritersParams {
+                    mount: super::now::mount(
+                        args.mount.as_deref(),
+                        "writers",
+                        context.json,
+                        &mut std::io::stdout().lock(),
+                    )?,
+                    window: args.window.unwrap_or(std::time::Duration::from_secs(60)),
+                };
+                let rows: tidemark_core::api::WritersResult = super::now::mount_call(
                     &mut client,
                     "writers",
-                    &tidemark_core::api::WritersParams {
-                        mount: super::now::mount(args.mount.as_deref())?,
-                        window: args.window.unwrap_or(std::time::Duration::from_secs(60)),
-                    },
+                    context,
+                    params.mount.as_deref(),
+                    &params,
                 )?;
                 return crate::render::now::writers(
                     &rows,
@@ -52,7 +60,16 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     direct: true,
                     interval: args.interval,
                 };
-                return run(&direct, context);
+                return run(&direct, context).with_context(|| {
+                    format!(
+                        "direct fallback: writers: {}",
+                        super::display_path(
+                            args.mount
+                                .as_deref()
+                                .unwrap_or_else(|| std::path::Path::new("/proc"))
+                        )
+                    )
+                });
             }
         }
     }

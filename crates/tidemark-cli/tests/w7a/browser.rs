@@ -1586,7 +1586,8 @@ fn post_tui_disjoint_traversals_all_sorts() {
         state::Sort::Name,
         state::Sort::Growth,
     ] {
-        for count in [2500, 2000] {
+        for rank in [0, 999, 1000, 2000, 2500] {
+            let count = 2500;
             for live in [false, true] {
                 let (_temp, mut b) = browser(count);
                 b.state.sort = sort;
@@ -1596,7 +1597,7 @@ fn post_tui_disjoint_traversals_all_sorts() {
                 root.own_files = 1;
                 let mut rows = vec![root];
                 for id in 1..=count {
-                    let before = id <= 750;
+                    let before = id <= rank;
                     let mut row = fixture::row(
                         id,
                         Some(0),
@@ -1630,6 +1631,62 @@ fn post_tui_disjoint_traversals_all_sorts() {
                         .collect();
                     let root = b.dir.clone();
                     install_refresh(&mut b, root, children);
+                }
+                for reverse in [false, true] {
+                    b.boundary(reverse).unwrap();
+                    for _ in 0..3 {
+                        let own_rank = if sort == state::Sort::Growth {
+                            count
+                        } else {
+                            rank
+                        } as usize;
+                        let expected = own_rank >= b.pages.offset
+                            && (own_rank < b.pages.offset + b.rows.len()
+                                || b.pages.offset + b.rows.len() == count as usize);
+                        assert_eq!(b.own_position() != usize::MAX, expected,
+                            "membership {sort:?} rank={rank} live={live} offset={} reverse={reverse}", b.pages.offset);
+                        if b.pages.offset > 0 {
+                            let offset = b.pages.offset;
+                            b.state.selected = 0;
+                            let first = b.child_at(0).map(|r| r.0.id).unwrap_or(0);
+                            b.page(true).unwrap();
+                            b.state.selected = b.count() - 1;
+                            let previous =
+                                b.child_at(b.state.selected).map(|r| r.0.id).unwrap_or(0);
+                            let own_rank = if sort == state::Sort::Growth {
+                                count
+                            } else {
+                                rank
+                            };
+                            let mut logical = (1..=count).collect::<Vec<_>>();
+                            logical.insert(own_rank as usize, 0);
+                            let first_rank = logical.iter().position(|&id| id == first).unwrap();
+                            assert_eq!(
+                                previous,
+                                logical[first_rank - 1],
+                                "Up must move exactly one row"
+                            );
+                            assert_eq!(
+                                b.own_position() != usize::MAX,
+                                own_rank as usize >= b.pages.offset
+                                    && ((own_rank as usize) < b.pages.offset + b.rows.len()
+                                        || b.pages.offset + b.rows.len() == count as usize)
+                            );
+                            b.page(false).unwrap();
+                            assert_eq!(b.pages.offset, offset);
+                            assert_eq!(b.child_at(0).map(|r| r.0.id).unwrap_or(0), first);
+                            // Down from the previous page's last row, then Up,
+                            // must return to that same adjacent logical row.
+                            b.page(true).unwrap();
+                            b.state.selected = b.count() - 1;
+                            assert_eq!(
+                                b.child_at(b.state.selected).map(|r| r.0.id).unwrap_or(0),
+                                previous
+                            );
+                            b.page(false).unwrap();
+                        }
+                        b.page(reverse).unwrap();
+                    }
                 }
                 let mut forward = Vec::new();
                 b.boundary(false).unwrap();
@@ -3249,4 +3306,165 @@ fn files_rows_line_up_under_the_header() {
     assert_eq!(zero.find(&older), huge.find(&newer), "{zero}\n{huge}");
     assert_eq!(header.find("PATH"), zero.find('/'), "{header}\n{zero}");
     assert_eq!(zero.find('/'), huge.find('/'), "{zero}\n{huge}");
+}
+
+fn remedy_catalog_case(broad: bool, count: i64) -> String {
+    let state = ::test_support::private_tempdir().unwrap();
+    let live = ::test_support::private_tempdir().unwrap();
+    let subject = live.path().join("data/new");
+    std::fs::create_dir_all(&subject).unwrap();
+    let narrow = RawPath::from_path(&live.path().join("data")).unwrap();
+    let path = RawPath::from_path(&subject).unwrap();
+    let mut ids = Vec::new();
+    for index in 0..count {
+        let root = if broad && index == 1 {
+            RawPath::new(b"/".to_vec()).unwrap()
+        } else {
+            narrow.clone()
+        };
+        let mut meta = fixture::meta(root.clone(), 1_000_000 + index * 100);
+        meta.scan_id =
+            serde_json::from_str(&format!("\"20260101T000000Z-{:08}\"", index + 1)).unwrap();
+        let dir = state
+            .path()
+            .join("snapshots")
+            .join(tidemark_store::catalog::root_slug(&root));
+        let mut rows = vec![fixture::row(0, None, root.as_bytes(), 0)];
+        rows[0].subtree_end = u32::from(index == 1);
+        if index == 1 {
+            rows.push(fixture::row(1, Some(0), path.as_bytes(), 0));
+        }
+        let mut writer = tidemark_store::writer::SnapshotWriter::create(&dir, &meta).unwrap();
+        writer.put_dirs(&rows).unwrap();
+        writer.finish(&meta).unwrap();
+        ids.push(meta.scan_id.to_string());
+    }
+    let catalog = tidemark_store::catalog::Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let mut config = tidemark_core::config::Config::default();
+    config.general.state_dir = state.path().to_path_buf();
+    let context = crate::Context {
+        config,
+        config_path: "/unused".into(),
+        json: false,
+        color: false,
+    };
+    let (_, default) = crate::cmd::snapshots::select(&context, Some(&subject), None).unwrap();
+    assert_eq!(default.meta().scan_id.to_string(), ids[count as usize - 1]);
+    assert!(default.dir_by_path(&path).unwrap().is_none());
+    let (_, old) = crate::cmd::snapshots::select(&context, Some(&subject), Some(&ids[0])).unwrap();
+    crate::cmd::snapshots::missing_path(&context, &path, &old).to_string()
+}
+
+#[test]
+fn post_tui2_remedy_requires_working_default() {
+    for broad in [false, true] {
+        let message = remedy_catalog_case(broad, 3);
+        assert!(
+            message.contains("use --snapshot 20260101T000000Z-00000002"),
+            "{message}"
+        );
+        assert!(!message.contains("drop --snapshot"), "{message}");
+    }
+}
+
+#[test]
+fn post_tui2_remedy_search_is_capped() {
+    let message = remedy_catalog_case(false, 25);
+    assert!(message.contains("run: tidemark scan"), "{message}");
+    assert!(!message.contains("contains this path"), "{message}");
+}
+
+#[test]
+fn post_tuititle_full_legend_at_80_columns() {
+    let mut failures = Vec::new();
+    for sort in [
+        state::Sort::Size,
+        state::Sort::Reclaim,
+        state::Sort::Files,
+        state::Sort::Newest,
+        state::Sort::Growth,
+        state::Sort::Name,
+    ] {
+        for live in [false, true] {
+            for filter in [String::new(), "x".repeat(60)] {
+                let (_temp, mut b) = browser(3);
+                b.state.sort = sort;
+                if live {
+                    let root = b.dir.clone();
+                    let children = b.rows.clone();
+                    install_refresh(&mut b, root, children);
+                }
+                b.state.filter = filter.clone();
+                let screen = render(&b, 80, 24);
+                // Tide's narrow legend is its own row. The anchor is two columns,
+                // so the screen helper inserts one continuation space after it.
+                let legend =
+                    "⚓  linked outside  ⚠ errors  ▲ rising  ▼ ebbing  LEVEL share of charged";
+                if screen.matches(legend).count() != 1 {
+                    failures.push(format!(
+                        "{sort:?} live={live} filter={}\n{screen}",
+                        filter.len()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn post_tuititle_filter_budget_preserves_status_and_wide_text() {
+    for sort in [
+        state::Sort::Size,
+        state::Sort::Reclaim,
+        state::Sort::Files,
+        state::Sort::Newest,
+        state::Sort::Growth,
+        state::Sort::Name,
+    ] {
+        for live in [false, true] {
+            for filter in ["x".repeat(60), "界\\\n".repeat(10)] {
+                let (_temp, mut b) = browser(3);
+                b.state.sort = sort;
+                if live {
+                    let root = b.dir.clone();
+                    let children = b.rows.clone();
+                    install_refresh(&mut b, root, children);
+                }
+                b.state.filter = filter.clone();
+                for editing in [false, true] {
+                    b.state.editing = editing;
+                    for width in [80, 160] {
+                        let screen = render(&b, width, 24);
+                        let title = screen
+                            .lines()
+                            .find(|line| line.contains("depth") && line.contains("sort "))
+                            .unwrap_or_else(|| panic!("no depth title\n{screen}"));
+                        assert!(
+                            title.contains(&format!("sort {}", crate::render::enum_label(sort))),
+                            "{title}"
+                        );
+                        let live_mark = format!(" {} live", b.theme.glyphs.sep);
+                        assert_eq!(title.contains(&live_mark), live, "{title}");
+                        if width == 80 {
+                            assert!(title.contains("..."), "{title}");
+                        } else {
+                            // The screen helper serializes the blank continuation cell
+                            // after each double-width character as an extra space.
+                            let displayed = super::escape(filter.as_bytes()).replace('界', "界 ");
+                            assert!(title.contains(&displayed), "{title}");
+                        }
+                        let legend = if width >= 110 {
+                            "⚓  anchored by hard links outside   ⚠ scan errors   ▲ rising   ▼ ebbing   LEVEL = share of charged bytes"
+                        } else {
+                            "⚓  linked outside  ⚠ errors  ▲ rising  ▼ ebbing  LEVEL share of charged"
+                        };
+                        assert_eq!(screen.matches(legend).count(), 1, "{screen}");
+                        assert_eq!(b.state.filter, filter);
+                    }
+                }
+            }
+        }
+    }
 }

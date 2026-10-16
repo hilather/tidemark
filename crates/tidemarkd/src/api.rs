@@ -263,10 +263,16 @@ pub(crate) fn dispatch_controlled(
                 let _: StatusParams = params(request)?;
                 value(available(view.status(now))?)
             }
-            "now" => value(available(view.now(&params(request)?, now))?),
+            "now" => {
+                let p: NowParams = params(request)?;
+                if let Some(detail) = view.unwatched_mount_detail(p.mount.as_deref()) {
+                    return Err(DaemonError::Unavailable(detail));
+                }
+                value(available(view.now(&p, now))?)
+            }
             "hot" => {
-                let p = params(request)?;
-                if let Some(detail) = view.hot_unwatched_detail(&p) {
+                let p: HotParams = params(request)?;
+                if let Some(detail) = view.unwatched_mount_detail(p.mount.as_deref()) {
                     return Err(DaemonError::Unavailable(detail));
                 }
                 value(
@@ -274,12 +280,34 @@ pub(crate) fn dispatch_controlled(
                         .ok_or_else(|| DaemonError::Unavailable(view.hot_unavailable_detail(&p)))?,
                 )
             }
-            "lvm" => value(available(view.lvm_report(&params(request)?))?),
-            "phantom" => value(available(view.phantom(&params(request)?))?),
-            "writers" => value(
-                view.writers(&params(request)?)
-                    .ok_or_else(|| DaemonError::Unavailable(view.process_unavailable_detail()))?,
-            ),
+            "lvm" => {
+                let p: LvmParams = params(request)?;
+                if let Some(detail) = view.unwatched_mount_detail(p.mount.as_deref()) {
+                    return Err(DaemonError::Unavailable(detail));
+                }
+                value(
+                    view.lvm_report(&p)
+                        .ok_or_else(|| DaemonError::Unavailable(view.lvm_unavailable_detail()))?,
+                )
+            }
+            "phantom" => {
+                let p: PhantomParams = params(request)?;
+                if let Some(detail) = view.unwatched_mount_detail(p.mount.as_deref()) {
+                    return Err(DaemonError::Unavailable(detail));
+                }
+                value(available(view.phantom(&p))?)
+            }
+            "writers" => {
+                let p: WritersParams = params(request)?;
+                if let Some(detail) = view.unwatched_mount_detail(p.mount.as_deref()) {
+                    return Err(DaemonError::Unavailable(detail));
+                }
+                value(
+                    view.writers(&p).ok_or_else(|| {
+                        DaemonError::Unavailable(view.process_unavailable_detail())
+                    })?,
+                )
+            }
             "alerts.active" => {
                 let p: AlertsActiveParams = params(request)?;
                 let mut rows = available(view.active_alerts())?;
@@ -1002,6 +1030,134 @@ mod fuzz_seams;
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn lvm_disabled_and_pending_have_distinct_reasons() {
+        for enabled in [false, true] {
+            let mut config = tidemark_core::config::Config::default();
+            config.lvm.enabled = enabled;
+            config.watch.mounts = vec!["/A".into()];
+            let context = Context {
+                state: crate::state::LiveState::new(&config, 0),
+                scans: Default::default(),
+                reload: Arc::new(|| unreachable!()),
+            };
+            for mount in [None, Some("/A")] {
+                let request = Request {
+                    v: 1,
+                    id: "lvm-reason".into(),
+                    method: "lvm".into(),
+                    params: serde_json::json!({"mount": mount}),
+                };
+                let error = dispatch(&request, 0, &context, 120).unwrap().error.unwrap();
+                assert_eq!(error.code, ApiErrorCode::Unavailable);
+                assert_eq!(
+                    error.message,
+                    if enabled {
+                        "unavailable: measurement unavailable"
+                    } else {
+                        "unavailable: lvm report not configured: disabled by config"
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hot_rejects_unwatched_mount() {
+        reject_unwatched_mount("hot");
+    }
+    #[test]
+    fn phantom_rejects_unwatched_mount() {
+        reject_unwatched_mount("phantom");
+    }
+    #[test]
+    fn writers_rejects_unwatched_mount() {
+        reject_unwatched_mount("writers");
+    }
+    #[test]
+    fn lvm_rejects_unwatched_mount() {
+        reject_unwatched_mount("lvm");
+    }
+    #[test]
+    fn now_rejects_unwatched_mount() {
+        reject_unwatched_mount("now");
+    }
+    fn reject_unwatched_mount(method: &str) {
+        let mut config = tidemark_core::config::Config::default();
+        config.watch.mounts = vec!["/A".into()];
+        let context = Context {
+            state: crate::state::LiveState::new(&config, 0),
+            scans: Default::default(),
+            reload: Arc::new(|| unreachable!()),
+        };
+        for mount in ["/B", "/A/subdir", "/A"] {
+            if mount == "/A" {
+                context.state.publish_mount_presence(0, &[]).unwrap();
+            }
+            let request = Request {
+                v: 1,
+                id: "mount".into(),
+                method: method.into(),
+                params: serde_json::json!({"mount": mount, "window": "1m"}),
+            };
+            let mut request = request;
+            if method != "writers" {
+                request.params.as_object_mut().unwrap().remove("window");
+            }
+            if method == "hot" {
+                request.params =
+                    serde_json::json!({"mount": mount, "window": "1m", "by": "dir", "limit": 10});
+            }
+            let response = dispatch(&request, 0, &context, 120).unwrap();
+            let error = response
+                .error
+                .unwrap_or_else(|| panic!("{method} accepted {mount}"));
+            assert_eq!(error.code, ApiErrorCode::Unavailable);
+            if mount == "/A" {
+                assert_eq!(
+                    error.message, "unavailable: mount not present: /A",
+                    "{method}"
+                );
+            } else {
+                assert_eq!(error.message, format!("unavailable: {mount} is not watched (watch.mounts = [\"/A\"]); add it to [watch].mounts and run: tidemark deploy stage --from <file>"), "{method}");
+            }
+        }
+    }
+
+    #[test]
+    fn watched_lvm_mount_without_data_is_empty_success() {
+        let mut config = tidemark_core::config::Config::default();
+        config.watch.mounts = vec!["/A".into()];
+        let state = crate::state::LiveState::new(&config, 0);
+        state
+            .publish(
+                crate::state::Publication::Lvm(LvmResult {
+                    mounts: vec![],
+                    vgs: vec![],
+                    sampled_at: 120,
+                }),
+                crate::component("lvm", "ok", "test"),
+            )
+            .unwrap();
+        let context = Context {
+            state,
+            scans: Default::default(),
+            reload: Arc::new(|| unreachable!()),
+        };
+        let request = Request {
+            v: 1,
+            id: "empty".into(),
+            method: "lvm".into(),
+            params: serde_json::json!({"mount": "/A"}),
+        };
+        let response = dispatch(&request, 0, &context, 120).unwrap();
+        assert!(response.ok);
+        assert_eq!(
+            response.result.unwrap(),
+            serde_json::json!({"mounts": [], "vgs": [], "sampled_at": 120})
+        );
+    }
+
     #[test]
     fn hot_unwatched_mount_is_distinct_from_watched_idle_mount() {
         let mut config = tidemark_core::config::Config::default();

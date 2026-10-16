@@ -22,7 +22,12 @@ pub struct Args {
 pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     use tidemark_core::api::{HotBy, HotParams, HotWindow};
     let params = HotParams {
-        mount: super::now::mount(args.mount.as_deref())?,
+        mount: super::now::mount(
+            args.mount.as_deref(),
+            "hot",
+            context.json,
+            &mut std::io::stdout().lock(),
+        )?,
         window: match args.window.as_deref().unwrap_or("5m") {
             "1m" => HotWindow::OneMinute,
             "15m" => HotWindow::FifteenMinutes,
@@ -37,31 +42,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         limit: args.limit.unwrap_or(20),
     };
     let mut client = super::now::connect(context)?;
-    let rows: Vec<tidemark_core::live::HotEntry> =
-        client.call("hot", &params).map_err(|error| {
-            if let crate::client::ClientError::Remote(remote) = &error {
-                if remote.code == tidemark_core::api::ApiErrorCode::Unavailable
-                    && remote.message.contains(" is not watched (watch.mounts = ")
-                {
-                    if context.json {
-                        if let Err(write_error) = crate::render::json(
-                            "tidemark.hot.v1",
-                            serde_json::json!({"error": remote}),
-                            &mut std::io::stdout().lock(),
-                        ) {
-                            return write_error;
-                        }
-                    }
-                    return anyhow::Error::from(crate::CliError::Precondition(
-                        remote
-                            .message
-                            .trim_start_matches("unavailable: ")
-                            .to_owned(),
-                    ));
-                }
-            }
-            super::now::call_error(error, "hot")
-        })?;
+    let rows: Vec<tidemark_core::live::HotEntry> = super::now::mount_call(
+        &mut client,
+        "hot",
+        context,
+        params.mount.as_deref(),
+        &params,
+    )?;
     crate::render::hot::write_grouped(
         &rows,
         context.json,

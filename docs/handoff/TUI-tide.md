@@ -69,10 +69,25 @@ APPARENT below width 120 is the specified degrade (K, AB), not an extra cut. The
 
 No new measurements. The ignored `million_directory_navigation` scale test was not run.
 
+## Merge of origin/main (TUI commits since 150ba53)
+
+The branch was mid-merge. Tide's layout and selection helpers stayed. Main's behaviour fixes were ported onto them.
+
+| Commit | Resolution |
+|--------|------------|
+| 72214e8 own row on its forward page | `Pages.lower` look-behind stays in `load`, `turn_page`, and `own_position`. The snapshot page still uses Tide's `snapshot_sort_key`. The end-of-directory page size is main's `limit`, and a reverse page asks for one extra child so the boundary row is not the first row of the page. |
+| ca8bdd5 missing-path advice | Already merged in `cmd/snapshots.rs` (`default_entry`). The browser tests came in with the conflict and were kept. |
+| 21b9b40 remedy opens capped at twenty | Already merged (`REMEDY_CANDIDATE_LIMIT`). `post_tui2_remedy_search_is_capped` and `post_tui2_remedy_requires_working_default` were kept unchanged. |
+| c3ce697 return movement across pages | The stronger asserts inside `post_tui_disjoint_traversals_all_sorts` were already merged: Up lands on the adjacent logical row, and paging back returns to that same row. |
+| 488af41 legend in the main-pane bottom border | Dropped. Tide already draws the legend on its own line under the depth table. `post_tuititle_full_legend_at_80_columns` now requires that narrow legend once, for every sort, live on and off, and a 60-byte filter. `post_tuititle_filter_budget_preserves_status_and_wide_text` still requires the sort label, the live marker only while live, `...` at 80 columns, the full escaped filter at 160, one legend, and an unchanged filter. `depth_title` shortens the filter before the path so a long filter does not eat `sort` or `live`. |
+
+`main_80_24` and `main_160_48` stayed on the Tide renders. `deterministic_render_at_both_sizes` passed without a snapshot rewrite. The TUI module tests were 79 passed, 1 ignored (`million_directory_navigation`).
+
 ## Known gaps and follow-ups
 
 - Code-review sweep 3 stayed BLOCKED on the page-0 settle and the Esc offset write-back. Keystone approved these fixes without a fourth review round. This is that waiver, not a fresh code-gate pass. The Fable blockers (header-as-row and `depth_target` captured after the page changes) are covered by the tests named above. They do not replace another reviewer reading the diff.
 - This round's `CARGO_BUILD_JOBS=4 cargo xtask ci` exited 0 on the first attempt (448s) and printed `ci: all available checks passed`, including `w6a2` (25 tests) and `vm_test::tests::script_suite_collects_failures_and_prints_all_summaries` in both the xtask binary and `w8`. An earlier round's first attempt was killed by the linker (`ld terminated with signal 9`) while linking `tidemarkd` test `w6a2`; that was not a Tide failure. `xtask/src/vm_test.rs` was not changed.
+- The origin/main merge round chained `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -j4 -- -D warnings`, `cargo test -j4 -p tidemark-cli`, and `CARGO_BUILD_JOBS=4 cargo xtask ci`. The chain exited 0 in 743s. xtask printed `ci: all available checks passed`. `tidemark-cli` tests: lib 202 passed / 1 ignored, plus the integration suites in that command. TUI module: 79 passed / 1 ignored.
 - `cargo-deny` is not installed, so `xtask ci` printed `warning: cargo-deny is not installed; skipping cargo deny check` and continued. `--require-deny` was not passed. — install `cargo-deny` when a deny gate is required.
 - No commit or push from this worktree. Screenshots live in `docs/screenshots/tui-tide/` (`before/` and `after/`). The coordinator opens the pull request.
 - No real terminal, tmux, or VM run in this fix round. TestBackend snapshots and cell assertions are the visual check.

@@ -470,18 +470,24 @@ fn verify_timeout_is_bounded() {
     let fixture = Fixture::new();
     fixture.stage();
     fixture.sys.activating.set(true);
-    let start = Instant::now();
-    let result = verify(
+    let clock = FakeVerifyClock::default();
+    let result = verify_with_timing(
         &fixture.state,
-        Duration::from_millis(20),
+        Duration::from_secs(2),
         &fixture.sys,
         &Ping(false),
+        VerifyTiming {
+            grace: Duration::from_secs(10),
+            interval: Duration::from_millis(500),
+            normal_interval: Duration::from_secs(5),
+        },
+        &clock,
     )
     .unwrap();
     assert!(!result.healthy);
-    assert!(start.elapsed() >= Duration::from_millis(20));
-    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(clock.now(), Duration::from_secs(2));
 }
+
 #[test]
 fn purge_missing_marker_config_mismatch_and_replaced_symlink_leave_state_untouched() {
     for case in ["marker", "config", "symlink"] {
@@ -1403,11 +1409,30 @@ fn purge_writer_child() {
         return;
     };
     let state = PathBuf::from(state);
-    let _catalog = tidemark_store::catalog::Catalog::open(&state, true).unwrap();
-    let _series =
+    let catalog = tidemark_store::catalog::Catalog::open(&state, true).unwrap();
+    let series =
         tidemark_store::timeseries::TimeSeries::open(&state.join("timeseries.db"), true).unwrap();
-    fs::write(state.join("ready"), b"ready").unwrap();
+    // Catalog and TimeSeries share timeseries.db. Commit real sample data before
+    // readiness so the parent protects a live WAL and shared-memory index.
+    series
+        .insert_fs(&[tidemark_core::live::FsSample {
+            ts: 1_700_000_000,
+            mount: "/purge-test".into(),
+            size: 100,
+            used: 40,
+            avail: 60,
+            inodes: 10,
+            inodes_used: 4,
+        }])
+        .unwrap();
+    // SQLite's default checkpoint runs on commit (or last-connection close),
+    // not on a timer: https://sqlite.org/wal.html#automatic_checkpoint.
+    // Keep both handles idle and open across the parent's complete comparison.
+    fs::write(state.join("ready.tmp"), b"ready").unwrap();
+    fs::rename(state.join("ready.tmp"), state.join("ready")).unwrap();
     std::thread::sleep(Duration::from_secs(60));
+    drop(series);
+    drop(catalog);
 }
 #[test]
 fn purge_refuses_live_writer_without_changing_bytes_or_inodes() {
@@ -1426,6 +1451,8 @@ fn purge_refuses_live_writer_without_changing_bytes_or_inodes() {
         assert!(Instant::now() < deadline, "writer never became ready");
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(fs::read(f.state.join("ready")).unwrap(), b"ready");
+    assert!(child.0.try_wait().unwrap().is_none());
     let mut paths = vec![f.state.clone()];
     let mut originals = Vec::new();
     while let Some(path) = paths.pop() {
@@ -1435,6 +1462,15 @@ fn purge_refuses_live_writer_without_changing_bytes_or_inodes() {
         }
         let bytes = meta.is_file().then(|| fs::read(&path).unwrap());
         originals.push((path, meta.ino(), bytes));
+    }
+    for name in ["timeseries.db-wal", "timeseries.db-shm"] {
+        let path = f.state.join(name);
+        assert!(
+            originals
+                .iter()
+                .any(|(p, _, bytes)| p == &path && bytes.as_ref().is_some_and(|b| !b.is_empty())),
+            "live writer sidecar missing or empty: {name}"
+        );
     }
     let error = unstage(&f.state, true, &f.sys).unwrap_err();
     assert!(matches!(error, DeployError::Guard(_)));
@@ -1447,6 +1483,7 @@ fn purge_refuses_live_writer_without_changing_bytes_or_inodes() {
             assert_eq!(fs::read(path).unwrap(), bytes);
         }
     }
+    assert!(child.0.try_wait().unwrap().is_none());
     child.0.kill().unwrap();
     child.0.wait().unwrap();
 }
@@ -1837,6 +1874,21 @@ fn verify_live_components_override_stored_components_for_any_start() {
         .any(|item| item.detail.contains("daemon_started_at=100")));
 }
 
+#[derive(Default)]
+struct FakeVerifyClock(Cell<Duration>);
+impl VerifyClock for FakeVerifyClock {
+    fn now(&self) -> Duration {
+        self.0.get()
+    }
+    fn sleep(&self, duration: Duration) {
+        self.0.set(self.0.get() + duration);
+        assert!(
+            self.0.get() <= Duration::from_secs(30),
+            "poll loop ignored fake deadline"
+        );
+    }
+}
+
 #[test]
 fn verify_wait_rechecks_live_health() {
     struct Recovering(Cell<usize>);
@@ -1860,9 +1912,12 @@ fn verify_wait_rechecks_live_health() {
         Duration::from_secs(10),
         &fixture.sys,
         &api,
-        Duration::from_secs(10),
-        Duration::from_millis(2),
-        Duration::from_millis(2),
+        VerifyTiming {
+            grace: Duration::from_secs(10),
+            interval: Duration::from_secs(1),
+            normal_interval: Duration::from_secs(1),
+        },
+        &FakeVerifyClock::default(),
     )
     .unwrap();
     assert!(result.healthy);
@@ -1934,7 +1989,7 @@ fn verify_sampler_grace_sequences() {
             false,
             0,
             true,
-            true,
+            2,
         ),
         (
             false,
@@ -1943,9 +1998,9 @@ fn verify_sampler_grace_sequences() {
             false,
             0,
             false,
-            true,
+            3,
         ),
-        (false, "measurement failed", false, false, 0, false, false),
+        (false, "measurement failed", false, false, 0, false, 1),
         (
             false,
             "measurement pass in progress",
@@ -1953,7 +2008,7 @@ fn verify_sampler_grace_sequences() {
             false,
             0,
             false,
-            false,
+            1,
         ),
         (
             false,
@@ -1962,17 +2017,17 @@ fn verify_sampler_grace_sequences() {
             true,
             0,
             false,
-            false,
+            1,
         ),
-        (true, "measurement failed", false, false, 100, true, true),
+        (true, "measurement failed", false, false, 3000, true, 2),
         (
             false,
             "measurement pass in progress",
             false,
             false,
-            20,
+            2000,
             false,
-            true,
+            2,
         ),
     ] {
         let api = Sequence {
@@ -1982,24 +2037,22 @@ fn verify_sampler_grace_sequences() {
             other_bad,
             duplicate,
         };
-        let started = Instant::now();
+        let clock = FakeVerifyClock::default();
         let result = verify_with_timing(
             &fixture.state,
             Duration::from_millis(wait),
             &fixture.sys,
             &api,
-            if wait == 0 {
-                Duration::from_millis(100)
-            } else {
-                Duration::from_secs(10)
+            VerifyTiming {
+                grace: Duration::from_secs(3),
+                interval: Duration::from_secs(1),
+                normal_interval: Duration::from_secs(1),
             },
-            Duration::from_millis(2),
-            Duration::from_millis(2),
+            &clock,
         )
         .unwrap();
         assert_eq!(result.healthy, healthy);
-        assert_eq!(api.calls.get() > 1, retries);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(api.calls.get(), retries);
         if !healthy {
             assert!(result
                 .items
@@ -2019,4 +2072,324 @@ fn verify_socket_zero_budget_expires_before_connect() {
         api.status_with_budget(Duration::ZERO).unwrap_err().kind(),
         io::ErrorKind::TimedOut
     );
+}
+
+#[test]
+fn verify_sampler_then_timeout_keeps_history() {
+    struct TimeoutAfterProgress<'a>(Cell<usize>, &'a FakeVerifyClock);
+    impl ApiPing for TimeoutAfterProgress<'_> {
+        fn ping(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+            panic!("verify must propagate its remaining budget")
+        }
+        fn status_with_budget(
+            &self,
+            budget: Duration,
+        ) -> io::Result<tidemark_core::api::StatusResult> {
+            let call = self.0.get();
+            self.0.set(call + 1);
+            if call > 0 {
+                assert_eq!(budget, Duration::from_millis(400));
+                self.1.sleep(budget);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "status budget expired",
+                ));
+            }
+            assert_eq!(budget, Duration::from_secs(1));
+            self.1.sleep(Duration::from_millis(100));
+            let mut status = Ping(true).status()?;
+            status.components[0].state = "degraded".into();
+            status.components[0].detail = "measurement pass in progress".into();
+            Ok(status)
+        }
+    }
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.sys.active.set(true);
+    fixture.report(&record.config_sha256, true);
+    let clock = FakeVerifyClock::default();
+    let api = TimeoutAfterProgress(Cell::new(0), &clock);
+    let result = verify_with_timing(
+        &fixture.state,
+        Duration::ZERO,
+        &fixture.sys,
+        &api,
+        VerifyTiming {
+            grace: Duration::from_secs(1),
+            interval: Duration::from_millis(500),
+            normal_interval: Duration::from_secs(5),
+        },
+        &clock,
+    )
+    .unwrap();
+    assert!(!result.healthy);
+    assert_eq!(clock.now(), Duration::from_secs(1));
+    assert_eq!(api.0.get(), 2);
+    assert!(result
+        .items
+        .iter()
+        .any(|i| i.name == "api" && i.detail.contains("status budget expired")));
+    assert!(result.items.iter().any(|i| i.name == "core_components"
+        && i.detail.contains("last status 900 ms ago:")
+        && i.detail
+            .contains("sampler=degraded (measurement pass in progress)")));
+}
+
+#[test]
+fn verify_retry_probe_floor() {
+    struct Recovering(Cell<usize>);
+    impl ApiPing for Recovering {
+        fn ping(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+            let call = self.0.get();
+            self.0.set(call + 1);
+            let mut status = Ping(true).status()?;
+            if call == 0 {
+                status.components[0].state = "degraded".into();
+                status.components[0].detail = "measurement pass in progress".into();
+            }
+            Ok(status)
+        }
+    }
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.sys.active.set(true);
+    fixture.report(&record.config_sha256, true);
+    for (budget_ms, calls, healthy) in [(1249, 1, false), (1250, 2, true)] {
+        let api = Recovering(Cell::new(0));
+        let clock = FakeVerifyClock::default();
+        let result = verify_with_timing(
+            &fixture.state,
+            Duration::ZERO,
+            &fixture.sys,
+            &api,
+            VerifyTiming {
+                grace: Duration::from_millis(budget_ms),
+                interval: Duration::from_secs(1),
+                normal_interval: Duration::from_secs(5),
+            },
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(result.healthy, healthy);
+        assert_eq!(api.0.get(), calls);
+        assert_eq!(clock.now(), Duration::from_secs(1));
+        if !healthy {
+            assert!(result
+                .items
+                .iter()
+                .any(|i| i.name == "core_components" && i.detail.contains("sampler=degraded")));
+            assert!(!result
+                .items
+                .iter()
+                .any(|i| i.detail.contains("last status")));
+        }
+    }
+}
+
+#[test]
+fn verify_probe_floor_keeps_fresh_service_error() {
+    verify_probe_floor_keeps_fresh_checks(true);
+}
+
+#[test]
+fn verify_probe_floor_keeps_fresh_config_mismatch() {
+    verify_probe_floor_keeps_fresh_checks(false);
+}
+
+fn verify_probe_floor_keeps_fresh_checks(service_error: bool) {
+    struct SlowProbe<'a> {
+        clock: &'a FakeVerifyClock,
+        calls: Cell<usize>,
+        service_error: bool,
+    }
+    impl Systemctl for SlowProbe<'_> {
+        fn is_active(&self, _: &str) -> io::Result<bool> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            if call > 0 {
+                self.clock.sleep(Duration::from_secs(3));
+                if self.service_error {
+                    return Err(io::Error::other("injected service probe timed out"));
+                }
+            }
+            Ok(true)
+        }
+        fn is_enabled(&self, _: &str) -> io::Result<bool> {
+            panic!("unexpected enabled query")
+        }
+        fn enable(&self, _: &str) -> io::Result<()> {
+            panic!("unexpected enable")
+        }
+        fn disable_now(&self, _: &str) -> io::Result<()> {
+            panic!("unexpected disable")
+        }
+        fn restart(&self, _: &str) -> io::Result<()> {
+            panic!("unexpected restart")
+        }
+    }
+    struct Progress<'a>(Cell<usize>, &'a Fixture, bool);
+    impl ApiPing for Progress<'_> {
+        fn ping(&self) -> io::Result<()> {
+            panic!("expected status")
+        }
+        fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+            self.0.set(self.0.get() + 1);
+            if !self.2 {
+                self.1.report("changed-config", true);
+            }
+            let mut status = Ping(true).status()?;
+            status.components[0].state = "degraded".into();
+            status.components[0].detail = "measurement pass in progress".into();
+            Ok(status)
+        }
+    }
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.report(&record.config_sha256, true);
+    let clock = FakeVerifyClock::default();
+    let sys = SlowProbe {
+        clock: &clock,
+        calls: Cell::new(0),
+        service_error,
+    };
+    let api = Progress(Cell::new(0), &fixture, service_error);
+    let result = verify_with_timing(
+        &fixture.state,
+        Duration::from_secs(3),
+        &sys,
+        &api,
+        VerifyTiming {
+            grace: Duration::from_secs(10),
+            interval: Duration::from_millis(500),
+            normal_interval: Duration::from_secs(5),
+        },
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(sys.calls.get(), 2);
+    assert_eq!(api.0.get(), 1);
+    assert_eq!(clock.now(), Duration::from_millis(3500));
+    assert!(!result.healthy);
+    let fresh = result
+        .items
+        .iter()
+        .find(|item| {
+            item.name
+                == if service_error {
+                    "service"
+                } else {
+                    "config_hash"
+                }
+        })
+        .unwrap();
+    assert_eq!(fresh.status, CheckStatus::Fail, "{fresh:?}");
+    assert!(fresh.detail.contains(if service_error {
+        "injected service probe timed out"
+    } else {
+        "missing, invalid or stale report/staging record"
+    }));
+    let core = result
+        .items
+        .iter()
+        .find(|item| item.name == "core_components")
+        .unwrap();
+    assert_eq!(core.status, CheckStatus::Fail);
+    assert!(core.detail.contains("current daemon health unavailable"));
+    assert!(core.detail.contains(
+        "historical core observation: Fail (sampler=degraded (measurement pass in progress); scheduler=ok; api=ok; tswriter=ok)"
+    ));
+    assert!(core
+        .detail
+        .contains("last status 3500 ms ago: sampler=degraded (measurement pass in progress)"));
+    let api = result.items.iter().find(|item| item.name == "api").unwrap();
+    assert_eq!(api.status, CheckStatus::Fail);
+    assert!(api.detail.contains("API request skipped"));
+    assert!(api.detail.contains("historical API observation: Pass (ok)"));
+}
+
+#[test]
+fn verify_core_reasons_in_human_and_json_detail() {
+    struct ReasonStatus(usize, String);
+    impl ApiPing for ReasonStatus {
+        fn ping(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+            let mut status = Ping(true).status()?;
+            status.components[self.0].state = "degraded".into();
+            status.components[self.0].detail = self.1.clone();
+            // Healthy components must not expose their detail.
+            for (index, component) in status.components.iter_mut().enumerate() {
+                if index != self.0 {
+                    component.detail = "healthy detail hidden".into();
+                }
+            }
+            Ok(status)
+        }
+    }
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.sys.active.set(true);
+    fixture.report(&record.config_sha256, true);
+    for index in 0..4 {
+        for (raw, expected) in [
+            ("".into(), "".into()),
+            ("   ".into(), "".into()),
+            ("\u{2003} ".into(), "".into()),
+            ("not mounted: /mnt/x".into(), "not mounted: /mnt/x".into()),
+            ("bad\nline\u{1b}\0".into(), "bad\\x0Aline\\x1B\\x00".into()),
+            ("é".repeat(150), format!("{}…", "é".repeat(98))),
+            ("x".repeat(200), "x".repeat(200)),
+            ("x".repeat(201), format!("{}…", "x".repeat(197))),
+        ] {
+            let result = verify_with_timing(
+                &fixture.state,
+                Duration::ZERO,
+                &fixture.sys,
+                &ReasonStatus(index, raw),
+                VerifyTiming {
+                    grace: Duration::ZERO,
+                    interval: Duration::ZERO,
+                    normal_interval: Duration::ZERO,
+                },
+                &FakeVerifyClock::default(),
+            )
+            .unwrap();
+            assert!(!result.healthy);
+            let core = result
+                .items
+                .iter()
+                .find(|item| item.name == "core_components")
+                .unwrap();
+            let name = ["sampler", "scheduler", "api", "tswriter"][index];
+            let entry = if expected.is_empty() {
+                format!("{name}=degraded")
+            } else {
+                format!("{name}=degraded ({expected})")
+            };
+            // This is the escaping used by the human verify renderer.
+            let human = crate::render::table::diagnostic(&core.detail);
+            assert!(human.contains(&entry), "{human}");
+            assert_eq!(human.lines().count(), 1);
+            let json = serde_json::to_value(&result).unwrap();
+            let json_core = json["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == "core_components")
+                .unwrap();
+            assert!(json_core["detail"].as_str().unwrap().contains(&entry));
+            assert!(!core.detail.contains("healthy detail hidden"));
+            if expected.is_empty() {
+                assert!(!core.detail.contains('('), "{}", core.detail);
+            }
+            assert!(expected.len() <= 200);
+        }
+    }
 }

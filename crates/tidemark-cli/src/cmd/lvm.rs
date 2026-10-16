@@ -19,12 +19,20 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         std::time::Duration::from_secs(11),
     ) {
         Ok(mut client) => {
-            let report: tidemark_core::api::LvmResult = super::now::call(
+            let params = tidemark_core::api::LvmParams {
+                mount: super::now::mount(
+                    args.mount.as_deref(),
+                    "lvm",
+                    context.json,
+                    &mut std::io::stdout().lock(),
+                )?,
+            };
+            let report: tidemark_core::api::LvmResult = super::now::mount_call(
                 &mut client,
                 "lvm",
-                &tidemark_core::api::LvmParams {
-                    mount: super::now::mount(args.mount.as_deref())?,
-                },
+                context,
+                params.mount.as_deref(),
+                &params,
             )?;
             let db = context.config.general.state_dir.join("timeseries.db");
             let history = if db.try_exists()? {

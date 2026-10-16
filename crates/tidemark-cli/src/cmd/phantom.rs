@@ -23,12 +23,20 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             std::time::Duration::from_secs(11),
         ) {
             Ok(mut client) => {
-                let rows: tidemark_core::api::PhantomResult = super::now::call(
+                let params = tidemark_core::api::PhantomParams {
+                    mount: super::now::mount(
+                        args.mount.as_deref(),
+                        "phantom",
+                        context.json,
+                        &mut std::io::stdout().lock(),
+                    )?,
+                };
+                let rows: tidemark_core::api::PhantomResult = super::now::mount_call(
                     &mut client,
                     "phantom",
-                    &tidemark_core::api::PhantomParams {
-                        mount: super::now::mount(args.mount.as_deref())?,
-                    },
+                    context,
+                    params.mount.as_deref(),
+                    &params,
                 )?;
                 return crate::render::now::phantom(
                     &rows,
@@ -42,7 +50,16 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     mount: args.mount.clone(),
                     direct: true,
                 };
-                return run(&direct, context);
+                return run(&direct, context).with_context(|| {
+                    format!(
+                        "direct fallback: phantom: {}",
+                        super::display_path(
+                            args.mount
+                                .as_deref()
+                                .unwrap_or_else(|| std::path::Path::new("/proc"))
+                        )
+                    )
+                });
             }
         }
     }

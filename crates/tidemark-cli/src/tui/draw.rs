@@ -1018,21 +1018,44 @@ fn tide_line(theme: Theme, delta: Option<i128>) -> Line<'static> {
 pub(super) fn depth_title(b: &Browser, width: usize) -> Line<'static> {
     let glyphs = b.theme.glyphs;
     let sort = crate::render::enum_label(b.state.sort);
-    let mut suffix = format!(" {} sort {sort}", glyphs.sep);
-    if !b.state.filter.is_empty() {
-        suffix.push_str(&format!(
-            " {} filter \"{}\"",
-            glyphs.sep,
-            super::escape(b.state.filter.as_bytes())
-        ));
-    }
-    suffix.push_str(&live_suffix(b));
     let prefix = format!("depth {} ", glyphs.sep);
-    let budget = width.saturating_sub(
-        table::display_width(&prefix).saturating_add(table::display_width(&suffix)),
-    );
-    let path = table::shorten(&b.dir.path.display_lossy(), budget);
-    Line::from(clip_cols(&format!("{prefix}{path}{suffix}"), width))
+    let sort_part = format!(" {} sort {sort}", glyphs.sep);
+    let live = live_suffix(b);
+    let path = b.dir.path.display_lossy();
+    if b.state.filter.is_empty() {
+        let suffix = format!("{sort_part}{live}");
+        let budget = width.saturating_sub(
+            table::display_width(&prefix).saturating_add(table::display_width(&suffix)),
+        );
+        let path = table::shorten(&path, budget);
+        return Line::from(clip_cols(&format!("{prefix}{path}{suffix}"), width));
+    }
+    // The filter borrows width. Sort and the live marker stay; the path
+    // shortens only once the filter body no longer fits beside them.
+    let filter = super::escape(b.state.filter.as_bytes());
+    let overhead = table::display_width(&format!(" {} filter \"\"", glyphs.sep));
+    let with_path = table::display_width(&prefix)
+        + table::display_width(&path)
+        + table::display_width(&sort_part)
+        + table::display_width(&live);
+    let (path_shown, body_budget) = if with_path + overhead <= width {
+        (path, width - with_path - overhead)
+    } else {
+        let fixed = table::display_width(&prefix)
+            + table::display_width(&sort_part)
+            + table::display_width(&live);
+        (table::shorten(&path, width.saturating_sub(fixed)), 0)
+    };
+    let body = table::shorten(&filter, body_budget);
+    let filter_part = if body.is_empty() {
+        String::new()
+    } else {
+        format!(" {} filter \"{body}\"", glyphs.sep)
+    };
+    Line::from(clip_cols(
+        &format!("{prefix}{path_shown}{sort_part}{filter_part}{live}"),
+        width,
+    ))
 }
 
 fn live_suffix(b: &Browser) -> String {

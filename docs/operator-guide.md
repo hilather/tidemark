@@ -242,7 +242,7 @@ sudo tidemark now --mount /data
 
 Thin-pool data and metadata percentages can become critical while `df` still shows free space. VG FREE is unallocated volume-group headroom, not filesystem free space. An unknown percentage is not zero. Trends need history (at least three usable samples); percentages/day are percentage points/day. LVM disabled, missing tools or an unmapped filesystem can show n/a.
 
-Daemon LVM reports omit segment types and other LVs. Direct fallback includes them. Machine consumers must check the schema: this checkout emits `tidemark.lvm.daemon.v1` for daemon data and `tidemark.lvm.v1` for direct data.
+Daemon LVM reports omit segment types and other LVs. Direct fallback includes them. Machine consumers must check the schema: this checkout emits `tidemark.lvm.daemon.v1` for daemon data (including unwatched-mount and missing-path error documents) and `tidemark.lvm.v1` for direct data. When LVM is disabled by config and no report is available, the daemon reports `lvm report not configured: disabled by config` (exit 4); enabled but not yet measured reports `measurement unavailable`.
 <!-- gap: 08 and R4-12 still describe the two LVM shapes under one schema; current renderers distinguish them. Recheck after the LVM contract follow-up. -->
 <!-- Sample rendered from the empty daemon LVM fixture in crates/tidemark-cli/tests/w6a3.rs; no LVM host command was run. -->
 ```text
@@ -360,7 +360,7 @@ ROOT  RUNNING  NEXT RUN  LAST COMPLETE
 | Watcher fd mode | Normal on EL8. 8.8 uses mount marks and misses writes through another mount of the filesystem; 8.10 uses filesystem marks. Check loss/failed state separately. |
 | Watched filesystem refuses unmount (`target is busy`) | Stop the daemon/foreground watcher or remove the watch and reload; see [planned unmount](runbooks/watcher-degraded.md#planned-unmount). |
 | Watcher degraded | Check namespace, overflows, transport errors and excluded prefixes; follow [watcher degraded](runbooks/watcher-degraded.md). |
-| `daemon unavailable` | Check sudo, selected config/socket and service health. `now`, `hot`, `alerts`, `status` require the daemon and return 4. lvm/phantom/writers have direct fallback. |
+| `daemon unavailable` | Check sudo, selected config/socket and service health. `now`, `hot`, `alerts`, `status` require the daemon and return 4 if local validation succeeds. `now` and `hot` resolve `--mount` first, so a missing path returns 5 (`not_found` with `--json`) even without a daemon; other local resolution errors also take precedence. lvm/phantom/writers have direct fallback. |
 | Scan slow | Check adaptive throttling, busy leaf devices, entry counts, mode choice, errors and state-disk I/O. Use [scan impact](runbooks/scan-impact.md); do not switch a busy server to max. |
 | Scan seems stuck after Ctrl-C | Direct scan work stops within a second, then durable snapshot/catalog writes can delay exit (code 3). Do not repeatedly kill it during record publication. A forwarded scan continues in the daemon after Ctrl-C; cancel explicitly by root if intended. |
 | `df` and `du` disagree | Compare fresh, equal coverage and times; inspect deleted-open files, open writers, exclusions, mounts, filesystem metadata and reflinks using the [mismatch runbook](runbooks/df-du-mismatch.md). |
@@ -371,6 +371,8 @@ sudo tidemark scan /data --cancel
 
 Explicit cancellation targets the current scan of that root, not an atomic scan ID. Confirm the root/activity first; a replacement scan can race the request. Failed scans log retry details and leave scheduler health degraded until that root succeeds or leaves configuration. Scheduled retries back off from 30s to 1h; manual requests bypass backoff.
 <!-- gap: missing-mount rate-ring reset and reversible now degraded reasons remain open; after remount, confirm fresh samples before trusting rates or time-to-full. -->
+
+For daemon requests, a non-existent `--mount` path is a precondition failure (exit 5): `resolve mount: <path>: <OS error>`. With `--json`, `phantom`, `writers`, `lvm`, `now`, and `hot` emit their daemon success schema with `data.error.code = "not_found"` and the same message. An unconfigured mount also returns exit 5, with `data.error.code = "unavailable"`. A configured but absent mount returns exit 4 with `mount not present: <path>`; all five commands write the daemon error to stderr and leave stdout empty, including with `--json`. Explicit direct mode and direct fallback retain their existing behavior.
 
 Exit codes: **0** success; **1** runtime error; **2** usage/config error; **3** errors, degraded/partial or cancelled scan (including uncertain forwarded outcome); **4** daemon unavailable; **5** precondition failure; **6** verify unhealthy/timeout. Archive stderr as well as JSON. Paths with unusual bytes are escaped for text and use `path_b64` in JSON; do not parse human tables as filenames.
 
