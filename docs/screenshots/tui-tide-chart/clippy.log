@@ -1,0 +1,5 @@
+    Blocking waiting for file lock on build directory
+   Compiling tidemark-cli v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/crates/tidemark-cli)
+   Compiling tidemarkd v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/crates/tidemarkd)
+    Checking xtask v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.17s

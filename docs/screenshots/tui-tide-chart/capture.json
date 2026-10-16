@@ -1,0 +1,103 @@
+{
+  "waits": [
+    {
+      "name": "projects",
+      "seconds": 1.106,
+      "polls": 12,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "logs-missing",
+      "seconds": 0.5261,
+      "polls": 4,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "descend",
+      "seconds": 0.8644,
+      "polls": 7,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "ascend",
+      "seconds": 0.1593,
+      "polls": 2,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "own",
+      "seconds": 0.5018,
+      "polls": 6,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "info",
+      "seconds": 0.3791,
+      "polls": 3,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "older",
+      "seconds": 0.5901,
+      "polls": 8,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "restored",
+      "seconds": 0.3762,
+      "polls": 4,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "live",
+      "seconds": 0.4679,
+      "polls": 6,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "pruned-startup",
+      "seconds": 0.8435,
+      "polls": 7,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "mono",
+      "seconds": 0.2906,
+      "polls": 5,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "ascii",
+      "seconds": 0.3141,
+      "polls": 5,
+      "dimensions": "140x40",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    },
+    {
+      "name": "compact",
+      "seconds": 0.0971,
+      "polls": 2,
+      "dimensions": "80x24",
+      "loading_check": "neither Unicode nor ASCII loading marker in value label row; expected subject/state present"
+    }
+  ],
+  "tmux": "tmux 3.7c",
+  "locale": "C.UTF-8; ASCII uses C",
+  "colors": "TERM=xterm-256color COLORTERM=truecolor; NO_COLOR=1 for Mono",
+  "fixture": "/tmp/tidemark-tide-nits",
+  "binary": "/home/brewerm/git/muse-worktrees/tidemark-tide-chart/target/debug/tidemark",
+  "timestamp": "2026-10-16T18:21:09Z",
+  "command": "env -u NO_COLOR TERM=xterm-256color COLORTERM=truecolor LANG=C.UTF-8 /home/brewerm/git/muse-worktrees/tidemark-tide-chart/target/debug/tidemark -q --config /tmp/tidemark-tide-nits/config.toml --color always tui /tmp/tidemark-tide-nits/tree",
+  "kernel": "7.2.5-3-omarchy"
+}

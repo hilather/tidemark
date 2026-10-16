@@ -3,7 +3,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "fixture.rs"]
-mod fixture;
+pub(super) mod fixture;
+#[path = "tide_chart.rs"]
+mod tide_chart;
 use super::*;
 use ratatui::{backend::TestBackend, Terminal};
 use tidemark_core::{
@@ -11,7 +13,7 @@ use tidemark_core::{
     snapshot::{FileRow, LinkInstanceRow, LinkSetRow},
 };
 
-fn browser(count: u32) -> (tempfile::TempDir, Browser) {
+pub(super) fn browser(count: u32) -> (tempfile::TempDir, Browser) {
     let temp = ::test_support::private_tempdir().unwrap();
     let mut rows = vec![fixture::row(0, None, b"/fixture", u64::from(count) * 4096)];
     rows[0].subtree_end = count;
@@ -39,6 +41,11 @@ fn browser(count: u32) -> (tempfile::TempDir, Browser) {
         snapshots: vec![],
         message: String::new(),
         now: 1_000_100,
+        clock: 1_000_100,
+        history: history::History::default(),
+        history_refresh: false,
+        data_revision: 0,
+        info_subject: None,
         pages: Pages::default(),
         refresh: None,
         theme: theme::Theme::plain(),
@@ -77,6 +84,11 @@ fn browser_by_size(count: u32) -> (tempfile::TempDir, Browser) {
         snapshots: vec![],
         message: String::new(),
         now: 1_000_100,
+        clock: 1_000_100,
+        history: history::History::default(),
+        history_refresh: false,
+        data_revision: 0,
+        info_subject: None,
         pages: Pages::default(),
         refresh: None,
         theme: theme::Theme::plain(),
@@ -220,6 +232,11 @@ fn hostile_names_in_data_panes() {
         snapshots: vec![],
         message: String::new(),
         now: 1_000_100,
+        clock: 1_000_100,
+        history: history::History::default(),
+        history_refresh: false,
+        data_revision: 0,
+        info_subject: None,
         pages: Pages::default(),
         refresh: None,
         theme: theme::Theme::plain(),
@@ -285,6 +302,11 @@ fn million_directory_navigation() {
         snapshots: vec![],
         message: String::new(),
         now: 1_000_100,
+        clock: 1_000_100,
+        history: history::History::default(),
+        history_refresh: false,
+        data_revision: 0,
+        info_subject: None,
         pages: Pages::default(),
         refresh: None,
         theme: theme::Theme::plain(),
@@ -333,6 +355,11 @@ fn query_pages_skip_nested_subtrees_and_support_back() {
         snapshots: vec![],
         message: String::new(),
         now: 1_000_100,
+        clock: 1_000_100,
+        history: history::History::default(),
+        history_refresh: false,
+        data_revision: 0,
+        info_subject: None,
         pages: Pages::default(),
         refresh: None,
         theme: theme::Theme::plain(),
@@ -447,7 +474,8 @@ fn own_files_columns_and_info() {
     assert_eq!(line.matches('-').count(), 4);
     b.state.selected = b.own_position();
     b.pane(Pane::Info).unwrap();
-    assert!(b.text.contains("own files as charged"));
+    assert!(!b.text.contains("own files as charged"));
+    assert!(b.text.contains("Disk 12.0 KiB"));
 }
 
 #[test]
@@ -673,7 +701,14 @@ fn human_header_and_pane_labels_are_lowercase() {
         assert!(text.contains("1m 39s ago"), "{text}");
         assert!(text.contains("20260101T000000Z-00000000"), "{text}");
         assert!(text.contains("steady"), "{text}");
-        assert!(text.contains("high-water"), "{text}");
+        assert!(
+            text.contains(if width == 80 {
+                "hw "
+            } else {
+                "root high-water"
+            }),
+            "{text}"
+        );
         assert!(!text.contains("Walk") && !text.contains("Size"), "{text}");
         assert!(!text.contains("degraded=false"), "{text}");
     }
@@ -1862,7 +1897,7 @@ fn fmt_files_stays_within_six_columns() {
 }
 
 #[test]
-fn level_cells_use_largest_remainder_and_fit_bars_shift() {
+fn level_cells_use_largest_remainder() {
     assert_eq!(draw::level_cells(0, &[1, 1, 1], 4), vec![0, 0, 0]);
     assert_eq!(draw::level_cells(3, &[1, 1, 1], 3), vec![1, 1, 1]);
     assert_eq!(draw::level_cells(3, &[1, 1, 1], 4), vec![2, 1, 1]);
@@ -1875,10 +1910,6 @@ fn level_cells_use_largest_remainder_and_fit_bars_shift() {
     assert_eq!(draw::level_cells(5, &[1, 1], 3), vec![1, 0]);
     // A weight past the directory makes the floors overshoot; the split still sums to the width.
     assert_eq!(draw::level_cells(5, &[8, 2], 4), vec![3, 1]);
-    let mut values = [u64::MAX, u64::MAX / 2];
-    draw::fit_bar_values(&mut values, 6);
-    let max = values.iter().copied().max().unwrap();
-    assert!(u128::from(max) * 6 * 8 <= u128::from(u64::MAX));
 }
 
 #[test]
@@ -1995,7 +2026,7 @@ fn header_keeps_the_scan_id_and_high_water() {
     assert!(text.contains(&id), "{text}");
     assert!(text.contains("walk"), "{text}");
     assert!(text.contains("1m 39s ago"), "{text}");
-    assert!(text.contains("high-water"), "{text}");
+    assert!(text.contains("hw 68.9 MiB"), "{text}");
     assert!(text.contains("68.9 MiB"), "{text}");
     assert!(text.contains("steady"), "{text}");
     let header = text.lines().next().unwrap();
@@ -2008,91 +2039,6 @@ fn header_keeps_the_scan_id_and_high_water() {
 }
 
 #[test]
-fn tide_chart_uses_root_totals_and_the_smaller_tied_snapshot() {
-    let (_temp, mut b) = browser(1);
-    let id = b.snapshot.meta().scan_id.to_string();
-    let started = b.snapshot.meta().started_at;
-    let file = b.snapshot_file.clone();
-    b.snapshots = vec![
-        ("b-scan".into(), file.clone(), 500_000, Some(9_000)),
-        ("a-scan".into(), file.clone(), 500_000, Some(1_000)),
-        (id.clone(), file, started, Some(3_000)),
-    ];
-    let wide = render(&b, 140, 40);
-    assert!(wide.contains("root total by snapshot"), "{wide}");
-    assert!(wide.contains("since previous"), "{wide}");
-    assert!(wide.contains("+1.95 KiB"), "{wide}");
-    assert!(wide.contains("01-12 13h"), "{wide}");
-    assert!(wide.contains("2.93 KiB"), "{wide}");
-    assert!(!wide.contains("13h 2"), "{wide}");
-    assert!(!wide.contains("-5.86 KiB"), "{wide}");
-    b.theme = theme::Theme::select(true, false, Some("truecolor"), Some("linux"), Some("C"));
-    let ascii = render(&b, 140, 40);
-    assert!(ascii.contains("d +1.95 KiB since previous"), "{ascii}");
-    assert!(!ascii.contains('Δ'), "{ascii}");
-    assert!(!ascii.contains('·'), "{ascii}");
-    assert!(!ascii.contains('×'), "{ascii}");
-    b.theme = theme::Theme::plain();
-    b.snapshots.truncate(1);
-    let one = render(&b, 140, 40);
-    assert!(!one.contains("root total by snapshot"), "{one}");
-    b.snapshots.push((
-        "z-scan".into(),
-        b.snapshot_file.clone(),
-        started - 10,
-        Some(4_000),
-    ));
-    let narrow = render(&b, 80, 40);
-    assert!(!narrow.contains("root total by snapshot"), "{narrow}");
-    let file = b.snapshot_file.clone();
-    let mut outside = vec![
-        ("older".into(), file.clone(), started - 100, Some(10_000)),
-        (id, file.clone(), started, Some(50_000)),
-    ];
-    for index in 0..8 {
-        outside.push((
-            format!("newer-{index}"),
-            file.clone(),
-            started + 10 + i64::from(index),
-            Some(2_000),
-        ));
-    }
-    b.snapshots = outside;
-    let hidden = render(&b, 140, 40);
-    assert!(hidden.contains("root total by snapshot"), "{hidden}");
-    assert!(
-        !hidden.contains("since previous"),
-        "open snapshot is outside the chart window\n{hidden}"
-    );
-}
-
-#[test]
-fn tide_chart_omits_delta_when_previous_is_outside_the_window() {
-    let (_temp, mut b) = browser(1);
-    let id = b.snapshot.meta().scan_id.to_string();
-    let started = b.snapshot.meta().started_at;
-    let file = b.snapshot_file.clone();
-    let mut rows = vec![("older".into(), file.clone(), started - 10, Some(10_000))];
-    rows.push((id, file.clone(), started, Some(50_000)));
-    for index in 0..6 {
-        rows.push((
-            format!("newer-{index}"),
-            file.clone(),
-            started + 10 + i64::from(index),
-            Some(2_000),
-        ));
-    }
-    b.snapshots = rows;
-    let screen = render(&b, 140, 40);
-    assert!(screen.contains("root total by snapshot"), "{screen}");
-    assert!(screen.contains("48.8 KiB"), "{screen}");
-    assert!(
-        !screen.contains("since previous"),
-        "previous snapshot is outside the chart window\n{screen}"
-    );
-}
-
-#[test]
 fn size_column_is_right_aligned_at_both_widths() {
     let (_temp, mut b) = browser(3);
     b.rows[0].0.t_disk = 72_241_886;
@@ -2102,7 +2048,7 @@ fn size_column_is_right_aligned_at_both_widths() {
         let end = screen
             .lines()
             .find_map(|line| {
-                line.contains("68.9 MiB")
+                (line.contains("68.9 MiB") && line.contains('/'))
                     .then(|| token_end_column(line, "68.9 MiB"))
             })
             .unwrap()
@@ -3205,7 +3151,7 @@ fn header_shortens_the_path_to_the_leftover_budget() {
     let glyphs = theme::Theme::plain().glyphs;
     let path = format!("/{}", "p".repeat(180));
     let identity = "20260101T000000Z-00000000 · walk · 1m 39s ago · steady";
-    let right = "high-water 68.9 MiB";
+    let right = "root high-water 68.9 MiB";
     let (brand, shown) = draw::fit_header(120, identity, right, &path, glyphs);
     assert!(!brand);
     let shown = shown.expect("path kept");
@@ -3213,12 +3159,23 @@ fn header_shortens_the_path_to_the_leftover_budget() {
     assert!(cols > 12, "{shown} is {cols} columns");
     let fixed = draw::header_cols(identity) + 1 + draw::header_cols(right);
     assert!(cols + 2 + fixed <= 120, "cols {cols} fixed {fixed}");
-    let (narrow_brand, narrow) = draw::fit_header(80, identity, right, &path, glyphs);
+    let compact_right = "hw 68.9 MiB";
+    let (narrow_brand, narrow) = draw::fit_header(80, identity, compact_right, &path, glyphs);
     assert!(!narrow_brand);
-    assert!(
-        narrow.is_none(),
-        "a path shorter than 8 columns is dropped, got {narrow:?}"
-    );
+    let narrow = narrow.expect("short high-water label leaves room for the path");
+    let fixed = draw::header_cols(identity) + 1 + draw::header_cols(compact_right);
+    assert!(draw::header_cols(&narrow) >= 8);
+    assert!(draw::header_cols(&narrow) + 2 + fixed <= 80);
+
+    let (_temp, mut b) = browser(1);
+    b.dir.path = RawPath::new(path.into_bytes()).unwrap();
+    b.snapshots
+        .push((String::new(), Default::default(), 0, Some(72_246_886)));
+    let screen = render(&b, 80, 24);
+    let header = screen.lines().next().unwrap();
+    assert!(header.contains("hw 68.9 MiB"), "{header}");
+    assert!(header.starts_with("/p"), "{header}");
+    assert!(!header.contains("root high-water"), "{header}");
 }
 
 #[test]

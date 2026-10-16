@@ -1,0 +1,10 @@
+   Compiling tidemark-cli v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/crates/tidemark-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.64s
+     Running unittests src/lib.rs (target/debug/deps/tidemark_cli-37eec3a2360b1fa3)
+
+running 1 test
+navigation with history open held at barrier: 163.775µs
+test tui::history::tests::blocked_history_reader_does_not_block_navigation_or_relabel_old_bars ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 232 filtered out; finished in 0.04s
+

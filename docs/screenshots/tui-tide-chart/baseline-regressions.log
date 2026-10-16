@@ -1,0 +1,265 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling libc v0.2.190
+   Compiling cfg-if v1.0.5
+   Compiling bitflags v2.13.2
+   Compiling rustix v1.1.5
+   Compiling memchr v2.8.3
+   Compiling serde_core v1.0.229
+   Compiling once_cell v1.21.4
+   Compiling thiserror v2.0.21
+   Compiling linux-raw-sys v0.12.1
+   Compiling foldhash v0.2.0
+   Compiling itoa v1.0.18
+   Compiling equivalent v1.0.2
+   Compiling log v0.4.34
+   Compiling allocator-api2 v0.2.21
+   Compiling smallvec v1.16.3
+   Compiling regex-syntax v0.8.11
+   Compiling autocfg v1.5.1
+   Compiling strsim v0.11.1
+   Compiling heck v0.5.0
+   Compiling serde v1.0.229
+   Compiling crossbeam-utils v0.8.23
+   Compiling aho-corasick v1.1.5
+   Compiling hashbrown v0.16.1
+   Compiling unicode-segmentation v1.13.3
+   Compiling num-traits v0.2.19
+   Compiling parking_lot_core v0.9.12
+   Compiling zmij v1.0.23
+   Compiling rand_core v0.10.1
+   Compiling either v1.19.0
+   Compiling rustversion v1.0.23
+   Compiling syn v3.0.7
+   Compiling syn v2.0.119
+   Compiling tracing-core v0.1.36
+   Compiling getrandom v0.4.3
+   Compiling ident_case v1.0.1
+   Compiling scopeguard v1.2.0
+   Compiling winnow v1.0.4
+   Compiling serde_json v1.0.152
+   Compiling crossbeam-epoch v0.9.21
+   Compiling toml_parser v1.1.5+spec-1.1.0
+   Compiling lock_api v0.4.14
+   Compiling toml_writer v1.1.3+spec-1.1.0
+   Compiling iana-time-zone v0.1.65
+   Compiling version_check v0.9.5
+   Compiling crossbeam-deque v0.8.8
+   Compiling shlex v2.0.1
+   Compiling humantime v2.4.0
+   Compiling regex-automata v0.4.18
+   Compiling pin-project-lite v0.2.17
+   Compiling find-msvc-tools v0.1.14
+   Compiling castaway v0.2.4
+   Compiling generic-array v0.14.7
+   Compiling cc v1.7.0
+   Compiling chrono v0.4.45
+   Compiling parking_lot v0.12.5
+   Compiling errno v0.3.14
+   Compiling itertools v0.14.0
+   Compiling toml_datetime v1.1.2+spec-1.1.0
+   Compiling serde_spanned v1.1.2
+   Compiling hashbrown v0.17.1
+   Compiling toml v1.1.8+spec-1.1.0
+   Compiling pkg-config v0.3.34
+   Compiling base64 v0.22.1
+   Compiling ryu v1.0.23
+   Compiling unicode-width v0.2.2
+   Compiling static_assertions v1.1.0
+   Compiling xxhash-rust v0.8.19
+   Compiling anstyle v1.0.14
+   Compiling vcpkg v0.2.15
+   Compiling signal-hook v0.3.18
+   Compiling darling_core v0.24.1
+   Compiling unicode-truncate v2.0.1
+   Compiling compact_str v0.9.1
+   Compiling lru v0.18.5
+   Compiling signal-hook-registry v1.4.8
+   Compiling convert_case v0.10.0
+   Compiling fastrand v2.5.0
+   Compiling critical-section v1.2.0
+   Compiling indoc v2.0.8
+   Compiling typenum v1.20.1
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-parse v1.0.0
+   Compiling mio v1.2.4
+   Compiling deranged v0.5.8
+   Compiling libsqlite3-sys v0.36.0
+   Compiling time-core v0.1.9
+   Compiling rayon-core v1.13.0
+   Compiling bstr v1.13.1
+   Compiling litrs v1.0.0
+   Compiling num_threads v0.1.7
+   Compiling colorchoice v1.0.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling powerfmt v0.2.1
+   Compiling num-conv v0.2.2
+   Compiling lazy_static v1.5.1
+   Compiling anstyle-query v1.1.5
+   Compiling rustc-hash v2.1.3
+   Compiling anstream v1.0.0
+   Compiling sharded-slab v0.1.7
+   Compiling tempfile v3.27.0
+   Compiling globset v0.4.20
+   Compiling document-features v0.2.12
+   Compiling tidemark-sys v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/crates/tidemark-sys)
+   Compiling time v0.3.55
+   Compiling signal-hook-mio v0.2.5
+   Compiling matchers v0.2.0
+   Compiling tracing-log v0.2.0
+   Compiling crossbeam-channel v0.5.17
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_derive v1.0.229
+   Compiling hashlink v0.11.1
+   Compiling tracing-attributes v0.1.31
+   Compiling strum_macros v0.28.0
+   Compiling derive_more-impl v2.1.1
+   Compiling line-clipping v0.3.8
+   Compiling thread_local v1.1.10
+   Compiling nu-ansi-term v0.50.3
+   Compiling fallible-iterator v0.3.0
+   Compiling clap_lex v1.1.1
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling clap_derive v4.6.7
+   Compiling clap_builder v4.6.7
+   Compiling block-buffer v0.10.4
+   Compiling derive_more v2.1.1
+   Compiling crypto-common v0.1.7
+   Compiling crossterm v0.29.0
+   Compiling anyhow v1.0.104
+   Compiling kasuari v0.4.12
+   Compiling rayon v1.12.0
+   Compiling tracing v0.1.44
+   Compiling darling_macro v0.24.1
+   Compiling tracing-subscriber v0.3.23
+   Compiling darling v0.24.1
+   Compiling instability v0.3.14
+   Compiling digest v0.10.7
+   Compiling wait-timeout v0.2.1
+   Compiling predicates-core v1.0.10
+   Compiling tidemark-cli v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/crates/tidemark-cli)
+   Compiling cpufeatures v0.2.17
+   Compiling sha2 v0.10.9
+   Compiling difflib v0.4.0
+   Compiling fnv v1.0.7
+   Compiling cpufeatures v0.3.1
+   Compiling strum v0.28.0
+   Compiling termtree v0.5.1
+   Compiling ratatui-core v0.1.2
+   Compiling bit-vec v0.10.1
+   Compiling assert_cmd v2.2.2
+   Compiling quick-error v1.2.3
+   Compiling rusty-fork v0.3.1
+   Compiling predicates-tree v1.0.13
+   Compiling predicates v3.1.4
+   Compiling bit-set v0.11.1
+   Compiling clap v4.6.7
+   Compiling tracing-journald v0.3.2
+   Compiling clap_complete v4.6.11
+   Compiling chacha20 v0.10.2
+   Compiling rand v0.10.3
+   Compiling console v0.16.6
+   Compiling rand_xorshift v0.5.0
+   Compiling core_detect v1.0.0
+   Compiling similar v2.7.0
+   Compiling unarray v0.1.4
+   Compiling ratatui-widgets v0.3.2
+   Compiling ratatui-crossterm v0.1.2
+   Compiling proptest v1.12.0
+   Compiling humantime-serde v1.1.1
+   Compiling insta v1.49.0
+   Compiling tidemark-core v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/crates/tidemark-core)
+   Compiling ratatui-macros v0.7.2
+   Compiling ratatui v0.30.2
+   Compiling tidemark-fs v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/crates/tidemark-fs)
+   Compiling test-support v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/crates/test-support)
+   Compiling tidemark-live v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/crates/tidemark-live)
+   Compiling rusqlite v0.38.0
+   Compiling tidemark-store v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/crates/tidemark-store)
+   Compiling tidemark-scan v0.1.0 (/home/brewerm/git/muse-worktrees/tidemark-tide-chart/crates/tidemark-scan)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 54.40s
+     Running unittests src/lib.rs (target/debug/deps/tidemark_cli-37eec3a2360b1fa3)
+
+running 5 tests
+test deploy::tests::service_compensation_failure_is_reported_and_verified ... ok
+test deploy::tests::compensation_errors_are_reported_with_original_failure ... ok
+
+thread 'tui::tests::tide_chart::reported_info_follows_highlight_and_descended_first_row' (6357) panicked at crates/tidemark-cli/src/tui/../../tests/w7a/tide_chart.rs:55:5:
+/fixture
+Files 1  Inodes 1  Directories 1
+Disk 181 GiB  Reclaim 90.5 GiB  Shared 90.5 GiB
+Age histogram (charged bytes):
+<1d 181 GiB  1-7d 0 B  7-30d 0 B
+30-90d 0 B  90-365d 0 B  >=365d 0 B
+Errors 0
+Link totals: 0 sets, 0 instances, 0 B; incomplete 0
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tui::tests::tide_chart::reported_info_follows_highlight_and_descended_first_row ... FAILED
+
+thread 'tui::tests::tide_chart::reported_chart_total_follows_highlighted_directory' (6356) panicked at crates/tidemark-cli/src/tui/../../tests/w7a/tide_chart.rs:43:5:
+┌tide · root total by snapshot · axis from 158 GiB─────────────────────────────────────────────────────────────Δ +1.00 GiB since previous ▲┐
+│                                                         ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁   ▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃   ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅   ████████████████        │
+│▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃   ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅   ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   ████████████████   ████████████████   ████████████████   ████████████████        │
+│████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████        │
+│████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████        │
+│████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████        │
+│████175 GiB█████   ████176 GiB█████   ████177 GiB█████   ████178 GiB█████   ████179 GiB█████   ████180 GiB█████   ████181 GiB█████        │
+│   10-09 09h          10-09 10h          10-09 11h          10-09 12h          10-09 13h          10-09 14h          10-09 15h            │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+thread 'tui::tests::tide_chart::reported_zero_axis_and_visible_wave_crest' (6358) panicked at crates/tidemark-cli/src/tui/../../tests/w7a/tide_chart.rs:72:5:
+≋ tidemark  /fixture  20260101T000000Z-00000007 · walk · 0s ago · steady                                                  high-water 181 GiB
+┌tide · root total by snapshot · axis from 158 GiB─────────────────────────────────────────────────────────────Δ +1.00 GiB since previous ▲┐
+│                                                         ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁   ▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃   ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅   ████████████████        │
+│▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃   ▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅   ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   ████████████████   ████████████████   ████████████████   ████████████████        │
+│████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████        │
+│████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████        │
+│████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████   ████████████████        │
+│████175 GiB█████   ████176 GiB█████   ████177 GiB█████   ████178 GiB█████   ████179 GiB█████   ████180 GiB█████   ████181 GiB█████        │
+│   10-09 09h          10-09 10h          10-09 11h          10-09 12h          10-09 13h          10-09 14h          10-09 15h            │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌depth · /fixture · sort size──────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  NAME                                                LEVEL            SIZE▾  APPARENT   RECLAIM    SHARED   FILES      NEWEST        TIDE│
+│▶ projects/ ⚓                                         ▆▆▆┈┈┈┈┈┈┈┈┈  41.7 GiB  41.7 GiB  20.8 GiB  20.8 GiB       1 01-01 00:01           -│
+│  logs/ ⚓                                             ┈┈┈┈┈┈┈┈┈┈┈┈  7.00 GiB  7.00 GiB  3.50 GiB  3.50 GiB       1 01-01 00:01           -│
+│  ./ (files here)                                     ┈┈┈┈┈┈┈┈┈┈┈┈       0 B   181 GiB         -         -       1           -           -│
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+⚓  anchored by hard links outside   ⚠ scan errors   ▲ rising   ▼ ebbing   LEVEL = share of charged bytes                                    
+┌strata · projects/──────────────────────────────────────────────────┐┌soundings · projects/───────────────────────────────────────────────┐
+│<1d      ████████████████ 41.7 GiB                                  ││files    1                                                          │
+│1-7d     ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈ 0 B                                       ││inodes   1                                                          │
+│7-30d    ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈ 0 B                                       ││dirs     1                                                          │
+│30-90d   ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈ 0 B                                       ││disk     41.7 GiB                                                   │
+│90-365d  ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈ 0 B                                       ││reclaim  20.8 GiB                                                   │
+│≥365d    ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈ 0 B                                       ││shared   20.8 GiB                                                   │
+│surface = newest · seabed = ≥365d                                   ││reclaimable if removed 50% ██████                                   │
+│errors 0                                                            ││kept alive elsewhere 50% ██████                                     │
+│                                                                    ││                                                                    │
+└────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+↑↓ move · →/⏎ descend · ← up · s sort · / filter · i info · f files · l links · p snapshots · R live · ? help · q quit                      
+                                                                                                                                            
+test tui::tests::tide_chart::reported_chart_total_follows_highlighted_directory ... FAILED
+test tui::tests::tide_chart::reported_zero_axis_and_visible_wave_crest ... FAILED
+
+failures:
+
+failures:
+    tui::tests::tide_chart::reported_chart_total_follows_highlighted_directory
+    tui::tests::tide_chart::reported_info_follows_highlight_and_descended_first_row
+    tui::tests::tide_chart::reported_zero_axis_and_visible_wave_crest
+
+test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 207 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `-p tidemark-cli --lib`

@@ -2,7 +2,7 @@
 source: crates/tidemark-cli/src/tui/../../tests/w7a/browser.rs
 expression: first
 ---
-/fixture  20260101T000000Z-00000000 · walk · 1m 39s ago · steady    high-water -
+/fixture  20260101T000000Z-00000000 · walk · 1m 39s ago · steady            hw -
 ┌depth · /fixture · sort size──────────────────────────────────────────────────┐
 │  NAME        LEVEL     SIZE▾  RECLAIM   SHARED  FILES      NEWEST        TIDE│
 │▶ 00...01/ ⚓  ▆▆┈┈┈┈ 4.00 KiB 2.00 KiB 2.00 KiB      1 01-01 00:01           -│

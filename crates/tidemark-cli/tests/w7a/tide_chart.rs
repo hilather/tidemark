@@ -1,0 +1,694 @@
+//! Owned by: W7-A
+//! Selected-directory tide regressions using distinct, valid immutable snapshots.
+
+use super::*;
+
+const GIB: u64 = 1 << 30;
+const CHILD: u64 = 417 * GIB / 10;
+
+fn series() -> (tempfile::TempDir, Browser) {
+    let (temp, mut b) = browser(1);
+    let mut catalog = Vec::new();
+    for index in 1..=7 {
+        let mut rows = vec![
+            fixture::row(0, None, b"/fixture", (174 + index) * GIB),
+            fixture::row(1, Some(0), b"/fixture/projects", CHILD - (7 - index) * GIB),
+            fixture::row(2, Some(1), b"/fixture/projects/deep", 32 * GIB / 10),
+            fixture::row(3, Some(0), b"/fixture/logs", index * GIB),
+        ];
+        rows[0].own_charged = 0;
+        rows[0].own_apparent = 0;
+        rows[1].own_charged = 0;
+        rows[1].own_apparent = 0;
+        rows[1].subtree_end = 2;
+        rows[2].depth = 2;
+        if index % 2 == 0 {
+            for row in &mut rows[1..] {
+                row.id += 1;
+                row.subtree_end += 1;
+                if row.parent_id != Some(0) {
+                    row.parent_id = row.parent_id.map(|id| id + 1);
+                }
+            }
+            rows[0].subtree_end += 1;
+            rows.insert(1, fixture::row(1, Some(0), b"/fixture/added-earlier", 1));
+        }
+        let mut meta = fixture::meta(rows[0].path.clone(), 1_760_000_000 + index as i64 * 3600);
+        meta.scan_id = serde_json::from_str(&format!("\"20260101T000000Z-{index:08}\"")).unwrap();
+        let mut writer =
+            tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+        writer.put_dirs(&rows).unwrap();
+        let projects = rows
+            .iter()
+            .find(|r| r.path.as_bytes() == b"/fixture/projects")
+            .unwrap();
+        writer
+            .put_annotations(&[tidemark_core::snapshot::AnnotationRow {
+                dir_id: projects.id,
+                key: "owner".into(),
+                value: "projects".into(),
+            }])
+            .unwrap();
+        let file = writer.finish(&meta).unwrap();
+        catalog.push((
+            meta.scan_id.to_string(),
+            file,
+            meta.started_at,
+            Some(rows[0].t_disk),
+        ));
+    }
+    b.snapshot_file = catalog.last().unwrap().1.clone();
+    b.snapshot = Snapshot::open(&b.snapshot_file).unwrap();
+    b.dir = b.snapshot.root().unwrap();
+    b.snapshots = catalog;
+    b.load().unwrap();
+    (temp, b)
+}
+
+#[test]
+fn reported_chart_total_follows_highlighted_directory() {
+    let (_temp, mut b) = series();
+    pump(&mut b);
+    let screen = render(&b, 140, 40);
+    let chart = screen
+        .lines()
+        .skip(2)
+        .take(9)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(chart.contains("/fixture/projects"), "{chart}");
+    assert!(chart.contains("41.7 GiB"), "{chart}");
+    assert!(!chart.contains("181 GiB"), "{chart}");
+    b.on_key(KeyCode::Down, &Default::default()).unwrap();
+    pump(&mut b);
+    let screen = render(&b, 140, 40);
+    assert!(screen.contains("tide · /fixture/logs · disk"), "{screen}");
+}
+
+#[test]
+fn reported_info_follows_highlight_and_descended_first_row() {
+    let (_temp, mut b) = series();
+    b.on_key(KeyCode::Char('i'), &Default::default()).unwrap();
+    assert!(b.text.starts_with("/fixture/projects\n"), "{}", b.text);
+    assert!(b.text.contains("Disk 41.7 GiB"), "{}", b.text);
+    b.close_pane();
+    b.on_key(KeyCode::Enter, &Default::default()).unwrap();
+    b.on_key(KeyCode::Char('i'), &Default::default()).unwrap();
+    assert!(b.text.starts_with("/fixture/projects/deep\n"), "{}", b.text);
+    assert!(b.text.contains("Disk 3.20 GiB"), "{}", b.text);
+    b.close_pane();
+    b.on_key(KeyCode::Backspace, &Default::default()).unwrap();
+    b.on_key(KeyCode::Char('i'), &Default::default()).unwrap();
+    assert!(b.text.starts_with("/fixture/projects\n"), "{}", b.text);
+}
+
+#[test]
+fn failed_info_frame_keeps_running_and_retries_until_the_read_succeeds() {
+    let (temp, mut b) = series();
+    b.pane(Pane::Info).unwrap();
+    let previous_text = b.text.clone();
+    let previous_subject = b.info_subject.clone();
+
+    // Rename the annotations table in a private copy without changing SQLite page offsets.
+    // This preserves readable metadata/directories but makes the real Info query fail.
+    let mut bytes = std::fs::read(&b.snapshot_file).unwrap();
+    let name = b"annotations";
+    let mut replacements = 0;
+    for offset in 0..=bytes.len() - name.len() {
+        if &bytes[offset..offset + name.len()] == name {
+            bytes[offset] = b'x';
+            replacements += 1;
+        }
+    }
+    assert!(replacements > 0);
+    let broken = temp.path().join("missing-annotations.db");
+    std::fs::write(&broken, bytes).unwrap();
+    b.snapshot = Snapshot::open(&broken).unwrap();
+    b.data_revision += 1;
+    for _ in 0..2 {
+        b.message.clear();
+        b.prepare_frame(80, 24);
+        assert!(b.message.contains("annotations"), "{}", b.message);
+        assert_eq!(b.state.pane, Pane::Info);
+        assert_eq!(b.info_subject, previous_subject);
+        assert_eq!(b.text, previous_text);
+        assert!(render(&b, 80, 24).contains("annotations"));
+    }
+
+    // No subject/revision change: the next frame must retry the failed read.
+    b.snapshot = Snapshot::open(&b.snapshot_file).unwrap();
+    b.prepare_frame(80, 24);
+    assert_eq!(
+        b.info_subject,
+        Some((b.subject().0.path.clone(), b.data_revision))
+    );
+    assert_eq!(b.text.matches("owner: projects").count(), 1);
+    assert!(!b.on_key(KeyCode::Esc, &Default::default()).unwrap());
+    assert_eq!(b.state.pane, Pane::Main);
+}
+
+#[test]
+fn chart_title_and_delta_keep_separate_display_budgets() {
+    let (_temp, mut b) = series();
+    pump(&mut b);
+    for path in [
+        format!("/{}", "p".repeat(180)),
+        format!("/{}", "海".repeat(90)),
+    ] {
+        b.rows[0].0.path = RawPath::new(path.into_bytes()).unwrap();
+        for width in [100, 140] {
+            let screen = buffer(&b, width, 40);
+            let mut title = String::new();
+            let mut x = 0;
+            while x < width {
+                let glyph = screen[(x, 2)].symbol();
+                title.push_str(glyph);
+                // Ratatui reserves a second cell for the wide fixture character.
+                x += if glyph == "海" { 2 } else { 1 };
+            }
+            let left_end = title.find(" · disk").expect("complete subject title") + " · disk".len();
+            let left_start = title.find("tide · ").unwrap();
+            let delta_start = title.find(" Δ ").expect("complete delta label");
+            let delta_end = title.rfind('┐').unwrap();
+            let left = &title[left_start..left_end];
+            let right = &title[delta_start..delta_end];
+            assert!(right.contains("+1.00 GiB since previous ▲"), "{title}");
+            assert!(title[left_end..delta_start].contains('─'), "{title}");
+            assert!(
+                crate::render::table::display_width(left)
+                    + crate::render::table::display_width(right)
+                    + 3
+                    <= usize::from(width - 2),
+                "conservative title budgets overlap: {title}"
+            );
+        }
+    }
+}
+
+#[test]
+fn reported_zero_axis_and_visible_wave_crest() {
+    let (_temp, mut b) = series();
+    pump(&mut b);
+    let screen = render(&b, 140, 40);
+    assert!(!screen.contains("axis from"), "{screen}");
+    assert!(screen.contains("0 B"), "{screen}");
+    assert!(
+        screen.contains("█▇▆▇"),
+        "full-height crest missing\n{screen}"
+    );
+}
+
+fn pump(b: &mut Browser) {
+    b.prepare(140, 40).unwrap();
+    b.history.settle(b.clock);
+}
+
+fn buffer(b: &Browser, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|f| draw::draw(f, b)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+#[test]
+fn zero_axis_clamp_and_every_fractional_crest() {
+    assert_eq!(
+        [0, 25, 50, 100].map(|v| draw::eighths(v, 100, 5)),
+        [0, 10, 20, 40]
+    );
+    assert_eq!(draw::eighths(u64::MAX, 1, 5), 40);
+    assert_eq!(draw::eighths(u64::MAX, u64::MAX, 5), 40);
+    assert_eq!(draw::eighths(1, u64::MAX, 5), 0);
+    for h in [0, 1, 5] {
+        assert_eq!(draw::eighths(0, 0, h), 0);
+        assert_eq!(draw::eighths(100, 100, h), h * 8);
+        for e in 1..=8 * h {
+            let fill = (e - 1) % 8 + 1;
+            let base = (e - 1) / 8 * 8;
+            let levels: Vec<_> = (0..16).map(|c| draw::crest(fill, c)).collect();
+            assert_eq!(levels.iter().max(), Some(&fill));
+            assert!(levels.iter().all(|level| *level >= 1 && base + level <= e));
+            if fill == 1 {
+                assert_eq!(levels, vec![1; 16]);
+            }
+        }
+    }
+
+    let (_temp, mut b) = series();
+    pump(&mut b);
+    for e in 1..=8 {
+        b.history.samples.fill(Some(history::Sample::Known(40)));
+        b.history.samples[0] = Some(history::Sample::Known(e));
+        let screen = buffer(&b, 140, 40);
+        let mut levels = Vec::new();
+        for x in 4..20 {
+            for y in 3..7 {
+                assert_eq!(screen[(x, y)].symbol(), " ", "e={e}, x={x}, y={y}");
+            }
+            let level = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+                .iter()
+                .position(|glyph| *glyph == screen[(x, 7)].symbol())
+                .expect("eighth-block cell");
+            assert!(
+                (1..=e as usize).contains(&level),
+                "e={e}, x={x}, level={level}"
+            );
+            levels.push(level);
+        }
+        assert_eq!(levels.iter().max(), Some(&(e as usize)));
+        if e == 1 {
+            assert_eq!(levels, vec![1; 16]);
+        } else {
+            assert!(levels.iter().any(|level| *level < e as usize));
+        }
+    }
+}
+
+#[test]
+fn renderer_pins_crest_coordinates_colors_labels_and_zero_slots() {
+    use history::Sample::Known;
+    use ratatui::style::{Color, Modifier};
+    let (_temp, mut b) = series();
+    pump(&mut b);
+    b.theme = theme::Theme::select(
+        true,
+        false,
+        Some("truecolor"),
+        Some("xterm"),
+        Some("C.UTF-8"),
+    );
+    b.history.samples = [0, 25, 50, 100, 1, 100, 100]
+        .map(|v| Some(Known(v)))
+        .to_vec();
+    let screen = buffer(&b, 140, 40);
+    assert_eq!(screen[(1, 2)].symbol(), "┌");
+    for y in 3..=7 {
+        assert_eq!(screen[(4, y)].symbol(), " ");
+    }
+    assert_eq!(screen[(23, 6)].symbol(), "▂"); // 25/100 = 10 eighths.
+    assert_eq!(screen[(24, 6)].symbol(), "▁");
+    assert_eq!(screen[(42, 5)].symbol(), "▄"); // 50/100 = 20 eighths.
+    assert_eq!(screen[(61, 3)].symbol(), "█");
+    assert_eq!(screen[(62, 3)].symbol(), "▇");
+    assert_eq!(screen[(63, 3)].symbol(), "▆");
+    assert_eq!(screen[(61, 3)].fg, Color::Rgb(0x9e, 0xf0, 0xe6));
+    assert_eq!(screen[(61, 4)].fg, Color::Rgb(0x2e, 0xc4, 0xb6));
+    assert_eq!(screen[(118, 4)].fg, Color::Rgb(0x9e, 0xf0, 0xe6));
+    assert!(screen[(118, 3)].modifier.contains(Modifier::BOLD));
+    for y in 3..=9 {
+        for x in 2..138 {
+            assert_eq!(screen[(x, y)].bg, Color::Rgb(7, 21, 38));
+        }
+    }
+    let text = render(&b, 140, 40);
+    assert!(text.lines().nth(8).unwrap().contains('●'));
+    assert!(text.lines().nth(9).unwrap().contains("1 B")); // tiny positive keeps its value.
+    assert!(!text
+        .lines()
+        .skip(3)
+        .take(5)
+        .any(|line| line.contains("100 B")));
+    assert!(text.lines().nth(10).unwrap().contains("0 B"));
+    b.history.samples.fill(Some(Known(0)));
+    let zero = buffer(&b, 140, 40);
+    for y in 3..=7 {
+        for x in 4..134 {
+            assert_eq!(zero[(x, y)].symbol(), " ");
+        }
+    }
+}
+
+#[test]
+fn history_matches_paths_when_ids_change_and_older_opened_scans_stay_last() {
+    use history::Sample::Known;
+    let (_temp, mut b) = series();
+    pump(&mut b);
+    assert_eq!(
+        b.history.samples,
+        (1..=7)
+            .map(|i| Some(Known(CHILD - (7 - i) * GIB)))
+            .collect::<Vec<_>>()
+    );
+    b.on_key(KeyCode::Enter, &Default::default()).unwrap();
+    pump(&mut b);
+    assert!(b
+        .history
+        .samples
+        .iter()
+        .all(|s| *s == Some(Known(32 * GIB / 10))));
+    b.on_key(KeyCode::Backspace, &Default::default()).unwrap();
+    b.on_key(KeyCode::Char('p'), &Default::default()).unwrap();
+    let subject = b.subject().0.path.clone();
+    b.on_key(KeyCode::Down, &Default::default()).unwrap();
+    assert_eq!(b.subject().0.path, subject);
+    b.state.selected = 2;
+    b.enter().unwrap();
+    pump(&mut b);
+    assert_eq!(b.history.window.len(), 3);
+    assert_eq!(
+        b.history.window.last().unwrap().id,
+        b.snapshot.meta().scan_id.as_str()
+    );
+    assert!(render(&b, 140, 40).contains("since previous"));
+}
+
+#[test]
+fn own_no_match_and_backspace_follow_the_cursor_without_a_selection_stack() {
+    use history::Sample::Known;
+    let (_temp, mut b) = series();
+    b.on_key(KeyCode::End, &Default::default()).unwrap();
+    pump(&mut b);
+    assert!(b.subject().1);
+    assert_eq!(b.history.samples.last(), Some(&Some(Known(181 * GIB))));
+    let text = render(&b, 140, 40);
+    assert!(text.contains("whole directory"));
+    assert!(text.contains("(files here)"));
+    b.on_key(KeyCode::Char('i'), &Default::default()).unwrap();
+    assert!(b.text.contains("Disk 181 GiB"));
+    assert!(!b.text.contains("[own files]"));
+    b.close_pane();
+    b.state.filter = "nothing".into();
+    b.boundary(false).unwrap();
+    pump(&mut b);
+    assert!(b.subject().1);
+    assert_eq!(b.history.samples.last(), Some(&Some(Known(181 * GIB))));
+    b.state.filter.clear();
+    b.state.sort = state::Sort::Name;
+    b.boundary(false).unwrap();
+    // Name sorting puts ./ at row 0; select projects explicitly, then ascend to ./.
+    let index = b
+        .child_display_index(&RawPath::new(b"/fixture/projects".to_vec()).unwrap())
+        .unwrap();
+    b.state.selected = index;
+    b.main_selected = index;
+    b.on_key(KeyCode::Enter, &Default::default()).unwrap();
+    b.on_key(KeyCode::Backspace, &Default::default()).unwrap();
+    pump(&mut b);
+    assert_eq!(b.main_selected, 0);
+    assert!(b.subject().1);
+    b.on_key(KeyCode::Char('i'), &Default::default()).unwrap();
+    assert!(b.text.contains("Disk 181 GiB"));
+}
+
+#[test]
+fn live_endpoint_preserves_saved_history_scales_above_max_and_stamps_completion_clock() {
+    use history::Sample::Known;
+    let (_temp, mut b) = series();
+    pump(&mut b);
+    let saved = b.history.samples.clone();
+    let mut rows = b.rows.clone();
+    rows[0].0.t_disk = CHILD * 2;
+    rows[0].0.id = 900;
+    b.clock = 2_000_000_000;
+    let root = b.dir.clone();
+    install_refresh(&mut b, root, rows);
+    b.poll_refresh().unwrap();
+    pump(&mut b);
+    assert_eq!(b.pages.live_at, Some(b.clock));
+    assert_eq!(b.history.samples, saved);
+    assert_eq!(b.history.samples.last(), Some(&Some(Known(CHILD))));
+    let text = render(&b, 140, 40);
+    assert!(text.contains("◆ live"));
+    assert!(text.contains("vs snapshot"));
+    assert!(text.contains("83.4 GiB"));
+    let screen = buffer(&b, 140, 40);
+    assert_eq!(screen[(118, 3)].symbol(), "█"); // live max: full height.
+    assert_eq!(screen[(99, 5)].symbol(), "▄"); // saved current: exactly half height.
+    b.on_key(KeyCode::Char('i'), &Default::default()).unwrap();
+    assert!(b.text.contains("Disk 83.4 GiB"));
+    assert!(
+        b.text.contains("owner: projects"),
+        "live id must resolve to the saved path"
+    );
+    b.close_pane();
+    b.on_key(KeyCode::Enter, &Default::default()).unwrap();
+    pump(&mut b);
+    assert!(b.pages.live.is_none());
+    assert!(!render(&b, 140, 40).contains("◆ live"));
+}
+
+#[test]
+fn live_only_path_does_not_borrow_saved_ids_or_seed_a_snapshot() {
+    use history::Sample::MissingPath;
+    let (_temp, mut b) = series();
+    let mut live = b.rows.clone();
+    live[0].0.path = RawPath::new(b"/fixture/only-live".to_vec()).unwrap();
+    live[0].0.name = b"only-live".to_vec(); // Deliberately reuses a saved directory id.
+    let root = b.dir.clone();
+    install_refresh(&mut b, root, live);
+    b.poll_refresh().unwrap();
+    pump(&mut b);
+    assert!(b
+        .history
+        .samples
+        .iter()
+        .all(|sample| *sample == Some(MissingPath)));
+    let text = render(&b, 140, 40);
+    assert!(text.contains("◆ live"));
+    assert!(!text.contains("vs snapshot"));
+    b.on_key(KeyCode::Char('i'), &Default::default()).unwrap();
+    assert!(b.text.starts_with("/fixture/only-live\n"));
+    assert!(!b.text.contains("Link totals"));
+    assert!(!b.text.contains("owner: projects"));
+}
+
+#[test]
+fn pruned_predecessor_in_picker_keeps_browser_open_and_suppresses_delta() {
+    let (_temp, mut b) = series();
+    std::fs::remove_file(&b.snapshots[4].1).unwrap();
+    b.pane(Pane::Picker).unwrap();
+    b.state.selected = 5;
+    b.enter().unwrap();
+    pump(&mut b);
+    assert!(b.old.is_none());
+    assert!(b.message.contains("comparison unavailable"));
+    assert!(matches!(
+        b.history.samples[4],
+        Some(history::Sample::Unavailable(_))
+    ));
+    let text = render(&b, 140, 40);
+    assert!(text.contains("n/a"));
+    assert!(!text.contains("since previous"));
+}
+
+#[test]
+fn chart_snapshots_cover_selections_missing_live_and_fallbacks() {
+    let (_temp, mut b) = series();
+    pump(&mut b);
+    for (name, width, height) in [
+        ("seven", 140, 40),
+        ("threshold", 100, 34),
+        ("compact", 80, 24),
+    ] {
+        let text = render(&b, width, height);
+        insta::with_settings!({snapshot_path => "snapshots"}, { insta::assert_snapshot!(format!("tide_{name}"), text); });
+    }
+    b.on_key(KeyCode::Down, &Default::default()).unwrap();
+    pump(&mut b);
+    insta::with_settings!({snapshot_path => "snapshots"}, { insta::assert_snapshot!("tide_logs", render(&b, 140, 40)); });
+    b.history.samples[2] = Some(history::Sample::MissingPath);
+    b.history.samples[5] = Some(history::Sample::Unavailable("cannot open snapshot"));
+    insta::with_settings!({snapshot_path => "snapshots"}, { insta::assert_snapshot!("tide_missing", render(&b, 140, 40)); });
+    let root = b.dir.clone();
+    let rows = b.rows.clone();
+    install_refresh(&mut b, root, rows);
+    b.poll_refresh().unwrap();
+    pump(&mut b);
+    insta::with_settings!({snapshot_path => "snapshots"}, { insta::assert_snapshot!("tide_live", render(&b, 140, 40)); });
+    for (term, lang, level) in [
+        ("xterm", "C.UTF-8", theme::Level::Basic),
+        ("xterm-256color", "C.UTF-8", theme::Level::Indexed),
+        ("linux", "C", theme::Level::Basic),
+    ] {
+        b.theme = theme::Theme::select(true, false, None, Some(term), Some(lang));
+        assert_eq!(b.theme.level, level);
+        let screen = buffer(&b, 140, 40);
+        assert_eq!(screen[(118, 7)].fg, b.theme.color(theme::Role::Foam));
+        if term == "linux" {
+            let text = render(&b, 140, 40);
+            let chart: String = text.lines().skip(2).take(9).collect();
+            assert!(chart.is_ascii());
+            assert!(chart.contains("+ live"));
+            insta::with_settings!({snapshot_path => "snapshots"}, { insta::assert_snapshot!("tide_ascii", text); });
+        }
+    }
+}
+
+#[test]
+fn history_subject_tracks_page_boundaries_sorts_and_filter() {
+    let (_temp, mut b) = browser_by_size(2500);
+    for sort in [
+        state::Sort::Size,
+        state::Sort::Reclaim,
+        state::Sort::Files,
+        state::Sort::Newest,
+        state::Sort::Growth,
+        state::Sort::Name,
+    ] {
+        b.state.sort = sort;
+        b.boundary(false).unwrap();
+        b.main_selected = b.state.selected;
+        for key in [
+            KeyCode::End,
+            KeyCode::Home,
+            KeyCode::PageDown,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::PageUp,
+        ] {
+            b.on_key(key, &Default::default()).unwrap();
+            pump(&mut b);
+            let (row, _) = b.subject();
+            assert_eq!(b.history.key.as_ref().unwrap().path, row.path);
+            assert_eq!(
+                b.history.samples.last(),
+                Some(&Some(history::Sample::Known(row.t_disk)))
+            );
+        }
+    }
+    b.state.filter = "00002000".into();
+    b.boundary(false).unwrap();
+    pump(&mut b);
+    assert!(b
+        .history
+        .key
+        .as_ref()
+        .unwrap()
+        .path
+        .as_bytes()
+        .ends_with(b"00002000"));
+}
+
+#[test]
+fn insufficient_history_null_catalog_totals_and_hidden_chart() {
+    let (_temp, mut b) = series();
+    for row in &mut b.snapshots {
+        row.3 = None;
+    }
+    pump(&mut b);
+    assert!(render(&b, 100, 34).contains("41.7 GiB"));
+    assert!(!render(&b, 80, 24).contains("tide ·"));
+    b.pane(Pane::Picker).unwrap();
+    b.state.selected = 0;
+    b.enter().unwrap();
+    pump(&mut b);
+    let text = render(&b, 140, 40);
+    assert!(text.contains("Insufficient history"));
+    assert!(text.contains("35.7 GiB disk"));
+
+    let mut live = b.rows.clone();
+    live[0].0.t_disk = CHILD * 2;
+    let root = b.dir.clone();
+    install_refresh(&mut b, root, live);
+    b.poll_refresh().unwrap();
+    pump(&mut b);
+    assert_eq!(b.history.window.len(), 1);
+    for width in [100, 140] {
+        let text = render(&b, width, 40);
+        assert!(
+            text.contains("Insufficient history · 83.4 GiB disk"),
+            "{text}"
+        );
+        assert!(!text.contains("◆ live"), "{text}");
+        assert!(!text.contains("vs snapshot"), "{text}");
+    }
+}
+
+#[test]
+fn failed_and_cancelled_refresh_do_not_create_live_endpoints() {
+    for cancelled in [false, true] {
+        let (_temp, mut b) = series();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        b.refresh = Some(Refresh {
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cancelled)),
+            rx,
+            worker: None,
+            started: std::time::Instant::now(),
+        });
+        tx.send(Err(anyhow::anyhow!("fixture refresh failure")))
+            .unwrap();
+        b.poll_refresh().unwrap();
+        pump(&mut b);
+        assert!(b.pages.live.is_none());
+        assert!(b.pages.live_at.is_none());
+        assert!(!render(&b, 140, 40).contains("◆ live"));
+    }
+}
+
+/// Export the exact deterministic series into an explicitly requested isolated state directory.
+/// No files are retained in ordinary test runs.
+#[test]
+fn export_visual_fixture_when_requested() {
+    use tidemark_store::catalog::{Catalog, ScanEntry};
+    let Some(destination) = std::env::var_os("TIDEMARK_TIDE_CAPTURE_DIR") else {
+        return;
+    };
+    let destination = std::path::PathBuf::from(destination);
+    assert!(destination.starts_with("/tmp"));
+    assert!(!destination.exists(), "choose a fresh isolated directory");
+    std::fs::create_dir(&destination).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = destination.join("tree");
+    std::fs::create_dir_all(root.join("projects/deep")).unwrap();
+    std::fs::create_dir_all(root.join("logs")).unwrap();
+    let raw_root = RawPath::from_path(&root).unwrap();
+    let state = destination.join("state");
+    let catalog = Catalog::open(&state, true).unwrap();
+    let files = state
+        .join("snapshots")
+        .join(tidemark_store::catalog::root_slug(&raw_root));
+    let (_temp, b) = series();
+    for entry in &b.snapshots {
+        let original = Snapshot::open(&entry.1).unwrap();
+        let mut meta = original.meta().clone();
+        meta.root = raw_root.clone();
+        meta.root_display = raw_root.display_lossy();
+        let mut rows = Vec::new();
+        for id in 0..=original.root().unwrap().subtree_end {
+            let mut row = original.dir(id).unwrap();
+            row.path = RawPath::new(
+                [
+                    raw_root.as_bytes(),
+                    &row.path.as_bytes()[b"/fixture".len()..],
+                ]
+                .concat(),
+            )
+            .unwrap();
+            row.path_hash = row.path.hash64();
+            if id == 0 {
+                row.name = raw_root.as_bytes().to_vec();
+            }
+            rows.push(row);
+        }
+        // Logs exists only in newer saved scans, giving the visual missing-path case.
+        if entry.2 < b.snapshots[3].2 {
+            rows.retain(|r| !r.path.as_bytes().ends_with(b"/logs"));
+        }
+        let mut writer = tidemark_store::writer::SnapshotWriter::create(&files, &meta).unwrap();
+        writer.put_dirs(&rows).unwrap();
+        let file = writer.finish(&meta).unwrap();
+        catalog
+            .record_finish(&ScanEntry {
+                scan_id: meta.scan_id.to_string(),
+                root: raw_root.clone(),
+                mode: meta.mode,
+                started_at: meta.started_at,
+                finished_at: Some(meta.finished_at),
+                status: "complete".into(),
+                degraded: false,
+                file: Some(file),
+                t_disk: entry.3,
+                t_inodes: Some(3),
+                t_dirs: Some(rows.len() as u64),
+                errors: Some(0),
+                duration_ms: Some(1000),
+            })
+            .unwrap();
+    }
+    std::fs::write(
+        destination.join("config.toml"),
+        format!("[general]\nstate_dir = {:?}\n", state),
+    )
+    .unwrap();
+    println!("visual fixture {}", destination.display());
+}
