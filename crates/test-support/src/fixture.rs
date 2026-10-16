@@ -575,6 +575,20 @@ mod tests {
         let victim = crate::private_tempdir().unwrap();
         let victim_child = victim.path().join("child");
         fs::create_dir(&victim_child).unwrap();
+        struct RestoreVictim([File; 2]);
+        impl Drop for RestoreVictim {
+            fn drop(&mut self) {
+                for directory in &self.0 {
+                    let _ = directory.set_permissions(Permissions::from_mode(0o700));
+                }
+            }
+        }
+        // Declared after victim so permissions are restored before TempDir drops,
+        // including when an assertion unwinds. Handles avoid following replacements.
+        let _restore_victim = RestoreVictim([
+            File::open(victim.path()).unwrap(),
+            File::open(&victim_child).unwrap(),
+        ]);
         fs::set_permissions(victim.path(), Permissions::from_mode(0o500)).unwrap();
         fs::set_permissions(&victim_child, Permissions::from_mode(0o500)).unwrap();
         fs::set_permissions(base.join("parent"), Permissions::from_mode(0o700)).unwrap();
