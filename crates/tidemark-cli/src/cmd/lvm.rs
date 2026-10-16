@@ -24,7 +24,12 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 "lvm",
                 context,
                 &tidemark_core::api::LvmParams {
-                    mount: super::now::mount(args.mount.as_deref())?,
+                    mount: super::now::mount(
+                        args.mount.as_deref(),
+                        "lvm",
+                        context.json,
+                        &mut std::io::stdout().lock(),
+                    )?,
                 },
             )?;
             let db = context.config.general.state_dir.join("timeseries.db");

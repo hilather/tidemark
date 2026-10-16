@@ -1,8 +1,6 @@
 //! Owned by: W6-A3
 //! Command surface and shared CLI support.
 
-use anyhow::Context as _;
-
 /// Final arguments for this command.
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -13,14 +11,18 @@ pub struct Args {
 
 /// Execute the command through the daemon API.
 pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
+    let mount = mount(
+        args.mount.as_deref(),
+        "now",
+        context.json,
+        &mut std::io::stdout().lock(),
+    )?;
     let mut client = connect(context)?;
     let report: tidemark_core::live::NowReport = mount_call(
         &mut client,
         "now",
         context,
-        &tidemark_core::api::NowParams {
-            mount: mount(args.mount.as_deref())?,
-        },
+        &tidemark_core::api::NowParams { mount },
     )?;
     crate::render::now::write(&report, context, &mut std::io::stdout().lock())
 }
@@ -66,13 +68,8 @@ fn mount_call_error(
             && remote.message.contains(" is not watched (watch.mounts = ")
         {
             if json {
-                let schema = match method {
-                    "hot" => "tidemark.hot.v1",
-                    "now" => "tidemark.now.v1",
-                    "phantom" => "tidemark.phantom.v1",
-                    "writers" => "tidemark.writers.v1",
-                    "lvm" => "tidemark.lvm.v1",
-                    _ => return call_error(error, method),
+                let Some(schema) = mount_schema(method) else {
+                    return call_error(error, method);
                 };
                 if let Err(write_error) =
                     crate::render::json(schema, serde_json::json!({"error": remote}), out)
@@ -118,10 +115,45 @@ pub(crate) fn call_error(e: crate::client::ClientError, method: &str) -> anyhow:
     };
     error.context(format!("daemon request {method}"))
 }
-pub(crate) fn mount(path: Option<&std::path::Path>) -> anyhow::Result<Option<String>> {
+fn mount_schema(method: &str) -> Option<&'static str> {
+    match method {
+        "hot" => Some("tidemark.hot.v1"),
+        "now" => Some("tidemark.now.v1"),
+        "phantom" => Some("tidemark.phantom.v1"),
+        "writers" => Some("tidemark.writers.v1"),
+        "lvm" => Some("tidemark.lvm.daemon.v1"),
+        _ => None,
+    }
+}
+
+pub(crate) fn mount(
+    path: Option<&std::path::Path>,
+    method: &str,
+    json: bool,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<Option<String>> {
     path.map(|p| {
-        let raw = tidemark_fs::canon::canonicalize(p)
-            .with_context(|| format!("resolve mount: {}", super::display_path(p)))?;
+        let raw = tidemark_fs::canon::canonicalize(p).map_err(|error| {
+            let message = format!("resolve mount: {}: {error}", super::display_path(p));
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return anyhow::Error::new(error)
+                    .context(format!("resolve mount: {}", super::display_path(p)));
+            }
+            if json {
+                if let Some(schema) = mount_schema(method) {
+                    let error = tidemark_core::api::ApiError {
+                        code: tidemark_core::api::ApiErrorCode::NotFound,
+                        message: message.clone(),
+                    };
+                    if let Err(error) =
+                        crate::render::json(schema, serde_json::json!({"error": error}), out)
+                    {
+                        return error;
+                    }
+                }
+            }
+            crate::CliError::Precondition(message).into()
+        })?;
         raw.as_path().to_str().map(str::to_owned).ok_or_else(|| {
             crate::CliError::Configuration("API mount labels require UTF-8".into()).into()
         })
@@ -158,6 +190,84 @@ impl Drop for Interrupt {
 #[cfg(test)]
 mod mount_filter_tests {
     #[test]
+    fn missing_mount_is_a_precondition() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        let os_error = tidemark_fs::canon::canonicalize(&missing).unwrap_err();
+        let message = format!(
+            "resolve mount: {}: {os_error}",
+            super::super::display_path(&missing)
+        );
+        for method in ["phantom", "writers", "lvm", "now", "hot"] {
+            for json in [false, true] {
+                let mut output = Vec::new();
+                let error = super::mount(Some(&missing), method, json, &mut output).unwrap_err();
+                assert!(
+                    matches!(error.downcast_ref::<crate::CliError>(), Some(crate::CliError::Precondition(detail)) if detail == &message)
+                );
+                assert_eq!(crate::command_error(error).exit_code(), 5);
+                if json {
+                    let doc: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                    let schema = if method == "lvm" {
+                        "tidemark.lvm.daemon.v1".to_owned()
+                    } else {
+                        format!("tidemark.{method}.v1")
+                    };
+                    assert_eq!(
+                        doc,
+                        serde_json::json!({"schema": schema, "data": {"error": {"code": "not_found", "message": message}}})
+                    );
+                } else {
+                    assert!(output.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mount_resolution_keeps_existing_optional_and_utf8_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        assert_eq!(super::mount(None, "now", true, &mut out).unwrap(), None);
+        assert_eq!(
+            super::mount(Some(temp.path()), "now", true, &mut out).unwrap(),
+            Some(
+                std::fs::canonicalize(temp.path())
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            )
+        );
+        use std::os::unix::ffi::OsStringExt;
+        let non_utf8 = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![b'x', 255]));
+        std::fs::create_dir(&non_utf8).unwrap();
+        let error = super::mount(Some(&non_utf8), "now", true, &mut out).unwrap_err();
+        assert_eq!(crate::command_error(error).exit_code(), 2);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn disabled_lvm_remote_error_keeps_unavailable_exit() {
+        let error = super::mount_call_error(
+            crate::client::ClientError::Remote(tidemark_core::api::ApiError {
+                code: tidemark_core::api::ApiErrorCode::Unavailable,
+                message: "unavailable: lvm report not configured: disabled by config".into(),
+            }),
+            "lvm",
+            false,
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "daemon request lvm: unavailable: lvm report not configured: disabled by config"
+        );
+        assert_eq!(crate::command_error(error).exit_code(), 4);
+    }
+
+    #[test]
     fn phantom_unwatched_mapping_in_text_and_json() {
         let message = "/B is not watched (watch.mounts = [\"/A\"]); add it to [watch].mounts and run: tidemark deploy stage --from <file>";
         for method in ["phantom", "writers", "lvm", "now", "hot"] {
@@ -179,7 +289,14 @@ mod mount_filter_tests {
                 assert_eq!(crate::command_error(error).exit_code(), 5);
                 if json {
                     let doc: serde_json::Value = serde_json::from_slice(&output).unwrap();
-                    assert_eq!(doc["schema"], format!("tidemark.{method}.v1"));
+                    assert_eq!(
+                        doc["schema"],
+                        if method == "lvm" {
+                            "tidemark.lvm.daemon.v1".to_owned()
+                        } else {
+                            format!("tidemark.{method}.v1")
+                        }
+                    );
                     assert_eq!(doc["data"]["error"]["code"], "unavailable");
                     assert_eq!(
                         doc["data"]["error"]["message"],
