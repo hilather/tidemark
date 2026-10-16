@@ -12,7 +12,8 @@ import re
 import subprocess
 import unicodedata
 
-OUT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
+OUT = REPO_ROOT / 'docs' / 'screenshots' / 'tui-tide-chart'
 MOCK = Path('/home/brewerm/git/muse-worktrees/plans/tidemark-tide-chart/mocks/concept-3-tide.png')
 PALETTE = ['#000000','#800000','#008000','#808000','#000080','#800080','#008080','#c0c0c0',
            '#808080','#ff0000','#00ff00','#ffff00','#0000ff','#ff00ff','#00ffff','#ffffff']

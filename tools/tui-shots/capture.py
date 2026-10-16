@@ -10,8 +10,9 @@ import subprocess
 import tempfile
 import time
 
-OUT = Path(__file__).resolve().parent
-REPO = OUT.parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+OUT = REPO_ROOT / 'docs' / 'screenshots' / 'tui-tide-chart'
+REPO = REPO_ROOT
 FIXTURE = Path(os.environ.get('TIDEMARK_TIDE_CAPTURE_DIR', '/tmp/tidemark-tide-visual'))
 ROOT = str(FIXTURE / 'tree')
 # A fresh private socket guarantees that cleanup cannot target another run's server.
@@ -80,7 +81,7 @@ try:
                        colors='TERM=xterm-256color COLORTERM=truecolor; NO_COLOR=1 for Mono',
                        fixture=str(FIXTURE), binary=str(BINARY), timestamp=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                        command=command(), kernel=os.uname().release)
-    (OUT / 'capture.json').write_text(json.dumps(environment, indent=2) + '\n')
+    (Path('/tmp/tidemark-tide-visual') / 'capture.json').write_text(json.dumps(environment, indent=2) + '\n')
 finally:
     # This server/socket and all its panes were started by this script.
     # Send normal quit to each TUI, then close only our private server.

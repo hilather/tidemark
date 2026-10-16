@@ -51,7 +51,7 @@ The three `reported_*` tests were written and run before any production implemen
 | `reported_info_follows_highlight_and_descended_first_row` | **FAIL**: Info named the containing root. | **PASS**: 41.7 GiB selected child, 3.20 GiB first row after Enter, parent row zero after Backspace. |
 | `reported_zero_axis_and_visible_wave_crest` | **FAIL**: positive `axis from` floor and no wave crest. | **PASS**: explicit zero baseline and bounded visible crest. |
 
-Full original output: [baseline-regressions.log](../screenshots/tui-tide-chart/baseline-regressions.log). The old tests asserting root-total chart behavior were replaced deliberately. `own_files_columns_and_info` now asserts full-directory Info without the misleading own-files note. The size-column test now identifies the table row explicitly because the insufficient-history state also displays the subject's size.
+The full before/after test output was reviewed locally and is not committed. The old tests asserting root-total chart behavior were replaced deliberately. `own_files_columns_and_info` now asserts full-directory Info without the misleading own-files note. The size-column test now identifies the table row explicitly because the insufficient-history state also displays the subject's size.
 
 ## Regression coverage
 
@@ -72,9 +72,9 @@ Snapshot proposals were generated first, inspected as text/diffs, and only then 
 
 | Command | Result |
 | --- | --- |
-| `cargo fmt --all -- --check` | **PASS** after the follow-up fixes; [log](../screenshots/tui-tide-chart/fmt.log). |
-| `cargo clippy --workspace --all-targets -- -D warnings` | **PASS** after the follow-up fixes, including the final tests; [log](../screenshots/tui-tide-chart/clippy.log). |
-| `cargo test -p tidemark-cli` | **PASS** after the follow-up fixes: 234 library tests passed, one existing library scale test ignored; all integration and doc-test targets passed. [Full log](../screenshots/tui-tide-chart/cli-tests.log). |
+| `cargo fmt --all -- --check` | **PASS** after the follow-up fixes. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **PASS** after the follow-up fixes, including the final tests. |
+| `cargo test -p tidemark-cli` | **PASS** after the follow-up fixes: 234 library tests passed, one existing library scale test ignored; all integration and doc-test targets passed. |
 | Focused worker/browser regression runs | **PASS**, including delayed-reader navigation and visual fixtures. |
 | `cargo xtask ci` | **NOT RUN**, explicitly reserved for Matt. |
 | Privileged VM tests | Not run; no new privileged behavior introduced. Existing scale tests remain ignored by the ordinary suite. |
@@ -92,7 +92,7 @@ On this development machine (Linux `7.2.5-3-omarchy`, Rust 1.98.0, unoptimized t
 | Returning to cached path | 18.611 μs | Zero opens/queries |
 | Down + history preparation while an open is held at a barrier | 163.775 μs | The open remains blocked throughout input handling |
 
-[History measurements](../screenshots/tui-tide-chart/history-measurements.log), [navigation barrier measurement](../screenshots/tui-tide-chart/navigation-measurement.log). These measure cold **reader handles**, not a deliberately evicted OS page cache or remote/slow storage. Capture polling times include the existing 100 ms event-loop interval and are recorded separately in `capture.json`. No general table-navigation latency claim is made.
+Measured by `tui::history::tests::seven_reader_bound_eviction_and_cold_warm_measurements` (cold 18.4 ms, warm readers 1.5 ms, cached path 18.6 µs) and `blocked_history_reader_does_not_block_navigation_or_relabel_old_bars` (navigation with a blocked history open: 164 µs). These measure cold **reader handles**, not a deliberately evicted OS page cache or remote/slow storage. Capture polling times include the existing 100 ms event-loop interval and are written to `/tmp/tidemark-tide-visual/capture.json` by the capture script. No general table-navigation latency claim is made.
 
 ## Visual evidence and accepted departures
 
@@ -106,7 +106,7 @@ Evidence lives in [docs/screenshots/tui-tide-chart](../screenshots/tui-tide-char
 
 After the code-gate nits, all final after captures and both comparison composites were regenerated. The supplied mock, composite, and native chart were inspected for palette, border, spacing, fill, crest bounds, labels, and current emphasis. Colors and bar geometry match the required roles/coordinates. The explicit v4 foam ripple is clearly visible within the top occupied cell in both refreshed composites, reviewed at native resolution. The compact capture retains `/tmp.../tree` beside `hw 181 GiB`; the root and descended `./` rows show `0 B` apparent beside `0 B` disk. The accepted differences are selected-directory data; a zero-based scale; two label rows with IEC values; five plot rows instead of six; delta in the border title; missing/loading/live states; the opened `●`/`*` marker; and a separate sand `◆ live`/`+ live` label. The v4 crest tint overrides v3's single-color cap. Fixture paths, number of visible rows, counts, and ages differ from the illustrative mock; unrelated table/panel layout is retained.
 
-Captures are truecolor UTF-8 at 140×40, plus Mono/ASCII and 80×24. `NO_COLOR` is explicitly cleared for color captures and set for Mono. The refreshed capture session completed at `2026-10-16T18:21:09Z`. Each final chart capture waits for the value-label row to contain neither loading marker (Unicode `…`, ASCII `...`); waits and dimensions are in [capture.json](../screenshots/tui-tide-chart/capture.json). The separate `ascii-loading.ansi` preserves an intentionally identified loading frame; it is not the final ASCII comparison.
+Captures are truecolor UTF-8 at 140×40, plus Mono/ASCII and 80×24. `NO_COLOR` is explicitly cleared for color captures and set for Mono. The refreshed capture session completed at `2026-10-16T18:21:09Z`. Each final chart capture waits for the value-label row to contain neither loading marker (Unicode `…`, ASCII `...`); the capture script writes waits and dimensions to `/tmp/tidemark-tide-visual/capture.json`. 
 
 Pango/Cairo renders captured cells at 16 px, 9.6 px columns and 19.5 px rows, with JetBrains Mono/DejaVu Sans Mono and no ligature shaping across cells. Fixed cell coordinates prevent text shaping from moving labels between style runs. ImageMagick only assembles/crops screenshots. Chromium could not finish the isolated local rendering run, so it is not needed by reproduction. Raw ANSI remains the authority for terminal attributes; reset colors use an explicit neutral background in the Mono rendering.
 
@@ -116,11 +116,12 @@ Reproduce with a fresh isolated directory (choose a new name if it already exist
 export TIDEMARK_TIDE_CAPTURE_DIR=/tmp/tidemark-tide-visual-recapture
 cargo test -p tidemark-cli --lib export_visual_fixture_when_requested -- --nocapture
 cargo build -p tidemark-cli --bin tidemark
-python3 docs/screenshots/tui-tide-chart/capture.py
-python3 docs/screenshots/tui-tide-chart/render.py
+python3 tools/tui-shots/capture.py
+python3 tools/tui-shots/render.py
+# intermediate .ansi/.html files land next to the PNGs; only the PNGs are committed
 ```
 
-The capture script creates a fresh private socket directory and closes only the tmux server it starts there; it never reuses an existing session. It uses existing `-q` because an existing throttle warning on stderr can overwrite the live TUI on this fixture filesystem. The original affected capture is preserved as `live-with-stderr.ansi`; no logging behavior was changed. The real empty fixture directories measure 0 B during refresh, correctly leaving an empty labelled live endpoint; the larger-live-value case is separately covered by the buffer regression.
+The capture script creates a fresh private socket directory and closes only the tmux server it starts there; it never reuses an existing session. It uses existing `-q` because an existing throttle warning on stderr can overwrite the live TUI on this fixture filesystem. The original affected capture was kept locally, not committed; no logging behavior was changed. The real empty fixture directories measure 0 B during refresh, correctly leaving an empty labelled live endpoint; the larger-live-value case is separately covered by the buffer regression.
 
 ## Limits and reviewer notes
 
