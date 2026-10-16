@@ -2271,7 +2271,7 @@ fn verify_probe_floor_keeps_fresh_checks(service_error: bool) {
     assert_eq!(core.status, CheckStatus::Fail);
     assert!(core.detail.contains("current daemon health unavailable"));
     assert!(core.detail.contains(
-        "historical core observation: Fail (sampler=degraded; scheduler=ok; api=ok; tswriter=ok)"
+        "historical core observation: Fail (sampler=degraded (measurement pass in progress); scheduler=ok; api=ok; tswriter=ok)"
     ));
     assert!(core
         .detail
@@ -2280,4 +2280,75 @@ fn verify_probe_floor_keeps_fresh_checks(service_error: bool) {
     assert_eq!(api.status, CheckStatus::Fail);
     assert!(api.detail.contains("API request skipped"));
     assert!(api.detail.contains("historical API observation: Pass (ok)"));
+}
+
+#[test]
+fn verify_core_reasons_in_human_and_json_detail() {
+    struct ReasonStatus(usize, String);
+    impl ApiPing for ReasonStatus {
+        fn ping(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+            let mut status = Ping(true).status()?;
+            status.components[self.0].state = "degraded".into();
+            status.components[self.0].detail = self.1.clone();
+            // Healthy components must not expose their detail.
+            for (index, component) in status.components.iter_mut().enumerate() {
+                if index != self.0 {
+                    component.detail = "healthy detail hidden".into();
+                }
+            }
+            Ok(status)
+        }
+    }
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.sys.active.set(true);
+    fixture.report(&record.config_sha256, true);
+    for index in 0..4 {
+        for (raw, expected) in [
+            ("not mounted: /mnt/x".into(), "not mounted: /mnt/x".into()),
+            ("bad\nline\u{1b}\0".into(), "bad\\x0Aline\\x1B\\x00".into()),
+            ("é".repeat(150), format!("{}…", "é".repeat(98))),
+            ("x".repeat(200), "x".repeat(200)),
+            ("x".repeat(201), format!("{}…", "x".repeat(197))),
+        ] {
+            let result = verify_with_timing(
+                &fixture.state,
+                Duration::ZERO,
+                &fixture.sys,
+                &ReasonStatus(index, raw),
+                VerifyTiming {
+                    grace: Duration::ZERO,
+                    interval: Duration::ZERO,
+                    normal_interval: Duration::ZERO,
+                },
+                &FakeVerifyClock::default(),
+            )
+            .unwrap();
+            assert!(!result.healthy);
+            let core = result
+                .items
+                .iter()
+                .find(|item| item.name == "core_components")
+                .unwrap();
+            let name = ["sampler", "scheduler", "api", "tswriter"][index];
+            let entry = format!("{name}=degraded ({expected})");
+            // This is the escaping used by the human verify renderer.
+            let human = crate::render::table::diagnostic(&core.detail);
+            assert!(human.contains(&entry), "{human}");
+            assert_eq!(human.lines().count(), 1);
+            let json = serde_json::to_value(&result).unwrap();
+            let json_core = json["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == "core_components")
+                .unwrap();
+            assert!(json_core["detail"].as_str().unwrap().contains(&entry));
+            assert!(!core.detail.contains("healthy detail hidden"));
+            assert!(expected.len() <= 200);
+        }
+    }
 }

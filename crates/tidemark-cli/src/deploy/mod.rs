@@ -241,6 +241,28 @@ fn check(name: &'static str, status: CheckStatus, detail: impl Into<String>) -> 
         detail: detail.into(),
     }
 }
+// Bound the escaped reason, including the ellipsis, to 200 UTF-8 bytes.
+// Escape one scalar at a time to avoid allocating proportional to daemon input,
+// and retain whole scalars/control-byte tokens when truncating.
+fn core_reason(detail: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut output = String::with_capacity(LIMIT);
+    let mut truncated_end = 0;
+    for ch in detail.chars() {
+        let mut bytes = [0; 4];
+        let token = crate::render::table::diagnostic(ch.encode_utf8(&mut bytes));
+        if output.len() + token.len() > LIMIT {
+            output.truncate(truncated_end);
+            output.push('…');
+            break;
+        }
+        output.push_str(&token);
+        if output.len() <= LIMIT - '…'.len_utf8() {
+            truncated_end = output.len();
+        }
+    }
+    output
+}
 fn io_detail(error: &io::Error) -> String {
     if error.kind() == io::ErrorKind::PermissionDenied {
         format!("{error}; {}", crate::ACCESS_HINT)
@@ -769,20 +791,27 @@ fn verify_poll(
     let core_details = ["sampler", "scheduler", "api", "tswriter"]
         .iter()
         .map(|name| {
-            let states: Vec<_> = components
+            let matching: Vec<_> = components
                 .into_iter()
                 .flatten()
                 .filter(|component| component.name == *name)
-                .map(|component| component.state.as_str())
                 .collect();
-            format!(
-                "{name}={}",
-                if states.is_empty() {
-                    "missing".into()
-                } else {
-                    states.join(",")
-                }
-            )
+            match matching.as_slice() {
+                [] => format!("{name}=missing"),
+                [component] if component.state != "ok" => format!(
+                    "{name}={} ({})",
+                    component.state,
+                    core_reason(&component.detail)
+                ),
+                _ => format!(
+                    "{name}={}",
+                    matching
+                        .iter()
+                        .map(|component| component.state.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            }
         })
         .collect::<Vec<_>>()
         .join("; ");
