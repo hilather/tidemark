@@ -23,18 +23,20 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             std::time::Duration::from_secs(11),
         ) {
             Ok(mut client) => {
+                let params = tidemark_core::api::PhantomParams {
+                    mount: super::now::mount(
+                        args.mount.as_deref(),
+                        "phantom",
+                        context.json,
+                        &mut std::io::stdout().lock(),
+                    )?,
+                };
                 let rows: tidemark_core::api::PhantomResult = super::now::mount_call(
                     &mut client,
                     "phantom",
                     context,
-                    &tidemark_core::api::PhantomParams {
-                        mount: super::now::mount(
-                            args.mount.as_deref(),
-                            "phantom",
-                            context.json,
-                            &mut std::io::stdout().lock(),
-                        )?,
-                    },
+                    params.mount.as_deref(),
+                    &params,
                 )?;
                 return crate::render::now::phantom(
                     &rows,

@@ -18,11 +18,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         &mut std::io::stdout().lock(),
     )?;
     let mut client = connect(context)?;
+    let params = tidemark_core::api::NowParams { mount };
     let report: tidemark_core::live::NowReport = mount_call(
         &mut client,
         "now",
         context,
-        &tidemark_core::api::NowParams { mount },
+        params.mount.as_deref(),
+        &params,
     )?;
     crate::render::now::write(&report, context, &mut std::io::stdout().lock())
 }
@@ -50,22 +52,36 @@ pub(crate) fn mount_call<P: serde::Serialize, R: serde::de::DeserializeOwned>(
     client: &mut crate::client::Client,
     method: &str,
     context: &crate::Context,
+    mount: Option<&str>,
     params: &P,
 ) -> anyhow::Result<R> {
     client.call(method, params).map_err(|error| {
-        mount_call_error(error, method, context.json, &mut std::io::stdout().lock())
+        mount_call_error(
+            error,
+            method,
+            mount,
+            context.json,
+            &mut std::io::stdout().lock(),
+        )
     })
 }
 
 fn mount_call_error(
     error: crate::client::ClientError,
     method: &str,
+    mount: Option<&str>,
     json: bool,
     out: &mut impl std::io::Write,
 ) -> anyhow::Error {
     if let crate::client::ClientError::Remote(remote) = &error {
         if remote.code == tidemark_core::api::ApiErrorCode::Unavailable
-            && remote.message.contains(" is not watched (watch.mounts = ")
+            && mount.is_some_and(|mount| {
+                remote
+                    .message
+                    .strip_prefix("unavailable: ")
+                    .and_then(|message| message.strip_prefix(mount))
+                    .is_some_and(|suffix| suffix.starts_with(" is not watched (watch.mounts = "))
+            })
         {
             if json {
                 let Some(schema) = mount_schema(method) else {
@@ -203,7 +219,7 @@ mod mount_filter_tests {
                 crate::client::ClientError::Remote(tidemark_core::api::ApiError {
                     code: tidemark_core::api::ApiErrorCode::Unavailable,
                     message: "unavailable: /B is not watched (watch.mounts = [\"/A\"]); add it to [watch].mounts and run: tidemark deploy stage --from <file>".into(),
-                }), method, false, &mut Vec::new(),
+                }), method, Some("/B"), false, &mut Vec::new(),
             );
             println!("{prefix}: {error:#}");
             let cli = crate::cli::Cli::try_parse_from([
@@ -288,6 +304,7 @@ mod mount_filter_tests {
                 message: "unavailable: lvm report not configured: disabled by config".into(),
             }),
             "lvm",
+            None,
             false,
             &mut Vec::new(),
         );
@@ -300,66 +317,114 @@ mod mount_filter_tests {
 
     #[test]
     fn absent_mount_is_unavailable_in_text_and_json_for_all_methods() {
-        for method in ["hot", "now", "phantom", "writers", "lvm"] {
-            for json in [false, true] {
-                let remote = tidemark_core::api::ApiError {
-                    code: tidemark_core::api::ApiErrorCode::Unavailable,
-                    message: "unavailable: mount not present: /A".into(),
-                };
-                let mut output = Vec::new();
-                let error = super::mount_call_error(
-                    crate::client::ClientError::Remote(remote),
-                    method,
-                    json,
-                    &mut output,
-                );
-                assert_eq!(
-                    format!("{error:#}"),
-                    format!("daemon request {method}: unavailable: mount not present: /A")
-                );
-                assert_eq!(crate::command_error(error).exit_code(), 4);
-                assert!(output.is_empty(), "{method} json={json}");
+        for mount in ["/A", "/data is not watched (watch.mounts = x"] {
+            for method in ["hot", "now", "phantom", "writers", "lvm"] {
+                for json in [false, true] {
+                    let remote = tidemark_core::api::ApiError {
+                        code: tidemark_core::api::ApiErrorCode::Unavailable,
+                        message: format!("unavailable: mount not present: {mount}"),
+                    };
+                    let mut output = Vec::new();
+                    let error = super::mount_call_error(
+                        crate::client::ClientError::Remote(remote),
+                        method,
+                        Some(mount),
+                        json,
+                        &mut output,
+                    );
+                    assert_eq!(
+                        format!("{error:#}"),
+                        format!("daemon request {method}: unavailable: mount not present: {mount}")
+                    );
+                    assert_eq!(crate::command_error(error).exit_code(), 4);
+                    assert!(output.is_empty(), "{method} json={json}");
+                }
             }
         }
     }
 
     #[test]
     fn phantom_unwatched_mapping_in_text_and_json() {
-        let message = "/B is not watched (watch.mounts = [\"/A\"]); add it to [watch].mounts and run: tidemark deploy stage --from <file>";
-        for method in ["phantom", "writers", "lvm", "now", "hot"] {
+        for mount in ["/B", "/data is not watched (watch.mounts = x"] {
+            let message = format!("{mount} is not watched (watch.mounts = [\"/A\"]); add it to [watch].mounts and run: tidemark deploy stage --from <file>");
+            for method in ["phantom", "writers", "lvm", "now", "hot"] {
+                for json in [false, true] {
+                    let remote = tidemark_core::api::ApiError {
+                        code: tidemark_core::api::ApiErrorCode::Unavailable,
+                        message: format!("unavailable: {message}"),
+                    };
+                    let mut output = Vec::new();
+                    let error = super::mount_call_error(
+                        crate::client::ClientError::Remote(remote),
+                        method,
+                        Some(mount),
+                        json,
+                        &mut output,
+                    );
+                    assert!(
+                        matches!(error.downcast_ref::<crate::CliError>(), Some(crate::CliError::Precondition(detail)) if detail == &message)
+                    );
+                    assert_eq!(crate::command_error(error).exit_code(), 5);
+                    if json {
+                        let doc: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                        assert_eq!(
+                            doc["schema"],
+                            if method == "lvm" {
+                                "tidemark.lvm.daemon.v1".to_owned()
+                            } else {
+                                format!("tidemark.{method}.v1")
+                            }
+                        );
+                        assert_eq!(doc["data"]["error"]["code"], "unavailable");
+                        assert_eq!(
+                            doc["data"]["error"]["message"],
+                            format!("unavailable: {message}")
+                        );
+                    } else {
+                        assert!(output.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unwatched_classification_requires_exact_requested_mount_and_prefix() {
+        for method in ["hot", "now", "phantom", "writers", "lvm"] {
             for json in [false, true] {
-                let remote = tidemark_core::api::ApiError {
-                    code: tidemark_core::api::ApiErrorCode::Unavailable,
-                    message: format!("unavailable: {message}"),
-                };
-                let mut output = Vec::new();
-                let error = super::mount_call_error(
-                    crate::client::ClientError::Remote(remote),
-                    method,
-                    json,
-                    &mut output,
-                );
-                assert!(
-                    matches!(error.downcast_ref::<crate::CliError>(), Some(crate::CliError::Precondition(detail)) if detail == message)
-                );
-                assert_eq!(crate::command_error(error).exit_code(), 5);
-                if json {
-                    let doc: serde_json::Value = serde_json::from_slice(&output).unwrap();
-                    assert_eq!(
-                        doc["schema"],
-                        if method == "lvm" {
-                            "tidemark.lvm.daemon.v1".to_owned()
-                        } else {
-                            format!("tidemark.{method}.v1")
-                        }
+                for (mount, message) in [
+                    (None, "unavailable: /B is not watched (watch.mounts = [] )"),
+                    (
+                        Some("/A"),
+                        "unavailable: /B is not watched (watch.mounts = [] )",
+                    ),
+                    (Some("/B"), "/B is not watched (watch.mounts = [] )"),
+                    (
+                        Some("/B"),
+                        "unavailable: detail: /B is not watched (watch.mounts = [] )",
+                    ),
+                    (
+                        Some("/B"),
+                        "unavailable: /B/subdir is not watched (watch.mounts = [] )",
+                    ),
+                ] {
+                    let mut output = Vec::new();
+                    let error = super::mount_call_error(
+                        crate::client::ClientError::Remote(tidemark_core::api::ApiError {
+                            code: tidemark_core::api::ApiErrorCode::Unavailable,
+                            message: message.into(),
+                        }),
+                        method,
+                        mount,
+                        json,
+                        &mut output,
                     );
-                    assert_eq!(doc["data"]["error"]["code"], "unavailable");
                     assert_eq!(
-                        doc["data"]["error"]["message"],
-                        format!("unavailable: {message}")
+                        format!("{error:#}"),
+                        format!("daemon request {method}: {message}")
                     );
-                } else {
-                    assert!(output.is_empty());
+                    assert_eq!(crate::command_error(error).exit_code(), 4);
+                    assert!(output.is_empty(), "{method} json={json}");
                 }
             }
         }

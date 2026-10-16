@@ -42,8 +42,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         limit: args.limit.unwrap_or(20),
     };
     let mut client = super::now::connect(context)?;
-    let rows: Vec<tidemark_core::live::HotEntry> =
-        super::now::mount_call(&mut client, "hot", context, &params)?;
+    let rows: Vec<tidemark_core::live::HotEntry> = super::now::mount_call(
+        &mut client,
+        "hot",
+        context,
+        params.mount.as_deref(),
+        &params,
+    )?;
     crate::render::hot::write_grouped(
         &rows,
         context.json,
