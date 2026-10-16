@@ -121,13 +121,29 @@ pub(super) fn draw(frame: &mut Frame<'_>, b: &Browser) {
     } else {
         title
     };
-    let title = if b.state.pane == Pane::Main {
-        format!("{title} | Name Share SIZE APPARENT RECLAIM SHARED FILES NEWEST Δ")
+    let block = if b.state.pane == Pane::Main {
+        let prefix = format!(
+            "main | {} | filter ",
+            crate::render::enum_label(b.state.sort)
+        );
+        let suffix = if b.pages.live.is_some() {
+            " | live (Δ snapshot)"
+        } else {
+            ""
+        };
+        let filter_width = usize::from(chunks[1].width)
+            .saturating_sub(2 + table::display_width(&prefix) + table::display_width(suffix));
+        let filter = table::shorten(&super::escape(b.state.filter.as_bytes()), filter_width);
+        // The bottom border keeps the full legend visible without consuming a list row.
+        // Only the filter borrows space from the status title; paging is unchanged.
+        Block::bordered()
+            .title(format!("{prefix}{filter}{suffix}"))
+            .title_bottom("Name Share SIZE APPARENT RECLAIM SHARED FILES NEWEST Δ")
     } else {
-        title
+        Block::bordered().title(title)
     };
     let list = List::new(items)
-        .block(Block::bordered().title(title))
+        .block(block)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("> ");
     let mut selection = ListState::default().with_selected(Some(b.state.selected));

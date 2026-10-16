@@ -1206,8 +1206,8 @@ impl LiveStateView {
             .is_some_and(|last| last.ts.saturating_sub(first.ts) >= 300)
     }
     /// Explain a requested mount outside the daemon's effective watch configuration.
-    pub fn hot_unwatched_detail(&self, p: &HotParams) -> Option<String> {
-        let mount = p.mount.as_ref()?;
+    pub fn unwatched_mount_detail(&self, mount: Option<&str>) -> Option<String> {
+        let mount = mount?;
         if self
             .data
             .config
