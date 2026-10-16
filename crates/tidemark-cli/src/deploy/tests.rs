@@ -1409,10 +1409,16 @@ fn purge_writer_child() {
         return;
     };
     let state = PathBuf::from(state);
-    let _catalog = tidemark_store::catalog::Catalog::open(&state, true).unwrap();
-    let _series =
+    let catalog = tidemark_store::catalog::Catalog::open(&state, true).unwrap();
+    let series =
         tidemark_store::timeseries::TimeSeries::open(&state.join("timeseries.db"), true).unwrap();
-    fs::write(state.join("ready"), b"ready").unwrap();
+    // Keep live writer ownership while finishing all SQLite close/checkpoint work
+    // before the parent snapshots every file, including any database sidecars.
+    let _writer = tidemark_store::lease::WriterLease::acquire(&state).unwrap();
+    drop(series);
+    drop(catalog);
+    fs::write(state.join("ready.tmp"), b"ready").unwrap();
+    fs::rename(state.join("ready.tmp"), state.join("ready")).unwrap();
     std::thread::sleep(Duration::from_secs(60));
 }
 #[test]
@@ -1432,6 +1438,8 @@ fn purge_refuses_live_writer_without_changing_bytes_or_inodes() {
         assert!(Instant::now() < deadline, "writer never became ready");
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(fs::read(f.state.join("ready")).unwrap(), b"ready");
+    assert!(child.0.try_wait().unwrap().is_none());
     let mut paths = vec![f.state.clone()];
     let mut originals = Vec::new();
     while let Some(path) = paths.pop() {
@@ -1453,6 +1461,7 @@ fn purge_refuses_live_writer_without_changing_bytes_or_inodes() {
             assert_eq!(fs::read(path).unwrap(), bytes);
         }
     }
+    assert!(child.0.try_wait().unwrap().is_none());
     child.0.kill().unwrap();
     child.0.wait().unwrap();
 }
@@ -2308,6 +2317,9 @@ fn verify_core_reasons_in_human_and_json_detail() {
     fixture.report(&record.config_sha256, true);
     for index in 0..4 {
         for (raw, expected) in [
+            ("".into(), "".into()),
+            ("   ".into(), "".into()),
+            ("\u{2003} ".into(), "".into()),
             ("not mounted: /mnt/x".into(), "not mounted: /mnt/x".into()),
             ("bad\nline\u{1b}\0".into(), "bad\\x0Aline\\x1B\\x00".into()),
             ("é".repeat(150), format!("{}…", "é".repeat(98))),
@@ -2334,7 +2346,11 @@ fn verify_core_reasons_in_human_and_json_detail() {
                 .find(|item| item.name == "core_components")
                 .unwrap();
             let name = ["sampler", "scheduler", "api", "tswriter"][index];
-            let entry = format!("{name}=degraded ({expected})");
+            let entry = if expected.is_empty() {
+                format!("{name}=degraded")
+            } else {
+                format!("{name}=degraded ({expected})")
+            };
             // This is the escaping used by the human verify renderer.
             let human = crate::render::table::diagnostic(&core.detail);
             assert!(human.contains(&entry), "{human}");
@@ -2348,6 +2364,9 @@ fn verify_core_reasons_in_human_and_json_detail() {
                 .unwrap();
             assert!(json_core["detail"].as_str().unwrap().contains(&entry));
             assert!(!core.detail.contains("healthy detail hidden"));
+            if expected.is_empty() {
+                assert!(!core.detail.contains('('), "{}", core.detail);
+            }
             assert!(expected.len() <= 200);
         }
     }
