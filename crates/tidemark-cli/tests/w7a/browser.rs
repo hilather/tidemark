@@ -46,6 +46,7 @@ pub(super) fn browser(count: u32) -> (tempfile::TempDir, Browser) {
         history_refresh: false,
         data_revision: 0,
         info_subject: None,
+        info_error: None,
         pages: Pages::default(),
         refresh: None,
         theme: theme::Theme::plain(),
@@ -89,6 +90,7 @@ fn browser_by_size(count: u32) -> (tempfile::TempDir, Browser) {
         history_refresh: false,
         data_revision: 0,
         info_subject: None,
+        info_error: None,
         pages: Pages::default(),
         refresh: None,
         theme: theme::Theme::plain(),
@@ -237,6 +239,7 @@ fn hostile_names_in_data_panes() {
         history_refresh: false,
         data_revision: 0,
         info_subject: None,
+        info_error: None,
         pages: Pages::default(),
         refresh: None,
         theme: theme::Theme::plain(),
@@ -307,6 +310,7 @@ fn million_directory_navigation() {
         history_refresh: false,
         data_revision: 0,
         info_subject: None,
+        info_error: None,
         pages: Pages::default(),
         refresh: None,
         theme: theme::Theme::plain(),
@@ -360,6 +364,7 @@ fn query_pages_skip_nested_subtrees_and_support_back() {
         history_refresh: false,
         data_revision: 0,
         info_subject: None,
+        info_error: None,
         pages: Pages::default(),
         refresh: None,
         theme: theme::Theme::plain(),
@@ -511,6 +516,7 @@ fn instances_page_all_rows_forward_backward_and_end() {
 
 #[test]
 fn worker_live_refresh_mutation_and_cancellation() {
+    use std::os::unix::fs::MetadataExt;
     let fixture = test_support::materialize(
         r#"
 [[entry]]
@@ -528,6 +534,18 @@ size = 8192
     let rows =
         crate::live_rows::live_rows(&path, &config, &std::sync::atomic::AtomicBool::new(false))
             .unwrap();
+    let newest = ["a", "a/file"]
+        .map(|path| std::fs::metadata(fixture.root.join(path)).unwrap().mtime())
+        .into_iter()
+        .max()
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.path.as_path() == fixture.root.join("a"))
+            .unwrap()
+            .newest_mtime,
+        newest
+    );
     let store = ::test_support::private_tempdir().unwrap();
     let file = fixture::snapshot(store.path(), &rows, 1_000_000);
     let (_temp, mut b) = browser(0);
@@ -544,6 +562,18 @@ size = 8192
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(b.pages.live.is_some(), "{}", b.message);
+    let newest = ["a", "a/file", "a/new"]
+        .map(|path| std::fs::metadata(fixture.root.join(path)).unwrap().mtime())
+        .into_iter()
+        .max()
+        .unwrap();
+    assert_eq!(
+        b.rows[0].0.newest_mtime, newest,
+        "live rows retain Unix seconds from stat, through aggregation and refresh"
+    );
+    let screen = render(&b, 160, 48);
+    let row = screen.lines().find(|line| line.contains("a/")).unwrap();
+    assert!(row.contains(&draw::fmt_when(newest, b.now)), "{row}");
     assert_eq!(
         b.rows[0].0.t_disk,
         test_support::oracle::du_disk(fixture.root.join("a"))
@@ -1864,11 +1894,13 @@ fn token_end_column(line: &str, token: &str) -> Option<usize> {
 }
 
 #[test]
-fn fmt_when_uses_the_utc_year_and_keeps_epoch_dates() {
+fn fmt_when_uses_the_utc_year_and_dashes_unknown_timestamps() {
     let now = 1_781_524_800;
     assert_eq!(draw::fmt_when(now, now), "06-15 12:00");
     assert_eq!(draw::fmt_when(100, 1_000_100), "01-01 00:01");
-    assert_eq!(draw::fmt_when(0, now), "1970-01-01");
+    assert_eq!(draw::fmt_when(0, now), "-");
+    assert_eq!(draw::fmt_when(i64::MIN, now), "-");
+    assert_eq!(draw::fmt_when(100, now), "1970-01-01");
     assert_eq!(draw::fmt_when(-1, now), "1969-12-31");
 }
 
@@ -2048,7 +2080,7 @@ fn size_column_is_right_aligned_at_both_widths() {
         let end = screen
             .lines()
             .find_map(|line| {
-                (line.contains("68.9 MiB") && line.contains('/'))
+                (line.starts_with('│') && line.contains("68.9 MiB") && line.contains('/'))
                     .then(|| token_end_column(line, "68.9 MiB"))
             })
             .unwrap()
@@ -2056,7 +2088,7 @@ fn size_column_is_right_aligned_at_both_widths() {
         let mut saw_peer = false;
         for line in screen
             .lines()
-            .filter(|line| line.contains("4.00 KiB") && line.contains('/'))
+            .filter(|line| line.starts_with('│') && line.contains("4.00 KiB") && line.contains('/'))
         {
             if line.contains("68.9 MiB") {
                 continue;

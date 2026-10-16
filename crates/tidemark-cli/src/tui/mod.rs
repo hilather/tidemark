@@ -69,6 +69,7 @@ struct Browser {
     history_refresh: bool,
     data_revision: u64,
     info_subject: Option<(tidemark_core::path::RawPath, u64)>,
+    info_error: Option<String>,
     pages: Pages,
     refresh: Option<Refresh>,
     theme: theme::Theme,
@@ -910,8 +911,18 @@ impl Browser {
 
     /// Keep read failures visible and retryable on the next frame.
     fn prepare_frame(&mut self, width: u16, height: u16) {
-        if let Err(error) = self.prepare(width, height) {
-            self.message = escape(error.to_string().as_bytes());
+        match self.prepare(width, height) {
+            Err(error) => {
+                self.message = escape(error.to_string().as_bytes());
+                self.info_error = Some(self.message.clone());
+            }
+            Ok(()) if self.state.pane == Pane::Info => {
+                // Recovery must preserve any message that replaced this Info error.
+                if self.info_error.take().as_ref() == Some(&self.message) {
+                    self.message.clear();
+                }
+            }
+            Ok(()) => {}
         }
     }
 
@@ -1405,6 +1416,7 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         history_refresh: false,
         data_revision: 0,
         info_subject: None,
+        info_error: None,
         pages: Pages::default(),
         refresh: None,
         theme,

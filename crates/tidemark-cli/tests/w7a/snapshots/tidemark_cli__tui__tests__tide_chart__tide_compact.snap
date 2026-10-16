@@ -1,12 +1,13 @@
 ---
 source: crates/tidemark-cli/src/tui/../../tests/w7a/tide_chart.rs
+assertion_line: 676
 expression: text
 ---
 /fixture  20260101T000000Z-00000007 · walk · 0s ago · steady          hw 181 GiB
 ┌depth · /fixture · sort size──────────────────────────────────────────────────┐
 │  NAME        LEVEL     SIZE▾  RECLAIM   SHARED  FILES      NEWEST        TIDE│
-│▶ pr...ts/ ⚓  ▆┈┈┈┈┈ 41.7 GiB 20.8 GiB 20.8 GiB      1 01-01 00:01           -│
-│  logs/ ⚓     ┈┈┈┈┈┈ 7.00 GiB 3.50 GiB 3.50 GiB      1 01-01 00:01           -│
+│▶ pr...ts/ ⚓  ▆┈┈┈┈┈ 41.7 GiB 20.8 GiB 20.8 GiB      1 10-09 15:43           -│
+│  logs/ ⚓     ┈┈┈┈┈┈ 7.00 GiB 3.50 GiB 3.50 GiB      1 10-09 15:23           -│
 │  .           ┈┈┈┈┈┈      0 B        -        -      1           -           -│
 │                                                                              │
 │                                                                              │

@@ -34,6 +34,12 @@ fn series() -> (tempfile::TempDir, Browser) {
             rows.insert(1, fixture::row(1, Some(0), b"/fixture/added-earlier", 1));
         }
         let mut meta = fixture::meta(rows[0].path.clone(), 1_760_000_000 + index as i64 * 3600);
+        // The generic row helper uses 100 seconds after the epoch. Capture fixtures
+        // need real Unix seconds near their snapshot, with a distinct subtree max.
+        for row in &mut rows {
+            row.newest_mtime = meta.started_at - i64::from(row.id) * 600;
+            row.mtime = row.newest_mtime - 3600;
+        }
         meta.scan_id = serde_json::from_str(&format!("\"20260101T000000Z-{index:08}\"")).unwrap();
         let mut writer =
             tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
@@ -59,10 +65,81 @@ fn series() -> (tempfile::TempDir, Browser) {
     }
     b.snapshot_file = catalog.last().unwrap().1.clone();
     b.snapshot = Snapshot::open(&b.snapshot_file).unwrap();
+    b.now = b.snapshot.meta().finished_at;
+    b.clock = b.now;
     b.dir = b.snapshot.root().unwrap();
     b.snapshots = catalog;
     b.load().unwrap();
     (temp, b)
+}
+
+#[test]
+fn newest_fixture_seconds_survive_snapshot_and_live_rows() {
+    let (_temp, mut b) = series();
+    b.now = b.snapshot.meta().started_at;
+    for (path, id, expected) in [
+        (b"/fixture/projects".as_slice(), 1, "10-09 15:43"),
+        (b"/fixture/logs".as_slice(), 3, "10-09 15:23"),
+    ] {
+        let row = b
+            .snapshot
+            .dir_by_path(&RawPath::new(path.to_vec()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.newest_mtime, b.now - id * 600);
+        assert_ne!(row.newest_mtime, row.mtime, "NEWEST is the subtree maximum");
+        let text = render(&b, 140, 40);
+        let line = text
+            .lines()
+            .find(|line| {
+                line.contains(&format!(
+                    "{}/",
+                    row.path.file_name().unwrap().display_lossy()
+                ))
+            })
+            .unwrap();
+        assert!(line.contains(expected), "{line}");
+    }
+
+    let root = b.dir.clone();
+    let mut rows = b.rows.clone();
+    rows[0].0.mtime = 100;
+    rows[0].0.newest_mtime = b.now + 3600;
+    install_refresh(&mut b, root, rows);
+    b.poll_refresh().unwrap();
+    let text = render(&b, 140, 40);
+    let line = text
+        .lines()
+        .find(|line| line.contains("projects/"))
+        .unwrap();
+    assert!(line.contains("10-09 16:53"), "{line}");
+}
+
+#[test]
+fn newest_zero_and_missing_render_as_dash_in_saved_and_live_rows() {
+    let (_temp, mut b) = series();
+    for live in [false, true] {
+        let mut rows = b.rows.clone();
+        rows[0].0.newest_mtime = 0;
+        rows[1].0.newest_mtime = i64::MIN;
+        if live {
+            let root = b.dir.clone();
+            install_refresh(&mut b, root, rows);
+            b.poll_refresh().unwrap();
+        } else {
+            b.rows = rows;
+        }
+        let text = render(&b, 140, 40);
+        for name in ["projects/", "logs/"] {
+            let row = text.lines().find(|line| line.contains(name)).unwrap();
+            // FILES, NEWEST, TIDE are the final three columns.
+            assert_eq!(
+                row.trim_end_matches('│').split_whitespace().rev().nth(1),
+                Some("-"),
+                "{row}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -135,6 +212,13 @@ fn failed_info_frame_keeps_running_and_retries_until_the_read_succeeds() {
         assert!(render(&b, 80, 24).contains("annotations"));
     }
 
+    // Preparing another pane does not establish that the Info read recovered.
+    let info_error = b.message.clone();
+    b.state.pane = Pane::Main;
+    b.prepare_frame(80, 24);
+    assert_eq!(b.message, info_error);
+    b.state.pane = Pane::Info;
+
     // No subject/revision change: the next frame must retry the failed read.
     b.snapshot = Snapshot::open(&b.snapshot_file).unwrap();
     b.prepare_frame(80, 24);
@@ -143,6 +227,21 @@ fn failed_info_frame_keeps_running_and_retries_until_the_read_succeeds() {
         Some((b.subject().0.path.clone(), b.data_revision))
     );
     assert_eq!(b.text.matches("owner: projects").count(), 1);
+    assert!(b.message.is_empty(), "{}", b.message);
+
+    // A message from another action must survive a successful Info retry.
+    b.snapshot = Snapshot::open(&broken).unwrap();
+    b.data_revision += 1;
+    b.prepare_frame(80, 24);
+    assert!(b.message.contains("annotations"), "{}", b.message);
+    b.message = "Live refresh already running".into();
+    b.snapshot = Snapshot::open(&b.snapshot_file).unwrap();
+    b.prepare_frame(80, 24);
+    assert_eq!(
+        b.info_subject,
+        Some((b.subject().0.path.clone(), b.data_revision))
+    );
+    assert_eq!(b.message, "Live refresh already running");
     assert!(!b.on_key(KeyCode::Esc, &Default::default()).unwrap());
     assert_eq!(b.state.pane, Pane::Main);
 }
@@ -166,7 +265,8 @@ fn chart_title_and_delta_keep_separate_display_budgets() {
                 // Ratatui reserves a second cell for the wide fixture character.
                 x += if glyph == "海" { 2 } else { 1 };
             }
-            let left_end = title.find(" · disk").expect("complete subject title") + " · disk".len();
+            let suffix = " · disk 41.7 GiB";
+            let left_end = title.find(suffix).expect("complete subject title") + suffix.len();
             let left_start = title.find("tide · ").unwrap();
             let delta_start = title.find(" Δ ").expect("complete delta label");
             let delta_end = title.rfind('┐').unwrap();
@@ -191,9 +291,13 @@ fn reported_zero_axis_and_visible_wave_crest() {
     pump(&mut b);
     let screen = render(&b, 140, 40);
     assert!(!screen.contains("axis from"), "{screen}");
-    assert!(screen.contains("0 B"), "{screen}");
     assert!(
-        screen.contains("█▇▆▇"),
+        screen.lines().nth(7).unwrap().starts_with(" │0"),
+        "{screen}"
+    );
+    assert!(!screen.lines().nth(10).unwrap().contains("0 B"), "{screen}");
+    assert!(
+        screen.contains("▆▆▇▇▇▇████▇▇▇▇▆▆"),
         "full-height crest missing\n{screen}"
     );
 }
@@ -227,6 +331,22 @@ fn zero_axis_clamp_and_every_fractional_crest() {
             let levels: Vec<_> = (0..16).map(|c| draw::crest(fill, c)).collect();
             assert_eq!(levels.iter().max(), Some(&fill));
             assert!(levels.iter().all(|level| *level >= 1 && base + level <= e));
+            assert_eq!(levels, levels.iter().rev().copied().collect::<Vec<_>>());
+            assert!(levels.iter().all(|level| fill - level <= 2));
+            let runs: Vec<_> = levels
+                .iter()
+                .enumerate()
+                .filter_map(|(i, level)| (i == 0 || *level != levels[i - 1]).then_some(*level))
+                .collect();
+            let maxima = runs
+                .iter()
+                .enumerate()
+                .filter(|(i, level)| {
+                    (*i == 0 || **level > runs[*i - 1])
+                        && (*i + 1 == runs.len() || **level > runs[*i + 1])
+                })
+                .count();
+            assert_eq!(maxima, 1, "one maximum run, never a sawtooth: {levels:?}");
             if fill == 1 {
                 assert_eq!(levels, vec![1; 16]);
             }
@@ -264,6 +384,98 @@ fn zero_axis_clamp_and_every_fractional_crest() {
 }
 
 #[test]
+fn previous_level_tick_uses_the_plot_scale_and_known_comparison_only() {
+    use history::Sample::{Known, MissingPath, Unavailable};
+    let (_temp, mut b) = series();
+    pump(&mut b);
+    for width in [100, 140] {
+        let tick_x = if width == 100 { 79 } else { 117 };
+        for (previous, y) in [
+            (0, 7),
+            (1, 7),
+            (8, 7),
+            (9, 6),
+            (16, 6),
+            (17, 5),
+            (32, 4),
+            (33, 3),
+            (40, 3),
+        ] {
+            b.history.samples.fill(Some(Known(40)));
+            b.history.samples[5] = Some(Known(previous));
+            let screen = buffer(&b, width, 40);
+            for row in 3..=7 {
+                assert_eq!(
+                    screen[(tick_x, row)].symbol(),
+                    if row == y { "─" } else { " " },
+                    "width={width}, previous={previous}, row={row}"
+                );
+            }
+        }
+        for missing in [None, Some(MissingPath), Some(Unavailable("test"))] {
+            b.history.samples[5] = missing;
+            let screen = buffer(&b, width, 40);
+            assert!((3..=7).all(|row| screen[(tick_x, row)].symbol() == " "));
+        }
+    }
+    // Live compares against the opened snapshot, even when the older predecessor differs.
+    b.history.samples.fill(Some(Known(40)));
+    b.history.samples[6] = Some(Known(20));
+    b.pages.live = Some(b.rows.clone());
+    b.pages.live_at = Some(b.clock);
+    b.rows[0].0.t_disk = 80;
+    let screen = buffer(&b, 140, 40);
+    assert_eq!(screen[(117, 6)].symbol(), "─"); // 20/80 * 40 = 10 eighths.
+    assert_eq!(screen[(117, 5)].symbol(), " "); // Not the older 40-byte sample.
+    b.history.samples[6] = Some(MissingPath);
+    assert!((3..=7).all(|y| buffer(&b, 140, 40)[(117, y)].symbol() == " "));
+}
+
+#[test]
+fn latest_bar_alone_is_bright_in_every_palette_with_and_without_live() {
+    use ratatui::style::Modifier;
+    let (_temp, mut b) = series();
+    pump(&mut b);
+    for live in [false, true] {
+        if live {
+            b.pages.live = Some(b.rows.clone());
+            b.pages.live_at = Some(b.clock);
+        }
+        for (no_color, color, term, level) in [
+            (false, Some("truecolor"), "xterm", theme::Level::Rgb),
+            (false, None, "xterm-256color", theme::Level::Indexed),
+            (false, None, "xterm", theme::Level::Basic),
+            (true, None, "xterm", theme::Level::Mono),
+        ] {
+            b.theme = theme::Theme::select(true, no_color, color, Some(term), Some("C.UTF-8"));
+            assert_eq!(b.theme.level, level);
+            let screen = buffer(&b, 140, 40);
+            for index in 0..7 {
+                let x = 4 + index * 19;
+                let latest = index == 6;
+                for y in 3..=7 {
+                    if screen[(x, y)].symbol() == " " {
+                        continue;
+                    }
+                    assert_eq!(
+                        screen[(x, y)].fg,
+                        b.theme.color(if latest {
+                            theme::Role::Foam
+                        } else {
+                            theme::Role::Teal
+                        })
+                    );
+                    assert_eq!(
+                        screen[(x, y)].modifier.contains(Modifier::BOLD),
+                        latest && matches!(level, theme::Level::Basic | theme::Level::Mono)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn renderer_pins_crest_coordinates_colors_labels_and_zero_slots() {
     use history::Sample::Known;
     use ratatui::style::{Color, Modifier};
@@ -284,16 +496,16 @@ fn renderer_pins_crest_coordinates_colors_labels_and_zero_slots() {
     for y in 3..=7 {
         assert_eq!(screen[(4, y)].symbol(), " ");
     }
-    assert_eq!(screen[(23, 6)].symbol(), "▂"); // 25/100 = 10 eighths.
+    assert_eq!(screen[(29, 6)].symbol(), "▂"); // 25/100 = 10 eighths at centre.
     assert_eq!(screen[(24, 6)].symbol(), "▁");
-    assert_eq!(screen[(42, 5)].symbol(), "▄"); // 50/100 = 20 eighths.
-    assert_eq!(screen[(61, 3)].symbol(), "█");
-    assert_eq!(screen[(62, 3)].symbol(), "▇");
-    assert_eq!(screen[(63, 3)].symbol(), "▆");
-    assert_eq!(screen[(61, 3)].fg, Color::Rgb(0x9e, 0xf0, 0xe6));
+    assert_eq!(screen[(48, 5)].symbol(), "▄"); // 50/100 = 20 eighths.
+    assert_eq!(screen[(67, 3)].symbol(), "█");
+    assert_eq!(screen[(63, 3)].symbol(), "▇");
+    assert_eq!(screen[(61, 3)].symbol(), "▆");
+    assert_eq!(screen[(61, 3)].fg, Color::Rgb(0x2e, 0xc4, 0xb6));
     assert_eq!(screen[(61, 4)].fg, Color::Rgb(0x2e, 0xc4, 0xb6));
     assert_eq!(screen[(118, 4)].fg, Color::Rgb(0x9e, 0xf0, 0xe6));
-    assert!(screen[(118, 3)].modifier.contains(Modifier::BOLD));
+    assert!(!screen[(118, 3)].modifier.contains(Modifier::BOLD));
     for y in 3..=9 {
         for x in 2..138 {
             assert_eq!(screen[(x, y)].bg, Color::Rgb(7, 21, 38));
@@ -307,12 +519,15 @@ fn renderer_pins_crest_coordinates_colors_labels_and_zero_slots() {
         .skip(3)
         .take(5)
         .any(|line| line.contains("100 B")));
-    assert!(text.lines().nth(10).unwrap().contains("0 B"));
+    assert!(!text.lines().nth(10).unwrap().contains("0 B"));
     b.history.samples.fill(Some(Known(0)));
     let zero = buffer(&b, 140, 40);
     for y in 3..=7 {
         for x in 4..134 {
-            assert_eq!(zero[(x, y)].symbol(), " ");
+            assert_eq!(
+                zero[(x, y)].symbol(),
+                if (x, y) == (117, 7) { "─" } else { " " }
+            );
         }
     }
 }
@@ -411,8 +626,8 @@ fn live_endpoint_preserves_saved_history_scales_above_max_and_stamps_completion_
     assert!(text.contains("vs snapshot"));
     assert!(text.contains("83.4 GiB"));
     let screen = buffer(&b, 140, 40);
-    assert_eq!(screen[(118, 3)].symbol(), "█"); // live max: full height.
-    assert_eq!(screen[(99, 5)].symbol(), "▄"); // saved current: exactly half height.
+    assert_eq!(screen[(124, 3)].symbol(), "█"); // live max: full height at centre.
+    assert_eq!(screen[(105, 5)].symbol(), "▄"); // saved current: exactly half height.
     b.on_key(KeyCode::Char('i'), &Default::default()).unwrap();
     assert!(b.text.contains("Disk 83.4 GiB"));
     assert!(

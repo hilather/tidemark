@@ -6,3 +6,9 @@
 
 # Host identity carried into git-free VM source copies.
 .tidemark-build-id
+
+# Python bytecode from tools/tui-shots
+__pycache__/
+# Intermediate capture output from tools/tui-shots (only PNGs are committed)
+/docs/screenshots/**/*.ansi
+/docs/screenshots/**/*.html

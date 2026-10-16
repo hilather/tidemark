@@ -24,9 +24,10 @@ waits = []
 def tmux(*args):
     return subprocess.check_output(TMUX + list(args), text=True)
 
-def command(color=True, ascii=False):
-    return shlex.join(['env', '-u', 'NO_COLOR', 'TERM=' + ('linux' if ascii else 'xterm-256color'),
-                      'COLORTERM=truecolor', 'LANG=' + ('C' if ascii else 'C.UTF-8'),
+def command(color=True, ascii=False, palette='rgb'):
+    term = 'linux' if ascii else 'xterm' if palette == 'basic' else 'xterm-256color'
+    return shlex.join(['env', '-u', 'NO_COLOR', 'TERM=' + term,
+                      'COLORTERM=' + ('truecolor' if palette == 'rgb' else ''), 'LANG=' + ('C' if ascii else 'C.UTF-8'),
                       *([] if color else ['NO_COLOR=1']), str(BINARY),
                       '-q', '--config', str(FIXTURE / 'config.toml'), '--color', 'always',
                       'tui', str(FIXTURE / 'tree')])
@@ -75,17 +76,20 @@ try:
     capture('mono', ['41.7 GiB', 'tide ·'], pane='tide:mono')
     tmux('new-window', '-d', '-t', 'tide:2', '-n', 'ascii', command(True, True))
     capture('ascii', ['41.7 GiB', '+tide .'], pane='tide:ascii')
+    for index, palette in enumerate(['basic', 'indexed'], start=4):
+        tmux('new-window', '-d', '-t', f'tide:{index}', '-n', palette, command(palette=palette))
+        capture(palette, ['41.7 GiB', 'tide ·'], pane=f'tide:{palette}')
     tmux('resize-window', '-t', 'tide:mono', '-x', '80', '-y', '24')
     capture('compact', ['41.7 GiB', 'hw 181 GiB'], pane='tide:mono', chart=False)
     environment = dict(waits=waits, tmux=tmux('-V').strip(), locale='C.UTF-8; ASCII uses C',
-                       colors='TERM=xterm-256color COLORTERM=truecolor; NO_COLOR=1 for Mono',
+                       colors='RGB: xterm-256color/truecolor; Indexed: xterm-256color; Basic: xterm; NO_COLOR=1 for Mono',
                        fixture=str(FIXTURE), binary=str(BINARY), timestamp=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                        command=command(), kernel=os.uname().release)
-    (Path('/tmp/tidemark-tide-visual') / 'capture.json').write_text(json.dumps(environment, indent=2) + '\n')
+    (FIXTURE / 'capture.json').write_text(json.dumps(environment, indent=2) + '\n')
 finally:
     # This server/socket and all its panes were started by this script.
     # Send normal quit to each TUI, then close only our private server.
-    for pane in ['tide:0', 'tide:mono', 'tide:ascii', 'tide:pruned']:
+    for pane in ['tide:0', 'tide:mono', 'tide:ascii', 'tide:pruned', 'tide:basic', 'tide:indexed']:
         subprocess.run(TMUX + ['send-keys', '-t', pane, 'q'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(TMUX + ['kill-server'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     SOCKET_DIR.cleanup()

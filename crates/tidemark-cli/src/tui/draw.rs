@@ -34,7 +34,11 @@ pub(super) fn civil(ts: i64) -> (i64, i64, i64, i64, i64) {
 }
 
 /// `MM-DD HH:MM` in the same UTC year as `now`, otherwise `YYYY-MM-DD`.
+/// Zero and the empty-maximum sentinel have no useful timestamp to display.
 pub(super) fn fmt_when(ts: i64, now: i64) -> String {
+    if ts == 0 || ts == i64::MIN {
+        return "-".into();
+    }
     let (year, month, day, hour, minute) = civil(ts);
     let (now_year, _, _, _, _) = civil(now);
     if year == now_year {
@@ -382,7 +386,7 @@ fn header_line(b: &Browser, width: usize) -> Line<'static> {
         meta.scan_id, glyphs.sep, glyphs.sep, glyphs.sep
     );
     let high = high_water_text(&b.snapshots);
-    let mut high_label = "root high-water ";
+    let mut high_label = "| root high-water ";
     let mut right = format!("{high_label}{high}");
     let path = b.dir.path.display_lossy();
     if fit_header(width, &identity, &right, &path, glyphs)
@@ -427,7 +431,10 @@ fn header_line(b: &Browser, width: usize) -> Line<'static> {
         .sum::<usize>();
     let gap = width.saturating_sub(used + header_cols(&right));
     spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(Span::styled(high_label.to_string(), dim_style(theme)));
+    spans.push(Span::styled(
+        high_label.to_string(),
+        style_fg(theme, Role::Dim),
+    ));
     spans.push(Span::styled(
         high,
         style_fg(theme, Role::Sand).add_modifier(Modifier::BOLD),
@@ -1124,11 +1131,14 @@ pub(super) fn eighths(value: u64, maximum: u64, height: u16) -> u16 {
     u16::try_from((u128::from(value) * limit / u128::from(maximum)).min(limit)).unwrap_or(u16::MAX)
 }
 
-/// Ripple stays inside the true top cell; every fourth column reaches the measured height.
+/// One shallow, symmetric crest across the 16-column bar, bounded by its true top.
 pub(super) fn crest(fill: u16, column: u16) -> u16 {
-    fill.saturating_sub([0, 1, 2, 1][usize::from(column % 4)])
-        .max(1)
-        .min(fill)
+    let inset = match column.min(15) {
+        0..=1 | 14..=15 => 2,
+        2..=5 | 10..=13 => 1,
+        _ => 0,
+    };
+    fill.saturating_sub(inset).max(1).min(fill)
 }
 
 struct ChartSample<'a> {
@@ -1217,8 +1227,9 @@ fn draw_chart(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
         String::new()
     };
     let suffix = format!(
-        " {} disk{context}{}",
+        " {} disk {}{context}{}",
         b.theme.glyphs.sep,
+        size::bytes(subject.t_disk),
         if live_at.is_some() { " / live" } else { "" }
     );
     let prefix = format!("tide {} ", b.theme.glyphs.sep);
@@ -1229,8 +1240,7 @@ fn draw_chart(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
         "{prefix}{}{suffix}",
         table::shorten(&subject.path.display_lossy(), budget)
     );
-    let mut block = pane_block(b.theme, Line::from(title))
-        .title_bottom(Line::from(" 0 B ").style(dim_style(b.theme)));
+    let mut block = pane_block(b.theme, Line::from(title));
     if !b.theme.glyphs.unicode {
         block = block.border_set(ratatui::symbols::border::Set {
             top_left: "+",
@@ -1293,15 +1303,20 @@ fn draw_chart(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
         .filter_map(|s| s.sample.and_then(Sample::value))
         .max()
         .unwrap_or(0);
+    if height == 0 {
+        return;
+    }
+    // Zero stays at the foot of the plot, separate from the value labels/border.
+    frame.buffer_mut()[(area.x + 1, area.y + height)]
+        .set_symbol("0")
+        .set_style(dim_style(b.theme));
+    let baseline = chart_baseline(b, displayed);
     for (index, sample) in displayed.iter().enumerate() {
         let x = area.x + 3 + u16::try_from(index).unwrap_or(0) * 19;
         let value = sample.sample.and_then(Sample::value);
         let e = eighths(value.unwrap_or(0), maximum, height);
-        let color = if sample.current || sample.live {
-            Role::Foam
-        } else {
-            Role::Teal
-        };
+        let latest = index + 1 == displayed.len();
+        let color = if latest { Role::Foam } else { Role::Teal };
         for row in 0..e.div_ceil(8) {
             let fill = (e - row * 8).min(8);
             let top = row + 1 == e.div_ceil(8);
@@ -1318,15 +1333,23 @@ fn draw_chart(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
                     "#"
                 };
                 let mut style = style_fg(b.theme, color);
-                if top && matches!(b.theme.level, Level::Rgb | Level::Indexed) {
-                    style = style_fg(b.theme, Role::Foam);
-                    if sample.current || sample.live {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
+                if latest && matches!(b.theme.level, Level::Basic | Level::Mono) {
+                    style = style.add_modifier(Modifier::BOLD);
                 }
                 frame.buffer_mut()[(x + column, y)]
                     .set_symbol(glyph)
                     .set_style(style);
+            }
+        }
+        if latest {
+            if let Some(previous) = baseline {
+                let previous_eighths = eighths(previous, maximum, height);
+                // A side tick leaves the crest intact, including when the baseline
+                // is above a declining endpoint. Zero occupies the bottom plot row.
+                let y = area.y + height - previous_eighths.saturating_sub(1) / 8;
+                frame.buffer_mut()[(x - 1, y)]
+                    .set_symbol(if b.theme.glyphs.unicode { "─" } else { "-" })
+                    .set_style(dim_style(b.theme));
             }
         }
         let (_, month, day, hour, _) = civil(sample.started);
@@ -1354,7 +1377,7 @@ fn draw_chart(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
             Some(Sample::Unavailable(_)) => "n/a".into(),
             None => if b.theme.glyphs.unicode { "…" } else { "..." }.into(),
         };
-        let style = if sample.current || sample.live {
+        let style = if latest {
             key_style(b.theme)
         } else {
             style_fg(b.theme, Role::Dim)
@@ -1376,18 +1399,22 @@ fn draw_chart(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
 }
 
 fn chart_delta(b: &Browser, samples: &[ChartSample<'_>]) -> Option<i128> {
-    let opened = samples.iter().find(|s| s.current)?.sample?.value()?;
-    if let Some(live) = samples.iter().find(|s| s.live) {
-        return Some(i128::from(live.sample?.value()?) - i128::from(opened));
+    let latest = samples.last()?.sample?.value()?;
+    Some(i128::from(latest) - i128::from(chart_baseline(b, samples)?))
+}
+
+/// Use the same known, displayed predecessor for both the tick and delta.
+fn chart_baseline(b: &Browser, samples: &[ChartSample<'_>]) -> Option<u64> {
+    if samples.last()?.live {
+        return samples.iter().find(|s| s.current)?.sample?.value();
     }
     let meta = b.snapshot.meta();
     let previous = super::previous_complete(&b.snapshots, meta.started_at, meta.scan_id.as_str())?;
-    let baseline = samples
+    samples
         .iter()
         .find(|s| s.id == Some(previous.0.as_str()))?
         .sample?
-        .value()?;
-    Some(i128::from(opened) - i128::from(baseline))
+        .value()
 }
 
 fn draw_panels(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
