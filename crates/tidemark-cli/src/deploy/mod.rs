@@ -716,12 +716,22 @@ fn verify_poll(
     let stopped = items.iter().any(|item| item.detail == SERVICE_START_HINT);
     let remaining = budget.saturating_sub(clock.now().saturating_sub(poll_started));
     // Service/file probes may consume the useful budget after the loop's check.
-    if remaining < VERIFY_PROBE_FLOOR {
-        if let Some(previous) = previous {
-            return (previous.clone(), false);
-        }
-    }
-    let status = if stopped {
+    // Keep their fresh evidence even when another API request cannot be made.
+    let skipped = remaining < VERIFY_PROBE_FLOOR && previous.is_some();
+    let status = if skipped {
+        let history = previous
+            .and_then(|result| result.items.iter().find(|item| item.name == "api"))
+            .map(|item| {
+                format!(
+                    "; historical API observation: {:?} ({})",
+                    item.status, item.detail
+                )
+            })
+            .unwrap_or_default();
+        Err(io::Error::other(format!(
+            "API request skipped: remaining allowance below 250 ms{history}"
+        )))
+    } else if stopped {
         Err(io::Error::other("service is not running"))
     } else {
         api.status_with_budget(remaining)
@@ -794,6 +804,19 @@ fn verify_poll(
             .unwrap_or_else(|| "unknown".into());
         if let Some(item) = items.iter_mut().find(|item| item.name == "core_components") {
             item.detail = format!("current daemon health unavailable; firstboot report describes daemon_started_at={start}; stored health cannot certify this start");
+            if skipped {
+                if let Some(core) = previous.and_then(|result| {
+                    result
+                        .items
+                        .iter()
+                        .find(|item| item.name == "core_components")
+                }) {
+                    item.detail.push_str(&format!(
+                        "; historical core observation: {:?} ({})",
+                        core.status, core.detail
+                    ));
+                }
+            }
         }
     }
     items.push(outcome("api", false, status.map(|_| ())));

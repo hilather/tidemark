@@ -2160,3 +2160,124 @@ fn verify_retry_probe_floor() {
         }
     }
 }
+
+#[test]
+fn verify_probe_floor_keeps_fresh_service_error() {
+    verify_probe_floor_keeps_fresh_checks(true);
+}
+
+#[test]
+fn verify_probe_floor_keeps_fresh_config_mismatch() {
+    verify_probe_floor_keeps_fresh_checks(false);
+}
+
+fn verify_probe_floor_keeps_fresh_checks(service_error: bool) {
+    struct SlowProbe<'a> {
+        clock: &'a FakeVerifyClock,
+        calls: Cell<usize>,
+        service_error: bool,
+    }
+    impl Systemctl for SlowProbe<'_> {
+        fn is_active(&self, _: &str) -> io::Result<bool> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            if call > 0 {
+                self.clock.sleep(Duration::from_secs(3));
+                if self.service_error {
+                    return Err(io::Error::other("injected service probe timed out"));
+                }
+            }
+            Ok(true)
+        }
+        fn is_enabled(&self, _: &str) -> io::Result<bool> {
+            panic!("unexpected enabled query")
+        }
+        fn enable(&self, _: &str) -> io::Result<()> {
+            panic!("unexpected enable")
+        }
+        fn disable_now(&self, _: &str) -> io::Result<()> {
+            panic!("unexpected disable")
+        }
+        fn restart(&self, _: &str) -> io::Result<()> {
+            panic!("unexpected restart")
+        }
+    }
+    struct Progress<'a>(Cell<usize>, &'a Fixture, bool);
+    impl ApiPing for Progress<'_> {
+        fn ping(&self) -> io::Result<()> {
+            panic!("expected status")
+        }
+        fn status(&self) -> io::Result<tidemark_core::api::StatusResult> {
+            self.0.set(self.0.get() + 1);
+            if !self.2 {
+                self.1.report("changed-config", true);
+            }
+            let mut status = Ping(true).status()?;
+            status.components[0].state = "degraded".into();
+            status.components[0].detail = "measurement pass in progress".into();
+            Ok(status)
+        }
+    }
+    let fixture = Fixture::new();
+    let record = fixture.stage();
+    fixture.report(&record.config_sha256, true);
+    let clock = FakeVerifyClock::default();
+    let sys = SlowProbe {
+        clock: &clock,
+        calls: Cell::new(0),
+        service_error,
+    };
+    let api = Progress(Cell::new(0), &fixture, service_error);
+    let result = verify_with_timing(
+        &fixture.state,
+        Duration::from_secs(3),
+        &sys,
+        &api,
+        VerifyTiming {
+            grace: Duration::from_secs(10),
+            interval: Duration::from_millis(500),
+            normal_interval: Duration::from_secs(5),
+        },
+        &clock,
+    )
+    .unwrap();
+    assert_eq!(sys.calls.get(), 2);
+    assert_eq!(api.0.get(), 1);
+    assert_eq!(clock.now(), Duration::from_millis(3500));
+    assert!(!result.healthy);
+    let fresh = result
+        .items
+        .iter()
+        .find(|item| {
+            item.name
+                == if service_error {
+                    "service"
+                } else {
+                    "config_hash"
+                }
+        })
+        .unwrap();
+    assert_eq!(fresh.status, CheckStatus::Fail, "{fresh:?}");
+    assert!(fresh.detail.contains(if service_error {
+        "injected service probe timed out"
+    } else {
+        "missing, invalid or stale report/staging record"
+    }));
+    let core = result
+        .items
+        .iter()
+        .find(|item| item.name == "core_components")
+        .unwrap();
+    assert_eq!(core.status, CheckStatus::Fail);
+    assert!(core.detail.contains("current daemon health unavailable"));
+    assert!(core.detail.contains(
+        "historical core observation: Fail (sampler=degraded; scheduler=ok; api=ok; tswriter=ok)"
+    ));
+    assert!(core
+        .detail
+        .contains("last status 3500 ms ago: sampler=degraded (measurement pass in progress)"));
+    let api = result.items.iter().find(|item| item.name == "api").unwrap();
+    assert_eq!(api.status, CheckStatus::Fail);
+    assert!(api.detail.contains("API request skipped"));
+    assert!(api.detail.contains("historical API observation: Pass (ok)"));
+}
