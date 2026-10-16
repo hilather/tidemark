@@ -277,6 +277,42 @@ pub struct OpenFile {
     /// Octal fdinfo open flags, if requested and available.
     pub flags: Option<u32>,
 }
+// Keep flags inside the metadata validation interval. The callbacks allow
+// deterministic descriptor-reuse interleavings without kernel timing races.
+fn read_descriptor(
+    devs: &[DevId],
+    want_flags: bool,
+    mut metadata_read: impl FnMut() -> io::Result<fs::Metadata>,
+    target_read: impl FnOnce() -> io::Result<Vec<u8>>,
+    flags_read: impl FnOnce() -> io::Result<u32>,
+) -> io::Result<Option<(fs::Metadata, Vec<u8>, Option<u32>)>> {
+    let Some(metadata) = per_fd(metadata_read())? else {
+        return Ok(None);
+    };
+    if !metadata.is_file() || !devs.contains(&metadata.dev()) {
+        return Ok(None);
+    }
+    let Some(target) = per_fd(target_read())? else {
+        return Ok(None);
+    };
+    let flags = if want_flags {
+        let Some(flags) = per_fd(flags_read())? else {
+            return Ok(None);
+        };
+        Some(flags)
+    } else {
+        None
+    };
+    // Reject descriptor reuse detectable by inode/device changes during the reads.
+    let Some(check) = per_fd(metadata_read())? else {
+        return Ok(None);
+    };
+    if metadata.dev() != check.dev() || metadata.ino() != check.ino() {
+        return Ok(None);
+    }
+    Ok(Some((metadata, target, flags)))
+}
+
 /// Collect regular-file metadata on selected devices, including unlinked open files.
 /// Procfs does no disk I/O, so Gate charging and O_NOATIME do not apply.
 /// Procfs fd magic links are stat-ed intentionally; readlink text is never followed
@@ -306,30 +342,16 @@ pub fn scan_open_files(devs: &[DevId], want_flags: bool) -> io::Result<Vec<OpenF
         let base = inventory.files.len();
         for fd in fds {
             let path = format!("/proc/{pid}/fd/{fd}");
-            let Some(metadata) = per_fd(fs::metadata(&path))? else {
+            let Some((metadata, target, flags)) = read_descriptor(
+                devs,
+                want_flags,
+                || fs::metadata(&path),
+                || read_fd_target(pid, fd),
+                || read_fdinfo_flags(pid, fd),
+            )?
+            else {
                 continue;
             };
-            if !metadata.is_file() || !devs.contains(&metadata.dev()) {
-                continue;
-            }
-            let Some(target) = per_fd(read_fd_target(pid, fd))? else {
-                continue;
-            };
-            let flags = if want_flags {
-                let Some(flags) = per_fd(read_fdinfo_flags(pid, fd))? else {
-                    continue;
-                };
-                Some(flags)
-            } else {
-                None
-            };
-            // Reject descriptor reuse detectable by inode/device changes during the reads.
-            let Some(check) = per_fd(fs::metadata(&path))? else {
-                continue;
-            };
-            if metadata.dev() != check.dev() || metadata.ino() != check.ino() {
-                continue;
-            }
             if inventory.files.len() == MAX_OPEN_FILES {
                 return Err(invalid());
             }
@@ -431,3 +453,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests/w1d/budget.rs"]
 mod budget_tests;
+
+#[cfg(test)]
+#[path = "../tests/w1d/fdskip2.rs"]
+mod fdskip2_tests;
