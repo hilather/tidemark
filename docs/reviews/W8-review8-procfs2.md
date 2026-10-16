@@ -1,0 +1,59 @@
+VERDICT: READY
+BLOCKER 0 / SHOULD-FIX 0 / NOTE 0
+
+Reviewed commit `b7927c9ab96802c4968203da6d190803724d5d6c`, with candidate-tree scope and review base `4404273d8e910581e66a180620777e0c3069710a`. The supplied integration checkout is `e21f78c03fc41b2ca10cac2990fd64b830cccc2d`; its entire tree matches the candidate (`e8386f300444efd34e81236a290937b28ce6fb92`). Also reviewed the requested cumulative `git diff feb6fb3..b7927c9 -- crates/tidemark-fs` and `git log --format='%h %s' feb6fb3..b7927c9`. Locations below refer to the candidate. READY is a source-review recommendation and evidence candidate, not a claim that uid 1000, GitHub CI, integration, or release gates have been verified.
+
+No supported remaining finding was identified. Review7's five blockers and one should-fix are addressed: the nonuniform-device filter, stale mount-ID cache and quadratic namespace lookup are removed; flags are again inside the metadata interval; typed OutOfMemory propagates; and final process validation no longer erases nontransient errors. `f213724` withdraws the prefilter, while the subsequent changes retain the per-fd skip policy and add the error/ordering corrections. No production source was edited for this review.
+
+**Four diagnostic probes rerun**
+
+The external harness uses the exact candidate `procfs.rs`, with only test include paths relocated and a review-only test module appended. Its production logic is unchanged. The four adapted probes passed; all fourteen harness tests passed, including the candidate's existing policy, budget and fdskip2 tests.
+
+| Review7 probe | Candidate result and evidence | Limits |
+| --- | --- | --- |
+| Nonuniform device | PASS. A real 12,345-byte deleted-open file in the attempt output had mount ID `1361`, mountinfo device `0:30`, actual metadata device `0:54`, and `nlink=0`. The complete `scan_open_files` retained its exact PID/fd/device/inode/size for both `want_flags=false` and `true`. Device admission now uses actual metadata at `crates/tidemark-fs/src/procfs.rs:292–295`. | Host filesystem evidence, without creating mounts; no XFS/OverlayFS VM run. |
+| Stale mount ID | PASS, adapted to the removed interface. There is no cache/map input to inject now. Successive synthetic old-unwatched/new-watched admission with the same fdinfo ID `42`, followed by unknown, malformed and missing IDs, retained every watched observation and called metadata twice. Parsing requested flags does not interpret mount IDs; production admission has no mountinfo or namespace dependency (`procfs.rs:234–242`, `285–316`, `350–370`). | Controlled inputs and source inspection establish that stale maps cannot filter this code. No live mount-ID churn was attempted. |
+| Reused-fd flags | PASS. With real temporary files, read read-only A's flags, then use safe `rustix::io::dup2` to replace that same descriptor number with write-only B before the first metadata observation. The candidate accepted B with B's write-only flags. Recorded callback order was exactly `[metadata, readlink, flags, metadata]`. | Deterministic actual descriptor replacement, without a scheduling race. Same-inode/ABA replacement remains a baseline limitation. |
+| Typed OOM | PASS. A deterministic failed `Vec::try_reserve(usize::MAX)` converted to `io::Error` had kind OutOfMemory and no raw errno, and propagated. An expanded matrix injected that error, raw ENOMEM/EMFILE/ENFILE, and eight nonresource cases at each of the four descriptor stages: all **48 cases** followed the requested propagate/skip policy and stopped further callbacks. | Injection exercises the actual helper; no host memory exhaustion or kernel fault injection. |
+
+The per-fd success path is exactly the base order: `fs::metadata` → regular-file/watched-device check → readlink → requested fdinfo flags → second `fs::metadata` → device/inode comparison (`procfs.rs:292–316`). Production callbacks at `368–370` execute those operations. When flags are unrequested, no fdinfo read occurs. The candidate's own tests additionally reject different-inode replacement and test the optional-flags path. The external trace assertion independently checks readlink-before-flags, which the candidate's callback assertions alone do not constrain.
+
+**Error policy at every inventory stage**
+
+Here “resource” means the task's specified raw ENOMEM/EMFILE/ENFILE and typed OutOfMemory, including typed OOM without errno. `transient()` at `procfs.rs:131–135` is byte-for-byte unchanged from `feb6fb3`: raw ENOENT/ESRCH/EACCES/EPERM only. EIO is not transient.
+
+| Stage | Error/result policy | Candidate location |
+| --- | --- | --- |
+| Empty watched-device list | Returns empty immediately; performs no reads. | `procfs.rs:340–343` |
+| Open `/proc` | Any error propagates. | `110`, `154–156`, `350` |
+| Enumerate PID or fd directory entries | Transient entry errors skip that entry; every other error propagates, including all specified resource errors. | `108–129` |
+| Numeric-ID reservation and caps | Reservation failure becomes ENOMEM; reaching the ID cap errors. No successful truncated list. | `117–123` |
+| Initial process starttime / open and enumerate fd list | Transient errors skip the process; all others propagate. The starttime reader propagates open/read failures and rejects malformed/incomplete data. | `174–185`, `352–360` |
+| First descriptor metadata | Resource errors propagate; every other error skips this fd. Nonregular/unwatched metadata skips without further observations. | `139–153`, `292–296` |
+| Descriptor readlink | Resource errors propagate; every other error skips this fd. Target text is never opened as a path. | `227–231`, `298–300` |
+| Requested fdinfo flags: open/read/parse | Resource errors propagate; other errors, including missing/malformed/oversized flags data, skip this fd. Unrequested flags remain None without reading. | `95–106`, `234–242`, `301–308` |
+| Descriptor metadata recheck | Resource errors propagate; every other error skips this fd. Device/inode changes reject the observation. | `310–315` |
+| Inventory record cap / byte admission | Errors propagate; allocation/admission errors do not return a partial successful inventory. | `46–77`, `375–389` |
+| Final starttime | Matching identity retains this process; changed identity or a transient error discards only its records and refunds target capacity. Every other error, including EIO, malformed data and all specified resource failures, propagates. | `80–85`, `321–333`, `391` |
+
+The retained final-starttime regression injected all four transient errnos, raw ENOMEM/EMFILE/ENFILE/EIO/EINVAL, typed OOM, and matching/changed identity; it passed and checked prior-process retention and truncation accounting. Errors returned by `read_descriptor`, `finish_process` and `Inventory::push` escape `scan_open_files` through `?`. I found no remaining route to partial `Ok` after one of the specified resource failures is returned by an inventory operation. The live caller preserves the error (`crates/tidemark-live/src/procscan.rs:181`); the daemon marks resource failures degraded and retries on its configured interval rather than publishing scan completion (`crates/tidemarkd/src/services/procscan.rs:133–141`). This conclusion does not claim recovery from allocator aborts or pressure that never returns an I/O error. Other per-fd errors such as ENOBUFS still follow the explicitly requested skip policy; the daemon's broader resource classifier does not change that local contract.
+
+**Comparison with `feb6fb3`**
+
+No new exclusion of a successfully observed watched file or wrong-flags path was found. Both metadata checks, file/device admission, PID identity validation, metadata fields and descriptor ordering are preserved. The mount-based false negatives and extra early fdinfo reads are gone.
+
+The behavior under errors needs a precise qualification: base nontransient metadata/readlink/recheck errors aborted the inventory; the candidate skips the affected fd. Base nontransient requested-fdinfo errors instead retained a record with `flags=None`; the candidate now skips that fd too. Thus a phantom record previously retained despite an fdinfo error can now be omitted, as the requested uniform per-fd policy explicitly requires. Resource fdinfo errors now abort, and nontransient final-starttime errors now abort instead of silently discarding a process. These are the requested corrections, not evidence that every base-retained record survives every error.
+
+No new unbounded container, recursion or successful-path syscall was introduced by the private helper extraction. The original 1 MiB proc-text cap, 1,048,576 numeric-ID/record caps, 8 MiB ID scratch reservation and 128 MiB inventory budget remain (`procfs.rs:12–18`, `46–77`, `95–129`, `344–348`). There is no namespace map or additional text reservation. Existing ID-vector growth and device-list membership costs are unchanged. Withdrawing the prefilter restores the base exposure to blocking metadata operations on remote filesystems; the patch does not promise to bound a hung stat's duration. Same-inode/ABA reuse and changes after observations remain best effort.
+
+**Validation and limits**
+
+- Read AGENTS.md, review7, the PROCFS-fdskip2 handoff, W1-D and its scanner/attribution references, process-scanner semantics, the changed source/tests and their live/daemon callers. The cumulative diff also retains the previously reviewed test-support permission-restoration guard. Its original open handles restore 0700 before victim TempDir cleanup, including normal panic unwinding (`crates/test-support/src/fixture.rs:578–591`). No explicit panic-injection test was run.
+- Pinned Rust 1.98.0, uid 0, umask 022: `cargo test --offline -p tidemark-fs -p test-support --no-fail-fast` passed: **116 passed, 0 failed, 2 existing scale tests ignored**. All four new fdskip2 regressions passed.
+- `cargo clippy --offline -p tidemark-fs -p test-support --all-targets -- -D warnings` and `cargo fmt --check` passed. Initial fmt/clippy invocations encountered the sandbox's unwritable default rustup home; selecting the already-installed toolchain/cache resolved that environmental error. The external harness's first compile required one additional relocated fixture include; its final compile and execution passed.
+- The standalone harness passed **14 tests**, including the four diagnostics and the 48-case descriptor error matrix. It changes no repository source and uses no mounts or privileged operations. Source copies, probe source, command, context, diff and logs are preserved under this attempt's output `library/` directory.
+- Ran `cargo clean --offline` for the dedicated review target directory and removed the standalone diagnostic executable after validation.
+
+Uid 1000 execution and GitHub Ubuntu 24.04 success are **not established**. This sandbox runs uid 0 with no permitted/effective capabilities and `NoNewPrivs=1`; no credential-changing or privileged commands were attempted. The new tests use owner-accessible temporary files, self-procfs and deterministic injected errors, with no observed source-level dependence on root or mounts. That supports portability but does not substitute for the requested execution gates. `.github/workflows/ci.yml:57–73` configures Ubuntu 24.04 and the pinned toolchain; configuration is not a successful CI run. No GitHub run was launched or verified. Those two execution checks remain for an appropriate runner.
+
+Also not established here: full-workspace tests/lints, cargo-deny, privileged VM runtime, real dead FUSE/NFS behavior, XFS/OverlayFS behavior, live mount churn, actual host memory-pressure behavior or scale timing. The handoff's broader validation is not represented as independently rerun evidence. No branches, merges, pushes, mounts, service/LVM changes or production-code edits were performed.
