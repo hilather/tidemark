@@ -1,5 +1,6 @@
 //! Owned by: W7-A
 //! In-module browser tests exercising the real store and drawing path.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "fixture.rs"]
 mod fixture;
@@ -40,6 +41,47 @@ fn browser(count: u32) -> (tempfile::TempDir, Browser) {
         now: 1_000_100,
         pages: Pages::default(),
         refresh: None,
+        theme: theme::Theme::plain(),
+        refresh_elapsed_ms: 0,
+        main_selected: 0,
+    };
+    b.load().unwrap();
+    (temp, b)
+}
+/// Children whose charged size grows with the id, so name order and size order disagree.
+fn browser_by_size(count: u32) -> (tempfile::TempDir, Browser) {
+    let temp = ::test_support::private_tempdir().unwrap();
+    let mut rows = vec![fixture::row(0, None, b"/fixture", u64::from(count) * 4096)];
+    rows[0].subtree_end = count;
+    rows[0].own_charged = 0;
+    for id in 1..=count {
+        rows.push(fixture::row(
+            id,
+            Some(0),
+            format!("/fixture/{id:08}").as_bytes(),
+            u64::from(id) * 4_096,
+        ));
+    }
+    let file = fixture::snapshot(temp.path(), &rows, 1_000_000);
+    let snapshot = Snapshot::open(&file).unwrap();
+    let dir = snapshot.root().unwrap();
+    let mut b = Browser {
+        snapshot,
+        snapshot_file: file.clone(),
+        old: None,
+        dir,
+        state: State::new(1),
+        rows: vec![],
+        text: String::new(),
+        links: vec![],
+        snapshots: vec![],
+        message: String::new(),
+        now: 1_000_100,
+        pages: Pages::default(),
+        refresh: None,
+        theme: theme::Theme::plain(),
+        refresh_elapsed_ms: 0,
+        main_selected: 0,
     };
     b.load().unwrap();
     (temp, b)
@@ -98,14 +140,26 @@ fn deterministic_render_at_both_sizes() {
         let first = render(&b, width, height);
         assert_eq!(first, render(&b, width, height));
         assert!(first.contains(if width >= 160 { "./ (files here)" } else { "." }));
-        assert!(first.contains("degraded=false"));
+        if width < 160 {
+            assert!(!first.contains("./ (files here)"), "{first}");
+        }
+        assert!(first.contains("steady"), "{first}");
+        assert!(!first.contains("degraded=false"), "{first}");
         insta::with_settings!({snapshot_path => "snapshots"}, { insta::assert_snapshot!(format!("main_{width}_{height}"),first); });
     }
 }
 #[test]
 fn too_small() {
     let (_temp, b) = browser(1);
-    assert!(render(&b, 79, 23).contains("terminal too small"));
+    let text = render(&b, 79, 23);
+    assert!(text.contains("terminal too small"), "{text}");
+    assert!(text.contains("need 80×24, have 79×23"), "{text}");
+    assert!(text.contains("minimum 80x24"), "{text}");
+    let mut ascii = b;
+    ascii.theme = theme::Theme::select(true, false, None, Some("linux"), Some("C"));
+    let text = render(&ascii, 79, 23);
+    assert!(text.contains("need 80x24, have 79x23"), "{text}");
+    assert!(!text.contains('×'), "{text}");
 }
 #[test]
 fn hostile_names_in_data_panes() {
@@ -168,6 +222,9 @@ fn hostile_names_in_data_panes() {
         now: 1_000_100,
         pages: Pages::default(),
         refresh: None,
+        theme: theme::Theme::plain(),
+        refresh_elapsed_ms: 0,
+        main_selected: 0,
     };
     b.load().unwrap();
     for pane in [
@@ -230,6 +287,9 @@ fn million_directory_navigation() {
         now: 1_000_100,
         pages: Pages::default(),
         refresh: None,
+        theme: theme::Theme::plain(),
+        refresh_elapsed_ms: 0,
+        main_selected: 0,
     };
     for step in 0..10 {
         let start = std::time::Instant::now();
@@ -275,6 +335,9 @@ fn query_pages_skip_nested_subtrees_and_support_back() {
         now: 1_000_100,
         pages: Pages::default(),
         refresh: None,
+        theme: theme::Theme::plain(),
+        refresh_elapsed_ms: 0,
+        main_selected: 0,
     };
     b.load().unwrap();
     assert_eq!(
@@ -577,6 +640,7 @@ fn live_additions_exceeding_growth_cap_fall_back_without_exiting() {
         cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rx,
         worker: None,
+        started: std::time::Instant::now(),
     });
     let children = (1..=10_001)
         .map(|id| {
@@ -604,9 +668,14 @@ fn human_header_and_pane_labels_are_lowercase() {
     let (_temp, b) = browser(1);
     for width in [80, 100] {
         let text = render(&b, width, 24);
-        assert!(text.contains("walk age"), "{text}");
-        assert!(text.contains("main | size | filter"), "{text}");
-        assert!(!text.contains("Walk") && !text.contains("Main | Size"));
+        assert!(text.contains("depth · /fixture · sort size"), "{text}");
+        assert!(text.contains("walk"), "{text}");
+        assert!(text.contains("1m 39s ago"), "{text}");
+        assert!(text.contains("20260101T000000Z-00000000"), "{text}");
+        assert!(text.contains("steady"), "{text}");
+        assert!(text.contains("high-water"), "{text}");
+        assert!(!text.contains("Walk") && !text.contains("Size"), "{text}");
+        assert!(!text.contains("degraded=false"), "{text}");
     }
 }
 
@@ -979,7 +1048,14 @@ fn own_files_after_refresh_use_snapshot_observation() {
         assert!(screen.contains(&crate::render::size::timestamp(meta.finished_at)));
         assert!(screen.contains("does not include changes since this snapshot"));
         assert!(!screen.contains("live (Δ snapshot)"));
-        assert!(!screen.contains("live values; delta"));
+        // The file list stays the snapshot. The finished refresh still reaches the message line.
+        assert!(screen.contains("live values; delta"), "{screen}");
+        if width >= 160 {
+            assert!(
+                screen.contains("live values; delta against snapshot"),
+                "{screen}"
+            );
+        }
     }
 }
 
@@ -989,6 +1065,7 @@ fn install_refresh(b: &mut Browser, root: DirRow, children: Vec<(DirRow, Option<
         cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rx,
         worker: None,
+        started: std::time::Instant::now(),
     });
     tx.send(Ok(LiveResult {
         root,
@@ -1001,12 +1078,85 @@ fn install_refresh(b: &mut Browser, root: DirRow, children: Vec<(DirRow, Option<
 }
 
 #[test]
+fn refresh_keeps_the_own_row_when_its_bytes_grow_past_the_children() {
+    let (_temp, mut b) = browser(3);
+    let config = tidemark_core::config::Config::default();
+    assert_eq!(b.own_position(), 3);
+    for _ in 0..3 {
+        b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    }
+    assert_eq!(b.state.selected, b.own_position());
+    assert_eq!(b.main_selected, b.own_position());
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    assert_eq!(b.state.pane, Pane::Info);
+    let mut root = b.dir.clone();
+    root.own_charged = 8192;
+    let children = b.rows.clone();
+    install_refresh(&mut b, root, children);
+    assert_eq!(b.main_selected, b.own_position());
+    assert_ne!(b.own_position(), usize::MAX);
+    assert!(
+        !b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+    let screen = render(&b, 140, 40);
+    assert!(screen.contains("(whole dir)"), "{screen}");
+    assert!(!screen.contains("strata · 00000003/"), "{screen}");
+    assert!(!screen.contains("soundings · 00000003/"), "{screen}");
+}
+
+#[test]
+fn refresh_keeps_a_child_on_a_later_page() {
+    let (_temp, mut b) = browser(1_001);
+    let config = tidemark_core::config::Config::default();
+    b.state.sort = state::Sort::Name;
+    b.boundary(false).unwrap();
+    b.on_key(crossterm::event::KeyCode::PageDown, &config)
+        .unwrap();
+    assert_eq!(b.pages.offset, 1_000);
+    assert_eq!(b.own_position(), usize::MAX);
+    let row = b
+        .child_at(b.main_selected)
+        .expect("child on the later page")
+        .0
+        .clone();
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    let children = (1..=1_001)
+        .map(|id| {
+            (
+                fixture::row(id, Some(0), format!("/fixture/{id:08}").as_bytes(), 4096),
+                None,
+            )
+        })
+        .collect();
+    let root = b.dir.clone();
+    install_refresh(&mut b, root, children);
+    assert_eq!(b.pages.offset, 1_000);
+    assert_eq!(b.child_at(b.main_selected).unwrap().0.path, row.path);
+    assert!(
+        !b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+    let screen = render(&b, 140, 40);
+    let name = escape(&row.name);
+    assert!(screen.contains(&format!("strata · {name}/")), "{screen}");
+    assert!(screen.contains(&format!("soundings · {name}/")), "{screen}");
+    assert!(!screen.contains("(whole dir)"), "{screen}");
+}
+
+#[test]
 fn live_refresh_from_later_page_restores_own_row() {
     let (_temp, mut b) = browser(2500);
     b.state.sort = state::Sort::Name;
     b.boundary(false).unwrap();
     b.page(false).unwrap();
     assert!(b.pages.cursor.is_some());
+    assert_eq!(b.pages.offset, 1_000);
+    let kept = b.child_at(b.main_selected).unwrap().0.path.clone();
     let children = (1..=2500)
         .map(|id| {
             (
@@ -1017,10 +1167,13 @@ fn live_refresh_from_later_page_restores_own_row() {
         .collect();
     let root = b.dir.clone();
     install_refresh(&mut b, root, children);
-    assert_eq!(b.pages.offset, 0);
-    assert_eq!(b.own_position(), 0);
+    // Name sort puts `./` on page 0. The open child on this page stays selected.
+    assert_eq!(b.pages.offset, 1_000);
+    assert_eq!(b.child_at(b.main_selected).unwrap().0.path, kept);
+    assert_eq!(b.own_position(), usize::MAX);
     assert!(b.pages.cursor.is_none());
     assert!(!b.pages.reverse);
+    b.boundary(false).unwrap();
     let mut own_rows = 0;
     loop {
         own_rows += usize::from(b.own_position() != usize::MAX);
@@ -1401,6 +1554,12 @@ fn live_reverse_boundary_keeps_own_row_for_every_sort() {
             root.own_files = 1;
             root.own_charged = 2048;
             install_refresh(&mut b, root, children);
+            // Refresh follows the open directory, which can leave page 0.
+            // The reverse-page check below starts at the first live page.
+            b.pages.offset = 0;
+            b.pages.cursor = None;
+            b.pages.reverse = false;
+            b.load().unwrap();
             let initial = b.own_position();
             assert_eq!(
                 initial,
@@ -1634,7 +1793,7 @@ fn post_tui_files_pane_fits_80_columns() {
     b.state.selected = b.own_position();
     b.enter().unwrap();
     let rendered = render(&b, 80, 24);
-    let title = rendered.lines().nth(4).unwrap();
+    let title = rendered.lines().nth(1).expect("files title row");
     assert!(
         title.contains(&b.snapshot.meta().scan_id.to_string()),
         "{title}"
@@ -1662,6 +1821,1779 @@ fn post_tui_missing_path_keeps_scan_remedy_without_complete_evidence() {
         assert!(message.contains("run: tidemark scan"), "{message}");
         assert!(!message.contains("drop --snapshot"), "{message}");
     }
+}
+
+fn token_end_column(line: &str, token: &str) -> Option<usize> {
+    let start = line.find(token)?;
+    Some(line[..start].chars().count() + token.chars().count())
+}
+
+#[test]
+fn fmt_when_uses_the_utc_year_and_keeps_epoch_dates() {
+    let now = 1_781_524_800;
+    assert_eq!(draw::fmt_when(now, now), "06-15 12:00");
+    assert_eq!(draw::fmt_when(100, 1_000_100), "01-01 00:01");
+    assert_eq!(draw::fmt_when(0, now), "1970-01-01");
+    assert_eq!(draw::fmt_when(-1, now), "1969-12-31");
+}
+
+#[test]
+fn fmt_files_stays_within_six_columns() {
+    let pins = [
+        (9_999, "9999"),
+        (10_000, "10.0k"),
+        (99_949, "99.9k"),
+        (99_950, "100k"),
+        (999_499, "999k"),
+        (999_500, "1.00M"),
+        (9_994_999, "9.99M"),
+        (999_499_999, "999M"),
+        (1_000_000_000, "1.00G"),
+        (1_000_000_000_000, "1.00T"),
+        (1_000_000_000_000_000, "1.00P"),
+        (1_000_000_000_000_000_000, "1.00E"),
+        (u64::MAX, "18.4E"),
+    ];
+    for (value, expected) in pins {
+        let text = draw::fmt_files(value);
+        assert_eq!(text, expected, "{value}");
+        assert!(text.chars().count() <= 6, "{text}");
+    }
+}
+
+#[test]
+fn level_cells_use_largest_remainder_and_fit_bars_shift() {
+    assert_eq!(draw::level_cells(0, &[1, 1, 1], 4), vec![0, 0, 0]);
+    assert_eq!(draw::level_cells(3, &[1, 1, 1], 3), vec![1, 1, 1]);
+    assert_eq!(draw::level_cells(3, &[1, 1, 1], 4), vec![2, 1, 1]);
+    assert_eq!(draw::level_cells(1_000, &[1], 12), vec![0]);
+    let huge = draw::level_cells(u64::MAX, &[u64::MAX, 0], 4);
+    assert_eq!(huge, vec![4, 0]);
+    // Remainder 7 beats remainder 2, so the last row takes the leftover, not the first.
+    assert_eq!(draw::level_cells(10, &[6, 3, 1], 7), vec![4, 2, 1]);
+    // Equal remainders: the lower index wins the one leftover.
+    assert_eq!(draw::level_cells(5, &[1, 1], 3), vec![1, 0]);
+    // A weight past the directory makes the floors overshoot; the split still sums to the width.
+    assert_eq!(draw::level_cells(5, &[8, 2], 4), vec![3, 1]);
+    let mut values = [u64::MAX, u64::MAX / 2];
+    draw::fit_bar_values(&mut values, 6);
+    let max = values.iter().copied().max().unwrap();
+    assert!(u128::from(max) * 6 * 8 <= u128::from(u64::MAX));
+}
+
+#[test]
+fn theme_select_follows_color_flags_and_locale() {
+    use theme::{Level, Theme};
+    assert_eq!(
+        Theme::select(
+            false,
+            false,
+            Some("truecolor"),
+            Some("xterm-256color"),
+            Some("C.UTF-8")
+        )
+        .level,
+        Level::Mono
+    );
+    assert_eq!(
+        Theme::select(
+            true,
+            true,
+            Some("truecolor"),
+            Some("xterm-256color"),
+            Some("C.UTF-8")
+        )
+        .level,
+        Level::Mono
+    );
+    let rgb = Theme::select(
+        true,
+        false,
+        Some("truecolor"),
+        Some("xterm-256color"),
+        Some("C.UTF-8"),
+    );
+    assert_eq!(rgb.level, Level::Rgb);
+    assert_eq!(rgb.glyphs.anchor, "⚓");
+    assert_eq!(
+        Theme::select(true, false, None, Some("xterm-256color"), Some("C.UTF-8")).level,
+        Level::Indexed
+    );
+    let basic = Theme::select(true, false, Some("other"), Some("xterm"), Some("C.UTF-8"));
+    assert_eq!(basic.level, Level::Basic);
+    assert_eq!(basic.color(theme::Role::Text), ratatui::style::Color::Reset);
+    assert_eq!(basic.color(theme::Role::Teal), ratatui::style::Color::Cyan);
+    assert_eq!(basic.color(theme::Role::Coral), ratatui::style::Color::Red);
+    assert_eq!(basic.strata(0), ratatui::style::Color::Reset);
+    assert_ne!(basic.strata(0), ratatui::style::Color::White);
+    assert_eq!(basic.strata(5), ratatui::style::Color::DarkGray);
+    let linux = Theme::select(
+        true,
+        false,
+        Some("truecolor"),
+        Some("linux"),
+        Some("C.UTF-8"),
+    );
+    assert_eq!(linux.level, Level::Rgb);
+    assert_eq!(linux.glyphs.anchor, "H");
+    assert_eq!(linux.glyphs.spinner[0], "|");
+    let posix = Theme::select(
+        true,
+        false,
+        Some("24bit"),
+        Some("xterm-256color"),
+        Some("C"),
+    );
+    assert_eq!(posix.glyphs.anchor, "H");
+    assert!(!posix.glyphs.unicode);
+}
+
+#[test]
+fn previous_complete_picks_the_nearer_start_then_smaller_id() {
+    let rows = vec![
+        (
+            "b-scan".into(),
+            std::path::PathBuf::from("b"),
+            1_000,
+            Some(9_000),
+        ),
+        (
+            "a-scan".into(),
+            std::path::PathBuf::from("a"),
+            1_000,
+            Some(1_000),
+        ),
+        (
+            "later".into(),
+            std::path::PathBuf::from("l"),
+            2_500,
+            Some(50),
+        ),
+        (
+            "open".into(),
+            std::path::PathBuf::from("o"),
+            3_000,
+            Some(3_000),
+        ),
+    ];
+    assert_eq!(previous_complete(&rows, 2_000, "open").unwrap().0, "a-scan");
+    assert_eq!(previous_complete(&rows, 3_000, "open").unwrap().0, "later");
+    assert!(previous_complete(&rows, 1_000, "a-scan").is_none());
+}
+
+#[test]
+fn header_keeps_the_scan_id_and_high_water() {
+    let (_temp, mut b) = browser(1);
+    let id = b.snapshot.meta().scan_id.to_string();
+    b.snapshots = vec![(
+        id.clone(),
+        b.snapshot_file.clone(),
+        b.snapshot.meta().started_at,
+        Some(72_241_886),
+    )];
+    let text = render(&b, 80, 24);
+    assert!(text.contains(&id), "{text}");
+    assert!(text.contains("walk"), "{text}");
+    assert!(text.contains("1m 39s ago"), "{text}");
+    assert!(text.contains("high-water"), "{text}");
+    assert!(text.contains("68.9 MiB"), "{text}");
+    assert!(text.contains("steady"), "{text}");
+    let header = text.lines().next().unwrap();
+    assert!(header.ends_with("68.9 MiB"), "{header}");
+    let wide = render(&b, 160, 24);
+    let wide_header = wide.lines().next().unwrap();
+    assert_eq!(wide_header.chars().count(), 160, "{wide_header}");
+    assert!(wide_header.ends_with("68.9 MiB"), "{wide_header}");
+    assert!(wide_header.contains('≋'), "{wide_header}");
+}
+
+#[test]
+fn tide_chart_uses_root_totals_and_the_smaller_tied_snapshot() {
+    let (_temp, mut b) = browser(1);
+    let id = b.snapshot.meta().scan_id.to_string();
+    let started = b.snapshot.meta().started_at;
+    let file = b.snapshot_file.clone();
+    b.snapshots = vec![
+        ("b-scan".into(), file.clone(), 500_000, Some(9_000)),
+        ("a-scan".into(), file.clone(), 500_000, Some(1_000)),
+        (id.clone(), file, started, Some(3_000)),
+    ];
+    let wide = render(&b, 140, 40);
+    assert!(wide.contains("root total by snapshot"), "{wide}");
+    assert!(wide.contains("since previous"), "{wide}");
+    assert!(wide.contains("+1.95 KiB"), "{wide}");
+    assert!(wide.contains("01-12 13h"), "{wide}");
+    assert!(wide.contains("2.93 KiB"), "{wide}");
+    assert!(!wide.contains("13h 2"), "{wide}");
+    assert!(!wide.contains("-5.86 KiB"), "{wide}");
+    b.theme = theme::Theme::select(true, false, Some("truecolor"), Some("linux"), Some("C"));
+    let ascii = render(&b, 140, 40);
+    assert!(ascii.contains("d +1.95 KiB since previous"), "{ascii}");
+    assert!(!ascii.contains('Δ'), "{ascii}");
+    assert!(!ascii.contains('·'), "{ascii}");
+    assert!(!ascii.contains('×'), "{ascii}");
+    b.theme = theme::Theme::plain();
+    b.snapshots.truncate(1);
+    let one = render(&b, 140, 40);
+    assert!(!one.contains("root total by snapshot"), "{one}");
+    b.snapshots.push((
+        "z-scan".into(),
+        b.snapshot_file.clone(),
+        started - 10,
+        Some(4_000),
+    ));
+    let narrow = render(&b, 80, 40);
+    assert!(!narrow.contains("root total by snapshot"), "{narrow}");
+    let file = b.snapshot_file.clone();
+    let mut outside = vec![
+        ("older".into(), file.clone(), started - 100, Some(10_000)),
+        (id, file.clone(), started, Some(50_000)),
+    ];
+    for index in 0..8 {
+        outside.push((
+            format!("newer-{index}"),
+            file.clone(),
+            started + 10 + i64::from(index),
+            Some(2_000),
+        ));
+    }
+    b.snapshots = outside;
+    let hidden = render(&b, 140, 40);
+    assert!(hidden.contains("root total by snapshot"), "{hidden}");
+    assert!(
+        !hidden.contains("since previous"),
+        "open snapshot is outside the chart window\n{hidden}"
+    );
+}
+
+#[test]
+fn tide_chart_omits_delta_when_previous_is_outside_the_window() {
+    let (_temp, mut b) = browser(1);
+    let id = b.snapshot.meta().scan_id.to_string();
+    let started = b.snapshot.meta().started_at;
+    let file = b.snapshot_file.clone();
+    let mut rows = vec![("older".into(), file.clone(), started - 10, Some(10_000))];
+    rows.push((id, file.clone(), started, Some(50_000)));
+    for index in 0..6 {
+        rows.push((
+            format!("newer-{index}"),
+            file.clone(),
+            started + 10 + i64::from(index),
+            Some(2_000),
+        ));
+    }
+    b.snapshots = rows;
+    let screen = render(&b, 140, 40);
+    assert!(screen.contains("root total by snapshot"), "{screen}");
+    assert!(screen.contains("48.8 KiB"), "{screen}");
+    assert!(
+        !screen.contains("since previous"),
+        "previous snapshot is outside the chart window\n{screen}"
+    );
+}
+
+#[test]
+fn size_column_is_right_aligned_at_both_widths() {
+    let (_temp, mut b) = browser(3);
+    b.rows[0].0.t_disk = 72_241_886;
+    for (width, height) in [(80, 24), (140, 40)] {
+        let screen = render(&b, width, height);
+        assert!(screen.contains("68.9 MiB"), "{screen}");
+        let end = screen
+            .lines()
+            .find_map(|line| {
+                line.contains("68.9 MiB")
+                    .then(|| token_end_column(line, "68.9 MiB"))
+            })
+            .unwrap()
+            .unwrap();
+        let mut saw_peer = false;
+        for line in screen
+            .lines()
+            .filter(|line| line.contains("4.00 KiB") && line.contains('/'))
+        {
+            if line.contains("68.9 MiB") {
+                continue;
+            }
+            assert_eq!(token_end_column(line, "4.00 KiB"), Some(end), "{line}");
+            saw_peer = true;
+        }
+        assert!(saw_peer, "{screen}");
+        let own = if width >= 120 {
+            screen.lines().find(|line| line.contains("./ (files here)"))
+        } else {
+            screen
+                .lines()
+                .find(|line| line.contains("0 B") && line.contains('.'))
+        }
+        .expect("own row");
+        assert_eq!(token_end_column(own, "0 B"), Some(end), "{own}");
+        if width >= 120 {
+            assert!(screen.contains("0000000"), "{screen}");
+        }
+    }
+}
+
+#[test]
+fn own_row_dashes_the_four_snapshot_cells() {
+    let (_temp, b) = browser(3);
+    let wide = render(&b, 160, 48);
+    let own = wide
+        .lines()
+        .find(|line| line.contains("./ (files here)"))
+        .unwrap();
+    assert!(own.contains("12.0 KiB"), "{own}");
+    assert!(own.matches(" -").count() >= 4, "{own}");
+    let narrow = render(&b, 80, 24);
+    assert!(!narrow.contains("./ (files here)"), "{narrow}");
+    let own = narrow.lines().find(|line| line.contains("0 B")).unwrap();
+    assert!(own.matches(" -").count() >= 4, "{own}");
+}
+
+#[test]
+fn no_match_copy_depends_on_editing() {
+    let (_temp, mut b) = browser(3);
+    b.state.filter = "zzz".into();
+    b.boundary(false).unwrap();
+    assert!(b.rows.is_empty());
+    assert_eq!(b.own_position(), usize::MAX);
+    let idle = render(&b, 80, 24);
+    assert!(
+        idle.contains("no matches for \"zzz\" · Esc clears the filter"),
+        "{idle}"
+    );
+    let idle_row = idle
+        .lines()
+        .position(|line| line.contains("no matches for"))
+        .unwrap();
+    assert_eq!(idle_row, 10, "centred in the table\n{idle}");
+    b.state.editing = true;
+    let editing = render(&b, 80, 24);
+    assert!(
+        editing.contains("no matches for \"zzz\" yet · Enter or Esc to finish"),
+        "{editing}"
+    );
+    let editing_row = editing
+        .lines()
+        .position(|line| line.contains("no matches for"))
+        .unwrap();
+    assert_eq!(editing_row, 10, "centred in the table\n{editing}");
+}
+
+#[test]
+fn info_and_help_do_not_use_the_table_marker() {
+    let (_temp, mut b) = browser(1);
+    b.pane(Pane::Help).unwrap();
+    let help = render(&b, 80, 24);
+    assert!(!help.contains('▶'), "{help}");
+    b.theme = theme::Theme::select(true, false, None, Some("linux"), Some("C"));
+    let ascii = render(&b, 80, 24);
+    assert!(!ascii.contains("> "), "{ascii}");
+    b.theme = theme::Theme::plain();
+    b.pane(Pane::Info).unwrap();
+    let mut lines = vec!["INFO-FIRST-LINE".to_string()];
+    for index in 1..40 {
+        lines.push(format!("INFO-LINE-{index:02}"));
+    }
+    b.text = lines.join("\n");
+    b.state.selected = 30;
+    let info = render(&b, 80, 24);
+    assert!(!info.contains("INFO-FIRST-LINE"), "{info}");
+    assert!(info.contains("INFO-LINE-30"), "{info}");
+    assert!(!info.contains('▶'), "{info}");
+}
+
+fn buffer_of(b: &Browser, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| draw::draw(frame, b)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+    (0..buffer.area.width)
+        .map(|x| buffer[(x, y)].symbol())
+        .collect()
+}
+
+fn row_containing(buffer: &ratatui::buffer::Buffer, needle: &str) -> u16 {
+    (0..buffer.area.height)
+        .find(|y| row_text(buffer, *y).contains(needle))
+        .unwrap_or_else(|| panic!("missing {needle}"))
+}
+
+#[test]
+fn rgb_frame_paints_navy_and_a_coral_rising_mark() {
+    use ratatui::style::{Color, Modifier};
+    let (_temp, mut b) = browser(3);
+    b.theme = theme::Theme::select(
+        true,
+        false,
+        Some("truecolor"),
+        Some("xterm-256color"),
+        Some("C.UTF-8"),
+    );
+    b.state.selected = 0;
+    b.rows[1].1 = Some(4_096);
+    let buffer = buffer_of(&b, 80, 24);
+    let mut navy = false;
+    let mut coral = false;
+    let mut teal_marker = false;
+    for cell in &buffer.content {
+        if cell.bg == Color::Rgb(7, 21, 38) && cell.symbol() == " " {
+            navy = true;
+        }
+        if cell.symbol() == "▲" && cell.fg == Color::Rgb(255, 123, 107) {
+            coral = true;
+        }
+        if cell.symbol() == "▾" {
+            assert_eq!(cell.fg, Color::Rgb(0x2e, 0xc4, 0xb6), "sort marker");
+            teal_marker = true;
+        }
+    }
+    assert!(teal_marker, "expected a teal sort marker");
+    assert!(navy, "expected a blank navy cell");
+    assert!(coral, "expected an unselected coral rising mark");
+    let legend = row_containing(&buffer, "ebbing");
+    let footer = row_containing(&buffer, "quit");
+    let last = buffer.area.width - 1;
+    assert_eq!(buffer[(last, legend)].bg, Color::Rgb(7, 21, 38));
+    assert_eq!(buffer[(last, footer)].bg, Color::Rgb(7, 21, 38));
+    let title = row_containing(&buffer, "depth");
+    let title_cell = (0..buffer.area.width)
+        .map(|x| &buffer[(x, title)])
+        .find(|cell| cell.symbol() == "d")
+        .expect("depth title");
+    assert_eq!(title_cell.fg, Color::Rgb(0x2e, 0xc4, 0xb6));
+    assert!(title_cell.modifier.contains(Modifier::BOLD));
+    let border = &buffer[(0, title + 1)];
+    assert_eq!(border.symbol(), "│");
+    assert_eq!(border.fg, Color::Rgb(0x1d, 0x3d, 0x57));
+    b.theme = theme::Theme::select(true, false, None, Some("xterm-256color"), Some("C.UTF-8"));
+    let indexed = buffer_of(&b, 80, 24);
+    let legend = row_containing(&indexed, "ebbing");
+    let footer = row_containing(&indexed, "quit");
+    assert_eq!(indexed[(last, legend)].bg, Color::Indexed(233));
+    assert_eq!(indexed[(last, footer)].bg, Color::Indexed(233));
+}
+
+#[test]
+fn main_selected_stays_on_the_depth_row_across_panes() {
+    let (_temp, mut b) = browser(10);
+    let config = tidemark_core::config::Config::default();
+    for _ in 0..3 {
+        assert!(!b.on_key(crossterm::event::KeyCode::Down, &config).unwrap());
+    }
+    assert_eq!(b.state.selected, 3);
+    assert_eq!(b.main_selected, 3);
+    assert_eq!(b.child_at(3).unwrap().0.id, 4);
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    assert_eq!(b.main_selected, 3);
+    let info = render(&b, 140, 40);
+    assert!(info.contains("strata · 00000004/"), "{info}");
+    assert!(info.contains("soundings · 00000004/"), "{info}");
+    b.on_key(crossterm::event::KeyCode::Char('/'), &config)
+        .unwrap();
+    assert!(b.state.editing);
+    assert_eq!(b.state.selected, 3);
+    assert_eq!(b.main_selected, 3);
+    b.state.editing = false;
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Left, &config).unwrap();
+    assert_eq!(b.state.pane, Pane::Main);
+    assert_eq!(b.state.selected, 3);
+    assert_eq!(b.main_selected, 3);
+    assert_eq!(b.pages.offset, 0);
+    let back = render(&b, 140, 40);
+    assert!(back.contains("strata · 00000004/"), "{back}");
+    assert!(!back.contains("strata · 00000001/"), "{back}");
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Esc, &config).unwrap();
+    assert_eq!(b.state.selected, 0);
+    assert_eq!(b.main_selected, 0);
+    assert_eq!(b.pages.offset, 0);
+    let escaped = render(&b, 140, 40);
+    assert!(escaped.contains("strata · 00000001/"), "{escaped}");
+    assert!(!escaped.contains("strata · 00000004/"), "{escaped}");
+}
+
+#[test]
+fn files_pane_formats_mtime_and_keeps_the_retained_timestamp() {
+    let (_temp, mut b) = browser(0);
+    let temp = ::test_support::private_tempdir().unwrap();
+    let mut rows = vec![b.dir.clone()];
+    rows[0].own_files = 1;
+    let meta = fixture::meta(rows[0].path.clone(), 1_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&rows).unwrap();
+    writer
+        .put_files(&[FileRow {
+            id: 0,
+            dir_id: 0,
+            name: Some(RawName::new(b"root".to_vec()).unwrap()),
+            ino: 2,
+            disk: 4_096,
+            apparent: 4_096,
+            mtime: 100,
+            nlink: 1,
+        }])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.dir = b.snapshot.root().unwrap();
+    b.pane(Pane::Files).unwrap();
+    let header = b.text.lines().next().unwrap();
+    assert!(header.contains("SIZE"), "{header}");
+    assert!(header.contains("MTIME"), "{header}");
+    assert!(header.contains("PATH"), "{header}");
+    assert!(b.text.contains("01-01 00:01"), "{}", b.text);
+    assert!(!b.text.contains("1970-01-01 00:01:40Z"), "{}", b.text);
+    b.close_pane();
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    assert!(b.text.contains("1970-01-01 00:01:40Z"), "{}", b.text);
+}
+
+#[test]
+fn files_footer_names_the_snapshot_while_refresh_runs() {
+    let (_temp, mut b) = browser(0);
+    b.state.selected = b.own_position();
+    b.enter().unwrap();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+        started: std::time::Instant::now(),
+    });
+    b.refresh_elapsed_ms = 2_500;
+    let screen = render(&b, 160, 24);
+    assert!(
+        screen.contains("Snapshot files; does not include changes since snapshot"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Live refresh running; Esc cancels"),
+        "{screen}"
+    );
+    assert!(screen.contains('⠙'), "{screen}");
+    assert!(screen.contains("2s"), "{screen}");
+    drop(tx);
+}
+
+#[test]
+fn poll_refresh_keeps_the_info_cursor_and_the_selected_directory() {
+    let (_temp, mut b) = browser(10);
+    let config = tidemark_core::config::Config::default();
+    for _ in 0..3 {
+        b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    }
+    let selected_id = b.child_at(3).unwrap().0.id;
+    let selected_path = b.child_at(3).unwrap().0.path.clone();
+    assert_eq!(selected_id, 4);
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    assert_eq!(b.state.pane, Pane::Info);
+    assert_eq!(b.state.selected, 2);
+    assert_eq!(b.main_selected, 3);
+    let mut children = b.rows.clone();
+    let position = children
+        .iter()
+        .position(|(row, _)| row.id == selected_id)
+        .unwrap();
+    let chosen = children.remove(position);
+    children.insert(0, chosen);
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+        started: std::time::Instant::now(),
+    });
+    tx.send(Ok(LiveResult {
+        root: b.dir.clone(),
+        children,
+        sort: b.state.sort,
+        growth: Default::default(),
+    }))
+    .unwrap();
+    b.poll_refresh().unwrap();
+    assert!(b.refresh.is_none());
+    assert_eq!(b.state.selected, 2, "info cursor");
+    assert_eq!(b.child_at(b.main_selected).unwrap().0.path, selected_path);
+    assert!(
+        !b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+    let info = render(&b, 140, 40);
+    assert!(info.contains("strata · 00000004/"), "{info}");
+    assert!(info.contains("soundings · 00000004/"), "{info}");
+    let gone: Vec<_> = b
+        .pages
+        .live
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter(|(row, _)| row.id != selected_id)
+        .cloned()
+        .collect();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+        started: std::time::Instant::now(),
+    });
+    tx.send(Ok(LiveResult {
+        root: b.dir.clone(),
+        children: gone,
+        sort: b.state.sort,
+        growth: Default::default(),
+    }))
+    .unwrap();
+    b.poll_refresh().unwrap();
+    assert_eq!(b.state.selected, 2, "info cursor after a missing directory");
+    assert_eq!(b.main_selected, 0);
+    assert!(
+        b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+    let after = render(&b, 140, 40);
+    assert!(!after.contains("strata · 00000004/"), "{after}");
+}
+
+#[test]
+fn refresh_does_not_keep_a_sibling_that_inherited_the_deleted_id() {
+    let (_temp, mut b) = browser(3);
+    let config = tidemark_core::config::Config::default();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    let selected_id = b.child_at(1).unwrap().0.id;
+    let selected_path = b.child_at(1).unwrap().0.path.clone();
+    assert_eq!(selected_id, 2);
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    assert_eq!(b.state.selected, 1);
+    let mut children = b.rows.clone();
+    children.retain(|(row, _)| row.path != selected_path);
+    let sibling_path = {
+        let sibling = children
+            .iter_mut()
+            .find(|(row, _)| row.id == selected_id + 1)
+            .unwrap();
+        sibling.0.id = selected_id;
+        sibling.0.path.clone()
+    };
+    assert!(children
+        .iter()
+        .any(|(row, _)| row.id == selected_id && row.path == sibling_path));
+    assert!(children.iter().all(|(row, _)| row.path != selected_path));
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+        started: std::time::Instant::now(),
+    });
+    tx.send(Ok(LiveResult {
+        root: b.dir.clone(),
+        children,
+        sort: b.state.sort,
+        growth: Default::default(),
+    }))
+    .unwrap();
+    b.poll_refresh().unwrap();
+    assert_eq!(b.state.selected, 1, "info cursor");
+    assert_eq!(b.main_selected, 0);
+    assert_ne!(b.child_at(b.main_selected).unwrap().0.path, sibling_path);
+    assert!(
+        b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+    let screen = render(&b, 140, 40);
+    assert!(screen.contains("strata · 00000001/"), "{screen}");
+    assert!(!screen.contains("strata · 00000003/"), "{screen}");
+}
+
+#[test]
+fn refresh_follows_the_path_when_an_earlier_page_reuses_its_id() {
+    let (_temp, mut b) = browser(1);
+    let target = b.child_at(0).unwrap().0.clone();
+    let mut children = Vec::with_capacity(1_001);
+    for index in 0..1_000 {
+        let id = if index == 0 {
+            target.id
+        } else {
+            10_000 + index
+        };
+        children.push((
+            fixture::row(
+                id,
+                Some(0),
+                format!("/fixture/x{index:04}").as_bytes(),
+                4_096,
+            ),
+            None,
+        ));
+    }
+    let mut real = target.clone();
+    real.id = 42;
+    children.push((real, None));
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+        started: std::time::Instant::now(),
+    });
+    tx.send(Ok(LiveResult {
+        root: b.dir.clone(),
+        children,
+        sort: b.state.sort,
+        growth: Default::default(),
+    }))
+    .unwrap();
+    b.poll_refresh().unwrap();
+    assert_eq!(b.pages.offset, 1_000);
+    assert_eq!(b.child_at(b.main_selected).unwrap().0.path, target.path);
+    assert_ne!(b.child_at(b.main_selected).unwrap().0.id, target.id);
+    assert!(
+        !b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+}
+
+#[test]
+fn files_message_shows_a_finished_and_a_failed_refresh() {
+    let (_temp, mut b) = browser(1);
+    b.pane(Pane::Files).unwrap();
+    b.state.selected = 3;
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+        started: std::time::Instant::now(),
+    });
+    tx.send(Ok(LiveResult {
+        root: b.dir.clone(),
+        children: b.rows.clone(),
+        sort: b.state.sort,
+        growth: Default::default(),
+    }))
+    .unwrap();
+    b.poll_refresh().unwrap();
+    assert!(b.refresh.is_none());
+    assert_eq!(b.state.selected, 3, "files cursor");
+    let done = render(&b, 160, 24);
+    assert!(
+        done.contains("Snapshot files; does not include changes since snapshot"),
+        "{done}"
+    );
+    assert!(
+        done.contains("live values; delta against snapshot"),
+        "{done}"
+    );
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+        started: std::time::Instant::now(),
+    });
+    tx.send(Err(anyhow::anyhow!("boom refresh failed")))
+        .unwrap();
+    b.poll_refresh().unwrap();
+    assert!(b.refresh.is_none());
+    assert_eq!(b.state.selected, 3, "files cursor after a failure");
+    let failed = render(&b, 160, 24);
+    assert!(
+        failed.contains("Snapshot files; does not include changes since snapshot"),
+        "{failed}"
+    );
+    assert!(failed.contains("boom refresh failed"), "{failed}");
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+        started: std::time::Instant::now(),
+    });
+    b.message = "Live refresh already running".into();
+    let already = render(&b, 160, 24);
+    assert!(
+        already.contains("Live refresh already running"),
+        "{already}"
+    );
+    assert!(
+        already.contains("Live refresh running; Esc cancels"),
+        "{already}"
+    );
+    assert!(
+        already.contains("Snapshot files; does not include changes since snapshot"),
+        "{already}"
+    );
+    drop(tx);
+}
+
+#[test]
+fn files_message_keeps_the_result_ahead_of_the_disclaimer_at_80_columns() {
+    let (_temp, mut b) = browser(1);
+    b.pane(Pane::Files).unwrap();
+    b.message = "live values; delta against snapshot; selected directory is gone".into();
+    let gone = render(&b, 80, 24);
+    let line = gone
+        .lines()
+        .find(|line| line.contains("selected directory is gone"))
+        .unwrap_or_else(|| panic!("{gone}"));
+    assert!(
+        line.contains("live values; delta against snapshot"),
+        "{line}"
+    );
+    if let Some(disclaimer) = line.find("Snapshot") {
+        assert!(
+            line.find("selected directory is gone").unwrap() < disclaimer,
+            "{line}"
+        );
+    }
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    b.refresh = Some(Refresh {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx,
+        worker: None,
+        started: std::time::Instant::now(),
+    });
+    b.message.clear();
+    let running = render(&b, 80, 24);
+    let line = running
+        .lines()
+        .find(|line| line.contains("Esc cancels"))
+        .unwrap_or_else(|| panic!("{running}"));
+    if let Some(disclaimer) = line.find("Snapshot") {
+        assert!(line.find("Esc cancels").unwrap() < disclaimer, "{line}");
+    }
+    drop(tx);
+}
+
+#[test]
+fn sort_from_info_keeps_the_directory_and_the_info_cursor() {
+    let (_temp, mut b) = browser(10);
+    let config = tidemark_core::config::Config::default();
+    for _ in 0..3 {
+        b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    }
+    let path = b.child_at(3).unwrap().0.path.clone();
+    assert!(path.display_lossy().ends_with("00000004"), "{path:?}");
+    let mut live = b.rows.clone();
+    for (row, _) in &mut live {
+        if row.path == path {
+            row.t_reclaimable = 1;
+        } else if row.id == 1 {
+            row.t_reclaimable = 9_000_000;
+        }
+    }
+    b.pages.live = Some(live);
+    b.pages.live_order = Some(b.state.sort);
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    assert_eq!(b.state.pane, Pane::Info);
+    assert_eq!(b.state.selected, 2);
+    assert_eq!(b.main_selected, 3);
+    b.on_key(crossterm::event::KeyCode::Char('s'), &config)
+        .unwrap();
+    assert_eq!(b.state.pane, Pane::Info);
+    assert_eq!(b.state.sort, state::Sort::Reclaim);
+    assert_eq!(b.state.selected, 2, "info cursor");
+    assert_eq!(b.child_at(b.main_selected).unwrap().0.path, path);
+    assert_ne!(b.main_selected, 3);
+    let info = render(&b, 140, 40);
+    assert!(info.contains("strata · 00000004/"), "{info}");
+    assert!(info.contains("soundings · 00000004/"), "{info}");
+    b.on_key(crossterm::event::KeyCode::Char('f'), &config)
+        .unwrap();
+    b.state.selected = 4;
+    b.on_key(crossterm::event::KeyCode::Char('s'), &config)
+        .unwrap();
+    assert_eq!(b.state.pane, Pane::Files);
+    assert_eq!(b.state.selected, 4, "files cursor");
+    assert_eq!(b.child_at(b.main_selected).unwrap().0.path, path);
+}
+
+fn page_to_rank_at_least_1000(b: &mut Browser) {
+    let config = tidemark_core::config::Config::default();
+    b.on_key(crossterm::event::KeyCode::PageDown, &config)
+        .unwrap();
+    assert!(b.pages.offset >= 1_000, "offset {}", b.pages.offset);
+}
+
+#[test]
+fn sort_from_info_keeps_a_child_ranked_past_the_first_snapshot_page() {
+    let (_temp, mut b) = browser(2000);
+    let config = tidemark_core::config::Config::default();
+    page_to_rank_at_least_1000(&mut b);
+    let path = b.child_at(b.main_selected).unwrap().0.path.clone();
+    assert_ne!(b.child_at(0).unwrap().0.id, 1);
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    assert_eq!(b.state.selected, 1);
+    b.on_key(crossterm::event::KeyCode::Char('s'), &config)
+        .unwrap();
+    assert_eq!(b.state.pane, Pane::Info);
+    assert_eq!(b.state.sort, state::Sort::Reclaim);
+    assert_eq!(b.state.selected, 1, "info cursor");
+    assert!(b.pages.offset >= 1_000, "offset {}", b.pages.offset);
+    assert_eq!(b.child_at(b.main_selected).unwrap().0.path, path);
+    assert!(
+        !b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+    while b.state.sort != state::Sort::Growth {
+        b.on_key(crossterm::event::KeyCode::Char('s'), &config)
+            .unwrap();
+        assert_eq!(b.child_at(b.main_selected).unwrap().0.path, path);
+        assert!(b.pages.offset >= 1_000, "offset {}", b.pages.offset);
+        assert_eq!(b.state.selected, 1, "info cursor");
+        assert!(
+            !b.message.contains("selected directory is gone"),
+            "{}",
+            b.message
+        );
+    }
+    assert!(b.pages.growth.is_some());
+}
+
+#[test]
+fn sort_from_info_keeps_the_own_row_past_the_first_page() {
+    let (_temp, mut b) = browser(2000);
+    let config = tidemark_core::config::Config::default();
+    b.on_key(crossterm::event::KeyCode::End, &config).unwrap();
+    assert!(b.pages.offset >= 1_000, "offset {}", b.pages.offset);
+    assert_eq!(b.main_selected, b.own_position());
+    assert_ne!(b.own_position(), usize::MAX);
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    let info_cursor = b.state.selected;
+    b.on_key(crossterm::event::KeyCode::Char('s'), &config)
+        .unwrap();
+    assert_eq!(b.state.sort, state::Sort::Reclaim);
+    assert_eq!(b.state.pane, Pane::Info);
+    assert_eq!(b.state.selected, info_cursor);
+    assert_eq!(b.main_selected, b.own_position());
+    assert_ne!(b.own_position(), usize::MAX);
+    assert!(b.pages.offset >= 1_000, "offset {}", b.pages.offset);
+    assert!(
+        !b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+    // Files ties on t_files and then name, so `./` moves to the front. The later
+    // sorts put it back after every child. Growth must read pages.growth, not name order.
+    for _ in 0..3 {
+        b.on_key(crossterm::event::KeyCode::Char('s'), &config)
+            .unwrap();
+        assert_eq!(b.state.selected, info_cursor);
+        assert_eq!(b.main_selected, b.own_position());
+        assert_ne!(b.own_position(), usize::MAX);
+        assert!(
+            !b.message.contains("selected directory is gone"),
+            "{}",
+            b.message
+        );
+    }
+    assert_eq!(b.state.sort, state::Sort::Growth);
+    assert!(b.pages.growth.is_some());
+    assert!(b.pages.offset >= 1_000, "offset {}", b.pages.offset);
+    assert_eq!(b.main_selected, b.own_position());
+}
+
+#[test]
+fn sort_into_growth_keeps_a_child_the_growth_cache_ranks_past_1000() {
+    let (_temp, mut b) = browser(2000);
+    let config = tidemark_core::config::Config::default();
+    let target = b.child_at(0).unwrap().0.path.clone();
+    let mut all = Vec::new();
+    loop {
+        all.extend(b.rows.clone());
+        if b.pages.offset + b.rows.len() >= b.pages.total {
+            break;
+        }
+        let offset = b.pages.offset;
+        b.page(false).unwrap();
+        assert_ne!(b.pages.offset, offset);
+    }
+    assert_eq!(all.len(), 2_000);
+    let index = all.iter().position(|(row, _)| row.path == target).unwrap();
+    let chosen = all.remove(index);
+    all.push(chosen);
+    b.boundary(false).unwrap();
+    b.pages.growth = Some(all);
+    b.state.sort = state::Sort::Newest;
+    b.state.selected = 0;
+    b.main_selected = 0;
+    assert_eq!(b.child_at(0).unwrap().0.path, target);
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    b.on_key(crossterm::event::KeyCode::Char('s'), &config)
+        .unwrap();
+    assert_eq!(b.state.sort, state::Sort::Growth);
+    assert_eq!(b.state.pane, Pane::Info);
+    assert_eq!(b.state.selected, 1, "info cursor");
+    assert_eq!(b.pages.offset, 1_000);
+    assert_eq!(b.child_at(b.main_selected).unwrap().0.path, target);
+    assert_ne!(
+        b.pages.growth.as_ref().unwrap().first().unwrap().0.path,
+        target
+    );
+    assert!(
+        !b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+}
+
+#[test]
+fn left_and_backspace_from_info_keep_the_deep_page() {
+    let (_temp, mut b) = browser(2000);
+    let config = tidemark_core::config::Config::default();
+    page_to_rank_at_least_1000(&mut b);
+    for _ in 0..4 {
+        b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    }
+    assert!(b.state.selected >= 4);
+    let deep = b.child_at(b.main_selected).unwrap().0.path.clone();
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Char('s'), &config)
+        .unwrap();
+    assert!(b.pages.offset >= 1_000);
+    assert!(b.main_selected > 0, "row {}", b.main_selected);
+    assert_eq!(b.child_at(b.main_selected).unwrap().0.path, deep);
+    let offset = b.pages.offset;
+    let selected = b.main_selected;
+    let cursor = b.pages.cursor.clone();
+    let first = b.rows.first().unwrap().0.id;
+    b.on_key(crossterm::event::KeyCode::Left, &config).unwrap();
+    assert_eq!(b.state.pane, Pane::Main);
+    assert_eq!(b.pages.offset, offset);
+    assert_eq!(b.pages.cursor, cursor);
+    assert_eq!(b.rows.first().unwrap().0.id, first);
+    assert_eq!(b.state.selected, selected);
+    assert_eq!(b.main_selected, selected);
+    assert_eq!(b.child_at(b.state.selected).unwrap().0.path, deep);
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    b.on_key(crossterm::event::KeyCode::Backspace, &config)
+        .unwrap();
+    assert_eq!(b.state.pane, Pane::Main);
+    assert_eq!(b.pages.offset, offset);
+    assert_eq!(b.pages.cursor, cursor);
+    assert_eq!(b.rows.first().unwrap().0.id, first);
+    assert_eq!(b.state.selected, selected);
+    assert_eq!(b.main_selected, selected);
+    assert_eq!(b.child_at(b.state.selected).unwrap().0.path, deep);
+}
+
+#[test]
+fn own_row_after_exactly_one_thousand_children_keeps_their_page() {
+    // rank == filtered_len == 1000 pulls ./ back onto the full page. Offset 1000 is the empty page.
+    assert_eq!(super::own_page_offset(1_000, 1_000), 0);
+    assert_eq!(super::own_page_offset(2_000, 2_000), 1_000);
+    // ./ after the first 1,000 of a longer list is an ordinary page boundary.
+    assert_eq!(super::own_page_offset(1_000, 1_500), 1_000);
+    assert_eq!(super::own_page_offset(999, 999), 0);
+    assert_eq!(super::own_page_offset(0, 0), 0);
+    let (_temp, mut b) = browser(1_000);
+    let config = tidemark_core::config::Config::default();
+    b.on_key(crossterm::event::KeyCode::End, &config).unwrap();
+    assert_eq!(b.pages.offset, 0);
+    assert_eq!(b.rows.len(), 1_000);
+    assert_eq!(b.main_selected, b.own_position());
+    assert_ne!(b.own_position(), usize::MAX);
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    b.on_key(crossterm::event::KeyCode::Char('s'), &config)
+        .unwrap();
+    assert_eq!(b.state.pane, Pane::Info);
+    assert_eq!(b.pages.offset, 0, "empty trailing page");
+    assert_eq!(b.rows.len(), 1_000);
+    assert_eq!(b.main_selected, b.own_position());
+    assert_ne!(b.own_position(), usize::MAX);
+    assert!(
+        !b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+}
+
+#[test]
+fn refresh_on_main_selects_the_own_row_and_the_child() {
+    let config = tidemark_core::config::Config::default();
+    let (_temp, mut b) = browser(3);
+    for _ in 0..3 {
+        b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    }
+    assert_eq!(b.state.pane, Pane::Main);
+    assert_eq!(b.state.selected, b.own_position());
+    assert_ne!(b.state.selected, 0);
+    let mut root = b.dir.clone();
+    root.own_charged = 5_000;
+    let mut children = b.rows.clone();
+    children[0].0.t_disk = 9_000;
+    children[1].0.t_disk = 8_000;
+    children[2].0.t_disk = 1_000;
+    install_refresh(&mut b, root, children);
+    assert_eq!(b.state.pane, Pane::Main);
+    assert_eq!(b.own_position(), 2);
+    assert_eq!(b.state.selected, 2);
+    assert_eq!(b.main_selected, 2);
+    assert!(
+        !b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+
+    let (_temp, mut b) = browser(3);
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    assert_eq!(b.state.selected, 2);
+    let path = b.child_at(2).unwrap().0.path.clone();
+    let mut children = b.rows.clone();
+    let chosen = children.remove(2);
+    children.insert(1, chosen);
+    children[0].0.t_disk = 9_000;
+    children[1].0.t_disk = 8_000;
+    children[2].0.t_disk = 7_000;
+    let root = b.dir.clone();
+    install_refresh(&mut b, root, children);
+    let index = b.child_display_index(&path).unwrap();
+    assert_eq!(index, 1);
+    assert_eq!(b.state.pane, Pane::Main);
+    assert_eq!(b.state.selected, index);
+    assert_eq!(b.main_selected, index);
+    assert_eq!(b.child_at(b.state.selected).unwrap().0.path, path);
+    assert!(
+        !b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+}
+
+#[test]
+fn enter_on_own_keeps_the_report_out_of_the_column_header() {
+    let (_temp, mut b) = browser(1);
+    let config = tidemark_core::config::Config::default();
+    b.on_key(crossterm::event::KeyCode::End, &config).unwrap();
+    assert_eq!(b.state.selected, b.own_position());
+    b.on_key(crossterm::event::KeyCode::Enter, &config).unwrap();
+    assert_eq!(b.state.pane, Pane::Files);
+    let first = b.text.lines().next().unwrap();
+    assert!(first.starts_with("Snapshot "), "{first}");
+    assert!(!super::files_column_header(first), "{first}");
+    assert!(b.column_header().is_none());
+    let lines = b.text.lines().count();
+    assert!(lines > 1, "{}", b.text);
+    assert_eq!(b.count(), lines);
+    assert!(b.text.contains("PATH  SIZE  APPARENT  MTIME"), "{}", b.text);
+    assert!(
+        b.text.contains("does not include changes since"),
+        "{}",
+        b.text
+    );
+    assert!(b.text.contains("charged to this directory"), "{}", b.text);
+    let screen = render(&b, 120, 24);
+    assert!(highlighted_line(&screen).contains("Snapshot"), "{screen}");
+    assert!(screen.contains("PATH  SIZE  APPARENT  MTIME"), "{screen}");
+    b.on_key(crossterm::event::KeyCode::End, &config).unwrap();
+    assert_eq!(b.state.selected, lines - 1);
+    let last = render(&b, 120, 24);
+    assert!(
+        highlighted_line(&last).contains("common ancestor"),
+        "{last}"
+    );
+    assert!(!highlighted_line(&last).contains("Snapshot"), "{last}");
+}
+
+#[test]
+fn load_ranked_page_follows_sort_direction_and_the_step_limit() {
+    let (_temp, mut b) = browser_by_size(2_500);
+    b.state.sort = state::Sort::Name;
+    b.load_ranked_page(1_000).unwrap();
+    assert_eq!(b.pages.offset, 1_000);
+    assert_eq!(b.rows.first().unwrap().0.id, 1_001);
+    b.state.sort = state::Sort::Size;
+    b.load_ranked_page(1_000).unwrap();
+    assert_eq!(b.pages.offset, 1_000);
+    assert_eq!(b.rows.first().unwrap().0.id, 1_500);
+
+    let deep = b
+        .snapshot
+        .dir_by_path(&RawPath::new(b"/fixture/00002200".to_vec()).unwrap())
+        .unwrap()
+        .unwrap();
+    b.state.sort = state::Sort::Name;
+    b.pages.total = 0;
+    b.load_ranked_page(2_000).unwrap();
+    assert_eq!(b.pages.offset, 1_000, "step limit stops the walk");
+    assert!(b.rows.iter().all(|row| row.0.id != deep.id));
+    assert!(b.child_display_index(&deep.path).is_none());
+    b.pages.total = 0;
+    b.state.pane = Pane::Main;
+    b.state.selected = 7;
+    b.main_selected = 7;
+    let missing = b.settle_child_target(&deep.path).unwrap();
+    assert!(missing);
+    assert_eq!(b.state.selected, 0);
+    assert_eq!(b.main_selected, 0);
+}
+
+#[test]
+fn end_and_arrows_on_an_empty_list_stay_at_zero() {
+    let (_temp, mut b) = browser(0);
+    let config = tidemark_core::config::Config::default();
+    b.on_key(crossterm::event::KeyCode::Char('l'), &config)
+        .unwrap();
+    assert_eq!(b.count(), 0);
+    b.state.selected = 4;
+    b.on_key(crossterm::event::KeyCode::End, &config).unwrap();
+    assert_eq!(b.state.selected, 0);
+    b.state.selected = 4;
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    assert_eq!(b.state.selected, 0);
+    b.state.selected = 4;
+    b.on_key(crossterm::event::KeyCode::Up, &config).unwrap();
+    assert_eq!(b.state.selected, 0);
+    b.on_key(crossterm::event::KeyCode::Char('f'), &config)
+        .unwrap();
+    assert_eq!(b.count(), 0, "{}", b.text);
+    b.state.selected = 4;
+    b.on_key(crossterm::event::KeyCode::End, &config).unwrap();
+    assert_eq!(b.state.selected, 0);
+    b.state.selected = 4;
+    b.on_key(crossterm::event::KeyCode::PageDown, &config)
+        .unwrap();
+    assert_eq!(b.state.selected, 0);
+}
+
+#[test]
+fn depth_title_keeps_the_filter_when_the_path_is_long() {
+    let (_temp, mut b) = browser(1);
+    b.dir.path = RawPath::new(format!("/{}", "p".repeat(180)).into_bytes()).unwrap();
+    b.state.filter = "zzz".into();
+    let title = draw::depth_title(&b, 80);
+    let text: String = title
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let cols: usize = title
+        .spans
+        .iter()
+        .map(|span| crate::render::table::display_width(span.content.as_ref()))
+        .sum();
+    assert!(cols <= 80, "{cols} {text}");
+    assert!(text.contains("filter \"zzz\""), "{text}");
+    assert!(text.contains("sort size"), "{text}");
+    assert!(text.contains("..."), "{text}");
+    let screen = render(&b, 80, 24);
+    let line = screen
+        .lines()
+        .find(|line| line.contains("depth") && line.contains("sort "))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(line.contains("filter \"zzz\""), "{line}");
+}
+
+#[test]
+fn esc_from_info_during_live_refresh_returns_to_the_first_child() {
+    let (_temp, mut b) = browser(1);
+    let config = tidemark_core::config::Config::default();
+    let target = b.child_at(0).unwrap().0.clone();
+    let mut children = Vec::with_capacity(1_001);
+    for index in 0..1_000 {
+        children.push((
+            fixture::row(
+                10_000 + index,
+                Some(0),
+                format!("/fixture/x{index:04}").as_bytes(),
+                8_192,
+            ),
+            None,
+        ));
+    }
+    children.push((target.clone(), None));
+    b.pages.live = Some(children);
+    b.pages.live_order = Some(b.state.sort);
+    b.state.filter = String::from_utf8(target.name.clone()).unwrap();
+    b.boundary(false).unwrap();
+    assert_eq!(b.rows.len(), 1);
+    assert_eq!(b.pages.offset, 0);
+    assert_eq!(b.child_at(0).unwrap().0.path, target.path);
+    b.main_selected = 0;
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    b.refresh = Some(Refresh {
+        cancel: cancel.clone(),
+        rx,
+        worker: None,
+        started: std::time::Instant::now(),
+    });
+    b.on_key(crossterm::event::KeyCode::Esc, &config).unwrap();
+    assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(b.state.pane, Pane::Main);
+    assert!(b.state.filter.is_empty());
+    assert_eq!(b.pages.offset, 0);
+    assert_eq!(b.state.selected, 0);
+    assert_eq!(b.main_selected, 0);
+    let first = &b.child_at(0).unwrap().0.path;
+    assert_ne!(first, &target.path);
+    assert!(
+        first.display_lossy().ends_with("x0000"),
+        "{first:?} offset {}",
+        b.pages.offset
+    );
+    drop(tx);
+}
+
+#[test]
+fn sort_from_info_reports_a_directory_that_is_really_gone() {
+    let (_temp, mut b) = browser(4);
+    let config = tidemark_core::config::Config::default();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    let path = b.child_at(1).unwrap().0.path.clone();
+    b.on_key(crossterm::event::KeyCode::Char('i'), &config)
+        .unwrap();
+    let mut children = b.rows.clone();
+    children.retain(|(row, _)| row.path != path);
+    b.pages.live = Some(children);
+    b.pages.live_order = Some(b.state.sort);
+    b.on_key(crossterm::event::KeyCode::Char('s'), &config)
+        .unwrap();
+    assert_eq!(b.state.pane, Pane::Info);
+    assert_eq!(b.state.sort, state::Sort::Reclaim);
+    assert_eq!(b.main_selected, 0);
+    assert_ne!(
+        b.child_at(b.main_selected).map(|(row, _)| row.path.clone()),
+        Some(path)
+    );
+    assert!(
+        b.message.contains("selected directory is gone"),
+        "{}",
+        b.message
+    );
+}
+
+#[test]
+fn header_shortens_the_path_to_the_leftover_budget() {
+    let glyphs = theme::Theme::plain().glyphs;
+    let path = format!("/{}", "p".repeat(180));
+    let identity = "20260101T000000Z-00000000 · walk · 1m 39s ago · steady";
+    let right = "high-water 68.9 MiB";
+    let (brand, shown) = draw::fit_header(120, identity, right, &path, glyphs);
+    assert!(!brand);
+    let shown = shown.expect("path kept");
+    let cols = draw::header_cols(&shown);
+    assert!(cols > 12, "{shown} is {cols} columns");
+    let fixed = draw::header_cols(identity) + 1 + draw::header_cols(right);
+    assert!(cols + 2 + fixed <= 120, "cols {cols} fixed {fixed}");
+    let (narrow_brand, narrow) = draw::fit_header(80, identity, right, &path, glyphs);
+    assert!(!narrow_brand);
+    assert!(
+        narrow.is_none(),
+        "a path shorter than 8 columns is dropped, got {narrow:?}"
+    );
+}
+
+#[test]
+fn pane_titles_stay_inside_the_width_and_strata_spell_one_age() {
+    let (_temp, mut b) = browser(1);
+    b.state.filter = "n".repeat(80);
+    for width in [12usize, 20, 40, 80] {
+        let depth = draw::depth_title(&b, width);
+        let cols: usize = depth
+            .spans
+            .iter()
+            .map(|span| crate::render::table::display_width(span.content.as_ref()))
+            .sum();
+        assert!(cols <= width, "depth {cols} > {width}: {depth:?}");
+        for pane in [Pane::Help, Pane::Files, Pane::Picker] {
+            b.state.pane = pane;
+            let title = draw::list_title(&b, width);
+            let cols: usize = title
+                .spans
+                .iter()
+                .map(|span| crate::render::table::display_width(span.content.as_ref()))
+                .sum();
+            assert!(cols <= width, "{pane:?} {cols} > {width}: {title:?}");
+        }
+    }
+    let long = "n".repeat(80);
+    for prefix in ["strata", "soundings"] {
+        let heading = draw::panel_heading(prefix, "·", &long, 40);
+        let cols = crate::render::table::display_width(&heading);
+        assert!(cols <= 38, "{prefix} {cols} > 38: {heading}");
+    }
+    assert_eq!(
+        draw::panel_heading("strata", "·", "/fixture (whole dir)", 40),
+        "strata · /fixture (whole dir)"
+    );
+    b.state.filter.clear();
+    b.state.pane = Pane::Main;
+    let unicode = render(&b, 140, 40);
+    assert!(unicode.contains("≥365d"), "{unicode}");
+    assert!(!unicode.contains(">=365d"), "{unicode}");
+    b.theme = theme::Theme::select(false, false, None, Some("linux"), Some("C"));
+    let ascii = render(&b, 140, 40);
+    assert!(ascii.contains(">=365d"), "{ascii}");
+    assert!(!ascii.contains("≥365d"), "{ascii}");
+}
+
+#[test]
+fn strata_sizes_share_a_column_and_soundings_fit_at_80() {
+    let (_temp, mut b) = browser(3);
+    let wide = render(&b, 140, 40);
+    let full = wide.lines().find(|line| line.contains("<1d")).unwrap();
+    let empty = wide.lines().find(|line| line.contains("1-7d")).unwrap();
+    assert_eq!(
+        full.find("4.00 KiB"),
+        empty.find("0 B"),
+        "full {full}\nempty {empty}"
+    );
+    b.rows[0].0.t_reclaimable = b.rows[0].0.t_disk;
+    b.main_selected = 0;
+    let narrow = render(&b, 80, 30);
+    let line = narrow
+        .lines()
+        .find(|line| line.contains("reclaimable if removed"))
+        .unwrap();
+    assert!(line.contains("reclaimable if removed 100%"), "{line}");
+    assert!(line.ends_with('│'), "{line}");
+}
+
+fn highlighted_line(screen: &str) -> &str {
+    screen
+        .lines()
+        .find(|line| line.contains('▶'))
+        .unwrap_or_else(|| panic!("no highlighted row\n{screen}"))
+}
+
+#[test]
+fn enter_on_the_second_highlighted_link_opens_that_set() {
+    let temp = ::test_support::private_tempdir().unwrap();
+    let root = fixture::row(0, None, b"/fixture", 24_576);
+    let meta = fixture::meta(root.path.clone(), 1_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&[root]).unwrap();
+    writer
+        .put_link_sets(&[
+            LinkSetRow {
+                ino: 303,
+                nlink: 1,
+                found: 1,
+                complete: true,
+                disk: 12_288,
+                apparent: 12_288,
+                mtime: 100,
+                lca_dir_id: 0,
+            },
+            LinkSetRow {
+                ino: 202,
+                nlink: 1,
+                found: 1,
+                complete: true,
+                disk: 8_192,
+                apparent: 8_192,
+                mtime: 100,
+                lca_dir_id: 0,
+            },
+            LinkSetRow {
+                ino: 101,
+                nlink: 1,
+                found: 1,
+                complete: true,
+                disk: 4_096,
+                apparent: 4_096,
+                mtime: 100,
+                lca_dir_id: 0,
+            },
+        ])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    let (_temp, mut b) = browser(0);
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.snapshot_file = file;
+    b.dir = b.snapshot.root().unwrap();
+    let config = tidemark_core::config::Config::default();
+    b.on_key(crossterm::event::KeyCode::Char('l'), &config)
+        .unwrap();
+    assert_eq!(b.links, vec![303, 202, 101]);
+    assert_eq!(b.count(), b.links.len());
+    let screen = render(&b, 120, 24);
+    let header = screen
+        .lines()
+        .find(|line| line.contains("INSTANCES"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(!header.contains('▶'), "header is a list row\n{header}");
+    assert!(highlighted_line(&screen).contains("303"), "{screen}");
+    b.on_key(crossterm::event::KeyCode::End, &config).unwrap();
+    assert_eq!(b.state.selected, b.links.len() - 1);
+    let last = render(&b, 120, 24);
+    assert!(highlighted_line(&last).contains("101"), "{last}");
+    assert!(!highlighted_line(&last).contains("303"), "{last}");
+    b.on_key(crossterm::event::KeyCode::Home, &config).unwrap();
+    b.on_key(crossterm::event::KeyCode::Down, &config).unwrap();
+    assert_eq!(b.state.selected, 1);
+    let second = render(&b, 120, 24);
+    let row = highlighted_line(&second);
+    assert!(row.contains("202"), "{row}");
+    assert!(!row.contains("303") && !row.contains("101"), "{row}");
+    b.on_key(crossterm::event::KeyCode::Enter, &config).unwrap();
+    assert_eq!(b.state.pane, Pane::Instances);
+    assert_eq!(b.pages.inode, Some(202));
+}
+
+#[test]
+fn files_column_header_is_not_a_selectable_row() {
+    let (_temp, mut b) = browser(0);
+    let temp = ::test_support::private_tempdir().unwrap();
+    let mut rows = vec![b.dir.clone()];
+    rows[0].own_files = 2;
+    let meta = fixture::meta(rows[0].path.clone(), 1_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&rows).unwrap();
+    writer
+        .put_files(&[
+            FileRow {
+                id: 0,
+                dir_id: 0,
+                name: Some(RawName::new(b"old".to_vec()).unwrap()),
+                ino: 2,
+                disk: 0,
+                apparent: 0,
+                mtime: 100,
+                nlink: 1,
+            },
+            FileRow {
+                id: 1,
+                dir_id: 0,
+                name: Some(RawName::new(b"huge".to_vec()).unwrap()),
+                ino: 3,
+                disk: 72_241_886,
+                apparent: 72_241_886,
+                mtime: 100,
+                nlink: 1,
+            },
+        ])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.dir = b.snapshot.root().unwrap();
+    let config = tidemark_core::config::Config::default();
+    b.on_key(crossterm::event::KeyCode::Char('f'), &config)
+        .unwrap();
+    let paths: Vec<String> = b
+        .text
+        .lines()
+        .skip(1)
+        .map(|line| line.rsplit_once("  ").unwrap().1.to_string())
+        .collect();
+    assert_eq!(paths.len(), 2, "{}", b.text);
+    assert_eq!(b.count(), paths.len());
+    let screen = render(&b, 120, 24);
+    let header = screen
+        .lines()
+        .find(|line| line.contains("MTIME") && line.contains("PATH"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    assert!(!header.contains('▶'), "header is a list row\n{header}");
+    assert!(highlighted_line(&screen).contains(&paths[0]));
+    b.on_key(crossterm::event::KeyCode::End, &config).unwrap();
+    assert_eq!(b.state.selected, 1);
+    let last = render(&b, 120, 24);
+    assert!(highlighted_line(&last).contains(&paths[1]), "{last}");
+    assert!(!highlighted_line(&last).contains("MTIME"), "{last}");
+}
+
+#[test]
+fn picker_dates_pad_so_the_total_column_lines_up() {
+    let (_temp, mut b) = browser(1);
+    let now = 1_781_524_800;
+    b.now = now;
+    let file = b.snapshot_file.clone();
+    b.snapshots = vec![
+        ("newer-scan".into(), file.clone(), now, Some(4_096)),
+        ("older-scan".into(), file, 0, Some(8_192)),
+    ];
+    b.pane(Pane::Picker).unwrap();
+    let screen = render(&b, 120, 24);
+    let newer = screen
+        .lines()
+        .find(|line| line.contains("newer-scan"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    let older = screen
+        .lines()
+        .find(|line| line.contains("older-scan"))
+        .unwrap_or_else(|| panic!("{screen}"));
+    let newer_at = newer.find("4.00 KiB").unwrap() - newer.find("newer-scan").unwrap();
+    let older_at = older.find("8.00 KiB").unwrap() - older.find("older-scan").unwrap();
+    assert_eq!(newer_at, older_at, "newer {newer}\nolder {older}");
+}
+
+#[test]
+fn links_rows_line_up_under_the_header() {
+    let temp = ::test_support::private_tempdir().unwrap();
+    let root = fixture::row(0, None, b"/fixture", 8_388_608);
+    let meta = fixture::meta(root.path.clone(), 1_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&[root]).unwrap();
+    writer
+        .put_link_sets(&[
+            LinkSetRow {
+                ino: 100,
+                nlink: 2,
+                found: 2,
+                complete: true,
+                disk: 4_096,
+                apparent: 4_096,
+                mtime: 100,
+                lca_dir_id: 0,
+            },
+            LinkSetRow {
+                ino: 7,
+                nlink: 1,
+                found: 1,
+                complete: true,
+                disk: 0,
+                apparent: 0,
+                mtime: 100,
+                lca_dir_id: 0,
+            },
+        ])
+        .unwrap();
+    writer
+        .put_link_instances(&[
+            LinkInstanceRow {
+                ino: 100,
+                dir_id: 0,
+                name: Some(RawName::new(b"left".to_vec()).unwrap()),
+            },
+            LinkInstanceRow {
+                ino: 100,
+                dir_id: 0,
+                name: Some(RawName::new(b"right".to_vec()).unwrap()),
+            },
+            LinkInstanceRow {
+                ino: 7,
+                dir_id: 0,
+                name: Some(RawName::new(b"only".to_vec()).unwrap()),
+            },
+        ])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    let (_temp, mut b) = browser(0);
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.snapshot_file = file;
+    b.dir = b.snapshot.root().unwrap();
+    b.pane(Pane::Links).unwrap();
+    let lines: Vec<&str> = b.text.lines().collect();
+    let header = lines[0];
+    assert!(header.starts_with("INO"), "{header}");
+    let kib = lines.iter().find(|line| line.contains("4.00 KiB")).unwrap();
+    let zero = lines.iter().find(|line| line.contains("0 B")).unwrap();
+    let size_end = header.find("SIZE").unwrap() + "SIZE".len();
+    assert_eq!(
+        kib.find("4.00 KiB").unwrap() + "4.00 KiB".len(),
+        size_end,
+        "{kib}"
+    );
+    assert_eq!(zero.find("0 B").unwrap() + "0 B".len(), size_end, "{zero}");
+    let instances = header.find("INSTANCES").unwrap();
+    assert_eq!(kib.find('⚓'), Some(instances), "{kib}");
+    assert_eq!(kib.matches('⚓').count(), 1, "{kib}");
+    assert_eq!(kib.matches("2").count(), 1, "{kib}");
+    assert!(!kib.contains("instance"), "{kib}");
+}
+
+#[test]
+fn files_rows_line_up_under_the_header() {
+    let (_temp, mut b) = browser(0);
+    let temp = ::test_support::private_tempdir().unwrap();
+    let mut rows = vec![b.dir.clone()];
+    rows[0].own_files = 2;
+    let meta = fixture::meta(rows[0].path.clone(), 1_000_000);
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(temp.path(), &meta).unwrap();
+    writer.put_dirs(&rows).unwrap();
+    writer
+        .put_files(&[
+            FileRow {
+                id: 0,
+                dir_id: 0,
+                name: Some(RawName::new(b"old".to_vec()).unwrap()),
+                ino: 2,
+                disk: 0,
+                apparent: 0,
+                mtime: 100,
+                nlink: 1,
+            },
+            FileRow {
+                id: 1,
+                dir_id: 0,
+                name: Some(RawName::new(b"huge".to_vec()).unwrap()),
+                ino: 3,
+                disk: 72_241_886,
+                apparent: 72_241_886,
+                mtime: 1_800_000_000,
+                nlink: 1,
+            },
+        ])
+        .unwrap();
+    let file = writer.finish(&meta).unwrap();
+    b.snapshot = Snapshot::open(&file).unwrap();
+    b.dir = b.snapshot.root().unwrap();
+    b.now = 1_800_000_000;
+    b.pane(Pane::Files).unwrap();
+    let older = draw::fmt_when(100, b.now);
+    let newer = draw::fmt_when(1_800_000_000, b.now);
+    assert_ne!(older.chars().count(), newer.chars().count());
+    let lines: Vec<&str> = b.text.lines().collect();
+    let header = lines[0];
+    let zero = lines
+        .iter()
+        .copied()
+        .find(|line| line.contains("0 B"))
+        .unwrap();
+    let huge = lines
+        .iter()
+        .copied()
+        .find(|line| line.contains("68.9 MiB"))
+        .unwrap();
+    let size_end = header.find("SIZE").unwrap() + "SIZE".len();
+    assert_eq!(zero.find("0 B").unwrap() + "0 B".len(), size_end, "{zero}");
+    assert_eq!(
+        huge.find("68.9 MiB").unwrap() + "68.9 MiB".len(),
+        size_end,
+        "{huge}"
+    );
+    assert_eq!(header.find("MTIME"), zero.find(&older), "{header}\n{zero}");
+    assert_eq!(zero.find(&older), huge.find(&newer), "{zero}\n{huge}");
+    assert_eq!(header.find("PATH"), zero.find('/'), "{header}\n{zero}");
+    assert_eq!(zero.find('/'), huge.find('/'), "{zero}\n{huge}");
 }
 
 fn remedy_catalog_case(broad: bool, count: i64) -> String {
@@ -1753,7 +3685,10 @@ fn post_tuititle_full_legend_at_80_columns() {
                 }
                 b.state.filter = filter.clone();
                 let screen = render(&b, 80, 24);
-                let legend = "Name Share SIZE APPARENT RECLAIM SHARED FILES NEWEST Δ";
+                // Tide's narrow legend is its own row. The anchor is two columns,
+                // so the screen helper inserts one continuation space after it.
+                let legend =
+                    "⚓  linked outside  ⚠ errors  ▲ rising  ▼ ebbing  LEVEL share of charged";
                 if screen.matches(legend).count() != 1 {
                     failures.push(format!(
                         "{sort:?} live={live} filter={}\n{screen}",
@@ -1790,15 +3725,16 @@ fn post_tuititle_filter_budget_preserves_status_and_wide_text() {
                     b.state.editing = editing;
                     for width in [80, 160] {
                         let screen = render(&b, width, 24);
-                        let title = screen.lines().nth(4).unwrap();
+                        let title = screen
+                            .lines()
+                            .find(|line| line.contains("depth") && line.contains("sort "))
+                            .unwrap_or_else(|| panic!("no depth title\n{screen}"));
                         assert!(
-                            title.contains(&format!(
-                                "main | {} | filter ",
-                                crate::render::enum_label(sort)
-                            )),
+                            title.contains(&format!("sort {}", crate::render::enum_label(sort))),
                             "{title}"
                         );
-                        assert_eq!(title.contains(" | live (Δ snapshot)"), live, "{title}");
+                        let live_mark = format!(" {} live", b.theme.glyphs.sep);
+                        assert_eq!(title.contains(&live_mark), live, "{title}");
                         if width == 80 {
                             assert!(title.contains("..."), "{title}");
                         } else {
@@ -1807,12 +3743,12 @@ fn post_tuititle_filter_budget_preserves_status_and_wide_text() {
                             let displayed = super::escape(filter.as_bytes()).replace('界', "界 ");
                             assert!(title.contains(&displayed), "{title}");
                         }
-                        assert_eq!(
-                            screen
-                                .matches("Name Share SIZE APPARENT RECLAIM SHARED FILES NEWEST Δ")
-                                .count(),
-                            1
-                        );
+                        let legend = if width >= 110 {
+                            "⚓  anchored by hard links outside   ⚠ scan errors   ▲ rising   ▼ ebbing   LEVEL = share of charged bytes"
+                        } else {
+                            "⚓  linked outside  ⚠ errors  ▲ rising  ▼ ebbing  LEVEL share of charged"
+                        };
+                        assert_eq!(screen.matches(legend).count(), 1, "{screen}");
                         assert_eq!(b.state.filter, filter);
                     }
                 }
