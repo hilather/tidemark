@@ -685,6 +685,37 @@ fn pruned_predecessor_in_picker_keeps_browser_open_and_suppresses_delta() {
 }
 
 #[test]
+fn picker_comparison_message_clears_when_predecessor_opens() {
+    let (_temp, mut b) = series();
+    let file = b.snapshots[4].1.clone();
+    let aside = file.with_extension("aside");
+    std::fs::rename(&file, &aside).unwrap();
+    b.pane(Pane::Picker).unwrap();
+    b.state.selected = 5;
+    b.enter().unwrap();
+    assert!(b.old.is_none());
+    assert_eq!(
+        b.message,
+        "Snapshot switched; preceding comparison unavailable"
+    );
+    std::fs::rename(&aside, &file).unwrap();
+    b.clock += history::COOLDOWN;
+    b.prepare(140, 40).unwrap();
+    b.deltas(24, false).unwrap();
+    assert_eq!(b.message, "");
+    assert!(b.old.is_some());
+    let grew = crate::render::tree::signed_bytes(1 << 30);
+    let text = render(&b, 140, 40);
+    assert!(text.contains(&grew), "{text}");
+    b.old = None;
+    b.prev_open_failed_at = None;
+    b.message = "Path absent in selected snapshot".into();
+    b.prepare(140, 40).unwrap();
+    assert_eq!(b.message, "Path absent in selected snapshot");
+    assert!(b.old.is_some());
+}
+
+#[test]
 fn chart_snapshots_cover_selections_missing_live_and_fallbacks() {
     let (_temp, mut b) = series();
     pump(&mut b);
@@ -780,6 +811,18 @@ fn ascii_chrome_is_ascii() {
     let overlay = buffer(&b, 79, 23);
     assert_ascii_cells(&overlay);
     assert_plus_corner(&overlay, "tide");
+    // Theme is already ASCII. `links` copies `glyphs.anchor` when the pane opens.
+    for (pane, title) in [
+        (Pane::Picker, "picker . "),
+        (Pane::Info, "info . "),
+        (Pane::Files, "Files | "),
+        (Pane::Links, "links . "),
+    ] {
+        b.pane(pane).unwrap();
+        let screen = buffer(&b, 80, 24);
+        assert_ascii_cells(&screen);
+        assert_plus_corner(&screen, title);
+    }
 }
 
 #[test]
