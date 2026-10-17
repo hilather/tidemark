@@ -2170,6 +2170,84 @@ fn previous_snapshot_retry_fills_tide() {
 }
 
 #[test]
+fn growth_order_rebuilds_when_predecessor_appears() {
+    let (temp, mut b) = browser(2);
+    let (id, file) = complete_scan(temp.path(), "20251201T000000Z-00000000", 900_000, 4096);
+    b.snapshots = vec![(id, file.clone(), 900_000, Some(4096))];
+    let aside = file.with_extension("aside");
+    std::fs::rename(&file, &aside).unwrap();
+    b.prepare(140, 24).unwrap();
+    b.state.sort = state::Sort::Growth;
+    b.load().unwrap();
+    assert!(
+        b.rows[0].0.path.as_bytes().ends_with(b"00000001"),
+        "{:?}",
+        b.rows[0].0.path
+    );
+    assert!(b.rows.iter().all(|(_, delta)| delta.is_none()));
+    std::fs::rename(&aside, &file).unwrap();
+    b.clock += history::COOLDOWN;
+    b.prepare(140, 24).unwrap();
+    assert!(
+        b.rows[0].0.path.as_bytes().ends_with(b"00000002"),
+        "{:?}",
+        b.rows[0].0.path
+    );
+    assert_eq!(b.rows[0].1, Some(4096));
+    b.pages.growth.as_mut().unwrap().reverse();
+    let sentinel = b.pages.growth.clone();
+    b.state.selected = 1;
+    b.prepare(140, 24).unwrap();
+    assert_eq!(b.state.selected, 1);
+    assert_eq!(b.pages.growth, sentinel);
+    // Second None→Some against the Growth cache still held above. Resetting
+    // `old` is what makes this Name prepare open again; `is_none` is red on a
+    // transition that leaves that cache in place.
+    b.old = None;
+    b.prev_open_failed_at = None;
+    b.state.sort = state::Sort::Name;
+    b.prepare(140, 24).unwrap();
+    assert!(b.pages.growth.is_none());
+    b.state.sort = state::Sort::Growth;
+    b.load().unwrap();
+    assert!(
+        b.rows[0].0.path.as_bytes().ends_with(b"00000002"),
+        "{:?}",
+        b.rows[0].0.path
+    );
+}
+
+#[test]
+fn growth_transition_keeps_off_main_subject() {
+    let (temp, mut b) = browser(2);
+    let (id, file) = complete_scan(temp.path(), "20251201T000000Z-00000000", 900_000, 4096);
+    b.snapshots = vec![(id, file.clone(), 900_000, Some(4096))];
+    let aside = file.with_extension("aside");
+    std::fs::rename(&file, &aside).unwrap();
+    b.prepare(140, 24).unwrap();
+    b.state.sort = state::Sort::Growth;
+    b.load().unwrap();
+    b.state.selected = 0;
+    b.pane(Pane::Info).unwrap();
+    assert!(
+        b.subject().0.path.as_bytes().ends_with(b"00000001"),
+        "{:?}",
+        b.subject().0.path
+    );
+    b.state.selected = 1;
+    let selected = b.state.selected;
+    std::fs::rename(&aside, &file).unwrap();
+    b.clock += history::COOLDOWN;
+    b.prepare(140, 24).unwrap();
+    assert!(
+        b.subject().0.path.as_bytes().ends_with(b"00000001"),
+        "{:?}",
+        b.subject().0.path
+    );
+    assert_eq!(b.state.selected, selected);
+}
+
+#[test]
 fn picker_binds_predecessor_of_picked_snapshot() {
     let (temp, mut b) = browser(1);
     let (a_id, a_file) = complete_scan(temp.path(), "20251101T000000Z-00000000", 800_000, 0);

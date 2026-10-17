@@ -76,6 +76,11 @@ struct Browser {
     refresh_elapsed_ms: u64,
     main_selected: usize,
 }
+
+/// Picker sentence cleared only when the missing predecessor later opens.
+const PRECEDING_COMPARISON_UNAVAILABLE: &str =
+    "Snapshot switched; preceding comparison unavailable";
+
 impl Browser {
     fn load(&mut self) -> anyhow::Result<()> {
         self.pages.total = if let Some(live) = &self.pages.live {
@@ -885,35 +890,59 @@ impl Browser {
     }
 
     /// At most one open, never from `draw`.
-    fn open_previous(&mut self) {
+    /// `true` only when this call moves `old` from `None` to `Some`.
+    fn open_previous(&mut self) -> bool {
         if self.old.is_some() {
-            return;
+            return false;
         }
         if self
             .prev_open_failed_at
             .is_some_and(|at| self.clock.saturating_sub(at) < history::COOLDOWN)
         {
-            return;
+            return false;
         }
         let started = self.snapshot.meta().started_at;
         let open_id = self.snapshot.meta().scan_id.to_string();
         let Some(previous) = previous_complete(&self.snapshots, started, &open_id) else {
             self.prev_open_failed_at = None;
-            return;
+            return false;
         };
         let file = previous.1.clone();
         match Snapshot::open(&file) {
             Ok(snapshot) => {
                 self.old = Some(snapshot);
                 self.prev_open_failed_at = None;
+                self.pages.growth = None;
+                if self.message == PRECEDING_COMPARISON_UNAVAILABLE {
+                    self.message.clear();
+                }
+                true
             }
-            Err(_) => self.prev_open_failed_at = Some(self.clock),
+            Err(_) => {
+                self.prev_open_failed_at = Some(self.clock);
+                false
+            }
         }
     }
 
     /// Event-loop preparation only; drawing never opens or queries history/Info.
     fn prepare(&mut self, width: u16, height: u16) -> anyhow::Result<()> {
-        self.open_previous();
+        if self.open_previous()
+            && self.state.sort == state::Sort::Growth
+            && self.pages.live.is_none()
+        {
+            // One rebuild on the None→Some transition. Main may reset to 0.
+            // Any other pane keeps the depth subject and its list cursor.
+            if self.state.pane != Pane::Main {
+                let target = self.depth_target();
+                let missing = self.reload_keeping_selection(target, |browser| browser.load())?;
+                if missing {
+                    self.remember_missing();
+                }
+            } else {
+                self.load()?;
+            }
+        }
         self.history
             .prepare_window(self.snapshot.meta(), &self.snapshot_file, &self.snapshots);
         let (row, _) = self.subject();
@@ -1129,7 +1158,7 @@ impl Browser {
                         self.message = if self.old.is_some() {
                             "Snapshot switched; comparing with preceding complete snapshot"
                         } else {
-                            "Snapshot switched; preceding comparison unavailable"
+                            PRECEDING_COMPARISON_UNAVAILABLE
                         }
                         .into();
                     } else {
