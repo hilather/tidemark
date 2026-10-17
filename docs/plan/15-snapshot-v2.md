@@ -33,16 +33,21 @@ offset 20+M          one zstd frame containing the complete SQLite file
   `cold_after_recent = true` (default) enables it. `recent` snapshots and each root's newest complete
   snapshot are never cold.
 - Publication order (crash-safe): write `<scan_id>.db.zst.tmp` exclusively (0600, trust checks as other
-  leaves), fsync, rename NOREPLACE to `.db.zst`, fsync directory, update the catalog row's `file`, then
+  leaves), fsync, rename NOREPLACE to `.db.zst`, fsync directory, durably update the catalog row's `file` (`synchronous=FULL`), then
   unlink the `.db` and fsync the directory. A crash leaves at most both files; startup cleanup removes the
-  `.db` when a valid `.db.zst` with the same scan id exists, and removes stray `.db.zst.tmp`.
+  `.db` only after streaming byte-for-byte equivalence with `.db.zst` is proved, and removes stray
+  `.db.zst.tmp`. A failed comparison keeps the hot file and removes the bad cold copy. Cleanup also
+  repairs a stale hot catalog pointer when only a valid cold file remains.
 - Catalog: `scans.file` points at whichever file exists; `rebuild_from_files` reads cold metadata from
-  the header JSON without inflating.
+  the header JSON without inflating for cold-only snapshots; when both forms exist, rebuilding
+  prefers the readable hot file and leaves pair resolution to cleanup.
 - Opening a cold snapshot inflates it to `snapshots/<root-slug>/.inflate/<scan_id>.<pid>.<n>.db` (private
   0700 directory inside state_dir, trust checks apply), opens that file `immutable=1`, and unlinks it
   when the `Snapshot` is dropped. The space guard accounts the uncompressed length before inflating and
   refuses (NoSpace) rather than fill the filesystem. Startup and the scan-lock holder sweep stale
   `.inflate/*` leaves.
+- Concurrent cold opens each check the space guard independently and may jointly overshoot the
+  free-space floor; no shared reservations are made.
 - Space-guard estimates (`previous × 1.25`) use the uncompressed length from the header for cold files.
 - `snapshots list` shows a `cold` marker and both sizes; `prune`, `rebuild-catalog`, corruption recovery
   and retention handle both forms. Uncompressed `.db` files are never rewritten in place.

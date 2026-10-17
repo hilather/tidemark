@@ -217,11 +217,42 @@ fn inflate(file: &mut File, output: &mut impl Write, length: u64) -> Result<()> 
     Ok(())
 }
 /// Validate the complete frame without materialising a SQLite file.
-/// Cleanup uses this before removing the uncompressed source.
+/// This checks framing only; destructive transitions require `matches_hot`.
 pub fn validate_cold(path: &Path) -> Result<()> {
     let mut source = open(path)?;
     let header = read_header(&mut source)?;
     inflate(&mut source, &mut std::io::sink(), header.uncompressed_len)
+}
+/// Prove that a cold payload reproduces the immutable hot source, with bounded buffers.
+pub(crate) fn matches_hot(cold: &Path, hot: &Path) -> Result<()> {
+    struct Compare(File);
+    impl Write for Compare {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut buffer = [0; 128 * 1024];
+            for chunk in bytes.chunks(buffer.len()) {
+                self.0.read_exact(&mut buffer[..chunk.len()])?;
+                if &buffer[..chunk.len()] != chunk {
+                    return Err(std::io::Error::other(
+                        "cold payload differs from hot snapshot",
+                    ));
+                }
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut source = open(cold)?;
+    let header = read_header(&mut source)?;
+    let mut compare = Compare(open(hot)?);
+    inflate(&mut source, &mut compare, header.uncompressed_len)?;
+    if compare.0.read(&mut [0])? != 0 {
+        return Err(StoreError::Invalid(
+            "hot snapshot exceeds cold payload".into(),
+        ));
+    }
+    Ok(())
 }
 /// Inflate into an exclusively created private leaf, checking the exact payload length.
 /// Removes the destination on any decoding failure.
@@ -272,21 +303,21 @@ pub(crate) fn prepare(path: &Path, guard: impl FnOnce(u64) -> Result<()>) -> Res
     let scan = header.metadata()?.scan_id;
     for n in 0..10_000u32 {
         let name = format!("{scan}.{}.{n}.db", std::process::id());
-        let mut output = match dir.create_leaf(OsStr::new(&name)) {
+        let output = match dir.create_leaf(OsStr::new(&name)) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
         };
-        rustix::fs::flock(&output, rustix::fs::FlockOperation::LockExclusive)
-            .map_err(std::io::Error::from)?;
-        rustix::fs::flock(dir.fd(), rustix::fs::FlockOperation::Unlock)
-            .map_err(std::io::Error::from)?;
-        let leaf = Inflated {
+        let mut leaf = Inflated {
             path: base.join(name),
-            _lock: output.try_clone()?,
+            _lock: output,
             dir,
         };
-        inflate(&mut source, &mut output, header.uncompressed_len)?;
+        rustix::fs::flock(&leaf._lock, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(std::io::Error::from)?;
+        rustix::fs::flock(leaf.dir.fd(), rustix::fs::FlockOperation::Unlock)
+            .map_err(std::io::Error::from)?;
+        inflate(&mut source, &mut leaf._lock, header.uncompressed_len)?;
         return Ok(leaf);
     }
     Err(StoreError::Invalid("inflate namespace exhausted".into()))

@@ -249,7 +249,7 @@ fn with_old<T>(
     use std::os::unix::ffi::OsStrExt;
     let mut uri = String::from("file:");
     // Absolute paths avoid SQLite URI authority/relative-path ambiguity.
-    let file = std::fs::canonicalize(old.file())?;
+    let file = std::fs::canonicalize(old.backing_file())?;
     for &byte in file.as_os_str().as_bytes() {
         if byte.is_ascii_alphanumeric() || b"/.-_".contains(&byte) {
             uri.push(char::from(byte));

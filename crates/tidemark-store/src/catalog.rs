@@ -290,6 +290,17 @@ impl Catalog {
         {
             return Err(StoreError::Invalid("unsafe cold catalog path".into()));
         }
+        let hot = path.with_extension("");
+        let directory =
+            crate::state_dir::StateDir::snapshot_dir(&crate::state_dir::file_parent(path)?, false)?;
+        if directory.check_leaf(
+            hot.file_name()
+                .ok_or_else(|| StoreError::Invalid("missing hot name".into()))?,
+        )? {
+            crate::cold::matches_hot(path, &hot)?;
+        }
+        // FULL synchronizes the WAL commit before callers may unlink the hot source.
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
         self.conn.execute(
             "UPDATE scans SET file=? WHERE scan_id=? AND status='complete'",
             params![SqlPath(relative.as_os_str().as_bytes()), scan_id],
@@ -360,7 +371,13 @@ impl Catalog {
                 root_dir.check_leaf(&file.file_name())?;
                 let path = file.path();
                 let cold = path.as_os_str().as_bytes().ends_with(b".db.zst");
-                if !cold && crate::cold::read_cold_header(&path.with_extension("db.zst")).is_ok() {
+                if cold
+                    && root_dir.check_leaf(
+                        path.with_extension("")
+                            .file_name()
+                            .ok_or_else(|| StoreError::Invalid("missing hot name".into()))?,
+                    )?
+                {
                     continue;
                 }
                 let loaded = if cold {
@@ -727,6 +744,7 @@ fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
                 let filename = file.file_name();
                 if !filename.to_bytes().ends_with(b".db.tmp")
                     && !filename.to_bytes().ends_with(b".db.zst.tmp")
+                    && !filename.to_bytes().ends_with(b".db.stage.tmp")
                 {
                     continue;
                 }
@@ -825,16 +843,41 @@ fn cleanup_cold(state: &Path) -> Result<(), StoreError> {
                 }
                 let hot = format!("{scan}.db");
                 if dir.check_leaf(OsStr::new(&hot))? {
-                    if crate::cold::validate_cold(&path).is_err() {
-                        continue;
-                    }
                     let hot_file = dir.open_leaf(OsStr::new(&hot), false, false)?;
                     if crate::space_guard::mount_id(&hot_file)? != mount {
+                        continue;
+                    }
+
+                    if let Err(error) = crate::cold::matches_hot(&path, &path.with_extension("")) {
+                        // Preserve the hot source and restore its catalog pointer before removal.
+                        let catalog = Catalog::open(state, true)?;
+                        catalog.conn.pragma_update(None, "synchronous", "FULL")?;
+                        catalog.conn.execute(
+                            "UPDATE scans SET file=? WHERE scan_id=? AND status='complete'",
+                            params![
+                                SqlPath(
+                                    path.with_extension("")
+                                        .strip_prefix(state)
+                                        .map_err(|_| StoreError::Invalid(
+                                            "hot file outside state".into()
+                                        ))?
+                                        .as_os_str()
+                                        .as_bytes()
+                                ),
+                                &scan
+                            ],
+                        )?;
+                        dir.unlink_leaf(&entry.file_name())?;
+                        rustix::fs::fsync(dir.fd()).map_err(std::io::Error::from)?;
+                        tracing::warn!(path=%path.display(), %error, "removed non-equivalent cold snapshot; kept hot source");
                         continue;
                     }
                     Catalog::open(state, true)?.point_to_cold(&scan, &path)?;
                     dir.unlink_leaf(OsStr::new(&hot))?;
                     rustix::fs::fsync(dir.fd()).map_err(std::io::Error::from)?;
+                } else if crate::cold::validate_cold(&path).is_ok() && Snapshot::open(&path).is_ok()
+                {
+                    Catalog::open(state, true)?.point_to_cold(&scan, &path)?;
                 }
             }
         }
