@@ -33,7 +33,7 @@ pub enum Command {
         /// Root path to scan or select.
         #[arg(long, value_name = "ROOT")]
         root: Option<std::path::PathBuf>,
-        /// Show snapshots that would be pruned without deleting them.
+        /// Show proposed deletions and compressions without changing snapshots.
         #[arg(long)]
         dry_run: bool,
     },
@@ -108,7 +108,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 crate::render::json(
                     "tidemark.snapshots.v1",
                     rows.iter()
-                        .map(entry_json)
+                        .map(|e| entry_json(refreshed(&catalog, e).as_ref().unwrap_or(e)))
                         .collect::<anyhow::Result<Vec<_>>>()?,
                     &mut out,
                 )?;
@@ -120,8 +120,14 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     "MODE".into(),
                     "STATUS".into(),
                     "DISK".into(),
+                    "STORAGE".into(),
+                    "FILE BYTES".into(),
+                    "UNCOMPRESSED BYTES".into(),
                 ]];
-                for e in rows {
+                for original in rows {
+                    let fresh = refreshed(&catalog, &original);
+                    let e = fresh.unwrap_or(original);
+                    let (cold, file_bytes, uncompressed_bytes) = entry_sizes(&e);
                     table.push(vec![
                         e.scan_id,
                         e.root.display_lossy(),
@@ -134,6 +140,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                         e.t_disk
                             .map(crate::render::size::bytes)
                             .unwrap_or_else(|| "unknown".into()),
+                        if cold { "cold".into() } else { "hot".into() },
+                        file_bytes
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        uncompressed_bytes
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "-".into()),
                     ]);
                 }
                 write!(out, "{}", crate::render::table::aligned(&table))?;
@@ -151,7 +164,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             }
             let data = if let Some(file) = &e.file {
                 serde_json::to_value(
-                    tidemark_store::reader::Snapshot::open(file)
+                    open_snapshot(context, file)
                         .with_context(|| format!("open snapshot: {}", super::display_path(file)))?
                         .meta(),
                 )?
@@ -168,11 +181,12 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         Command::Prune { dry_run, .. } => {
             let entries = catalog.list(root.as_ref())?;
             let mut ids = Vec::new();
+            let now = tidemark_core::time::unix_now();
             // The retention planner already groups by root and protects its latest complete scan.
             for id in tidemark_store::retention::retention_plan(
                 &entries,
                 &context.config.retention.snapshots,
-                tidemark_core::time::unix_now(),
+                now,
             ) {
                 if !dry_run {
                     if let Some(file) = entries
@@ -188,10 +202,56 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             if !dry_run {
                 catalog.rebuild_from_files()?;
             }
+            let policy = &context.config.retention.snapshots;
+            let mut compressed = Vec::new();
+            if policy.cold_after_recent {
+                for id in tidemark_store::retention::cold_plan(&entries, policy, policy.recent, now)
+                {
+                    let Some(hot) = entries
+                        .iter()
+                        .find(|e| e.scan_id == id)
+                        .and_then(|e| e.file.as_ref())
+                    else {
+                        continue;
+                    };
+                    if !dry_run {
+                        let result = (|| -> anyhow::Result<()> {
+                            let estimate = std::fs::metadata(hot)?.len() / 2;
+                            if let tidemark_store::space_guard::SpaceVerdict::Refuse { reason } =
+                                tidemark_store::space_guard::space_check(
+                                    state,
+                                    estimate,
+                                    &context.config.retention,
+                                )?
+                            {
+                                anyhow::bail!("{reason}");
+                            }
+                            let cold = tidemark_store::cold::compress_snapshot(
+                                hot,
+                                policy.cold_level,
+                                &|| false,
+                            )?;
+                            catalog.point_to_cold(&id, &cold)?;
+                            let directory = snapshot_directory(state, hot)?;
+                            let name = hot
+                                .file_name()
+                                .ok_or_else(|| anyhow::anyhow!("missing snapshot filename"))?;
+                            directory.unlink_leaf(name)?;
+                            rustix::fs::fsync(directory.fd())?;
+                            Ok(())
+                        })();
+                        if let Err(reason) = result {
+                            tracing::warn!(scan_id=%id, %reason, "cold compression skipped");
+                            continue;
+                        }
+                    }
+                    compressed.push(id);
+                }
+            }
             if context.json {
                 crate::render::json(
                     "tidemark.snapshots.v1",
-                    serde_json::json!({"dry_run":dry_run,"pruned":ids}),
+                    serde_json::json!({"dry_run":dry_run,"pruned":ids,"compressed":compressed}),
                     &mut out,
                 )?;
             } else {
@@ -201,6 +261,17 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                         out,
                         "{} {id}",
                         if *dry_run { "would prune" } else { "pruned" }
+                    )?;
+                }
+                for id in compressed {
+                    writeln!(
+                        out,
+                        "{} {id}",
+                        if *dry_run {
+                            "would compress"
+                        } else {
+                            "compressed"
+                        }
                     )?;
                 }
             }
@@ -240,8 +311,9 @@ fn entry_json(e: &tidemark_store::catalog::ScanEntry) -> anyhow::Result<serde_js
         .as_ref()
         .map(|p| tidemark_core::path::RawPath::from_path(p))
         .transpose()?;
+    let (cold, file_bytes, uncompressed_bytes) = entry_sizes(e);
     Ok(
-        serde_json::json!({"scan_id":e.scan_id,"root":e.root.to_json(),"mode":e.mode,
+        serde_json::json!({"cold":cold,"file_bytes":file_bytes,"uncompressed_bytes":uncompressed_bytes,"scan_id":e.scan_id,"root":e.root.to_json(),"mode":e.mode,
         "started_at":e.started_at,"finished_at":e.finished_at,"status":e.status,"degraded":e.degraded,
         "file":file.map(|p|p.to_json()),"t_disk":e.t_disk,"t_inodes":e.t_inodes,"t_dirs":e.t_dirs,
         "errors":e.errors,"duration_ms":e.duration_ms}),
@@ -251,29 +323,117 @@ pub(crate) fn remove_snapshot(
     state: &std::path::Path,
     file: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let parent = file
-        .parent()
-        .ok_or_else(|| crate::CliError::Precondition("snapshot has no parent".into()))?;
-    let allowed = std::fs::canonicalize(state.join("snapshots")).with_context(|| {
-        format!(
-            "resolve snapshot directory: {}",
-            super::display_path(&state.join("snapshots"))
-        )
-    })?;
-    let parent = std::fs::canonicalize(parent)
-        .with_context(|| format!("resolve parent: {}", super::display_path(parent)))?;
-    if !parent.starts_with(&allowed) || file.extension() != Some(std::ffi::OsStr::new("db")) {
-        return Err(crate::CliError::Precondition(
-            "catalog snapshot path is outside the state snapshot directory".into(),
-        )
-        .into());
+    let directory = snapshot_directory(state, file)?;
+    let name = file
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("missing snapshot filename"))?;
+    directory.unlink_leaf(name)?;
+    let bytes = name.as_encoded_bytes();
+    let stem = bytes
+        .strip_suffix(b".db.zst")
+        .or_else(|| bytes.strip_suffix(b".db"))
+        .ok_or_else(|| anyhow::anyhow!("invalid snapshot filename"))?;
+    use std::os::unix::ffi::OsStrExt;
+    // Both published forms may exist after a crash; delete them all so a rebuild cannot resurrect the scan.
+    for suffix in [
+        b".db".as_slice(),
+        b".db.zst".as_slice(),
+        b".db.bad".as_slice(),
+        b".db.zst.bad".as_slice(),
+    ] {
+        let mut sibling = stem.to_vec();
+        sibling.extend_from_slice(suffix);
+        directory.unlink_leaf(std::ffi::OsStr::from_bytes(&sibling))?;
     }
-    match std::fs::remove_file(file) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(anyhow::Error::new(e)
-            .context(format!("remove snapshot: {}", super::display_path(file)))),
+    rustix::fs::fsync(directory.fd())?;
+    Ok(())
+}
+fn snapshot_directory(
+    state: &std::path::Path,
+    file: &std::path::Path,
+) -> anyhow::Result<tidemark_store::state_dir::StateDir> {
+    let relative = file.strip_prefix(state.join("snapshots"))?;
+    let mut parts = relative.components();
+    let Some(std::path::Component::Normal(root)) = parts.next() else {
+        anyhow::bail!("unsafe snapshot root");
+    };
+    let Some(std::path::Component::Normal(_)) = parts.next() else {
+        anyhow::bail!("unsafe snapshot leaf");
+    };
+    if parts.next().is_some()
+        || !(file.as_os_str().as_encoded_bytes().ends_with(b".db")
+            || file.as_os_str().as_encoded_bytes().ends_with(b".db.zst"))
+    {
+        anyhow::bail!("catalog snapshot path is outside the state snapshot directory");
     }
+    Ok(tidemark_store::state_dir::StateDir::open(state, false)?
+        .subdir(std::ffi::OsStr::new("snapshots"), false)?
+        .subdir(root, false)?)
+}
+fn open_snapshot(
+    context: &crate::Context,
+    file: &std::path::Path,
+) -> Result<tidemark_store::reader::Snapshot, tidemark_store::StoreError> {
+    tidemark_store::reader::Snapshot::open_with_space_guard(file, |length| {
+        match tidemark_store::space_guard::space_check(
+            &context.config.general.state_dir,
+            length,
+            &context.config.retention,
+        )? {
+            tidemark_store::space_guard::SpaceVerdict::Ok => Ok(()),
+            tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
+                Err(tidemark_store::StoreError::Space(reason))
+            }
+        }
+    })
+}
+/// Re-read a catalog row once when its file vanished (a cold publication may have replaced it).
+fn refreshed(
+    catalog: &tidemark_store::catalog::Catalog,
+    e: &tidemark_store::catalog::ScanEntry,
+) -> Option<tidemark_store::catalog::ScanEntry> {
+    let vanished = e
+        .file
+        .as_ref()
+        .is_some_and(|f| std::fs::symlink_metadata(f).is_err());
+    if vanished {
+        return catalog.get(&e.scan_id).ok().flatten();
+    }
+    None
+}
+/// Sizes are optional metadata: failures yield unknown sizes plus a stderr diagnostic.
+fn entry_sizes(e: &tidemark_store::catalog::ScanEntry) -> (bool, Option<u64>, Option<u64>) {
+    let Some(file) = &e.file else {
+        return (false, None, None);
+    };
+    let cold = file.as_os_str().as_encoded_bytes().ends_with(b".db.zst");
+    let file_bytes = match std::fs::symlink_metadata(file) {
+        Ok(m) => m.len(),
+        Err(err) => {
+            eprintln!(
+                "warning: snapshot {}: cannot stat {}: {err}",
+                e.scan_id,
+                super::display_path(file)
+            );
+            return (cold, None, None);
+        }
+    };
+    let uncompressed = if cold {
+        match tidemark_store::cold::read_cold_header(file) {
+            Ok(h) => Some(h.uncompressed_len),
+            Err(err) => {
+                eprintln!(
+                    "warning: snapshot {}: unreadable cold header {}: {err}",
+                    e.scan_id,
+                    super::display_path(file)
+                );
+                None
+            }
+        }
+    } else {
+        Some(file_bytes)
+    };
+    (cold, Some(file_bytes), uncompressed)
 }
 // Bound diagnostic snapshot opens independently of the million-row catalog cap.
 const REMEDY_CANDIDATE_LIMIT: usize = 20;
@@ -338,7 +498,7 @@ pub(crate) fn select(
         .ok_or_else(|| crate::CliError::Precondition("snapshot has no file".into()))?;
     Ok((
         path,
-        tidemark_store::reader::Snapshot::open(&file)
+        open_snapshot(context, &file)
             .with_context(|| format!("open snapshot: {}", super::display_path(&file)))?,
     ))
 }
@@ -396,7 +556,7 @@ pub(crate) fn missing_path(
             });
             for entry in entries.into_iter().take(REMEDY_CANDIDATE_LIMIT) {
                 let Some(file) = entry.file else { continue };
-                let Ok(newer) = tidemark_store::reader::Snapshot::open(&file) else {
+                let Ok(newer) = open_snapshot(context, &file) else {
                     continue;
                 };
                 if newer.dir_by_path(path).is_ok_and(|row| row.is_some()) {

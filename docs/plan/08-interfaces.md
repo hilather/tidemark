@@ -66,7 +66,7 @@ Machine output uses `JsonDoc<T> { schema: Cow<'static, str>, data: T }`, with ow
 
 `scan --mode walk` reports in-memory apparent sizes exact at scan time. Bulk mode (including auto when it selects bulk) reports regular-file sizes recorded in XFS on-disk inodes: apparent sizes of files still being written or waiting for writeback may lag, down to zero for a new file, normally for about 30 seconds without a guaranteed deadline. Disk usage, counts, link accounting and charged bytes are unaffected by this lag. Tidemark never forces writeback or stats files to correct bulk sizes; choose walk when current apparent size matters (R3-16).
 
-`scan --keep-partial` can retain collected walk rows on cancellation before publication; cancellation observed inside `finish_with` discards even that partial candidate; cancelled bulk scans produce no snapshot. `scan --help` explicitly says the option is walk-only. `snapshots prune` deletes retention-selected files, then rebuilds the catalog from remaining files for all roots; `--dry-run` only shows proposed deletions. `snapshots rebuild-catalog --root PATH` is refused before recovery or mutation; omit `--root` to select global rebuilding.
+`scan --keep-partial` can retain collected walk rows on cancellation before publication; cancellation observed inside `finish_with` discards even that partial candidate; cancelled bulk scans produce no snapshot. `scan --help` explicitly says the option is walk-only. `snapshots prune` deletes retention-selected hot or cold files and their `.db.bad` / `.db.zst.bad` quarantine siblings, then rebuilds the catalog from remaining files for all roots. It compresses retained complete snapshots outside each root's `recent` set when `cold_after_recent` is true; each root's newest complete snapshot remains hot. `--dry-run` shows both proposed deletions and compressions without changing files or catalog. Compression refusals/failures warn and preserve the hot source. Prune JSON adds `compressed` (scan IDs) beside `dry_run` and `pruned`. `snapshots rebuild-catalog --root PATH` is refused before recovery or mutation; omit `--root` to select global rebuilding.
 
 `--sort growth` uses a CLI sort wrapper with a `Growth` case, requiring two snapshots; it is not a `snapshot::SortKey` variant. W2-C compares the selected snapshot with the older complete snapshot used for Δ24h, sorts descending signed disk-byte growth with raw-byte path tie breaking, and errors when the older snapshot is unavailable. `writers --window` accepts any positive humantime duration (`2m`, `1h`, etc.); no additional maximum is imposed by this contract. `hot` retains only `1m|5m|15m|60m`. CLI/API throttle overrides accept only `gentle|normal|max`; configured root throttle may select custom profiles.
 
@@ -148,6 +148,8 @@ Scan params carry `"root":"<utf-8 path>"` or `"root_b64":"<base64>"` (padded sta
 `tidemark_core::api` defines `ComponentState { name: String, state: String /* ok|degraded|disabled|error */, detail: String }` and `VgInfo { vg: String, size: u64, free: u64 }`; downstream re-exports are `tidemarkd::firstboot::ComponentState` and `tidemark_fs::lvm::VgInfo`.
 
 Error codes: `bad_request`, `forbidden`, `not_found`, `unavailable`, `busy`, `internal`. Frame collection, handler execution and response writes each have separate absolute 10 s budgets (R5-4/20); partial reads do not reset deadlines.
+
+`snapshots list` retains its existing JSON keys and adds `cold` (boolean), `file_bytes` (stored file length), and `uncompressed_bytes` (SQLite length, read from the checked header for cold files). Sizes are null for entries without files. Text output includes a hot/cold storage marker and both byte sizes.
 
 ## 3. Configuration (`/etc/tidemark/tidemark.toml`)
 
@@ -252,6 +254,8 @@ min_free_pct   = 5
   recent = 4
   daily  = 14
   weekly = 8
+  # cold_after_recent = true
+  # cold_level = 9  # integer 1..=19; invalid levels are configuration issues
   [retention.samples]
   raw         = "48h"
   five_min    = "35d"

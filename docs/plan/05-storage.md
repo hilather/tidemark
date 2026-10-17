@@ -281,6 +281,8 @@ Downsampling inserts bucket rows (last value per bucket) with `INSERT OR IGNORE`
 
 ## 7. Snapshot retention
 
+Cold snapshot retention, `.db.zst` publication and recovery, and decoded-size space estimates are specified in [15 §2](15-snapshot-v2.md#2-cold-file-format-snapshotsroot-slugscan_iddbzst). Retention deletes either stored form and the deleted scan's quarantine siblings.
+
 Successful completion is ordered: `ScanRecorder::scan_finished(&self, e: &ScanEntry) -> Result<(), ScanError>`, then `ScanRecorder::dir_series(&self, root: &RawPath, scan_id: &str, ts: i64, rows: &[DirRow]) -> Result<(), ScanError>`, then retention. The previous snapshot remains available during both callbacks. The daemon computes directory growth inside `scan_finished`, before retention can delete the predecessor. Successful metric-cache refresh/publication precedes that root's dirty take. A growth list that may be truncated is unavailable (`None`), never measured empty or a complete inventory.
 
 Configured per root:
@@ -296,7 +298,7 @@ Retention always keeps each root's newest complete snapshot, even with `recent =
 
 Partial and failed snapshots are deleted after 24 h. `tidemark snapshots prune --dry-run` shows what would go. Non-dry-run prune opens a writable catalog, deletes the snapshot files returned by the retention plan, then calls `Catalog::rebuild_from_files` for all roots using the files that remain. This removes deleted snapshots from the catalog without changing the store interface.
 
-Prune deletes retention-selected files and globally rebuilds the catalog from surviving snapshots; dry-run only reports deletions. Automatic retention and emergency pruning reconcile the catalog too; expired partial/failed artifacts are considered before protected complete snapshots. `snapshots rebuild-catalog --root PATH` is refused before recovery or mutation: omit `--root` for an explicit global rebuild. This follows W2-C-fix more precisely than the older D5 text, because the global store rebuild cannot preserve another root's historical failed/running rows.
+Prune deletes retention-selected files and globally rebuilds the catalog from surviving snapshots; dry-run reports deletions and compressions. After deletion, retained complete snapshots outside the recent set are compressed when enabled (15 §2). Automatic retention and emergency pruning reconcile the catalog too; expired partial/failed artifacts are considered before protected complete snapshots. `snapshots rebuild-catalog --root PATH` is refused before recovery or mutation: omit `--root` for an explicit global rebuild. This follows W2-C-fix more precisely than the older D5 text, because the global store rebuild cannot preserve another root's historical failed/running rows.
 
 ## 8. Space guard (NFR-7)
 

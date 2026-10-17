@@ -260,9 +260,11 @@ fn with_old<T>(
     }
     uri.push_str("?immutable=1&mode=ro");
     let mmap: i64 = new
-        .conn()
+        .v1_conn()
+        .and_then(|_| old.v1_conn())
+        .and_then(|_| new.v1_conn())?
         .pragma_query_value(Some("main"), "mmap_size", |r| r.get(0))?;
-    new.conn().execute("ATTACH DATABASE ?1 AS o", [uri])?;
+    new.v1_conn()?.execute("ATTACH DATABASE ?1 AS o", [uri])?;
     // All statements/cursors are dropped by the closure before detachment,
     // including on query/conversion errors. Drop also covers unwinding.
     struct Attachment<'a> {
@@ -289,7 +291,7 @@ fn with_old<T>(
         }
     }
     let mut attachment = Attachment {
-        conn: new.conn(),
+        conn: new.v1_conn()?,
         mmap,
         attached: true,
         restore: true,
@@ -301,14 +303,16 @@ fn with_old<T>(
     // not support bind parameters for PRAGMA settings; use its typed API with
     // a fixed constant and the previously read integer, never caller input.
     const MMAP_BYTES: i64 = 1 << 30;
-    new.conn()
+    new.v1_conn()?
         .pragma_update(Some("main"), "mmap_size", MMAP_BYTES)?;
-    new.conn()
+    new.v1_conn()?
         .pragma_update(Some("o"), "mmap_size", MMAP_BYTES)?;
     let result = query();
-    let detached = new.conn().execute("DETACH DATABASE o", []);
+    let detached = new.v1_conn()?.execute("DETACH DATABASE o", []);
     attachment.attached = detached.is_err();
-    let restored = new.conn().pragma_update(Some("main"), "mmap_size", mmap);
+    let restored = new
+        .v1_conn()?
+        .pragma_update(Some("main"), "mmap_size", mmap);
     attachment.restore = restored.is_err();
     let result = result?;
     detached?;
@@ -335,7 +339,7 @@ fn joined(
     // Target totals already come from dir_by_path. A child SUM cannot replace
     // them: own files and hard-link LCA charges also belong to the target.
     let count = if let Some(sql) = aggregate {
-        let mut statement = new.conn().prepare(&sql)?;
+        let mut statement = new.v1_conn()?.prepare(&sql)?;
         bind_joined(&mut statement, n, o, depth, limit, direction)?;
         let count = statement
             .raw_query()
@@ -346,7 +350,7 @@ fn joined(
     } else {
         0
     };
-    let mut statement = new.conn().prepare(&sql)?;
+    let mut statement = new.v1_conn()?.prepare(&sql)?;
     bind_joined(&mut statement, n, o, depth, limit, direction)?;
     let mut cursor = statement.raw_query();
     let mut rows = Vec::new();

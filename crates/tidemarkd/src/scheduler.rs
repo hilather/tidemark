@@ -2128,6 +2128,7 @@ mod tests {
             recent: 1,
             daily: 0,
             weekly: 0,
+            ..Default::default()
         };
         let cfg = Arc::new(cfg);
         let state = LiveState::new(&cfg, 0);
