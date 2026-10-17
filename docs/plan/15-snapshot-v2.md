@@ -55,9 +55,12 @@ offset 20+M+8        one zstd frame containing the complete SQLite file
   | Both valid but different, neither valid, or validation inconclusive | Preserve both files and catalog row; warn naming both |
 
   Resource/access failures (including inflate space refusal) are inconclusive. Quarantine renames use
-  NOREPLACE; an existing `.bad` leaf is preserved. `.bad` leaves are never opened as snapshots or swept
-  by startup/retention. They may only be removed by explicit prune or purge. CLI follow-up is needed:
-  current list is catalog-only and prune does not sweep quarantine leaves; purge removes the state tree.
+  NOREPLACE; an existing `.bad` leaf is preserved. `.bad` leaves are never opened as snapshots. When
+  retention or `snapshots prune` deletes a scan, that scan's `.bad` leaves are deleted with it, along with
+  both published forms (`.db` and `.db.zst`) if both exist, so a catalog rebuild cannot rediscover it.
+  Quarantine leaves of retained scans are never removed automatically; purge removes the state tree.
+  `snapshots list` reads file sizes (unknown sizes plus a stderr diagnostic when a file or cold header
+  is unreadable); it does not open snapshots.
   State-usage accounting already includes their allocated blocks, like all regular leaves.
 - Catalog: `scans.file` points at whichever file exists; `rebuild_from_files` reads cold metadata from
   the header JSON without inflating for cold-only snapshots; when both forms exist, rebuilding
