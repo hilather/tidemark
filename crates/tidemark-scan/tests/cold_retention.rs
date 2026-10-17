@@ -255,14 +255,29 @@ fn automatic_deletion_removes_both_published_forms_in_both_pointer_directions() 
         entries.sort_by_key(|e| e.started_at);
         let oldest = &entries[0];
         let hot = oldest.file.clone().unwrap();
+        // Hot and cold are both valid but their payloads differ: after compression one
+        // byte of the hot header's user_version field (offset 60..64, ignored by the
+        // reader) changes. Startup cleanup cannot prove the forms equal, so it
+        // preserves both and the retention deletion path must remove both.
         let cold = tidemark_store::cold::compress_snapshot(&hot, 1, &|| false).unwrap();
-        assert!(hot.exists() && cold.exists());
         if point_to_cold {
             Catalog::open(state.path(), true)
                 .unwrap()
                 .point_to_cold(&oldest.scan_id, &cold)
                 .unwrap();
         }
+        {
+            use std::os::unix::fs::{FileExt, PermissionsExt};
+            std::fs::set_permissions(&hot, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&hot).unwrap();
+            file.write_all_at(&[7], 80).unwrap();
+            file.sync_all().unwrap();
+        }
+        tidemark_store::catalog::cleanup_abandoned_scans(state.path(), epoch + 3 * 86400);
+        assert!(
+            hot.exists() && cold.exists(),
+            "cleanup must preserve the pair"
+        );
         let bad = hot.with_extension("db.bad");
         test_support::private_write(&bad, b"quarantine").unwrap();
         let mut deletion = cfg.clone();
