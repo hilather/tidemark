@@ -64,6 +64,7 @@ Nothing boot-critical is touched, so a bad deploy can't affect the reboot itself
 | [`12-decisions-and-risks.md`](12-decisions-and-risks.md) | ADRs and risk register |
 | [`13-contract-decisions.md`](13-contract-decisions.md) | Decided W0-B1 contracts (SCR-001–004 and review findings) |
 | [`14-postgres-deferred.md`](14-postgres-deferred.md) | Why database tracking was removed from v1; reference design for a future add-on |
+| [`15-snapshot-v2.md`](15-snapshot-v2.md) | Snapshot v2 columnar chunks and cold snapshots |
 | [`waves/`](waves/) | **Wave 0–7 implementation plans**: per task, owned paths, interfaces, steps, tests, acceptance criteria |
 | [`agents/`](agents/) | `AGENTS.md` for the repo root, prompt templates (implementer, reviewer, gate, coordinator, SCR), handoff template |
 
