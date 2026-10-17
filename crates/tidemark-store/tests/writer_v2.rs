@@ -794,3 +794,233 @@ fn incoming_file_ids_do_not_define_clustered_rows() {
         36
     );
 }
+
+#[test]
+fn finish_rechecks_space_after_input_and_each_conversion_checkpoint() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let m = meta();
+    let options = WriterOptions {
+        chunk_dirs: 2,
+        chunk_files: 2,
+        chunk_li: 2,
+        ..Default::default()
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tmp = test_support::private_tempdir().unwrap();
+    let mut w = SnapshotWriterV2::create_with_options(tmp.path(), &m, options.clone()).unwrap();
+    populate(&mut w, &(0..6).map(dir).collect::<Vec<_>>());
+    let count = calls.clone();
+    w.space_check_every(
+        u64::MAX,
+        Box::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            SpaceVerdict::Ok
+        }),
+    );
+    w.finish(&m).unwrap();
+    assert!(calls.load(Ordering::SeqCst) >= 25);
+    for stop in 0..calls.load(Ordering::SeqCst) {
+        let tmp = test_support::private_tempdir().unwrap();
+        let mut w = SnapshotWriterV2::create_with_options(tmp.path(), &m, options.clone()).unwrap();
+        populate(&mut w, &(0..6).map(dir).collect::<Vec<_>>());
+        let mut n = 0;
+        w.space_check_every(
+            u64::MAX,
+            Box::new(move || {
+                let refuse = n == stop;
+                n += 1;
+                if refuse {
+                    SpaceVerdict::Refuse {
+                        reason: "NoSpace test".into(),
+                    }
+                } else {
+                    SpaceVerdict::Ok
+                }
+            }),
+        );
+        assert!(
+            matches!(w.finish(&m), Err(StoreError::Space(_))),
+            "checkpoint {stop}"
+        );
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+}
+
+// This child also supplies reproducible before/after scale measurements. No clock
+// assertion: an external harness records elapsed time and peak RSS.
+#[test]
+fn conversion_scale_child() {
+    let Ok(root) = std::env::var("TIDEMARK_WRITER_PROBE") else {
+        return;
+    };
+    let m = meta();
+    let mut w = SnapshotWriterV2::create(std::path::Path::new(&root), &m).unwrap();
+    for start in (0..200_000).step_by(512) {
+        let rows = (start..(start + 512).min(200_000))
+            .map(|id| {
+                let mut d = dir(id);
+                if id == 0 {
+                    d.subtree_end = 199_999;
+                }
+                d
+            })
+            .collect::<Vec<_>>();
+        w.put_dirs(&rows).unwrap();
+    }
+    for start in (0..500_000).step_by(512) {
+        let rows = (start..(start + 512).min(500_000))
+            .rev()
+            .map(|id| LinkInstanceRow {
+                ino: 500_000 - u64::from(id),
+                dir_id: id % 200_000,
+                name: Some(RawName::new(format!("{id:0240}").into_bytes()).unwrap()),
+            })
+            .collect::<Vec<_>>();
+        w.put_link_instances(&rows).unwrap();
+    }
+    if std::env::var_os("TIDEMARK_STAGE_ONLY").is_some() {
+        // Model process death after committed input, without destructors.
+        std::process::exit(0);
+    }
+    w.finish(&m).unwrap();
+}
+
+#[test]
+fn staging_leaf_and_readback_plans() {
+    let tmp = test_support::private_tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "conversion_scale_child", "--nocapture"])
+        .env("TIDEMARK_WRITER_PROBE", tmp.path())
+        .env("TIDEMARK_STAGE_ONLY", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let stage = tmp.path().join(format!("{}.db.stage.tmp", meta().scan_id));
+    assert!(stage.is_file());
+    let c = Connection::open(stage).unwrap();
+    for table in ["dirs", "files", "link_instances"] {
+        let sql: String = c
+            .query_row("SELECT sql FROM sqlite_master WHERE name=?", [table], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(sql.contains("WITHOUT ROWID"), "{sql}");
+    }
+    c.execute_batch("CREATE TABLE spans(dir_id INTEGER PRIMARY KEY,lo INTEGER NOT NULL,n INTEGER NOT NULL) WITHOUT ROWID").unwrap();
+    // Keep this list synchronized with all build_output read-back statements.
+    for sql in [
+        "SELECT id,dir_id,CASE WHEN name_present=0 THEN NULL ELSE name END,ino,disk,apparent,mtime,nlink FROM files ORDER BY dir_id,name_present,name,id",
+        "SELECT * FROM dirs ORDER BY id",
+        "SELECT lo,n FROM spans WHERE dir_id=0",
+        "SELECT ino,dir_id,CASE WHEN name_present=0 THEN NULL ELSE name END FROM link_instances ORDER BY ino,dir_id,name_present,name,seq",
+        "SELECT * FROM link_sets", "SELECT * FROM skipped", "SELECT * FROM errors", "SELECT * FROM annotations",
+        "SELECT * FROM dirs WHERE depth <= 2 ORDER BY id",
+    ] {
+        for row in values(&c, &format!("EXPLAIN QUERY PLAN {sql}")) {
+            assert!(!format!("{row:?}").contains("USE TEMP B-TREE"), "{sql}: {row:?}");
+        }
+    }
+}
+
+#[test]
+fn conversion_never_uses_external_sqlite_scratch() {
+    let tmp = test_support::private_tempdir().unwrap();
+    let scratch = test_support::private_tempdir().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "conversion_scale_child", "--nocapture"])
+        .env("TIDEMARK_WRITER_PROBE", tmp.path())
+        .env("SQLITE_TMPDIR", scratch.path())
+        .spawn()
+        .unwrap();
+    let mut observed_scratch = false;
+    loop {
+        observed_scratch |= std::fs::read_dir(scratch.path()).unwrap().count() != 0;
+        // SQLite unlinks scratch immediately: inspect open descriptors too.
+        if let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", child.id())) {
+            for fd in fds.flatten() {
+                if let Ok(target) = std::fs::read_link(fd.path()) {
+                    observed_scratch |= target.starts_with(scratch.path());
+                }
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // Reap the child before asserting, including when the regression reappears.
+    assert!(
+        !observed_scratch,
+        "SQLite used external scratch during conversion"
+    );
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn clustered_staging_preserves_null_names_and_duplicate_instances() {
+    let tmp = test_support::private_tempdir().unwrap();
+    let m = meta();
+    let mut w = SnapshotWriterV2::create(tmp.path(), &m).unwrap();
+    let mut f = files()[0].clone();
+    f.name = None;
+    w.put_files(&[f.clone(), f]).unwrap();
+    let li = LinkInstanceRow {
+        ino: 9,
+        dir_id: 0,
+        name: None,
+    };
+    w.put_link_instances(&[li.clone(), li]).unwrap();
+    w.put_link_instances(&[LinkInstanceRow {
+        ino: 9,
+        dir_id: 0,
+        name: Some(RawName::new(b"a".to_vec()).unwrap()),
+    }])
+    .unwrap();
+    let c = Connection::open(w.finish(&m).unwrap()).unwrap();
+    let file_data: Vec<u8> = c
+        .query_row("SELECT data FROM file_chunks", [], |r| r.get(0))
+        .unwrap();
+    let rows = decode_files(&file_data).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.name.is_none()));
+    let li_data: Vec<u8> = c
+        .query_row("SELECT data FROM li_chunks", [], |r| r.get(0))
+        .unwrap();
+    let rows = decode_link_instances(&li_data).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(rows[0].name.is_none() && rows[1].name.is_none());
+    assert_eq!(rows[2].name.as_deref(), Some(&b"a"[..]));
+}
+
+#[test]
+fn space_guard_turns_to_refusal_after_last_input_row() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let tmp = test_support::private_tempdir().unwrap();
+    let m = meta();
+    let mut w = SnapshotWriterV2::create(tmp.path(), &m).unwrap();
+    let refuse = Arc::new(AtomicBool::new(false));
+    let flag = refuse.clone();
+    w.space_check_every(
+        0,
+        Box::new(move || {
+            if flag.load(Ordering::SeqCst) {
+                SpaceVerdict::Refuse {
+                    reason: "NoSpace after input".into(),
+                }
+            } else {
+                SpaceVerdict::Ok
+            }
+        }),
+    );
+    populate(&mut w, &(0..6).map(dir).collect::<Vec<_>>());
+    refuse.store(true, Ordering::SeqCst);
+    assert!(matches!(w.finish(&m), Err(StoreError::Space(_))));
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
