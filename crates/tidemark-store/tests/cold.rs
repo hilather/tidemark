@@ -556,7 +556,7 @@ fn valid_frame_with_wrong_payload_preserves_hot_and_catalog() {
     catalog.rebuild_from_files().unwrap();
     let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
     let bytes = fs::read(&cold).unwrap();
-    let header_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize + 20;
+    let header_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize + 28;
     let length = fs::metadata(&hot).unwrap().len() as usize;
     let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
     encoder.include_checksum(true).unwrap();
@@ -570,6 +570,7 @@ fn valid_frame_with_wrong_payload_preserves_hot_and_catalog() {
     cleanup_abandoned_scans(state.path(), 123);
     assert!(Snapshot::open(&hot).is_ok());
     assert!(!cold.exists());
+    assert!(cold.with_extension("zst.bad").exists());
     assert!(transition.is_err());
     assert_eq!(catalog.list(None).unwrap()[0].file.as_ref(), Some(&hot));
 }
@@ -652,4 +653,211 @@ fn descriptor_exhaustion_never_leaks_inflate_leaf() {
         }
     }
     assert!(errors > 0);
+}
+
+#[test]
+fn review_healthy_cold_corrupt_hot_deleted() {
+    let (state, hot) = catalog_fixture();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    fs::write(&hot, b"invalid SQLite header").unwrap();
+    assert!(opened(&cold).root().is_ok());
+    cleanup_abandoned_scans(state.path(), 123);
+    assert!(cold.exists());
+    assert!(!hot.exists());
+    assert!(hot.with_extension("db.bad").exists());
+    assert_eq!(catalog.list(None).unwrap()[0].file.as_ref(), Some(&cold));
+    assert!(opened(&cold).root().is_ok());
+}
+
+#[test]
+fn review_rebuild_hides_healthy_cold_behind_corrupt_hot() {
+    let (state, hot) = catalog_fixture();
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    fs::write(&hot, b"invalid SQLite header").unwrap();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    assert_eq!(catalog.rebuild_from_files().unwrap(), 1);
+    assert_eq!(catalog.list(None).unwrap()[0].file.as_ref(), Some(&cold));
+}
+
+// Preserve the original frame while changing valid JSON. Optionally recompute the
+// checksum to test semantic disagreement independently of accidental corruption.
+fn wrong_header(cold: &Path, checksum: bool) {
+    let bytes = fs::read(cold).unwrap();
+    let n = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    let mut json: serde_json::Value = serde_json::from_slice(&bytes[20..20 + n]).unwrap();
+    json["root"]["t_disk"] = 5096.into();
+    let json = serde_json::to_vec(&json).unwrap();
+    assert_eq!(n, json.len());
+    let mut changed = bytes.clone();
+    changed[20..20 + n].copy_from_slice(&json);
+    if checksum && &bytes[..8] == b"TMCOLD02" {
+        changed[20 + n..28 + n].copy_from_slice(&xxhash_rust::xxh3::xxh3_64(&json).to_le_bytes());
+    }
+    fs::write(cold, changed).unwrap();
+}
+
+#[test]
+fn review_matching_payload_wrong_header_survives_cleanup() {
+    let (state, hot) = catalog_fixture();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    wrong_header(&cold, true);
+    assert!(catalog
+        .point_to_cold(&meta().scan_id.to_string(), &cold)
+        .is_err());
+    cleanup_abandoned_scans(state.path(), 123);
+    assert!(hot.exists());
+    assert!(!cold.exists());
+    assert!(cold.with_extension("zst.bad").exists());
+    assert_eq!(catalog.list(None).unwrap()[0].file.as_ref(), Some(&hot));
+    assert_eq!(catalog.rebuild_from_files().unwrap(), 1);
+    assert_eq!(catalog.list(None).unwrap()[0].t_disk, Some(4096));
+}
+
+#[test]
+fn cold_only_rebuild_rejects_header_corruption_and_old_magic() {
+    for old_magic in [false, true] {
+        let (state, hot) = catalog_fixture();
+        let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+        fs::remove_file(&hot).unwrap();
+        if old_magic {
+            let mut bytes = fs::read(&cold).unwrap();
+            bytes[..8].copy_from_slice(b"TMCOLD01");
+            fs::write(&cold, bytes).unwrap();
+        } else {
+            wrong_header(&cold, false);
+        }
+        assert!(read_cold_header(&cold).is_err());
+        let catalog = Catalog::open(state.path(), true).unwrap();
+        assert_eq!(catalog.rebuild_from_files().unwrap(), 0);
+        assert!(cold.exists());
+    }
+}
+
+#[test]
+fn inconclusive_pairs_preserve_both_bytes_and_catalog() {
+    for both_valid in [false, true] {
+        let (state, hot) = catalog_fixture();
+        let catalog = Catalog::open(state.path(), true).unwrap();
+        catalog.rebuild_from_files().unwrap();
+        let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+        if both_valid {
+            let conn = rusqlite::Connection::open(&hot).unwrap();
+            conn.execute("UPDATE dirs SET t_disk=5096 WHERE id=0", [])
+                .unwrap();
+        } else {
+            fs::write(&hot, b"invalid SQLite header").unwrap();
+            fs::write(&cold, b"invalid cold header").unwrap();
+        }
+        let hot_bytes = fs::read(&hot).unwrap();
+        let cold_bytes = fs::read(&cold).unwrap();
+        cleanup_abandoned_scans(state.path(), 123);
+        assert_eq!(fs::read(&hot).unwrap(), hot_bytes);
+        assert_eq!(fs::read(&cold).unwrap(), cold_bytes);
+        assert_eq!(catalog.list(None).unwrap()[0].file.as_ref(), Some(&hot));
+    }
+}
+
+#[test]
+fn hot_identity_and_root_are_required_for_rebuild() {
+    for wrong_identity in [false, true] {
+        let (state, hot) = catalog_fixture();
+        let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+        fs::write(cold, b"invalid cold header").unwrap();
+        let conn = rusqlite::Connection::open(&hot).unwrap();
+        if wrong_identity {
+            conn.execute(
+                "UPDATE meta SET value='20260101T000000Z-00000001' WHERE key='scan_id'",
+                [],
+            )
+            .unwrap();
+        } else {
+            // A structurally readable snapshot with a missing root is invalid.
+            conn.execute("DELETE FROM dirs WHERE id=0", []).unwrap();
+        }
+        drop(conn);
+        let catalog = Catalog::open(state.path(), true).unwrap();
+        assert_eq!(catalog.rebuild_from_files().unwrap(), 0);
+    }
+}
+
+#[test]
+fn cold_frame_must_include_checksum() {
+    use std::io::Write;
+    let (_tmp, hot) = write_fixture(3);
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    let bytes = fs::read(&cold).unwrap();
+    let n = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    let offset = 20 + n + if &bytes[..8] == b"TMCOLD02" { 8 } else { 0 };
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    encoder.include_checksum(false).unwrap();
+    encoder.write_all(&fs::read(&hot).unwrap()).unwrap();
+    let mut bad = bytes[..offset].to_vec();
+    bad.extend(encoder.finish().unwrap());
+    fs::write(&cold, bad).unwrap();
+    assert!(validate_cold(&cold).is_err());
+    assert!(Snapshot::open(&cold).is_err());
+}
+
+#[test]
+fn quick_check_rejects_corruption_outside_meta_and_root() {
+    let (state, hot) = catalog_fixture();
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    fs::write(cold, b"invalid cold header").unwrap();
+    let conn = rusqlite::Connection::open(&hot).unwrap();
+    let page: u32 = conn
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name='annotations'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let size: u32 = conn
+        .pragma_query_value(None, "page_size", |r| r.get(0))
+        .unwrap();
+    drop(conn);
+    let mut bytes = fs::read(&hot).unwrap();
+    bytes[((page - 1) * size) as usize] = 0x7f; // invalid b-tree page type
+    fs::write(&hot, bytes).unwrap();
+    // Opening metadata/root alone misses corruption in an unrelated table.
+    assert!(Snapshot::open(&hot).unwrap().root().is_ok());
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    assert_eq!(catalog.rebuild_from_files().unwrap(), 0);
+}
+
+#[test]
+fn quarantine_collision_never_overwrites_previous_evidence() {
+    let (state, hot) = catalog_fixture();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    wrong_header(&cold, true);
+    let bad = cold.with_extension("zst.bad");
+    test_support::private_write(&bad, b"previous evidence").unwrap();
+    cleanup_abandoned_scans(state.path(), 123);
+    assert!(hot.exists());
+    assert!(cold.exists());
+    assert_eq!(fs::read(&bad).unwrap(), b"previous evidence");
+    assert_eq!(catalog.list(None).unwrap()[0].file.as_ref(), Some(&hot));
+}
+
+#[test]
+fn space_refusal_is_inconclusive_for_pair_cleanup() {
+    let (state, hot) = catalog_fixture();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    let mut bytes = fs::read(&cold).unwrap();
+    // Valid signed-domain length that cannot fit on the fixture filesystem.
+    bytes[8..16].copy_from_slice(&(i64::MAX as u64 - 1).to_le_bytes());
+    fs::write(&cold, &bytes).unwrap();
+    assert!(matches!(Snapshot::open(&cold), Err(StoreError::Space(_))));
+    cleanup_abandoned_scans(state.path(), 123);
+    assert!(hot.exists());
+    assert_eq!(fs::read(&cold).unwrap(), bytes);
+    assert!(!cold.with_extension("zst.bad").exists());
+    assert_eq!(catalog.list(None).unwrap()[0].file.as_ref(), Some(&hot));
 }
