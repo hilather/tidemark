@@ -217,3 +217,129 @@ fn list_sizes_prune_compression_dry_run_and_cold_deletion() {
     }
     assert_eq!(cat.list(None).unwrap().len(), 1);
 }
+
+fn two_scans(state: &Path, root: &Path) -> Vec<ScanEntry> {
+    let mut cfg = Config::default();
+    cfg.general.state_dir = state.to_owned();
+    cfg.retention.snapshots.cold_after_recent = false;
+    cfg.retention.snapshots.recent = 5;
+    for day in 0..2 {
+        scan(&cfg, root, 1_700_000_000 + day * 86400);
+    }
+    let mut entries = Catalog::open(state, false).unwrap().list(None).unwrap();
+    entries.sort_by_key(|e| e.started_at);
+    entries
+}
+
+#[test]
+fn prune_removes_both_published_forms_in_both_pointer_directions() {
+    for point_to_cold in [false, true] {
+        let root = test_support::private_tempdir().unwrap();
+        let state = test_support::private_tempdir().unwrap();
+        let entries = two_scans(state.path(), root.path());
+        let hot = entries[0].file.clone().unwrap();
+        let cold = tidemark_store::cold::compress_snapshot(&hot, 1, &|| false).unwrap();
+        if point_to_cold {
+            Catalog::open(state.path(), true)
+                .unwrap()
+                .point_to_cold(&entries[0].scan_id, &cold)
+                .unwrap();
+        }
+        let bad = hot.with_extension("db.bad");
+        test_support::private_write(&bad, b"evidence").unwrap();
+        config_support::direct_config(
+            state.path(),
+            "[retention.snapshots]\nrecent=1\ndaily=0\nweekly=0\ncold_after_recent=false\n",
+        );
+        command(state.path(), true)
+            .args(["snapshots", "prune"])
+            .assert()
+            .success();
+        assert!(!hot.exists() && !cold.exists() && !bad.exists());
+        let rows = Catalog::open(state.path(), false)
+            .unwrap()
+            .list(None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].scan_id, entries[0].scan_id);
+    }
+}
+
+#[test]
+fn list_survives_missing_hot_file_and_corrupt_cold_header() {
+    let root = test_support::private_tempdir().unwrap();
+    let state = test_support::private_tempdir().unwrap();
+    let mut entries = two_scans(state.path(), root.path());
+    let healthy = entries.pop().unwrap();
+    let broken = entries.pop().unwrap();
+    // Case 1: the catalog row's hot file is gone.
+    let file = broken.file.clone().unwrap();
+    std::fs::remove_file(&file).unwrap();
+    for json in [false, true] {
+        let out = command(state.path(), json)
+            .args(["snapshots", "list"])
+            .assert()
+            .success();
+        let out = out.get_output();
+        assert!(!out.stderr.is_empty());
+        let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+        if json {
+            let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            let rows = v["data"].as_array().unwrap();
+            assert_eq!(rows.len(), 2);
+            let row = rows
+                .iter()
+                .find(|r| r["scan_id"] == broken.scan_id)
+                .unwrap();
+            assert!(row["file_bytes"].is_null() && row["uncompressed_bytes"].is_null());
+            let ok = rows
+                .iter()
+                .find(|r| r["scan_id"] == healthy.scan_id)
+                .unwrap();
+            assert!(ok["file_bytes"].is_number());
+        } else {
+            let line = stdout
+                .lines()
+                .find(|l| l.starts_with(&broken.scan_id))
+                .unwrap();
+            assert!(line.ends_with('-'));
+            assert!(stdout.lines().any(|l| l.starts_with(&healthy.scan_id)));
+        }
+    }
+    // Case 2: a cold file with a corrupt header.
+    let hot = healthy.file.clone().unwrap();
+    let cold = tidemark_store::cold::compress_snapshot(&hot, 1, &|| false).unwrap();
+    Catalog::open(state.path(), true)
+        .unwrap()
+        .point_to_cold(&healthy.scan_id, &cold)
+        .unwrap();
+    let mut bytes = std::fs::read(&cold).unwrap();
+    bytes[0] ^= 0xff;
+    std::fs::write(&cold, bytes).unwrap();
+    for json in [false, true] {
+        let out = command(state.path(), json)
+            .args(["snapshots", "list"])
+            .assert()
+            .success();
+        let out = out.get_output();
+        assert!(!out.stderr.is_empty());
+        let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+        if json {
+            let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            let row = v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["scan_id"] == healthy.scan_id)
+                .unwrap();
+            assert!(row["cold"] == true && row["uncompressed_bytes"].is_null());
+            assert!(row["file_bytes"].is_number());
+        } else {
+            let line = stdout
+                .lines()
+                .find(|l| l.starts_with(&healthy.scan_id))
+                .unwrap();
+            assert!(line.ends_with('-') && line.contains("cold"));
+        }
+    }
+}

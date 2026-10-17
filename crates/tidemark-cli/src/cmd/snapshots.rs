@@ -108,7 +108,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 crate::render::json(
                     "tidemark.snapshots.v1",
                     rows.iter()
-                        .map(entry_json)
+                        .map(|e| entry_json(refreshed(&catalog, e).as_ref().unwrap_or(e)))
                         .collect::<anyhow::Result<Vec<_>>>()?,
                     &mut out,
                 )?;
@@ -124,8 +124,10 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     "FILE BYTES".into(),
                     "UNCOMPRESSED BYTES".into(),
                 ]];
-                for e in rows {
-                    let (cold, file_bytes, uncompressed_bytes) = entry_sizes(&e)?;
+                for original in rows {
+                    let fresh = refreshed(&catalog, &original);
+                    let e = fresh.unwrap_or(original);
+                    let (cold, file_bytes, uncompressed_bytes) = entry_sizes(&e);
                     table.push(vec![
                         e.scan_id,
                         e.root.display_lossy(),
@@ -141,10 +143,10 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                         if cold { "cold".into() } else { "hot".into() },
                         file_bytes
                             .map(|n| n.to_string())
-                            .unwrap_or_else(|| "unknown".into()),
+                            .unwrap_or_else(|| "-".into()),
                         uncompressed_bytes
                             .map(|n| n.to_string())
-                            .unwrap_or_else(|| "unknown".into()),
+                            .unwrap_or_else(|| "-".into()),
                     ]);
                 }
                 write!(out, "{}", crate::render::table::aligned(&table))?;
@@ -309,7 +311,7 @@ fn entry_json(e: &tidemark_store::catalog::ScanEntry) -> anyhow::Result<serde_js
         .as_ref()
         .map(|p| tidemark_core::path::RawPath::from_path(p))
         .transpose()?;
-    let (cold, file_bytes, uncompressed_bytes) = entry_sizes(e)?;
+    let (cold, file_bytes, uncompressed_bytes) = entry_sizes(e);
     Ok(
         serde_json::json!({"cold":cold,"file_bytes":file_bytes,"uncompressed_bytes":uncompressed_bytes,"scan_id":e.scan_id,"root":e.root.to_json(),"mode":e.mode,
         "started_at":e.started_at,"finished_at":e.finished_at,"status":e.status,"degraded":e.degraded,
@@ -332,7 +334,13 @@ pub(crate) fn remove_snapshot(
         .or_else(|| bytes.strip_suffix(b".db"))
         .ok_or_else(|| anyhow::anyhow!("invalid snapshot filename"))?;
     use std::os::unix::ffi::OsStrExt;
-    for suffix in [b".db.bad".as_slice(), b".db.zst.bad".as_slice()] {
+    // Both published forms may exist after a crash; delete them all so a rebuild cannot resurrect the scan.
+    for suffix in [
+        b".db".as_slice(),
+        b".db.zst".as_slice(),
+        b".db.bad".as_slice(),
+        b".db.zst.bad".as_slice(),
+    ] {
         let mut sibling = stem.to_vec();
         sibling.extend_from_slice(suffix);
         directory.unlink_leaf(std::ffi::OsStr::from_bytes(&sibling))?;
@@ -379,20 +387,53 @@ fn open_snapshot(
         }
     })
 }
-fn entry_sizes(
+/// Re-read a catalog row once when its file vanished (a cold publication may have replaced it).
+fn refreshed(
+    catalog: &tidemark_store::catalog::Catalog,
     e: &tidemark_store::catalog::ScanEntry,
-) -> anyhow::Result<(bool, Option<u64>, Option<u64>)> {
+) -> Option<tidemark_store::catalog::ScanEntry> {
+    let vanished = e
+        .file
+        .as_ref()
+        .is_some_and(|f| std::fs::symlink_metadata(f).is_err());
+    if vanished {
+        return catalog.get(&e.scan_id).ok().flatten();
+    }
+    None
+}
+/// Sizes are optional metadata: failures yield unknown sizes plus a stderr diagnostic.
+fn entry_sizes(e: &tidemark_store::catalog::ScanEntry) -> (bool, Option<u64>, Option<u64>) {
     let Some(file) = &e.file else {
-        return Ok((false, None, None));
+        return (false, None, None);
     };
     let cold = file.as_os_str().as_encoded_bytes().ends_with(b".db.zst");
-    let file_bytes = std::fs::symlink_metadata(file)?.len();
-    let uncompressed = if cold {
-        tidemark_store::cold::read_cold_header(file)?.uncompressed_len
-    } else {
-        file_bytes
+    let file_bytes = match std::fs::symlink_metadata(file) {
+        Ok(m) => m.len(),
+        Err(err) => {
+            eprintln!(
+                "warning: snapshot {}: cannot stat {}: {err}",
+                e.scan_id,
+                super::display_path(file)
+            );
+            return (cold, None, None);
+        }
     };
-    Ok((cold, Some(file_bytes), Some(uncompressed)))
+    let uncompressed = if cold {
+        match tidemark_store::cold::read_cold_header(file) {
+            Ok(h) => Some(h.uncompressed_len),
+            Err(err) => {
+                eprintln!(
+                    "warning: snapshot {}: unreadable cold header {}: {err}",
+                    e.scan_id,
+                    super::display_path(file)
+                );
+                None
+            }
+        }
+    } else {
+        Some(file_bytes)
+    };
+    (cold, Some(file_bytes), uncompressed)
 }
 // Bound diagnostic snapshot opens independently of the million-row catalog cap.
 const REMEDY_CANDIDATE_LIMIT: usize = 20;

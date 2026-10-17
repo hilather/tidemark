@@ -235,3 +235,45 @@ fn following_scan_estimates_cold_predecessor_from_uncompressed_header() {
     assert_eq!(catalog.list(None).unwrap().len(), 1);
     assert!(cold.exists());
 }
+
+#[test]
+fn automatic_deletion_removes_both_published_forms_in_both_pointer_directions() {
+    for point_to_cold in [false, true] {
+        let state = test_support::private_tempdir().unwrap();
+        let root = test_support::private_tempdir().unwrap();
+        let mut cfg = config(state.path(), false);
+        cfg.retention.snapshots.recent = 3;
+        let epoch = 1_800_000_000;
+        for day in 0..3 {
+            scan(&cfg, root.path(), epoch + day * 86400);
+        }
+        let key = RawPath::from_path(root.path()).unwrap();
+        let mut entries = Catalog::open(state.path(), false)
+            .unwrap()
+            .list(Some(&key))
+            .unwrap();
+        entries.sort_by_key(|e| e.started_at);
+        let oldest = &entries[0];
+        let hot = oldest.file.clone().unwrap();
+        let cold = tidemark_store::cold::compress_snapshot(&hot, 1, &|| false).unwrap();
+        assert!(hot.exists() && cold.exists());
+        if point_to_cold {
+            Catalog::open(state.path(), true)
+                .unwrap()
+                .point_to_cold(&oldest.scan_id, &cold)
+                .unwrap();
+        }
+        let bad = hot.with_extension("db.bad");
+        test_support::private_write(&bad, b"quarantine").unwrap();
+        let mut deletion = cfg.clone();
+        deletion.retention.snapshots.recent = 2;
+        deletion.retention.snapshots.daily = 0;
+        deletion.retention.snapshots.weekly = 0;
+        scan(&deletion, root.path(), epoch + 3 * 86400);
+        assert!(!hot.exists() && !cold.exists() && !bad.exists());
+        let catalog = Catalog::open(state.path(), false).unwrap();
+        let rows = catalog.list(Some(&key)).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|e| e.scan_id != oldest.scan_id));
+    }
+}

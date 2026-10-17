@@ -1194,7 +1194,13 @@ fn delete_snapshot(state: &std::path::Path, file: &std::path::Path) -> Result<()
         .or_else(|| bytes.strip_suffix(b".db"))
         .ok_or_else(|| ScanError::Precondition("unsafe snapshot name".into()))?;
     use std::os::unix::ffi::OsStrExt;
-    for suffix in [b".db.bad".as_slice(), b".db.zst.bad".as_slice()] {
+    // Both published forms may exist after a crash; delete them all so a rebuild cannot resurrect the scan.
+    for suffix in [
+        b".db".as_slice(),
+        b".db.zst".as_slice(),
+        b".db.bad".as_slice(),
+        b".db.zst.bad".as_slice(),
+    ] {
         let mut sibling = stem.to_vec();
         sibling.extend_from_slice(suffix);
         directory.unlink_leaf(std::ffi::OsStr::from_bytes(&sibling))?;

@@ -444,7 +444,14 @@ fn upgrade_fixture_options_and_drift() {
         format!(
             "{}# upgrade fixture 0.1.1\n",
             // Preserve the historical enabled destination in the upgrade fixture.
-            read("packaging/config/tidemark.toml").replace(
+            // The historical fixture predates the commented cold-snapshot defaults.
+            read("packaging/config/tidemark.toml")
+                .replace("  # cold_after_recent = true\n", "")
+                .replace(
+                    "  # cold_level = 9  # integer 1..=19; invalid levels are configuration issues\n",
+                    "",
+                )
+                .replace(
                 "textfile              = \"\"   # off; for node_exporter's textfile collector e.g. \"/var/lib/node_exporter/textfile_collector/tidemark.prom\"",
                 "textfile              = \"/var/lib/node_exporter/textfile_collector/tidemark.prom\"   # \"\" = disabled",
             )
