@@ -928,14 +928,19 @@ fn cleanup_cold(state: &Path) -> Result<(), StoreError> {
                         .ok_or_else(|| StoreError::Invalid("missing quarantine source".into()))?;
                     let mut quarantine = bad_name.to_os_string();
                     quarantine.push(".bad");
-                    rustix::fs::renameat_with(
+                    let rename = rustix::fs::renameat_with(
                         dir.fd(),
                         bad_name,
                         dir.fd(),
                         &quarantine,
                         rustix::fs::RenameFlags::NOREPLACE,
-                    )
-                    .map_err(std::io::Error::from)?;
+                    );
+                    if rename == Err(rustix::io::Errno::EXIST) {
+                        tracing::warn!(hot=%hot_path.display(), cold=%path.display(), source=%bad.display(), destination=%bad.with_file_name(&quarantine).display(),
+                            "quarantine already exists; preserving snapshot pair");
+                        continue;
+                    }
+                    rename.map_err(std::io::Error::from)?;
                     rustix::fs::fsync(dir.fd()).map_err(std::io::Error::from)?;
                     tracing::warn!(hot=%hot_path.display(), cold=%path.display(),
                         "quarantined invalid snapshot pair member");

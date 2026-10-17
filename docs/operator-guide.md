@@ -421,3 +421,21 @@ An active daemon or foreground `tidemark watch` keeps a directory descriptor ope
 `sudo tidemark symlinks /data --check-targets` resolves components only within the selected mount, including same-device bind boundaries. `other_fs` means the external target was not checked: it does not tell you whether it exists, dangles or loops. Reading link text may update that link’s atime under mount policy. No scan and no other command reads the text of symbolic links it finds; resolving an administrator-supplied path on the command line follows links in that path as ordinary tools do. The 40-expansion bound also treats overlong chains as loops. Tidemark never restores timestamps or changes mount options to hide this limit.
 
 `man tidemark` and `man tidemarkd` provide the packaged command references. Final guest acceptance for real second-user trust, filesystem marks under packaged restrictions and cross-mount link atime remains pending; implemented checks and earlier capability measurements do not replace those gates.
+
+## Cold snapshots
+
+By default, retention compresses retained complete snapshots outside each root's newest `recent` snapshots into `.db.zst` files. Each root's newest complete snapshot stays hot. `tidemark snapshots list` marks cold snapshots and shows stored and uncompressed byte sizes; JSON adds `cold`, `file_bytes`, and `uncompressed_bytes`.
+
+Cold snapshots open transparently for queries. Opening one temporarily inflates its uncompressed size into a private `.inflate/` directory beside the snapshots. The space guard can refuse this temporary allocation. Closing the snapshot removes the inflated file; startup cleanup removes abandoned inflation files and `.db.zst.tmp` compression temporaries.
+
+Files ending in `.db.bad` or `.db.zst.bad` are quarantined recovery evidence. Cleanup preserves an existing quarantine file and warns on a naming collision. Deleting a scan through retention or `snapshots prune` also removes its quarantine siblings. Do not use quarantine leaves as snapshots.
+
+To disable future compression, set:
+
+```toml
+[retention.snapshots]
+cold_after_recent = false
+# cold_level = 9  # 1 through 19
+```
+
+Existing cold snapshots remain readable. `tidemark snapshots prune --dry-run` previews both deletions and compressions; omit `--dry-run` to apply them with the daemon stopped. Compression space refusals leave the hot snapshot available.

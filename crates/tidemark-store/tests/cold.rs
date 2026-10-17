@@ -424,6 +424,7 @@ fn cold_selection_respects_recent_newest_calendar_status_and_deleted() {
         recent: 2,
         daily: 7,
         weekly: 8,
+        ..Default::default()
     };
     assert_eq!(
         cold_plan(&entries, &policy, 2, now),
@@ -435,7 +436,8 @@ fn cold_selection_respects_recent_newest_calendar_status_and_deleted() {
         &SnapshotRetention {
             recent: 0,
             daily: 0,
-            weekly: 0
+            weekly: 0,
+            ..Default::default()
         },
         0,
         now
@@ -860,4 +862,45 @@ fn space_refusal_is_inconclusive_for_pair_cleanup() {
     assert_eq!(fs::read(&cold).unwrap(), bytes);
     assert!(!cold.with_extension("zst.bad").exists());
     assert_eq!(catalog.list(None).unwrap()[0].file.as_ref(), Some(&hot));
+}
+
+#[test]
+fn quarantine_collision_does_not_stop_later_cold_pointer_repair() {
+    let (state, hot) = catalog_fixture();
+    let mut other = meta();
+    other.scan_id = serde_json::from_str("\"20260102T000000Z-00000000\"").unwrap();
+    let mut writer = SnapshotWriter::create(hot.parent().unwrap(), &other).unwrap();
+    let mut root = dir(0);
+    root.subtree_end = 0;
+    writer.put_dirs(&[root]).unwrap();
+    let second = writer.finish(&other).unwrap();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    compress_snapshot(&hot, 1, &|| false).unwrap();
+    compress_snapshot(&second, 1, &|| false).unwrap();
+    // Pick the collision from the actual directory iteration order, independent of filesystem ordering.
+    let cold: Vec<_> = fs::read_dir(hot.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.as_os_str().as_encoded_bytes().ends_with(b".db.zst"))
+        .collect();
+    assert_eq!(cold.len(), 2);
+    wrong_header(&cold[0], true);
+    let bad = cold[0].with_extension("zst.bad");
+    test_support::private_write(&bad, b"earlier quarantine").unwrap();
+    let repair_hot = cold[1].with_extension("");
+    fs::remove_file(&repair_hot).unwrap();
+    cleanup_abandoned_scans(state.path(), 123);
+    assert!(cold[0].exists());
+    assert!(cold[0].with_extension("").exists());
+    assert_eq!(fs::read(&bad).unwrap(), b"earlier quarantine");
+    let repaired = catalog
+        .list(None)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.file.as_ref() == Some(&cold[1]));
+    assert!(
+        repaired.is_some(),
+        "later cold-only entry must be repaired in the same cleanup"
+    );
 }

@@ -129,3 +129,37 @@ fn metrics_textfile_is_disabled_by_default_and_when_omitted() {
         assert!(config.validate().is_empty());
     }
 }
+
+#[test]
+fn cold_retention_defaults_validation_and_unknown_fields() {
+    let mut config: Config = toml::from_str("").unwrap();
+    assert!(config.retention.snapshots.cold_after_recent);
+    assert_eq!(config.retention.snapshots.cold_level, 9);
+    for level in [0, 20] {
+        config.retention.snapshots.cold_level = level;
+        assert!(config
+            .validate()
+            .iter()
+            .any(|i| i.field == "retention.snapshots.cold_level"));
+    }
+    for level in [1, 19] {
+        config.retention.snapshots.cold_level = level;
+        assert!(config.validate().is_empty());
+    }
+    assert!(toml::from_str::<Config>("[retention.snapshots]\ncold_typo = true").is_err());
+    let config: Config =
+        toml::from_str("[retention.snapshots]\ncold_after_recent = false\ncold_level = 3").unwrap();
+    assert!(!config.retention.snapshots.cold_after_recent);
+    assert_eq!(config.retention.snapshots.cold_level, 3);
+}
+
+#[test]
+fn historical_upgrade_config_receives_cold_defaults() {
+    let config = Config::from_toml_bytes(include_bytes!(
+        "../../../tests/install/upgrade-config/tidemark.toml"
+    ))
+    .unwrap();
+    assert!(config.validate().is_empty());
+    assert!(config.retention.snapshots.cold_after_recent);
+    assert_eq!(config.retention.snapshots.cold_level, 9);
+}
