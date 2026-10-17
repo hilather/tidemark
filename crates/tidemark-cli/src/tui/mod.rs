@@ -56,6 +56,7 @@ struct Browser {
     snapshot: Snapshot,
     snapshot_file: std::path::PathBuf,
     old: Option<Snapshot>,
+    prev_open_failed_at: Option<i64>,
     dir: DirRow,
     state: State,
     rows: Vec<(DirRow, Option<i128>)>,
@@ -63,7 +64,6 @@ struct Browser {
     links: Vec<u64>,
     snapshots: Vec<CatalogRow>,
     message: String,
-    now: i64,
     clock: i64,
     history: history::History,
     history_refresh: bool,
@@ -884,8 +884,36 @@ impl Browser {
         }
     }
 
+    /// At most one open, never from `draw`.
+    fn open_previous(&mut self) {
+        if self.old.is_some() {
+            return;
+        }
+        if self
+            .prev_open_failed_at
+            .is_some_and(|at| self.clock.saturating_sub(at) < history::COOLDOWN)
+        {
+            return;
+        }
+        let started = self.snapshot.meta().started_at;
+        let open_id = self.snapshot.meta().scan_id.to_string();
+        let Some(previous) = previous_complete(&self.snapshots, started, &open_id) else {
+            self.prev_open_failed_at = None;
+            return;
+        };
+        let file = previous.1.clone();
+        match Snapshot::open(&file) {
+            Ok(snapshot) => {
+                self.old = Some(snapshot);
+                self.prev_open_failed_at = None;
+            }
+            Err(_) => self.prev_open_failed_at = Some(self.clock),
+        }
+    }
+
     /// Event-loop preparation only; drawing never opens or queries history/Info.
     fn prepare(&mut self, width: u16, height: u16) -> anyhow::Result<()> {
+        self.open_previous();
         self.history
             .prepare_window(self.snapshot.meta(), &self.snapshot_file, &self.snapshots);
         let (row, _) = self.subject();
@@ -997,7 +1025,7 @@ impl Browser {
             Pane::Info => self.prepare_info()?,
             Pane::Files => {
                 let hits = self.snapshot.subtree_files(self.dir.id, &Default::default(), 100)?;
-                self.text = files_text(&hits, self.now);
+                self.text = files_text(&hits, self.clock);
             }
             Pane::Links => {
                 let hits = self
@@ -1092,13 +1120,11 @@ impl Browser {
                     let file = file.clone();
                     let snapshot = Snapshot::open(&file)?;
                     if let Some(dir) = snapshot.dir_by_path(&self.dir.path)? {
-                        let started = snapshot.meta().started_at;
-                        let open_id = snapshot.meta().scan_id.to_string();
-                        let old = previous_complete(&self.snapshots, started, &open_id)
-                            .and_then(|(_, previous, _, _)| Snapshot::open(previous).ok());
                         self.snapshot_file = file;
                         self.snapshot = snapshot;
-                        self.old = old;
+                        self.old = None;
+                        self.prev_open_failed_at = None;
+                        self.open_previous();
                         self.navigate(dir)?;
                         self.message = if self.old.is_some() {
                             "Snapshot switched; comparing with preceding complete snapshot"
@@ -1376,7 +1402,6 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
             .then_with(|| a.scan_id.cmp(&b.scan_id))
     });
     let open_id = snapshot.meta().scan_id.to_string();
-    let open_started = snapshot.meta().started_at;
     let snapshot_file = entries
         .iter()
         .find(|e| e.scan_id == open_id)
@@ -1386,8 +1411,6 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         .into_iter()
         .filter_map(|e| e.file.map(|file| (e.scan_id, file, e.started_at, e.t_disk)))
         .collect::<Vec<_>>();
-    let old = previous_complete(&snapshots, open_started, &open_id)
-        .and_then(|(_, file, _, _)| Snapshot::open(file).ok());
     let colorterm = std::env::var("COLORTERM").ok();
     let term = std::env::var("TERM").ok();
     let lang = locale_lang();
@@ -1402,7 +1425,8 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
     let mut browser = Browser {
         snapshot,
         snapshot_file,
-        old,
+        old: None,
+        prev_open_failed_at: None,
         dir,
         state: State::new(start),
         rows: Vec::new(),
@@ -1410,7 +1434,6 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         links: Vec::new(),
         snapshots,
         message: "Sort and filter apply to whole directory".into(),
-        now: tidemark_core::time::unix_now(),
         clock: tidemark_core::time::unix_now(),
         history: history::History::default(),
         history_refresh: false,
