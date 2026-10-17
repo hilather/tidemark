@@ -17,7 +17,7 @@ use tidemark_store::reader::Snapshot;
 pub(super) const SAMPLES: usize = 7;
 const CACHE_PATHS: usize = 128;
 const CACHE_BYTES: usize = 1024 * 1024;
-const COOLDOWN: i64 = 5;
+pub(super) const COOLDOWN: i64 = 5;
 
 /// One catalog identity. The opened entry is always last in a window.
 #[derive(Clone, Debug, PartialEq, Eq)]

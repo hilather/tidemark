@@ -65,8 +65,7 @@ fn series() -> (tempfile::TempDir, Browser) {
     }
     b.snapshot_file = catalog.last().unwrap().1.clone();
     b.snapshot = Snapshot::open(&b.snapshot_file).unwrap();
-    b.now = b.snapshot.meta().finished_at;
-    b.clock = b.now;
+    b.clock = b.snapshot.meta().finished_at;
     b.dir = b.snapshot.root().unwrap();
     b.snapshots = catalog;
     b.load().unwrap();
@@ -76,7 +75,7 @@ fn series() -> (tempfile::TempDir, Browser) {
 #[test]
 fn newest_fixture_seconds_survive_snapshot_and_live_rows() {
     let (_temp, mut b) = series();
-    b.now = b.snapshot.meta().started_at;
+    let started_at = b.snapshot.meta().started_at;
     for (path, id, expected) in [
         (b"/fixture/projects".as_slice(), 1, "10-09 15:43"),
         (b"/fixture/logs".as_slice(), 3, "10-09 15:23"),
@@ -86,7 +85,7 @@ fn newest_fixture_seconds_survive_snapshot_and_live_rows() {
             .dir_by_path(&RawPath::new(path.to_vec()).unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(row.newest_mtime, b.now - id * 600);
+        assert_eq!(row.newest_mtime, started_at - id * 600);
         assert_ne!(row.newest_mtime, row.mtime, "NEWEST is the subtree maximum");
         let text = render(&b, 140, 40);
         let line = text
@@ -104,7 +103,7 @@ fn newest_fixture_seconds_survive_snapshot_and_live_rows() {
     let root = b.dir.clone();
     let mut rows = b.rows.clone();
     rows[0].0.mtime = 100;
-    rows[0].0.newest_mtime = b.now + 3600;
+    rows[0].0.newest_mtime = started_at + 3600;
     install_refresh(&mut b, root, rows);
     b.poll_refresh().unwrap();
     let text = render(&b, 140, 40);

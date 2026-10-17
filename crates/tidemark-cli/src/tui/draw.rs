@@ -401,7 +401,7 @@ fn header_line(b: &Browser, width: usize) -> Line<'static> {
     let theme = b.theme;
     let glyphs = theme.glyphs;
     let meta = b.snapshot.meta();
-    let age = fmt_age(b.now.saturating_sub(meta.finished_at).max(0));
+    let age = fmt_age(b.clock.saturating_sub(meta.finished_at).max(0));
     let status = if meta.degraded { "degraded" } else { "steady" };
     let mode = crate::render::enum_label(meta.mode);
     let identity = format!(
@@ -953,7 +953,7 @@ fn data_row(
     cells.push(Cell::from(right_text(if own {
         "-".into()
     } else {
-        fmt_newest(row.newest_mtime, b.now)
+        fmt_newest(row.newest_mtime, b.clock)
     })));
     cells.push(Cell::from(if own {
         right_text("-".into())
@@ -1705,7 +1705,7 @@ fn draw_picker(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
                 " "
             };
             // Same-year stamps are 11 columns and older stamps are 10. Pad so the total lines up.
-            let when = format!("{:<11}", fmt_when(row.2, b.now));
+            let when = format!("{:<11}", fmt_when(row.2, b.clock));
             let total = row.3.map_or_else(|| "-".into(), size::bytes);
             ListItem::new(format!("{mark}  {}  {when}  {total}", row.0))
         })

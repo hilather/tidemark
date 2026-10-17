@@ -33,6 +33,7 @@ pub(super) fn browser(count: u32) -> (tempfile::TempDir, Browser) {
         snapshot,
         snapshot_file: file.clone(),
         old: None,
+        prev_open_failed_at: None,
         dir,
         state: State::new(1),
         rows: vec![],
@@ -40,7 +41,6 @@ pub(super) fn browser(count: u32) -> (tempfile::TempDir, Browser) {
         links: vec![],
         snapshots: vec![],
         message: String::new(),
-        now: 1_000_100,
         clock: 1_000_100,
         history: history::History::default(),
         history_refresh: false,
@@ -77,6 +77,7 @@ fn browser_by_size(count: u32) -> (tempfile::TempDir, Browser) {
         snapshot,
         snapshot_file: file.clone(),
         old: None,
+        prev_open_failed_at: None,
         dir,
         state: State::new(1),
         rows: vec![],
@@ -84,7 +85,6 @@ fn browser_by_size(count: u32) -> (tempfile::TempDir, Browser) {
         links: vec![],
         snapshots: vec![],
         message: String::new(),
-        now: 1_000_100,
         clock: 1_000_100,
         history: history::History::default(),
         history_refresh: false,
@@ -227,13 +227,13 @@ fn hostile_names_in_data_panes() {
         snapshot,
         snapshot_file: file.clone(),
         old: None,
+        prev_open_failed_at: None,
         state: State::new(1),
         rows: vec![],
         text: String::new(),
         links: vec![],
         snapshots: vec![],
         message: String::new(),
-        now: 1_000_100,
         clock: 1_000_100,
         history: history::History::default(),
         history_refresh: false,
@@ -298,13 +298,13 @@ fn million_directory_navigation() {
         snapshot,
         snapshot_file: file.clone(),
         old: None,
+        prev_open_failed_at: None,
         state: State::new(1),
         rows: vec![],
         text: String::new(),
         links: vec![],
         snapshots: vec![],
         message: String::new(),
-        now: 1_000_100,
         clock: 1_000_100,
         history: history::History::default(),
         history_refresh: false,
@@ -352,13 +352,13 @@ fn query_pages_skip_nested_subtrees_and_support_back() {
         snapshot,
         snapshot_file: file.clone(),
         old: None,
+        prev_open_failed_at: None,
         state: State::new(1),
         rows: vec![],
         text: String::new(),
         links: vec![],
         snapshots: vec![],
         message: String::new(),
-        now: 1_000_100,
         clock: 1_000_100,
         history: history::History::default(),
         history_refresh: false,
@@ -573,7 +573,7 @@ size = 8192
     );
     let screen = render(&b, 160, 48);
     let row = screen.lines().find(|line| line.contains("a/")).unwrap();
-    assert!(row.contains(&draw::fmt_when(newest, b.now)), "{row}");
+    assert!(row.contains(&draw::fmt_when(newest, b.clock)), "{row}");
     assert_eq!(
         b.rows[0].0.t_disk,
         test_support::oracle::du_disk(fixture.root.join("a"))
@@ -2100,6 +2100,100 @@ fn header_keeps_the_scan_id_and_high_water() {
     assert!(wide_header.contains('≋'), "{wide_header}");
 }
 
+/// Older complete scan in `dir`. The scan id is not the fixture default, so it
+/// does not collide with `browser`'s `20260101T000000Z-00000000` file.
+fn complete_scan(
+    dir: &std::path::Path,
+    scan_id: &str,
+    started_at: i64,
+    child_disk: u64,
+) -> (String, std::path::PathBuf) {
+    let mut rows = vec![
+        fixture::row(0, None, b"/fixture", child_disk),
+        fixture::row(1, Some(0), b"/fixture/00000001", child_disk),
+    ];
+    rows[0].subtree_end = 1;
+    rows[0].own_charged = 0;
+    let mut meta = fixture::meta(rows[0].path.clone(), started_at);
+    meta.scan_id = serde_json::from_str(&format!("\"{scan_id}\"")).unwrap();
+    meta.dirs = rows.len() as u64;
+    let mut writer = tidemark_store::writer::SnapshotWriter::create(dir, &meta).unwrap();
+    writer.put_dirs(&rows).unwrap();
+    let file = writer.finish(&meta).unwrap();
+    (meta.scan_id.to_string(), file)
+}
+
+fn child_line(screen: &str) -> String {
+    screen
+        .lines()
+        .find(|line| line.contains("00000001/"))
+        .unwrap_or_else(|| panic!("{screen}"))
+        .to_string()
+}
+
+#[test]
+fn header_age_follows_injected_clock() {
+    let (_temp, mut b) = browser(1);
+    let first = render(&b, 80, 24);
+    assert!(first.contains("1m 39s ago"), "{first}");
+    b.clock += 75;
+    let second = render(&b, 80, 24);
+    assert!(second.contains("2m 54s"), "{second}");
+    assert!(!second.contains("1m 39s"), "{second}");
+}
+
+#[test]
+fn previous_snapshot_retry_fills_tide() {
+    let (temp, mut b) = browser(1);
+    assert!(b.old.is_none());
+    assert_eq!(b.clock, 1_000_100);
+    let (id, file) = complete_scan(temp.path(), "20251201T000000Z-00000000", 900_000, 0);
+    b.snapshots = vec![(id, file.clone(), 900_000, Some(0))];
+    let aside = file.with_extension("aside");
+    std::fs::rename(&file, &aside).unwrap();
+    let grew = crate::render::tree::signed_bytes(4_096);
+    b.prepare_frame(140, 24);
+    b.deltas(24, false).unwrap();
+    let missing = child_line(&render(&b, 140, 24));
+    assert!(!missing.contains(&grew), "{missing}");
+    std::fs::rename(&aside, &file).unwrap();
+    b.clock += 4;
+    b.prepare_frame(140, 24);
+    b.deltas(24, false).unwrap();
+    let cooling = child_line(&render(&b, 140, 24));
+    assert!(!cooling.contains(&grew), "{cooling}");
+    b.clock += 1;
+    b.prepare_frame(140, 24);
+    b.deltas(24, false).unwrap();
+    let ready = child_line(&render(&b, 140, 24));
+    assert!(ready.contains(&grew), "{ready}");
+}
+
+#[test]
+fn picker_binds_predecessor_of_picked_snapshot() {
+    let (temp, mut b) = browser(1);
+    let (a_id, a_file) = complete_scan(temp.path(), "20251101T000000Z-00000000", 800_000, 0);
+    let (b_id, b_file) = complete_scan(temp.path(), "20251201T000000Z-00000000", 900_000, 8_192);
+    let c_id = b.snapshot.meta().scan_id.to_string();
+    let c_started = b.snapshot.meta().started_at;
+    let c_file = b.snapshot_file.clone();
+    b.old = Some(Snapshot::open(&b_file).unwrap());
+    b.snapshots = vec![
+        (a_id, a_file, 800_000, Some(0)),
+        (b_id.clone(), b_file, 900_000, Some(8_192)),
+        (c_id, c_file, c_started, Some(4_096)),
+    ];
+    b.pane(Pane::Picker).unwrap();
+    b.state.selected = 1;
+    b.enter().unwrap();
+    b.deltas(24, false).unwrap();
+    let line = child_line(&render(&b, 120, 24));
+    let against_a = crate::render::tree::signed_bytes(i128::from(8_192) - i128::from(0));
+    assert_eq!(b.snapshot.meta().scan_id.to_string(), b_id);
+    assert_eq!(against_a, "+8.00 KiB");
+    assert!(line.contains(&against_a), "{line}");
+}
+
 #[test]
 fn size_column_is_right_aligned_at_both_widths() {
     let (_temp, mut b) = browser(3);
@@ -3453,7 +3547,7 @@ fn files_column_header_is_not_a_selectable_row() {
 fn picker_dates_pad_so_the_total_column_lines_up() {
     let (_temp, mut b) = browser(1);
     let now = 1_781_524_800;
-    b.now = now;
+    b.clock = now;
     let file = b.snapshot_file.clone();
     b.snapshots = vec![
         ("newer-scan".into(), file.clone(), now, Some(4_096)),
@@ -3585,10 +3679,10 @@ fn files_rows_line_up_under_the_header() {
     let file = writer.finish(&meta).unwrap();
     b.snapshot = Snapshot::open(&file).unwrap();
     b.dir = b.snapshot.root().unwrap();
-    b.now = 1_800_000_000;
+    b.clock = 1_800_000_000;
     b.pane(Pane::Files).unwrap();
-    let older = draw::fmt_when(100, b.now);
-    let newer = draw::fmt_when(1_800_000_000, b.now);
+    let older = draw::fmt_when(100, b.clock);
+    let newer = draw::fmt_when(1_800_000_000, b.clock);
     assert_ne!(older.chars().count(), newer.chars().count());
     let lines: Vec<&str> = b.text.lines().collect();
     let header = lines[0];
