@@ -438,6 +438,18 @@ impl StateDir {
         self.leaf(name, &fs::fstat(&fd)?)?;
         Ok(File::from(fd))
     }
+    /// Exclusively create a private regular leaf, never opening an existing name.
+    pub(crate) fn create_leaf(&self, name: &OsStr) -> io::Result<File> {
+        self.name(name)?;
+        let fd = fs::openat(
+            &self.fd,
+            name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )?;
+        self.leaf(name, &fs::fstat(&fd)?)?;
+        Ok(File::from(fd))
+    }
     /// Open an integrity-checked child, or create it privately, relative to this descriptor.
     pub fn subdir(&self, name: &OsStr, create: bool) -> io::Result<Self> {
         self.name(name)?;
@@ -450,6 +462,9 @@ impl StateDir {
             result => result.map_err(|e| context(&path, e))?,
         };
         check(&path, &fs::fstat(&fd)?, Role::Subdirectory, false)?;
+        if crate::space_guard::mount_id(&fd)? != crate::space_guard::mount_id(&self.fd)? {
+            return Err(error(&path, "state child crosses a mount"));
+        }
         Ok(Self { fd, path })
     }
     /// Exclusively create a private child directory relative to this descriptor.
