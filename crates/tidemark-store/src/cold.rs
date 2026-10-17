@@ -14,7 +14,7 @@ use tidemark_core::{
     snapshot::{DirRow, SnapshotMeta},
 };
 type Result<T> = std::result::Result<T, StoreError>;
-const MAGIC: &[u8; 8] = b"TMCOLD01";
+const MAGIC: &[u8; 8] = b"TMCOLD02";
 const MAX_HEADER: usize = 1024 * 1024;
 /// Cold container metadata; reading this never inflates the SQLite payload.
 #[derive(Serialize, Deserialize)]
@@ -107,6 +107,11 @@ fn read_header(file: &mut File) -> Result<ColdHeader> {
     }
     let mut json = vec![0; n];
     file.read_exact(&mut json)?;
+    let mut checksum = [0; 8];
+    file.read_exact(&mut checksum)?;
+    if u64::from_le_bytes(checksum) != xxhash_rust::xxh3::xxh3_64(&json) {
+        return Err(StoreError::Invalid("cold header checksum mismatch".into()));
+    }
     let mut header: ColdHeader = serde_json::from_slice(&json)?;
     header.uncompressed_len = u64::from_le_bytes(length);
     header.metadata()?;
@@ -115,6 +120,75 @@ fn read_header(file: &mut File) -> Result<ColdHeader> {
 /// Read a bounded, validated cold header without decompressing the frame.
 pub fn read_cold_header(path: &Path) -> Result<ColdHeader> {
     read_header(&mut open(path)?)
+}
+// Read all catalog-visible values with the same bounded metadata policy as compression.
+fn snapshot_header(snapshot: &Snapshot, length: u64) -> Result<ColdHeader> {
+    let mut meta = BTreeMap::new();
+    let mut stmt = snapshot
+        .conn()
+        .prepare("SELECT key,value FROM meta ORDER BY key")?;
+    let mut rows = stmt.query([])?;
+    let mut size = 0usize;
+    while let Some(row) = rows.next()? {
+        let key: String = row.get(0)?;
+        let value: String = row.get(1)?;
+        size = size.saturating_add(key.len()).saturating_add(value.len());
+        if size > MAX_HEADER {
+            return Err(StoreError::Invalid("cold metadata exceeds bound".into()));
+        }
+        meta.insert(key, value);
+    }
+    Ok(ColdHeader {
+        user_version: snapshot.meta().schema_version,
+        meta,
+        root: snapshot.root()?,
+        uncompressed_len: length,
+    })
+}
+fn checked_snapshot(path: &Path, scan: &str) -> Result<Snapshot> {
+    let snapshot = Snapshot::open(path)?;
+    let check: String = snapshot
+        .conn()
+        .pragma_query_value(None, "quick_check", |r| r.get(0))?;
+    if check != "ok" || snapshot.meta().scan_id.to_string() != scan {
+        return Err(StoreError::Invalid(
+            "invalid snapshot integrity or identity".into(),
+        ));
+    }
+    snapshot.root()?;
+    Ok(snapshot)
+}
+/// Check hot SQLite integrity, supported version, filename identity and root presence.
+pub(crate) fn valid_hot(path: &Path) -> Result<Snapshot> {
+    let scan = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| StoreError::Invalid("invalid hot filename".into()))?;
+    checked_snapshot(path, scan)
+}
+fn header_matches_snapshot(header: &ColdHeader, snapshot: &Snapshot) -> Result<()> {
+    let actual = snapshot_header(snapshot, header.uncompressed_len)?;
+    if header.user_version != actual.user_version
+        || header.meta != actual.meta
+        || serde_json::to_value(&header.root)? != serde_json::to_value(&actual.root)?
+    {
+        return Err(StoreError::Invalid(
+            "cold header disagrees with SQLite snapshot".into(),
+        ));
+    }
+    Ok(())
+}
+/// Fully validate a cold member using a guarded, bounded-memory inflate leaf.
+pub(crate) fn valid_cold(path: &Path) -> Result<()> {
+    let header = read_cold_header(path)?;
+    let scan = header.metadata()?.scan_id.to_string();
+    if path.file_name() != Some(OsStr::new(&format!("{scan}.db.zst"))) {
+        return Err(StoreError::Invalid(
+            "cold filename identity mismatch".into(),
+        ));
+    }
+    let snapshot = checked_snapshot(path, &scan)?;
+    header_matches_snapshot(&header, &snapshot)
 }
 /// Stream a complete snapshot to an exclusive temporary, sync, rename without replacement,
 /// then sync its directory. Catalog update and source unlink belong to the caller.
@@ -134,27 +208,7 @@ pub fn compress_snapshot(path: &Path, level: i32, cancelled: &dyn Fn() -> bool) 
         ));
     }
     let mut source = open(path)?;
-    let mut meta = BTreeMap::new();
-    let mut stmt = snapshot
-        .conn()
-        .prepare("SELECT key,value FROM meta ORDER BY key")?;
-    let mut rows = stmt.query([])?;
-    let mut size = 0usize;
-    while let Some(row) = rows.next()? {
-        let key: String = row.get(0)?;
-        let value: String = row.get(1)?;
-        size = size.saturating_add(key.len()).saturating_add(value.len());
-        if size > MAX_HEADER {
-            return Err(StoreError::Invalid("cold metadata exceeds bound".into()));
-        }
-        meta.insert(key, value);
-    }
-    let header = ColdHeader {
-        user_version: snapshot.meta().schema_version,
-        meta,
-        root: snapshot.root()?,
-        uncompressed_len: source.metadata()?.len(),
-    };
+    let header = snapshot_header(&snapshot, source.metadata()?.len())?;
     header.metadata()?;
     let json = serde_json::to_vec(&header)?;
     if json.len() > MAX_HEADER {
@@ -171,6 +225,7 @@ pub fn compress_snapshot(path: &Path, level: i32, cancelled: &dyn Fn() -> bool) 
     output.write_all(&header.uncompressed_len.to_le_bytes())?;
     output.write_all(&(json.len() as u32).to_le_bytes())?;
     output.write_all(&json)?;
+    output.write_all(&xxhash_rust::xxh3::xxh3_64(&json).to_le_bytes())?;
     let mut encoder = zstd::stream::write::Encoder::new(output, level)?;
     encoder.include_checksum(true)?;
     let mut buffer = [0; 128 * 1024];
@@ -203,7 +258,17 @@ pub fn compress_snapshot(path: &Path, level: i32, cancelled: &dyn Fn() -> bool) 
     Ok(destination)
 }
 fn inflate(file: &mut File, output: &mut impl Write, length: u64) -> Result<()> {
-    let mut decoder = zstd::stream::read::Decoder::new(file)?.single_frame();
+    // Require the single standard zstd frame's content-checksum flag; decoding
+    // alone would also accept frames that omit the checksum entirely.
+    let mut prefix = [0; 5];
+    file.read_exact(&mut prefix)?;
+    if prefix[..4] != [0x28, 0xb5, 0x2f, 0xfd] || prefix[4] & 4 == 0 {
+        return Err(StoreError::Invalid(
+            "cold frame requires zstd checksum".into(),
+        ));
+    }
+    let input = std::io::Cursor::new(prefix).chain(file);
+    let mut decoder = zstd::stream::read::Decoder::new(input)?.single_frame();
     decoder.window_log_max(27)?;
     let n = std::io::copy(&mut decoder.by_ref().take(length.saturating_add(1)), output)?;
     if n != length {
@@ -245,6 +310,7 @@ pub(crate) fn matches_hot(cold: &Path, hot: &Path) -> Result<()> {
     }
     let mut source = open(cold)?;
     let header = read_header(&mut source)?;
+    header_matches_snapshot(&header, &valid_hot(hot)?)?;
     let mut compare = Compare(open(hot)?);
     inflate(&mut source, &mut compare, header.uncompressed_len)?;
     if compare.0.read(&mut [0])? != 0 {
