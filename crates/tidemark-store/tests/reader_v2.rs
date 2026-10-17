@@ -646,3 +646,164 @@ fn missing_directory_and_limit_errors_match_v1() {
             .to_string()
     );
 }
+
+// ---- SNAP-reader2-fix regressions ----
+
+/// Rewrites the v2 file with `sql` applied, then reopens it.
+fn tampered(p: Pair, sql: &str) -> (tempfile::TempDir, Snapshot, Snapshot) {
+    let Pair {
+        _one,
+        _two,
+        one: _,
+        two,
+    } = p;
+    drop(two);
+    let file = std::fs::read_dir(_two.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let conn = rusqlite::Connection::open(&file).unwrap();
+    conn.execute_batch(sql).unwrap();
+    drop(conn);
+    let snap = Snapshot::open(&file).unwrap();
+    // Keep a second, independent reader for warmed-cache orderings.
+    let snap2 = Snapshot::open(&file).unwrap();
+    drop(_one);
+    (_two, snap, snap2)
+}
+fn is_invalid<T: std::fmt::Debug>(r: Result<T, StoreError>) -> bool {
+    matches!(r, Err(StoreError::Invalid(_)))
+}
+
+#[test]
+fn b1_overlapping_chunks_are_invalid_cold_warm_and_range() {
+    let rows = tree(5, 12);
+    // chunk 4..=5 re-registered as 3..=5, overlapping chunks 2..=3 and 4..=5.
+    let sql = "INSERT INTO dir_chunks(first_id,last_id,data) SELECT 3,5,data FROM dir_chunks WHERE first_id=4;";
+    let (_d, cold, warm) = tampered(pair(&rows, 0, 64, 2), sql);
+    for id in 2..=7 {
+        assert!(is_invalid(cold.dir(id)), "cold {id}");
+    }
+    // Warm the cache with an unaffected chunk, then query in both orders.
+    assert!(warm.dir(16).is_ok());
+    for id in (0..rows.len() as u32).rev() {
+        if (2..=7).contains(&id) {
+            assert!(is_invalid(warm.dir(id)), "warm reversed {id}");
+        }
+    }
+    for id in 0..rows.len() as u32 {
+        if (2..=7).contains(&id) {
+            assert!(is_invalid(warm.dir(id)), "warm forward {id}");
+        }
+    }
+    assert!(is_invalid(cold.subtree_dirs(0, 20, SortKey::Name, 100)));
+    assert!(is_invalid(cold.subtree_dirs(0, 20, SortKey::Disk, 100)));
+    assert!(is_invalid(cold.wide_dirs(0, 1, 100)));
+}
+
+#[test]
+fn b1_gaps_between_chunks_are_invalid() {
+    let rows = tree(5, 12);
+    let (_d, cold, warm) = tampered(
+        pair(&rows, 0, 64, 2),
+        "DELETE FROM dir_chunks WHERE first_id=4;",
+    );
+    assert!(is_invalid(cold.dir(2)));
+    assert!(is_invalid(cold.dir(6)));
+    assert!(warm.dir(16).is_ok());
+    assert!(is_invalid(warm.dir(6)));
+    assert!(is_invalid(warm.dir(2)));
+    assert!(is_invalid(cold.subtree_dirs(0, 20, SortKey::Name, 100)));
+    assert!(is_invalid(cold.subtree_dirs(0, 20, SortKey::Disk, 100)));
+    assert!(is_invalid(cold.wide_dirs(0, 1, 100)));
+}
+
+#[test]
+fn s1_shallow_subtree_does_not_decode_deep_chunks() {
+    let rows = tree(5, 12);
+    let p = pair(&rows, 2, 64, 2);
+    let expected: Vec<Vec<DirRow>> = SORTS
+        .iter()
+        .map(|s| p.one.subtree_dirs(0, 2, *s, 100).unwrap())
+        .collect();
+    let expected_top: Vec<Vec<DirRow>> = SORTS
+        .iter()
+        .map(|s| p.one.subtree_dirs(1, 1, *s, 100).unwrap())
+        .collect();
+    let metrics = p.one.metrics_candidates(2, 100).unwrap();
+    let (_d, snap, _) = tampered(p, "UPDATE dir_chunks SET data=x'00' WHERE first_id=8;");
+    for (s, want) in SORTS.iter().zip(&expected) {
+        eq_rows(want, &snap.subtree_dirs(0, 2, *s, 100).unwrap());
+    }
+    for (s, want) in SORTS.iter().zip(&expected_top) {
+        eq_rows(want, &snap.subtree_dirs(1, 1, *s, 100).unwrap());
+    }
+    let got = snap.metrics_candidates(2, 100).unwrap();
+    eq_rows(&metrics.0, &got.0);
+    eq_rows(&metrics.1, &got.1);
+    // A query that does need the deep chunk still reports corruption.
+    assert!(is_invalid(snap.subtree_dirs(0, 12, SortKey::Name, 100)));
+}
+
+#[test]
+fn s2_oversized_blob_is_rejected_by_length() {
+    let rows = tree(5, 12);
+    let sql = "UPDATE dir_chunks SET data=zeroblob(67108864) WHERE first_id=0;";
+    let (_d, snap, _) = tampered(pair(&rows, 0, 64, 2), sql);
+    let err = snap.root().unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Invalid(m) if m.contains("dir_chunks.data")),
+        "{err:?}"
+    );
+    // Projected path (wide_dirs with min>0) and a subtree scan.
+    assert!(is_invalid(snap.wide_dirs(0, 1, 10)));
+    assert!(is_invalid(snap.subtree_dirs(0, 20, SortKey::Disk, 10)));
+}
+
+#[test]
+fn s3_corrupt_coordinates_and_meta_are_invalid() {
+    let rows = tree(5, 12);
+    let (_d, snap, _) = tampered(
+        pair(&rows, 0, 64, 2),
+        "UPDATE dir_chunks SET last_id=-1 WHERE first_id=0;",
+    );
+    let err = snap.root().unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Invalid(m) if m.contains("dir_chunks.last_id")),
+        "{err:?}"
+    );
+    let (_d, snap, _) = tampered(
+        pair(&rows, 0, 64, 2),
+        "UPDATE dir_chunks SET last_id='x' WHERE first_id=4;",
+    );
+    assert!(is_invalid(snap.dir(5)));
+    let (_d, snap, _) = tampered(
+        pair(&rows, 0, 64, 2),
+        "UPDATE dir_chunks SET last_id=4294967296 WHERE first_id=0;",
+    );
+    assert!(is_invalid(snap.root()));
+    let p = pair(&rows, 0, 64, 2);
+    let file = std::fs::read_dir(p._two.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    drop(p.two);
+    let conn = rusqlite::Connection::open(&file).unwrap();
+    conn.execute("DELETE FROM meta WHERE key='plain_depth'", [])
+        .unwrap();
+    drop(conn);
+    match Snapshot::open(&file) {
+        Err(StoreError::Invalid(m)) => assert!(m.contains("plain_depth"), "{m}"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    // A legitimately missing id keeps the v1-compatible error.
+    let p = pair(&rows, 0, 64, 2);
+    assert_eq!(
+        p.one.dir(999).unwrap_err().to_string(),
+        p.two.dir(999).unwrap_err().to_string()
+    );
+}

@@ -21,6 +21,89 @@ fn required(error: StoreError) -> StoreError {
 fn invalid() -> StoreError {
     StoreError::Invalid("invalid v2 directory data".into())
 }
+fn bad(what: &str) -> StoreError {
+    StoreError::Invalid(format!("invalid v2 snapshot: {what}"))
+}
+// Mirrors the codec's compressed-input ceiling (`chunk.rs`: MAX_BYTES + 1 MiB,
+// private there) so oversized blobs are rejected before they are read.
+const MAX_CHUNK_BLOB: usize = 40 * 1024 * 1024 + 1024 * 1024;
+/// Stored chunk coordinates, read without materialising the BLOB.
+#[derive(Clone, Copy)]
+struct ChunkRef {
+    first: u32,
+    last: u32,
+    len: usize,
+}
+fn id_col(v: rusqlite::Result<i64>, what: &str) -> Result<u32> {
+    v.ok()
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| bad(what))
+}
+fn chunk_ref(
+    first: rusqlite::Result<i64>,
+    last: rusqlite::Result<i64>,
+    len: rusqlite::Result<i64>,
+) -> Result<ChunkRef> {
+    let first = id_col(first, "dir_chunks.first_id out of range")?;
+    let last = id_col(last, "dir_chunks.last_id out of range")?;
+    let len = len
+        .ok()
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| bad("dir_chunks.data is not a blob"))?;
+    if last < first {
+        return Err(bad("dir_chunks.last_id precedes first_id"));
+    }
+    Ok(ChunkRef { first, last, len })
+}
+/// Reads the data of one chunk, rejecting oversized blobs before allocation.
+fn chunk_data(conn: &Connection, c: ChunkRef) -> Result<Vec<u8>> {
+    if c.len > MAX_CHUNK_BLOB {
+        return Err(bad("dir_chunks.data exceeds codec input ceiling"));
+    }
+    let data = conn
+        .query_row(
+            "SELECT data FROM dir_chunks WHERE first_id=?",
+            [c.first],
+            |r| Ok(r.get::<_, Vec<u8>>(0)),
+        )
+        .optional()?
+        .ok_or_else(missing)?;
+    data.map_err(|_| bad("dir_chunks.data is not a blob"))
+}
+/// A chunk is usable only when its interval is exactly contiguous with its
+/// neighbours: the first chunk starts at 0, and no chunk overlaps or leaves a gap.
+fn check_neighbours(conn: &Connection, c: ChunkRef) -> Result<()> {
+    let prev = conn
+        .query_row(
+            "SELECT last_id FROM dir_chunks WHERE first_id<? ORDER BY first_id DESC LIMIT 1",
+            [c.first],
+            |r| Ok(r.get::<_, i64>(0)),
+        )
+        .optional()?;
+    match prev {
+        None if c.first != 0 => return Err(bad("dir_chunks does not start at id 0")),
+        Some(last) => {
+            let last = id_col(last, "dir_chunks.last_id out of range")?;
+            if last.checked_add(1) != Some(c.first) {
+                return Err(bad("dir_chunks intervals overlap or leave a gap"));
+            }
+        }
+        None => {}
+    }
+    let next = conn
+        .query_row(
+            "SELECT first_id FROM dir_chunks WHERE first_id>? ORDER BY first_id LIMIT 1",
+            [c.first],
+            |r| Ok(r.get::<_, i64>(0)),
+        )
+        .optional()?;
+    if let Some(first) = next {
+        if c.last.checked_add(1) != Some(id_col(first, "dir_chunks.first_id out of range")?) {
+            return Err(bad("dir_chunks intervals overlap or leave a gap"));
+        }
+    }
+    Ok(())
+}
 // At most 32 chunks and 8 MiB retained, plus one transient codec-bounded chunk
 // (40 MiB decoded columns plus MAX_ROWS full rows). Arc keeps the single
 // active range chunk alive during callbacks; parent reconstruction may retain
@@ -112,9 +195,12 @@ impl Backend {
     }
     pub(super) fn open(conn: &Connection) -> Result<Self> {
         let get = |key| -> Result<u32> {
-            let s: String =
-                conn.query_row("SELECT value FROM meta WHERE key=?", [key], |r| r.get(0))?;
-            s.parse().map_err(|_| invalid())
+            let s: String = conn
+                .query_row("SELECT value FROM meta WHERE key=?", [key], |r| r.get(0))
+                .optional()?
+                .ok_or_else(|| bad(&format!("meta key {key} is missing")))?;
+            s.parse()
+                .map_err(|_| bad(&format!("meta key {key} is not a number")))
         };
         Ok(Self {
             plain_depth: get("plain_depth")?,
@@ -130,7 +216,10 @@ impl Backend {
             cache.push_front(entry);
             return Ok(rows);
         }
-        let (first,last,data): (u32,u32,Vec<u8>) = snap.conn.query_row("SELECT first_id,last_id,data FROM dir_chunks WHERE first_id<=? ORDER BY first_id DESC LIMIT 1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(missing)?;
+        let found = self.locate(snap, id)?.ok_or_else(missing)?;
+        let ChunkRef { first, last, .. } = found;
+        check_neighbours(&snap.conn, found)?;
+        let data = chunk_data(&snap.conn, found)?;
         let rows = Arc::new(chunk::decode_dirs(&data, first)?);
         if rows.last().map(|r| r.id) != Some(last) {
             return Err(invalid());
@@ -154,6 +243,28 @@ impl Backend {
             });
         }
         Ok(rows)
+    }
+    fn locate(&self, snap: &Snapshot, id: u32) -> Result<Option<ChunkRef>> {
+        snap.conn
+            .query_row(
+                "SELECT first_id,last_id,length(data) FROM dir_chunks WHERE first_id<=? ORDER BY first_id DESC LIMIT 1",
+                [id],
+                |r| Ok((r.get::<_, i64>(0), r.get::<_, i64>(1), r.get::<_, i64>(2))),
+            )
+            .optional()?
+            .map(|(a, b, c)| chunk_ref(a, b, c))
+            .transpose()
+    }
+    // Shallow rows (depth <= plain_depth) come from SQL without touching chunks.
+    fn shallow_row(&self, snap: &Snapshot, id: u32) -> Result<Option<ChunkDir>> {
+        let mut stmt = snap
+            .conn
+            .prepare(&format!("{SHALLOW_COLUMNS} FROM shallow_dirs WHERE id=?"))?;
+        let mut rows = stmt.query([id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(Self::from_shallow(dir_row(row)?))),
+            None => Ok(None),
+        }
     }
     fn raw(&self, snap: &Snapshot, id: u32) -> Result<ChunkDir> {
         let rows = self.chunk(snap, id)?;
@@ -269,15 +380,7 @@ impl Backend {
         mut visit: impl FnMut(ChunkDir) -> Result<()>,
     ) -> Result<()> {
         // Missing parent is an empty listing in v1.
-        let exists = snap
-            .conn
-            .query_row(
-                "SELECT last_id FROM dir_chunks WHERE first_id<=? ORDER BY first_id DESC LIMIT 1",
-                [id],
-                |r| r.get::<_, u32>(0),
-            )
-            .optional()?
-            .is_some_and(|last| last >= id);
+        let exists = self.locate(snap, id)?.is_some_and(|c| c.last >= id);
         if !exists {
             return Ok(());
         }
@@ -533,8 +636,30 @@ impl Backend {
         sort: SortKey,
         limit: usize,
     ) -> Result<Vec<DirRow>> {
-        let root = self.raw(snap, id)?;
+        let shallow_root = self.shallow_row(snap, id)?;
+        let root = match shallow_root {
+            Some(root) => root,
+            None => self.raw(snap, id)?,
+        };
         let max = u64::from(root.depth) + u64::from(depth);
+        if max <= u64::from(self.plain_depth) && root.depth <= self.plain_depth {
+            // Every requested row is a shallow row: no chunk is decoded.
+            return self.collect(
+                snap,
+                limit,
+                |v| {
+                    let mut stmt = snap.conn.prepare(&format!(
+                        "{SHALLOW_COLUMNS} FROM shallow_dirs WHERE id>=? AND id<=? AND depth<=? ORDER BY id"
+                    ))?;
+                    let mut rows = stmt.query(params![id, root.subtree_end, i64::try_from(max).map_err(|_| invalid())?])?;
+                    while let Some(row) = rows.next()? {
+                        v(Self::from_shallow(dir_row(row)?))?;
+                    }
+                    Ok(())
+                },
+                |r| Ok((-key(r, sort), r.name.clone(), r.id)),
+            );
+        }
         if matches!(
             sort,
             SortKey::Disk | SortKey::Reclaimable | SortKey::Files | SortKey::Newest
@@ -614,25 +739,32 @@ impl Backend {
         hi: u32,
         mut visit: impl FnMut(u32, chunk::DirProjection) -> Result<()>,
     ) -> Result<()> {
-        let mut stmt=snap.conn.prepare("SELECT first_id,last_id,data FROM dir_chunks WHERE first_id >= (SELECT first_id FROM dir_chunks WHERE first_id<=?1 ORDER BY first_id DESC LIMIT 1) AND first_id<=?2 ORDER BY first_id")?;
+        let mut stmt = snap.conn.prepare("SELECT first_id,last_id,length(data) FROM dir_chunks WHERE first_id >= (SELECT first_id FROM dir_chunks WHERE first_id<=?1 ORDER BY first_id DESC LIMIT 1) AND first_id<=?2 ORDER BY first_id")?;
         let mut chunks = stmt.query(params![lo, hi])?;
         let mut expected = None;
         let mut covered = false;
+        let mut seen = None;
         while let Some(chunk) = chunks.next()? {
-            let first: u32 = chunk.get(0)?;
-            let last: u32 = chunk.get(1)?;
-            if expected.is_some_and(|id| id != first) {
-                return Err(invalid());
+            let c = chunk_ref(chunk.get(0), chunk.get(1), chunk.get(2))?;
+            if expected.is_some_and(|id| id != c.first) {
+                return Err(bad("dir_chunks intervals overlap or leave a gap"));
             }
-            let data: Vec<u8> = chunk.get(2)?;
-            let projection = chunk::decode_dir_projection(&data, first)?;
+            if seen.is_none() {
+                check_neighbours(&snap.conn, c)?;
+            }
+            seen = Some(c);
+            let data = chunk_data(&snap.conn, c)?;
+            let projection = chunk::decode_dir_projection(&data, c.first)?;
             let count = u32::try_from(projection.entries.len()).map_err(|_| invalid())?;
-            if count == 0 || first.checked_add(count - 1) != Some(last) {
+            if count == 0 || c.first.checked_add(count - 1) != Some(c.last) {
                 return Err(invalid());
             }
-            visit(first, projection)?;
-            covered = last >= hi;
-            expected = last.checked_add(1);
+            visit(c.first, projection)?;
+            covered = c.last >= hi;
+            expected = c.last.checked_add(1);
+        }
+        if let Some(c) = seen {
+            check_neighbours(&snap.conn, c)?;
         }
         if !covered {
             return Err(invalid());
@@ -674,7 +806,10 @@ impl Backend {
                 "metrics candidate limit exceeds 1,000,000-row query cap".into(),
             ));
         }
-        let root = self.raw(snap, 0)?;
+        let root = match self.shallow_row(snap, 0)? {
+            Some(root) => root,
+            None => self.raw(snap, 0)?,
+        };
         let mut count = 0;
         let mut query = |sort| {
             self.collect(
