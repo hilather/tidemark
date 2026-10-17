@@ -13,6 +13,7 @@ privileged = ["test-support/privileged"]
 workspace = true
 
 [dependencies]
+zstd.workspace = true
 rustc-hash.workspace = true
 smallvec.workspace = true
 

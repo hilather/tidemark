@@ -6,6 +6,7 @@
 
 /// catalog module skeleton.
 pub mod catalog;
+pub mod chunk;
 /// diff module skeleton.
 pub mod diff;
 /// export_ncdu module skeleton.
