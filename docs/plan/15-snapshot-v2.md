@@ -22,27 +22,55 @@ TUI and CLI latency budget (§8).
 ## 2. Cold file format (`snapshots/<root-slug>/<scan_id>.db.zst`)
 
 ```
-offset 0   8 bytes   magic  b"TMCOLD01"
+offset 0   8 bytes   magic  b"TMCOLD02"
 offset 8   u64 LE    uncompressed length of the SQLite file (bytes)
 offset 16  u32 LE    meta JSON length M
-offset 20  M bytes   meta JSON: {"user_version":N, "meta":{<every meta key/value of the snapshot>}}
-offset 20+M          one zstd frame containing the complete SQLite file
+offset 20  M bytes   header JSON: {"user_version":N,"meta":{<every meta key/value of the snapshot>},"root":<root DirRow as serde JSON>}
+offset 20+M  u64 LE  xxh3_64 checksum of the M JSON bytes
+offset 20+M+8        one zstd frame containing the complete SQLite file
 ```
 
 - Compression level from config `[retention.snapshots] cold_level` (default 9, range 1..=19);
   `cold_after_recent = true` (default) enables it. `recent` snapshots and each root's newest complete
   snapshot are never cold.
 - Publication order (crash-safe): write `<scan_id>.db.zst.tmp` exclusively (0600, trust checks as other
-  leaves), fsync, rename NOREPLACE to `.db.zst`, fsync directory, update the catalog row's `file`, then
+  leaves), fsync, rename NOREPLACE to `.db.zst`, fsync directory, durably update the catalog row's `file` (`synchronous=FULL`), then
   unlink the `.db` and fsync the directory. A crash leaves at most both files; startup cleanup removes the
-  `.db` when a valid `.db.zst` with the same scan id exists, and removes stray `.db.zst.tmp`.
+  `.db` only after streaming byte-for-byte equivalence with `.db.zst` and equality of the header's
+  user_version, every meta key/value and root with the hot snapshot are proved; removes stray
+  `.db.zst.tmp`. Cleanup also repairs a stale hot catalog pointer when only a fully valid cold file remains.
+- Header reads verify the JSON checksum before parsing. The unreleased `TMCOLD01` format is rejected.
+  Hot validity requires read-only SQLite open, `PRAGMA quick_check = ok`, a supported user_version,
+  meta scan_id matching the filename and a root row. Cold validity additionally requires valid header,
+  exact declared decoded length, complete zstd frame/checksum and no trailing bytes, and the decoded
+  snapshot passing hot validity with identical header user_version/meta/root. Validation inflates into
+  a guarded private `.inflate` leaf with bounded decoder memory, removed on completion or failure.
+- Cleanup resolves pairs as follows (catalog commits use FULL synchronization before any rename/unlink):
+
+  | Evidence | Action |
+  |---|---|
+  | Payload bytes equal, header equals valid hot meta/root/version | Catalog → cold, unlink hot, fsync directory |
+  | Only hot valid, cold proven invalid | Catalog → hot, rename cold to `<id>.db.zst.bad`, fsync directory |
+  | Only cold valid, hot proven invalid | Catalog → cold, rename hot to `<id>.db.bad`, fsync directory |
+  | Both valid but different, neither valid, or validation inconclusive | Preserve both files and catalog row; warn naming both |
+
+  Resource/access failures (including inflate space refusal) are inconclusive. Quarantine renames use
+  NOREPLACE; an existing `.bad` leaf is preserved. `.bad` leaves are never opened as snapshots or swept
+  by startup/retention. They may only be removed by explicit prune or purge. CLI follow-up is needed:
+  current list is catalog-only and prune does not sweep quarantine leaves; purge removes the state tree.
+  State-usage accounting already includes their allocated blocks, like all regular leaves.
 - Catalog: `scans.file` points at whichever file exists; `rebuild_from_files` reads cold metadata from
-  the header JSON without inflating.
-- Opening a cold snapshot inflates it to `snapshots/<root-slug>/.inflate/<scan_id>.<pid>.db` (private
+  the header JSON without inflating for cold-only snapshots; when both forms exist, rebuilding
+  records hot only after hot validity passes, otherwise records cold if its checksummed header validates.
+  Cold-only and fallback rebuild are header-only (not full cold validation); neither valid → skip and warn.
+  Pair resolution remains cleanup's responsibility.
+- Opening a cold snapshot inflates it to `snapshots/<root-slug>/.inflate/<scan_id>.<pid>.<n>.db` (private
   0700 directory inside state_dir, trust checks apply), opens that file `immutable=1`, and unlinks it
   when the `Snapshot` is dropped. The space guard accounts the uncompressed length before inflating and
   refuses (NoSpace) rather than fill the filesystem. Startup and the scan-lock holder sweep stale
   `.inflate/*` leaves.
+- Concurrent cold opens each check the space guard independently and may jointly overshoot the
+  free-space floor; no shared reservations are made.
 - Space-guard estimates (`previous × 1.25`) use the uncompressed length from the header for cold files.
 - `snapshots list` shows a `cold` marker and both sizes; `prune`, `rebuild-catalog`, corruption recovery
   and retention handle both forms. Uncompressed `.db` files are never rewritten in place.

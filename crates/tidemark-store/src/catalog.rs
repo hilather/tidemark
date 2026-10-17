@@ -275,6 +275,38 @@ impl Catalog {
         )?;
         Ok(())
     }
+    /// Point an existing complete scan at its published cold file. Source unlink is separate.
+    pub fn point_to_cold(&self, scan_id: &str, path: &Path) -> Result<(), StoreError> {
+        let header = crate::cold::read_cold_header(path)?;
+        if header.metadata()?.scan_id.to_string() != scan_id {
+            return Err(StoreError::Invalid("cold scan identity mismatch".into()));
+        }
+        let relative = path
+            .strip_prefix(&self.state_dir)
+            .map_err(|_| StoreError::Invalid("cold file outside state directory".into()))?;
+        if relative
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+        {
+            return Err(StoreError::Invalid("unsafe cold catalog path".into()));
+        }
+        let hot = path.with_extension("");
+        let directory =
+            crate::state_dir::StateDir::snapshot_dir(&crate::state_dir::file_parent(path)?, false)?;
+        if directory.check_leaf(
+            hot.file_name()
+                .ok_or_else(|| StoreError::Invalid("missing hot name".into()))?,
+        )? {
+            crate::cold::matches_hot(path, &hot)?;
+        }
+        // FULL synchronizes the WAL commit before callers may unlink the hot source.
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
+        self.conn.execute(
+            "UPDATE scans SET file=? WHERE scan_id=? AND status='complete'",
+            params![SqlPath(relative.as_os_str().as_bytes()), scan_id],
+        )?;
+        Ok(())
+    }
     /// Reconstruct catalog records atomically from valid published snapshot files.
     ///
     /// Corrupt/unsupported files are logged and skipped; temporary files are ignored.
@@ -331,12 +363,51 @@ impl Catalog {
                 .subdir(&root.file_name(), false)?;
             for file in fs::read_dir(root.path())? {
                 let file = file?;
-                if !file.file_name().as_bytes().ends_with(b".db") {
+                if !file.file_name().as_bytes().ends_with(b".db")
+                    && !file.file_name().as_bytes().ends_with(b".db.zst")
+                {
                     continue;
                 }
                 root_dir.check_leaf(&file.file_name())?;
                 let path = file.path();
-                let loaded = Snapshot::open(&path).and_then(|s| Ok((s.root()?, s.meta().clone())));
+                let cold = path.as_os_str().as_bytes().ends_with(b".db.zst");
+                if cold
+                    && root_dir.check_leaf(
+                        path.with_extension("")
+                            .file_name()
+                            .ok_or_else(|| StoreError::Invalid("missing hot name".into()))?,
+                    )?
+                    && crate::cold::valid_hot(&path.with_extension("")).is_ok()
+                {
+                    continue;
+                }
+                let loaded = if cold {
+                    crate::cold::read_cold_header(&path).and_then(|h| {
+                        let m = h.metadata()?;
+                        if path.file_name()
+                            != Some(std::ffi::OsStr::new(&format!("{}.db.zst", m.scan_id)))
+                        {
+                            return Err(StoreError::Invalid(
+                                "cold filename identity mismatch".into(),
+                            ));
+                        }
+                        Ok((h.root, m))
+                    })
+                } else {
+                    // Legacy hot-only rebuild accepts historical filenames. A pair must
+                    // satisfy the stricter predicate before hot can suppress cold.
+                    let paired = root_dir.check_leaf(
+                        path.with_extension("db.zst")
+                            .file_name()
+                            .ok_or_else(|| StoreError::Invalid("missing cold name".into()))?,
+                    )?;
+                    let snapshot = if paired {
+                        crate::cold::valid_hot(&path)
+                    } else {
+                        Snapshot::open(&path)
+                    };
+                    snapshot.and_then(|s| Ok((s.root()?, s.meta().clone())))
+                };
                 let (d, m) = match loaded {
                     Ok(rows) => rows,
                     Err(error) => {
@@ -398,7 +469,9 @@ fn verify_snapshot_tree(
         let child = directory.subdir(&root.file_name(), false)?;
         for leaf in fs::read_dir(root.path())? {
             let leaf = leaf?;
-            if leaf.file_name().as_bytes().ends_with(b".db") {
+            if leaf.file_name().as_bytes().ends_with(b".db")
+                || leaf.file_name().as_bytes().ends_with(b".db.zst")
+            {
                 child.check_leaf(&leaf.file_name())?;
             }
         }
@@ -607,6 +680,9 @@ pub fn cleanup_abandoned_scans(state_dir: &Path, now: i64) {
     if let Err(error) = cleanup_temporaries(state_dir) {
         tracing::warn!(%error, "snapshot temporary cleanup failed");
     }
+    if let Err(error) = cleanup_cold(state_dir) {
+        tracing::warn!(%error, "cold snapshot cleanup failed");
+    }
     if let Err(error) = repair_running(state_dir, now) {
         tracing::warn!(%error, "abandoned scan catalog repair failed");
     }
@@ -688,7 +764,10 @@ fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
             while let Some(file) = files.next() {
                 let file = file?;
                 let filename = file.file_name();
-                if !filename.to_bytes().ends_with(b".db.tmp") {
+                if !filename.to_bytes().ends_with(b".db.tmp")
+                    && !filename.to_bytes().ends_with(b".db.zst.tmp")
+                    && !filename.to_bytes().ends_with(b".db.stage.tmp")
+                {
                     continue;
                 }
                 let removed = (|| -> std::io::Result<()> {
@@ -716,6 +795,154 @@ fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
         })();
         if let Err(error) = result {
             tracing::warn!(root=%name.to_string_lossy(), %error, "snapshot directory cleanup failed");
+        }
+    }
+    Ok(())
+}
+
+// Resource and access failures do not prove corruption. Keep both members when
+// validation cannot finish (notably a space-guard refusal or descriptor exhaustion).
+fn pair_validity(result: Result<(), StoreError>) -> Option<bool> {
+    match result {
+        Ok(()) => Some(true),
+        Err(StoreError::Io(e)) => match e.kind() {
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData => Some(false),
+            _ => None,
+        },
+        Err(StoreError::Sql(rusqlite::Error::SqliteFailure(e, _))) => matches!(
+            e.code,
+            rusqlite::ErrorCode::DatabaseCorrupt
+                | rusqlite::ErrorCode::NotADatabase
+                | rusqlite::ErrorCode::Unknown
+        )
+        .then_some(false),
+        Err(StoreError::Space(_) | StoreError::Cancelled | StoreError::NotYetImplemented) => None,
+        Err(_) => Some(false),
+    }
+}
+
+// Readers retain a flock on each inflated leaf. An unlocked inode is stale regardless
+// of PID reuse; cleanup does not guess process liveness or consult the wall clock.
+fn cleanup_cold(state: &Path) -> Result<(), StoreError> {
+    use std::ffi::OsStr;
+    let verified = crate::state_dir::StateDir::open(state, false)?;
+    let snapshots = match verified.subdir(OsStr::new("snapshots"), false) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mount = crate::space_guard::mount_id(snapshots.fd())?;
+    for root in fs::read_dir(state.join("snapshots"))? {
+        let root = root?;
+        if !root.file_type()?.is_dir() {
+            continue;
+        }
+        let dir = snapshots.subdir(&root.file_name(), false)?;
+        if crate::space_guard::mount_id(dir.fd())? != mount {
+            continue;
+        }
+        for entry in fs::read_dir(root.path())? {
+            let entry = entry?;
+            if entry.file_name() == ".inflate" {
+                let inflate = dir.subdir(OsStr::new(".inflate"), false)?;
+                if crate::space_guard::mount_id(inflate.fd())? != mount {
+                    continue;
+                }
+                match rustix::fs::flock(
+                    inflate.fd(),
+                    rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                ) {
+                    Ok(()) => {}
+                    Err(rustix::io::Errno::WOULDBLOCK) => continue,
+                    Err(e) => return Err(std::io::Error::from(e).into()),
+                }
+                for leaf in fs::read_dir(entry.path())? {
+                    let leaf = leaf?;
+                    if !leaf.file_name().as_bytes().ends_with(b".db") {
+                        continue;
+                    }
+                    let file = inflate.open_leaf(&leaf.file_name(), false, false)?;
+                    if crate::space_guard::mount_id(&file)? != mount {
+                        continue;
+                    }
+                    match rustix::fs::flock(
+                        &file,
+                        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                    ) {
+                        Ok(()) => inflate.unlink_leaf(&leaf.file_name())?,
+                        Err(rustix::io::Errno::WOULDBLOCK) => {}
+                        Err(e) => return Err(std::io::Error::from(e).into()),
+                    }
+                }
+            } else if entry.file_name().as_bytes().ends_with(b".db.zst") {
+                let path = entry.path();
+                let name = entry.file_name();
+                let Some(scan) = name.to_str().and_then(|n| n.strip_suffix(".db.zst")) else {
+                    continue;
+                };
+                let hot = format!("{scan}.db");
+                if dir.check_leaf(OsStr::new(&hot))? {
+                    let hot_file = dir.open_leaf(OsStr::new(&hot), false, false)?;
+                    if crate::space_guard::mount_id(&hot_file)? != mount {
+                        continue;
+                    }
+
+                    let hot_path = path.with_extension("");
+                    if crate::cold::matches_hot(&path, &hot_path).is_ok() {
+                        Catalog::open(state, true)?.point_to_cold(scan, &path)?;
+                        dir.unlink_leaf(OsStr::new(&hot))?;
+                        rustix::fs::fsync(dir.fd()).map_err(std::io::Error::from)?;
+                        continue;
+                    }
+                    let hot_valid = pair_validity(crate::cold::valid_hot(&hot_path).map(|_| ()));
+                    let cold_valid = pair_validity(crate::cold::valid_cold(&path));
+                    let (keep, bad) = match (hot_valid, cold_valid) {
+                        (Some(true), Some(false)) => (&hot_path, &path),
+                        (Some(false), Some(true)) => (&path, &hot_path),
+                        _ => {
+                            tracing::warn!(hot=%hot_path.display(), cold=%path.display(),
+                                "inconclusive snapshot pair; preserving both and catalog");
+                            continue;
+                        }
+                    };
+                    // Commit the verified survivor before quarantining its sibling. Never replace
+                    // an earlier quarantine: a collision leaves both published members intact.
+                    let catalog = Catalog::open(state, true)?;
+                    catalog.conn.pragma_update(None, "synchronous", "FULL")?;
+                    catalog.conn.execute(
+                        "UPDATE scans SET file=? WHERE scan_id=? AND status='complete'",
+                        params![
+                            SqlPath(
+                                keep.strip_prefix(state)
+                                    .map_err(|_| StoreError::Invalid(
+                                        "snapshot outside state".into()
+                                    ))?
+                                    .as_os_str()
+                                    .as_bytes()
+                            ),
+                            scan
+                        ],
+                    )?;
+                    let bad_name = bad
+                        .file_name()
+                        .ok_or_else(|| StoreError::Invalid("missing quarantine source".into()))?;
+                    let mut quarantine = bad_name.to_os_string();
+                    quarantine.push(".bad");
+                    rustix::fs::renameat_with(
+                        dir.fd(),
+                        bad_name,
+                        dir.fd(),
+                        &quarantine,
+                        rustix::fs::RenameFlags::NOREPLACE,
+                    )
+                    .map_err(std::io::Error::from)?;
+                    rustix::fs::fsync(dir.fd()).map_err(std::io::Error::from)?;
+                    tracing::warn!(hot=%hot_path.display(), cold=%path.display(),
+                        "quarantined invalid snapshot pair member");
+                } else if crate::cold::valid_cold(&path).is_ok() {
+                    Catalog::open(state, true)?.point_to_cold(scan, &path)?;
+                }
+            }
         }
     }
     Ok(())

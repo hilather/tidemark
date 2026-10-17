@@ -6,6 +6,8 @@
 
 /// catalog module skeleton.
 pub mod catalog;
+pub mod cold;
+
 pub mod chunk;
 /// diff module skeleton.
 pub mod diff;
@@ -23,6 +25,7 @@ pub mod space_guard;
 pub mod timeseries;
 /// writer module skeleton.
 pub mod writer;
+pub mod writer_v2;
 
 /// Verified state-directory trust boundary.
 pub mod state_dir;
