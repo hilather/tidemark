@@ -807,3 +807,99 @@ fn s3_corrupt_coordinates_and_meta_are_invalid() {
         p.two.dir(999).unwrap_err().to_string()
     );
 }
+
+// ---- SNAP-reader2-fix2 regressions ----
+
+fn v2_file(sql: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let p = pair(&tree(5, 12), 0, 64, 2);
+    let Pair {
+        _one, _two, two, ..
+    } = p;
+    drop(two);
+    let file = std::fs::read_dir(_two.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let conn = rusqlite::Connection::open(&file).unwrap();
+    conn.execute_batch(sql).unwrap();
+    (_two, file)
+}
+
+fn vm_hwm_kib() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+/// Child half of `s2_text_chunk_is_rejected_without_reading_payload`: runs
+/// only when re-executed by the parent with `TM_TEXT_CHUNK_FILE` set.
+#[test]
+fn s2_child_open_and_query() {
+    let Some(file) = std::env::var_os("TM_TEXT_CHUNK_FILE") else {
+        return;
+    };
+    let snap = Snapshot::open(std::path::Path::new(&file)).unwrap();
+    let err = snap.root().unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Invalid(m) if m.contains("dir_chunks")),
+        "{err:?}"
+    );
+    assert!(is_invalid(snap.wide_dirs(0, 1, 10)));
+    assert!(is_invalid(snap.subtree_dirs(0, 20, SortKey::Disk, 10)));
+    let hwm = vm_hwm_kib();
+    assert!(hwm < 40 * 1024, "VmHWM {hwm} KiB reached payload size");
+}
+
+#[test]
+fn s2_text_chunk_is_rejected_without_reading_payload() {
+    let (_dir, file) =
+        v2_file("UPDATE dir_chunks SET data=CAST(zeroblob(67108864) AS TEXT) WHERE first_id=0;");
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "s2_child_open_and_query", "--nocapture"])
+        .env("TM_TEXT_CHUNK_FILE", &file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn s2_non_blob_chunk_types_are_invalid_naming_table() {
+    for value in ["'text'", "12", "1.5"] {
+        let (_dir, file) = v2_file(&format!(
+            "UPDATE dir_chunks SET data={value} WHERE first_id=0;"
+        ));
+        let snap = Snapshot::open(&file).unwrap();
+        let err = snap.root().unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Invalid(m) if m.contains("dir_chunks")),
+            "{value}: {err:?}"
+        );
+        assert!(is_invalid(snap.wide_dirs(0, 1, 10)), "{value}");
+    }
+}
+
+#[test]
+fn s3_wrong_typed_v2_meta_is_invalid_naming_key() {
+    for key in ["plain_depth", "hash_width"] {
+        for value in ["x'32'", "NULL"] {
+            // Rebuild `meta` without NOT NULL so NULL can be stored.
+            let (_dir, file) = v2_file(&format!(
+                "CREATE TABLE meta2 (key TEXT PRIMARY KEY,value);
+                 INSERT INTO meta2 SELECT key,value FROM meta;
+                 DROP TABLE meta; ALTER TABLE meta2 RENAME TO meta;
+                 UPDATE meta SET value={value} WHERE key='{key}';"
+            ));
+            match Snapshot::open(&file) {
+                Err(StoreError::Invalid(m)) => assert!(m.contains(key), "{key}/{value}: {m}"),
+                other => panic!("{key}/{value}: {:?}", other.map(|_| ())),
+            }
+        }
+    }
+}

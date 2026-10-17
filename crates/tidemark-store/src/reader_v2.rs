@@ -42,12 +42,18 @@ fn id_col(v: rusqlite::Result<i64>, what: &str) -> Result<u32> {
 fn chunk_ref(
     first: rusqlite::Result<i64>,
     last: rusqlite::Result<i64>,
-    len: rusqlite::Result<i64>,
+    len: rusqlite::Result<Option<i64>>,
+    kind: rusqlite::Result<String>,
 ) -> Result<ChunkRef> {
     let first = id_col(first, "dir_chunks.first_id out of range")?;
     let last = id_col(last, "dir_chunks.last_id out of range")?;
+    // `length(data)` is evaluated only for BLOBs: on TEXT it reads the payload.
+    if kind.as_deref() != Ok("blob") {
+        return Err(bad("dir_chunks.data is not a blob"));
+    }
     let len = len
         .ok()
+        .flatten()
         .and_then(|v| usize::try_from(v).ok())
         .ok_or_else(|| bad("dir_chunks.data is not a blob"))?;
     if last < first {
@@ -195,9 +201,18 @@ impl Backend {
     }
     pub(super) fn open(conn: &Connection) -> Result<Self> {
         let get = |key| -> Result<u32> {
-            let s: String = conn
-                .query_row("SELECT value FROM meta WHERE key=?", [key], |r| r.get(0))
-                .optional()?
+            let s = conn
+                .query_row("SELECT value FROM meta WHERE key=?", [key], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|e| match e {
+                    rusqlite::Error::InvalidColumnType(..)
+                    | rusqlite::Error::FromSqlConversionFailure(..) => {
+                        bad(&format!("meta key {key} is not text"))
+                    }
+                    other => StoreError::Sql(other),
+                })?
                 .ok_or_else(|| bad(&format!("meta key {key} is missing")))?;
             s.parse()
                 .map_err(|_| bad(&format!("meta key {key} is not a number")))
@@ -247,12 +262,19 @@ impl Backend {
     fn locate(&self, snap: &Snapshot, id: u32) -> Result<Option<ChunkRef>> {
         snap.conn
             .query_row(
-                "SELECT first_id,last_id,length(data) FROM dir_chunks WHERE first_id<=? ORDER BY first_id DESC LIMIT 1",
+                "SELECT first_id,last_id,CASE WHEN typeof(data)='blob' THEN length(data) END,typeof(data) FROM dir_chunks WHERE first_id<=? ORDER BY first_id DESC LIMIT 1",
                 [id],
-                |r| Ok((r.get::<_, i64>(0), r.get::<_, i64>(1), r.get::<_, i64>(2))),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0),
+                        r.get::<_, i64>(1),
+                        r.get::<_, Option<i64>>(2),
+                        r.get::<_, String>(3),
+                    ))
+                },
             )
             .optional()?
-            .map(|(a, b, c)| chunk_ref(a, b, c))
+            .map(|(a, b, c, d)| chunk_ref(a, b, c, d))
             .transpose()
     }
     // Shallow rows (depth <= plain_depth) come from SQL without touching chunks.
@@ -739,13 +761,13 @@ impl Backend {
         hi: u32,
         mut visit: impl FnMut(u32, chunk::DirProjection) -> Result<()>,
     ) -> Result<()> {
-        let mut stmt = snap.conn.prepare("SELECT first_id,last_id,length(data) FROM dir_chunks WHERE first_id >= (SELECT first_id FROM dir_chunks WHERE first_id<=?1 ORDER BY first_id DESC LIMIT 1) AND first_id<=?2 ORDER BY first_id")?;
+        let mut stmt = snap.conn.prepare("SELECT first_id,last_id,CASE WHEN typeof(data)='blob' THEN length(data) END,typeof(data) FROM dir_chunks WHERE first_id >= (SELECT first_id FROM dir_chunks WHERE first_id<=?1 ORDER BY first_id DESC LIMIT 1) AND first_id<=?2 ORDER BY first_id")?;
         let mut chunks = stmt.query(params![lo, hi])?;
         let mut expected = None;
         let mut covered = false;
         let mut seen = None;
         while let Some(chunk) = chunks.next()? {
-            let c = chunk_ref(chunk.get(0), chunk.get(1), chunk.get(2))?;
+            let c = chunk_ref(chunk.get(0), chunk.get(1), chunk.get(2), chunk.get(3))?;
             if expected.is_some_and(|id| id != c.first) {
                 return Err(bad("dir_chunks intervals overlap or leave a gap"));
             }
