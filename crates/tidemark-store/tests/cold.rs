@@ -527,3 +527,129 @@ fn cold_open_and_cleanup_refuse_same_device_inflate_bind_mount() {
     assert!(result.is_err());
     assert_eq!(preserved.unwrap(), b"unchanged");
 }
+
+#[test]
+fn diff_and_explain_all_hot_cold_directions() {
+    use tidemark_store::diff::{diff, explain, DiffMetric};
+    let (_a, hot_a) = write_fixture(3);
+    let (_b, hot_b) = write_fixture(3);
+    let cold_a = compress_snapshot(&hot_a, 1, &|| false).unwrap();
+    let cold_b = compress_snapshot(&hot_b, 1, &|| false).unwrap();
+    for new_path in [&hot_a, &cold_a] {
+        let new = opened(new_path);
+        for old in [&hot_b, &cold_b] {
+            let rows = diff(&new, old, &meta().root, DiffMetric::Disk, 2, 20).unwrap();
+            assert_eq!(rows.len(), 3);
+            assert!(rows.iter().all(|row| row.delta == 0));
+            let explanation =
+                explain(&new, old, &meta().root, DiffMetric::Disk, 0.8, 1, 20).unwrap();
+            assert_eq!(explanation.target_delta, 0);
+        }
+    }
+}
+
+#[test]
+fn valid_frame_with_wrong_payload_preserves_hot_and_catalog() {
+    use std::io::Write;
+    let (state, hot) = catalog_fixture();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    let bytes = fs::read(&cold).unwrap();
+    let header_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize + 20;
+    let length = fs::metadata(&hot).unwrap().len() as usize;
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+    encoder.include_checksum(true).unwrap();
+    encoder.write_all(&vec![0; length]).unwrap();
+    let mut bad = bytes[..header_len].to_vec();
+    bad.extend(encoder.finish().unwrap());
+    fs::write(&cold, bad).unwrap();
+    validate_cold(&cold).unwrap();
+    assert!(Snapshot::open(&cold).is_err());
+    let transition = catalog.point_to_cold(&meta().scan_id.to_string(), &cold);
+    cleanup_abandoned_scans(state.path(), 123);
+    assert!(Snapshot::open(&hot).is_ok());
+    assert!(!cold.exists());
+    assert!(transition.is_err());
+    assert_eq!(catalog.list(None).unwrap()[0].file.as_ref(), Some(&hot));
+}
+
+#[test]
+fn rebuild_prefers_hot_over_truncated_cold() {
+    let (state, hot) = catalog_fixture();
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    let f = fs::OpenOptions::new().write(true).open(&cold).unwrap();
+    f.set_len(f.metadata().unwrap().len() - 1).unwrap();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    assert_eq!(catalog.rebuild_from_files().unwrap(), 1);
+    assert_eq!(catalog.list(None).unwrap()[0].file.as_ref(), Some(&hot));
+}
+
+#[test]
+fn cleanup_repairs_cold_only_stale_hot_pointer() {
+    let (state, hot) = catalog_fixture();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    fs::remove_file(&hot).unwrap();
+    cleanup_abandoned_scans(state.path(), 123);
+    assert_eq!(catalog.list(None).unwrap()[0].file.as_ref(), Some(&cold));
+    assert!(opened(&cold).root().is_ok());
+}
+
+#[test]
+fn cleanup_sweeps_v2_staging_leaf() {
+    let (state, hot) = catalog_fixture();
+    let stage = hot.with_extension("db.stage.tmp");
+    test_support::private_write(&stage, b"abandoned stage").unwrap();
+    cleanup_abandoned_scans(state.path(), 123);
+    assert!(!stage.exists());
+    assert!(hot.exists());
+}
+
+#[test]
+fn descriptor_exhaustion_never_leaks_inflate_leaf() {
+    const CHILD: &str = "TIDEMARK_COLD_EMFILE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "descriptor_exhaustion_never_leaks_inflate_leaf",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    let (tmp, hot) = write_fixture(3);
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    let original = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    let mut errors = 0;
+    // Probe all setup descriptor boundaries, restoring the limit before inspection.
+    for cap in 4..24 {
+        rustix::process::setrlimit(
+            rustix::process::Resource::Nofile,
+            rustix::process::Rlimit {
+                current: Some(cap),
+                maximum: original.maximum,
+            },
+        )
+        .unwrap();
+        let result = Snapshot::open_with_space_guard(&cold, |_| Ok(()));
+        rustix::process::setrlimit(rustix::process::Resource::Nofile, original).unwrap();
+        errors += usize::from(result.is_err());
+        drop(result);
+        let inflate = tmp.path().join(".inflate");
+        if inflate.exists() {
+            assert_eq!(fs::read_dir(inflate).unwrap().count(), 0, "limit {cap}");
+        }
+    }
+    assert!(errors > 0);
+}

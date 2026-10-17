@@ -42,6 +42,7 @@ pub struct Snapshot {
     conn: Connection,
     meta: SnapshotMeta,
     file: std::path::PathBuf,
+    backing_file: std::path::PathBuf,
     _inflated: Option<crate::cold::Inflated>,
 }
 
@@ -275,11 +276,15 @@ impl Snapshot {
     pub(crate) fn conn(&self) -> &rusqlite::Connection {
         &self.conn
     }
-    /// The snapshot file this reader was opened from (to ATTACH it read-only and immutable from
-    /// another snapshot's connection).
+    /// The durable catalog file this reader was opened from.
     #[allow(dead_code)] // Sibling query owners adopt this seam in their follow-up tasks.
     pub(crate) fn file(&self) -> &std::path::Path {
         &self.file
+    }
+
+    /// SQLite backing file, retained for the lifetime of this reader.
+    pub(crate) fn backing_file(&self) -> &Path {
+        &self.backing_file
     }
 
     /// Open an immutable snapshot without acquiring SQLite locks.
@@ -330,6 +335,7 @@ impl Snapshot {
             conn,
             meta,
             file: path.to_path_buf(),
+            backing_file: opened.to_path_buf(),
             _inflated: inflated,
         })
     }
