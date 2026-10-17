@@ -42,6 +42,7 @@ pub struct Snapshot {
     conn: Connection,
     meta: SnapshotMeta,
     file: std::path::PathBuf,
+    _inflated: Option<crate::cold::Inflated>,
 }
 
 fn decode_path(bytes: Vec<u8>) -> rusqlite::Result<RawPath> {
@@ -291,13 +292,28 @@ impl Snapshot {
     /// # Ok(()) }
     /// ```
     pub fn open(path: &Path) -> Result<Self> {
-        let parent = crate::state_dir::file_parent(path)?;
-        let name = path
+        Self::open_with_space_guard(path, |length| {
+            crate::space_guard::inflate_check(path, length)
+        })
+    }
+    /// Open with an injected inflate space policy. The guard runs before creating a leaf.
+    pub fn open_with_space_guard(
+        path: &Path,
+        guard: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<Self> {
+        let inflated = if path.as_os_str().as_bytes().ends_with(b".db.zst") {
+            Some(crate::cold::prepare(path, guard)?)
+        } else {
+            None
+        };
+        let opened = inflated.as_ref().map_or(path, |leaf| leaf.path.as_path());
+        let parent = crate::state_dir::file_parent(opened)?;
+        let name = opened
             .file_name()
             .ok_or_else(|| StoreError::Invalid("snapshot name missing".into()))?;
         let directory = crate::state_dir::StateDir::snapshot_dir(&parent, false)?;
         directory.leaf_identity(name)?;
-        let conn = immutable_connection(path)?;
+        let conn = immutable_connection(opened)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version != 1 {
             return Err(StoreError::Invalid(format!(
@@ -314,6 +330,7 @@ impl Snapshot {
             conn,
             meta,
             file: path.to_path_buf(),
+            _inflated: inflated,
         })
     }
     /// Return scan metadata without querying the database.

@@ -25,7 +25,7 @@ TUI and CLI latency budget (§8).
 offset 0   8 bytes   magic  b"TMCOLD01"
 offset 8   u64 LE    uncompressed length of the SQLite file (bytes)
 offset 16  u32 LE    meta JSON length M
-offset 20  M bytes   meta JSON: {"user_version":N, "meta":{<every meta key/value of the snapshot>}}
+offset 20  M bytes   header JSON: {"user_version":N,"meta":{<every meta key/value of the snapshot>},"root":<root DirRow as serde JSON>}
 offset 20+M          one zstd frame containing the complete SQLite file
 ```
 
@@ -38,7 +38,7 @@ offset 20+M          one zstd frame containing the complete SQLite file
   `.db` when a valid `.db.zst` with the same scan id exists, and removes stray `.db.zst.tmp`.
 - Catalog: `scans.file` points at whichever file exists; `rebuild_from_files` reads cold metadata from
   the header JSON without inflating.
-- Opening a cold snapshot inflates it to `snapshots/<root-slug>/.inflate/<scan_id>.<pid>.db` (private
+- Opening a cold snapshot inflates it to `snapshots/<root-slug>/.inflate/<scan_id>.<pid>.<n>.db` (private
   0700 directory inside state_dir, trust checks apply), opens that file `immutable=1`, and unlinks it
   when the `Snapshot` is dropped. The space guard accounts the uncompressed length before inflating and
   refuses (NoSpace) rather than fill the filesystem. Startup and the scan-lock holder sweep stale

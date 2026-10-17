@@ -6,6 +6,8 @@
 
 /// catalog module skeleton.
 pub mod catalog;
+pub mod cold;
+
 pub mod chunk;
 /// diff module skeleton.
 pub mod diff;

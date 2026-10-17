@@ -49,3 +49,41 @@ pub fn retention_plan(entries: &[ScanEntry], policy: &SnapshotRetention, now: i6
     deleted.sort();
     deleted
 }
+
+/// Select retained complete hot scans to compress, per root, newest first.
+/// Each root's newest and `max(policy.recent, recent_uncompressed)` newest scans stay hot.
+pub fn cold_plan(
+    entries: &[ScanEntry],
+    policy: &SnapshotRetention,
+    recent_uncompressed: usize,
+    now: i64,
+) -> Vec<String> {
+    let deleted: BTreeSet<_> = retention_plan(entries, policy, now).into_iter().collect();
+    let mut roots: BTreeMap<&[u8], Vec<&ScanEntry>> = BTreeMap::new();
+    for entry in entries.iter().filter(|e| e.status == "complete") {
+        roots.entry(entry.root.as_bytes()).or_default().push(entry);
+    }
+    let mut plan = Vec::new();
+    for rows in roots.values_mut() {
+        rows.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.scan_id.cmp(&a.scan_id))
+        });
+        for entry in rows
+            .iter()
+            .skip(policy.recent.max(recent_uncompressed).max(1))
+        {
+            if !deleted.contains(&entry.scan_id)
+                && entry
+                    .file
+                    .as_ref()
+                    .is_some_and(|p| p.extension() == Some(std::ffi::OsStr::new("db")))
+            {
+                plan.push(entry.scan_id.clone());
+            }
+        }
+    }
+    plan.sort();
+    plan
+}
