@@ -10,6 +10,8 @@ use tidemark_core::{
     path::{RawName, RawPath},
     snapshot::*,
 };
+#[path = "reader_v2.rs"]
+mod v2;
 type Result<T> = std::result::Result<T, StoreError>;
 /// A lock-free reader of a published immutable snapshot.
 ///
@@ -40,6 +42,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// ```
 pub struct Snapshot {
     conn: Connection,
+    v2: Option<v2::Backend>,
     meta: SnapshotMeta,
     file: std::path::PathBuf,
     backing_file: std::path::PathBuf,
@@ -276,6 +279,13 @@ impl Snapshot {
     pub(crate) fn conn(&self) -> &rusqlite::Connection {
         &self.conn
     }
+    /// Reject legacy SQL on columnar snapshots.
+    pub(crate) fn v1_conn(&self) -> Result<&Connection> {
+        if self.v2.is_some() {
+            return Err(StoreError::NotYetImplemented);
+        }
+        Ok(&self.conn)
+    }
     /// The durable catalog file this reader was opened from.
     #[allow(dead_code)] // Sibling query owners adopt this seam in their follow-up tasks.
     pub(crate) fn file(&self) -> &std::path::Path {
@@ -320,18 +330,24 @@ impl Snapshot {
         directory.leaf_identity(name)?;
         let conn = immutable_connection(opened)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version != 1 {
+        if !matches!(version, 1 | 2) {
             return Err(StoreError::Invalid(format!(
                 "unsupported snapshot version {version}"
             )));
         }
         let meta = read_meta(&conn)?;
-        if meta.schema_version != 1 {
+        if i64::from(meta.schema_version) != version {
             return Err(StoreError::Invalid(
                 "metadata version disagrees with database".into(),
             ));
         }
+        let v2 = if version == 2 {
+            Some(v2::Backend::open(&conn)?)
+        } else {
+            None
+        };
         Ok(Self {
+            v2,
             conn,
             meta,
             file: path.to_path_buf(),
@@ -349,12 +365,18 @@ impl Snapshot {
     }
     /// Fetch a directory by its preorder identifier.
     pub fn dir(&self, id: u32) -> Result<DirRow> {
+        if let Some(backend) = &self.v2 {
+            return backend.dir(self, id);
+        }
         Ok(self
             .conn
             .query_row("SELECT * FROM dirs WHERE id=?", [id], dir_row)?)
     }
     /// Look up exact raw path bytes; the hash is only an accelerator.
     pub fn dir_by_path(&self, path: &RawPath) -> Result<Option<DirRow>> {
+        if let Some(backend) = &self.v2 {
+            return backend.dir_by_path(self, path);
+        }
         Ok(self
             .conn
             .query_row(
@@ -366,6 +388,9 @@ impl Snapshot {
     }
     /// Fetch direct children ordered by the requested metric and raw name.
     pub fn children(&self, id: u32, sort: SortKey, limit: usize) -> Result<Vec<DirRow>> {
+        if let Some(backend) = &self.v2 {
+            return backend.children(self, id, sort, limit);
+        }
         let mut stmt = self.conn.prepare(&format!(
             "SELECT * FROM dirs WHERE parent_id=? ORDER BY {}, id LIMIT ?",
             order(sort)
@@ -379,6 +404,9 @@ impl Snapshot {
     }
     /// Count direct children matching a raw-byte substring; empty matches all.
     pub fn children_count(&self, id: u32, filter: &[u8]) -> Result<u64> {
+        if let Some(backend) = &self.v2 {
+            return backend.children_count(self, id, filter);
+        }
         Ok(self.conn.query_row(
             "SELECT count(*) FROM dirs WHERE parent_id=?1 AND (length(?2)=0 OR instr(name,?2)>0)",
             params![id, filter],
@@ -402,6 +430,10 @@ impl Snapshot {
         limit: usize,
         filter: &[u8],
     ) -> Result<Vec<DirRow>> {
+        if let Some(backend) = &self.v2 {
+            return backend
+                .children_page(self, id, sort, descending, cursor, reverse, limit, filter);
+        }
         if limit > crate::error::MAX_QUERY_ROWS {
             return Err(StoreError::Invalid("child page exceeds query cap".into()));
         }
@@ -474,6 +506,7 @@ impl Snapshot {
         reverse: bool,
         limit: usize,
     ) -> Result<Vec<(i64, LinkInstanceRow)>> {
+        self.v1_conn()?;
         if limit > crate::error::MAX_QUERY_ROWS {
             return Err(StoreError::Invalid("link page exceeds query cap".into()));
         }
@@ -514,6 +547,9 @@ impl Snapshot {
         depth: u32,
         limit: usize,
     ) -> Result<(Vec<DirRow>, Vec<DirRow>, u64, std::path::PathBuf)> {
+        if let Some(backend) = &self.v2 {
+            return backend.metrics_candidates(self, depth, limit);
+        }
         if limit > crate::error::MAX_QUERY_ROWS {
             return Err(StoreError::Invalid(
                 "metrics candidate limit exceeds 1,000,000-row query cap".into(),
@@ -549,6 +585,9 @@ impl Snapshot {
         sort: SortKey,
         limit: usize,
     ) -> Result<Vec<DirRow>> {
+        if let Some(backend) = &self.v2 {
+            return backend.subtree_dirs(self, id, max_depth_rel, sort, limit);
+        }
         let d = self.dir(id)?;
         let depth = u64::from(d.depth) + u64::from(max_depth_rel);
         let mut stmt = self.conn.prepare(&format!(
@@ -572,6 +611,7 @@ impl Snapshot {
         filter: &FileFilter,
         limit: usize,
     ) -> Result<Vec<FileHit>> {
+        self.v1_conn()?;
         let d = self.dir(id)?;
         let cutoff = |age: Option<std::time::Duration>| -> Result<Option<i64>> {
             age.map(|age| {
@@ -614,6 +654,9 @@ impl Snapshot {
     }
     /// Fetch subtree directories with at least the direct-entry threshold.
     pub fn wide_dirs(&self, id: u32, min_entries: u32, limit: usize) -> Result<Vec<DirRow>> {
+        if let Some(backend) = &self.v2 {
+            return backend.wide_dirs(self, id, min_entries, limit);
+        }
         let d = self.dir(id)?;
         let mut stmt=self.conn.prepare("SELECT * FROM dirs WHERE id BETWEEN ? AND ? AND entries>=? ORDER BY entries DESC,name,id LIMIT ?")?;
         let result = stmt
@@ -637,6 +680,7 @@ impl Snapshot {
         filter: &LinkFilter,
         limit: usize,
     ) -> Result<Vec<LinkSetHit>> {
+        self.v1_conn()?;
         if !filter.boundary.is_empty() && filter.boundary_depth.is_some() {
             return Err(StoreError::Invalid(
                 "boundary globs and depth are mutually exclusive".into(),
@@ -747,6 +791,7 @@ impl Snapshot {
     }
     /// Fetch stored hard-link instances in deterministic byte-name order.
     pub fn link_instances(&self, ino: u64) -> Result<Vec<LinkInstanceRow>> {
+        self.v1_conn()?;
         let mut stmt = self
             .conn
             .prepare("SELECT * FROM link_instances WHERE ino=? ORDER BY dir_id,name")?;
@@ -759,6 +804,7 @@ impl Snapshot {
     }
     /// Fetch skipped entries in the inclusive subtree.
     pub fn skipped_under(&self, id: u32) -> Result<Vec<SkipRow>> {
+        self.v1_conn()?;
         let d = self.dir(id)?;
         let mut stmt = self.conn.prepare(
             "SELECT * FROM skipped WHERE dir_id BETWEEN ? AND ? ORDER BY dir_id,name,reason",
@@ -772,6 +818,7 @@ impl Snapshot {
     }
     /// Fetch errors in the subtree, including unknown-parent errors at the root.
     pub fn errors_under(&self, id: u32, limit: usize) -> Result<Vec<ErrorRow>> {
+        self.v1_conn()?;
         let d = self.dir(id)?;
         let mut stmt=self.conn.prepare("SELECT * FROM errors WHERE dir_id BETWEEN ? AND ? OR (?=0 AND dir_id IS NULL) ORDER BY path,op,errno LIMIT ?")?;
         let result = stmt
@@ -783,6 +830,7 @@ impl Snapshot {
     }
     /// Fetch annotation key/value pairs for one directory in lexical order.
     pub fn annotations(&self, id: u32) -> Result<Vec<(String, String)>> {
+        self.v1_conn()?;
         let mut stmt = self
             .conn
             .prepare("SELECT key,value FROM annotations WHERE dir_id=? ORDER BY key,value")?;

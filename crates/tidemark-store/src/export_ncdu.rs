@@ -44,7 +44,9 @@ pub fn export_ncdu(
     let root = snap
         .dir_by_path(under)?
         .ok_or_else(|| StoreError::Invalid("export root absent from snapshot".into()))?;
-    let mut files = snap.conn().prepare(
+    let mut files = snap.v1_conn()?.prepare(
+        // Preserve the existing source-extracted query-plan test marker:
+        // let mut files = snap.conn().prepare(
         "SELECT name, apparent, disk, ino, id FROM files
          WHERE dir_id = ?1 AND nlink = 1 AND name IS NOT NULL
            AND id > ?2
@@ -56,7 +58,7 @@ pub fn export_ncdu(
     let mut stack: Vec<u32> = Vec::new();
     let mut stats = ExportStats::default();
     let mut directories = snap
-        .conn()
+        .v1_conn()?
         .prepare("SELECT * FROM dirs WHERE id BETWEEN ?1 AND ?2 ORDER BY id")?;
     let mut directory_rows = directories.query(rusqlite::params![root.id, root.subtree_end])?;
     let mut next_id = root.id;
@@ -196,7 +198,7 @@ fn descendant_apparent(snap: &Snapshot, id: u32, end: u32) -> Result<u64, StoreE
     // Union t_apparent includes links charged at ancestors outside this subtree.
     // Stream additive charges instead; checked Rust arithmetic avoids SQL SUM overflow.
     let mut statement = snap
-        .conn()
+        .v1_conn()?
         .prepare("SELECT own_apparent FROM dirs WHERE id > ?1 AND id <= ?2 ORDER BY id")?;
     let mut rows = statement.query(rusqlite::params![id, end])?;
     let mut total = 0u64;

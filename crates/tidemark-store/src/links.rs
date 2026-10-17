@@ -81,7 +81,7 @@ impl Regions {
         let globs = builder
             .build()
             .map_err(|e| StoreError::Invalid(e.to_string()))?;
-        let mut stmt = snap.conn().prepare(
+        let mut stmt = snap.v1_conn()?.prepare(
             "SELECT id,subtree_end,path,depth FROM dirs WHERE id BETWEEN ?1 AND ?2 ORDER BY id",
         )?;
         let mut rows = stmt.query(rusqlite::params![root.id, root.subtree_end])?;
@@ -347,12 +347,12 @@ fn stream_sets(
 ) -> Result<(), StoreError> {
     // Two ordered cursors avoid both a global sort and an index lookup per inode.
     // The primary-key scan remains outermost for byte-path tie ordering at the limit.
-    let mut sets_stmt = snap.conn().prepare(
+    let mut sets_stmt = snap.v1_conn()?.prepare(
         "SELECT l.*,d.path FROM link_sets l NOT INDEXED CROSS JOIN dirs d ON d.id=l.lca_dir_id \
          WHERE l.lca_dir_id BETWEEN ?1 AND ?2 ORDER BY l.ino",
     )?;
     let mut instances_stmt = snap
-        .conn()
+        .v1_conn()?
         .prepare("SELECT ino,dir_id FROM link_instances ORDER BY ino")?;
     let mut sets = sets_stmt.query(rusqlite::params![start, end])?;
     let mut instances = instances_stmt.query([])?;
@@ -555,7 +555,7 @@ pub fn link_report(
             .then_with(|| a.b.cmp(&b.b))
     });
     region_pairs.truncate(top);
-    let mut stmt = snap.conn().prepare("SELECT path,t_disk-t_reclaimable,t_disk FROM dirs WHERE id BETWEEN ?1 AND ?2 AND t_disk>t_reclaimable ORDER BY t_disk-t_reclaimable DESC,path LIMIT ?3")?;
+    let mut stmt = snap.v1_conn()?.prepare("SELECT path,t_disk-t_reclaimable,t_disk FROM dirs WHERE id BETWEEN ?1 AND ?2 AND t_disk>t_reclaimable ORDER BY t_disk-t_reclaimable DESC,path LIMIT ?3")?;
     let mut rows = stmt.query(rusqlite::params![
         root.id,
         root.subtree_end,
