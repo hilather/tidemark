@@ -728,6 +728,92 @@ fn chart_snapshots_cover_selections_missing_live_and_fallbacks() {
     }
 }
 
+fn buffer_rows(screen: &ratatui::buffer::Buffer) -> Vec<String> {
+    (0..screen.area.height)
+        .map(|y| {
+            (0..screen.area.width)
+                .map(|x| screen[(x, y)].symbol())
+                .collect()
+        })
+        .collect()
+}
+
+/// Every cell is ASCII. A box-drawing scalar (U+2500–U+257F) is rejected on its own.
+fn assert_ascii_cells(screen: &ratatui::buffer::Buffer) {
+    for y in 0..screen.area.height {
+        for x in 0..screen.area.width {
+            let symbol = screen[(x, y)].symbol();
+            if symbol.is_ascii() {
+                continue;
+            }
+            let ch = symbol.chars().next().unwrap();
+            assert!(
+                !('\u{2500}'..='\u{257F}').contains(&ch),
+                "box drawing U+{:04X} {symbol:?} at ({x}, {y})",
+                u32::from(ch)
+            );
+            panic!("non-ascii ({x}, {y}) {symbol:?} U+{:04X}", u32::from(ch));
+        }
+    }
+}
+
+/// The pane corner sits in the cell immediately before its title, including a centered overlay.
+fn assert_plus_corner(screen: &ratatui::buffer::Buffer, title: &str) {
+    let found = buffer_rows(screen).iter().any(|row| {
+        row.find(title)
+            .is_some_and(|index| row[..index].ends_with('+'))
+    });
+    assert!(found, "missing + corner before {title}");
+}
+
+#[test]
+fn ascii_chrome_is_ascii() {
+    let (_temp, mut b) = series();
+    b.theme = theme::Theme::select(true, false, None, Some("linux"), Some("C"));
+    pump(&mut b);
+    let main = buffer(&b, 140, 40);
+    assert_ascii_cells(&main);
+    assert_plus_corner(&main, "depth");
+    b.pane(Pane::Help).unwrap();
+    let help = buffer(&b, 80, 24);
+    assert_ascii_cells(&help);
+    assert_plus_corner(&help, "help . ");
+    let overlay = buffer(&b, 79, 23);
+    assert_ascii_cells(&overlay);
+    assert_plus_corner(&overlay, "tide");
+}
+
+#[test]
+fn unicode_chrome_keeps_plain_borders() {
+    let (_temp, mut b) = series();
+    b.theme = theme::Theme::plain();
+    pump(&mut b);
+    let main = buffer(&b, 140, 40);
+    assert_eq!(main[(1, 2)].symbol(), "┌");
+    let rows = buffer_rows(&main);
+    let depth = rows
+        .iter()
+        .position(|row| row.contains("┌depth"))
+        .expect("depth title");
+    assert!(rows[depth].contains("┌depth"));
+    assert!(
+        rows[depth + 1].starts_with('│'),
+        "table edge {}",
+        rows[depth + 1]
+    );
+    b.pane(Pane::Help).unwrap();
+    let help = buffer_rows(&buffer(&b, 80, 24));
+    let title = help
+        .iter()
+        .position(|row| row.contains("┌help"))
+        .expect("help title");
+    assert!(
+        help[title + 1].starts_with('│'),
+        "help edge {}",
+        help[title + 1]
+    );
+}
+
 #[test]
 fn history_subject_tracks_page_boundaries_sorts_and_filter() {
     let (_temp, mut b) = browser_by_size(2500);

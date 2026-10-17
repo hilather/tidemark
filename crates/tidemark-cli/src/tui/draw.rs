@@ -34,7 +34,6 @@ pub(super) fn civil(ts: i64) -> (i64, i64, i64, i64, i64) {
 }
 
 /// `MM-DD HH:MM` in the same UTC year as `now`, otherwise `YYYY-MM-DD`.
-/// Zero and the empty-maximum sentinel have no useful timestamp to display.
 pub(super) fn fmt_when(ts: i64, now: i64) -> String {
     let (year, month, day, hour, minute) = civil(ts);
     let (now_year, _, _, _, _) = civil(now);
@@ -47,6 +46,7 @@ pub(super) fn fmt_when(ts: i64, now: i64) -> String {
 
 /// NEWEST cell: an unset subtree maximum (0, or the empty-maximum sentinel
 /// `i64::MIN`) renders as `-`; every other time goes through [`fmt_when`].
+/// Zero and the empty-maximum sentinel have no useful timestamp to display.
 pub(super) fn fmt_newest(ts: i64, now: i64) -> String {
     if ts == 0 || ts == i64::MIN {
         return "-".into();
@@ -372,12 +372,29 @@ fn dim_style(theme: Theme) -> Style {
     style_fg(theme, Role::Dim).add_modifier(Modifier::DIM)
 }
 
+/// ASCII stand-in for ratatui's PLAIN set. Unicode mode keeps that default.
+const ASCII_BORDER: ratatui::symbols::border::Set<'static> = ratatui::symbols::border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
+
 fn pane_block(theme: Theme, title: Line<'_>) -> Block<'_> {
-    Block::bordered()
+    let block = Block::bordered()
         .border_style(style_fg(theme, Role::Edge))
         .title_style(style_fg(theme, Role::Teal).add_modifier(Modifier::BOLD))
         .style(base_style(theme))
-        .title(title)
+        .title(title);
+    if theme.glyphs.unicode {
+        block
+    } else {
+        block.border_set(ASCII_BORDER)
+    }
 }
 
 fn header_line(b: &Browser, width: usize) -> Line<'static> {
@@ -1247,18 +1264,6 @@ fn draw_chart(frame: &mut Frame<'_>, area: Rect, b: &Browser) {
         table::shorten(&subject.path.display_lossy(), budget)
     );
     let mut block = pane_block(b.theme, Line::from(title));
-    if !b.theme.glyphs.unicode {
-        block = block.border_set(ratatui::symbols::border::Set {
-            top_left: "+",
-            top_right: "+",
-            bottom_left: "+",
-            bottom_right: "+",
-            vertical_left: "|",
-            vertical_right: "|",
-            horizontal_top: "-",
-            horizontal_bottom: "-",
-        });
-    }
     if let Some(label) = delta_label {
         block = block.title_top(label.right_aligned());
     }
