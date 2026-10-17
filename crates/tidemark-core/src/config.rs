@@ -305,6 +305,10 @@ impl Default for MetricsConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SnapshotRetention {
+    /// Compress retained snapshots outside the recent set.
+    pub cold_after_recent: bool,
+    /// Zstd compression level (1 through 19).
+    pub cold_level: i32,
     /// recent setting.
     pub recent: usize,
     /// daily setting.
@@ -315,6 +319,8 @@ pub struct SnapshotRetention {
 impl Default for SnapshotRetention {
     fn default() -> Self {
         Self {
+            cold_after_recent: true,
+            cold_level: 9,
             recent: 4,
             daily: 14,
             weekly: 8,
@@ -898,6 +904,9 @@ impl Config {
                     "must be positive and finite",
                 );
             }
+        }
+        if !(1..=19).contains(&self.retention.snapshots.cold_level) {
+            issue(issues, "retention.snapshots.cold_level", "expected 1–19");
         }
         if !self.retention.min_free_pct.is_finite()
             || !(0.0..=100.0).contains(&self.retention.min_free_pct)

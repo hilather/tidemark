@@ -86,6 +86,20 @@ pub fn run_scan(
     )
 }
 
+/// Run a serialized scan using an injected UTC clock for scheduling and retention.
+pub fn run_scan_with_clock(
+    cfg: &Config,
+    req: &ScanRequest,
+    recorder: &dyn ScanRecorder,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(&Progress) + Sync),
+    clock: &dyn Fn() -> i64,
+) -> Result<ScanOutcome, ScanError> {
+    run_scan_with_environment(cfg, req, recorder, cancel, progress, clock, &|| {
+        read_os_release(std::fs::File::open("/etc/os-release"))
+    })
+}
+
 // Host metadata is separate from scanned regular files; tests replace both seams.
 fn run_scan_with_environment(
     cfg: &Config,
@@ -160,7 +174,7 @@ fn run_scan_with_environment(
             .and_then(|p| p.t_dirs)
             .unwrap_or(used / 20);
         let estimate = match previous.as_ref().and_then(|p| p.file.as_ref()) {
-            Some(file) => std::fs::metadata(file)?.len().saturating_mul(5).div_ceil(4),
+            Some(file) => snapshot_length(file)?.saturating_mul(5).div_ceil(4),
             None => dirs_estimate.saturating_mul(300),
         };
         guard_and_prune(
@@ -606,6 +620,7 @@ fn run_scan_with_environment(
                     }
                 }
                 catalog.rebuild_after_scan()?;
+                compress_retained(cfg, &catalog, &req.root, meta.finished_at, cancel);
                 tracing::info!(
                     memory_estimate,
                     peak_rss_bytes = observed_peak_rss(),
@@ -1078,6 +1093,78 @@ impl crate::agg::RowSink for WriterSink<'_> {
     }
 }
 
+fn snapshot_length(file: &std::path::Path) -> Result<u64, ScanError> {
+    if file.as_os_str().as_encoded_bytes().ends_with(b".db.zst") {
+        Ok(tidemark_store::cold::read_cold_header(file)?.uncompressed_len)
+    } else {
+        Ok(std::fs::metadata(file)?.len())
+    }
+}
+
+fn compress_retained(
+    cfg: &Config,
+    catalog: &tidemark_store::catalog::Catalog,
+    root: &RawPath,
+    now: i64,
+    cancel: &AtomicBool,
+) {
+    let policy = &cfg.retention.snapshots;
+    if !policy.cold_after_recent {
+        return;
+    }
+    let entries = match catalog.list(Some(root)) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, "cannot plan cold retention");
+            return;
+        }
+    };
+    for id in tidemark_store::retention::cold_plan(&entries, policy, policy.recent, now) {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        let Some(hot) = entries
+            .iter()
+            .find(|e| e.scan_id == id)
+            .and_then(|e| e.file.as_ref())
+        else {
+            continue;
+        };
+        let result = (|| -> Result<(), ScanError> {
+            let estimate = std::fs::metadata(hot)?.len() / 2;
+            match tidemark_store::space_guard::space_check(
+                &cfg.general.state_dir,
+                estimate,
+                &cfg.retention,
+            )? {
+                tidemark_store::space_guard::SpaceVerdict::Ok => {}
+                tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
+                    return Err(ScanError::Precondition(reason))
+                }
+            }
+            let cold = tidemark_store::cold::compress_snapshot(hot, policy.cold_level, &|| {
+                cancel.load(std::sync::atomic::Ordering::Acquire)
+            })?;
+            catalog.point_to_cold(&id, &cold)?;
+            // Publication is durable before removing the source; retain quarantine siblings.
+            let slug = tidemark_store::catalog::root_slug(root);
+            let directory =
+                tidemark_store::state_dir::StateDir::open(&cfg.general.state_dir, false)?
+                    .subdir(std::ffi::OsStr::new("snapshots"), false)?
+                    .subdir(std::ffi::OsStr::new(&slug), false)?;
+            let name = hot
+                .file_name()
+                .ok_or_else(|| ScanError::Precondition("missing hot filename".into()))?;
+            directory.unlink_leaf(name)?;
+            rustix::fs::fsync(directory.fd())?;
+            Ok(())
+        })();
+        if let Err(reason) = result {
+            tracing::warn!(scan_id=%id, %reason, "cold compression skipped");
+        }
+    }
+}
+
 fn delete_snapshot(state: &std::path::Path, file: &std::path::Path) -> Result<(), ScanError> {
     let relative = file.strip_prefix(state.join("snapshots")).map_err(|_| {
         ScanError::Precondition("snapshot deletion outside state directory refused".into())
@@ -1091,13 +1178,28 @@ fn delete_snapshot(state: &std::path::Path, file: &std::path::Path) -> Result<()
         Some(std::path::Component::Normal(n)) => n,
         _ => return Err(ScanError::Precondition("unsafe snapshot path".into())),
     };
-    if components.next().is_some() || file.extension() != Some(std::ffi::OsStr::new("db")) {
+    if components.next().is_some()
+        || !(file.as_os_str().as_encoded_bytes().ends_with(b".db")
+            || file.as_os_str().as_encoded_bytes().ends_with(b".db.zst"))
+    {
         return Err(ScanError::Precondition("unsafe snapshot path".into()));
     }
     let directory = tidemark_store::state_dir::StateDir::open(state, false)?
         .subdir(std::ffi::OsStr::new("snapshots"), false)?
         .subdir(root, false)?;
     directory.unlink_leaf(name)?;
+    let bytes = name.as_encoded_bytes();
+    let stem = bytes
+        .strip_suffix(b".db.zst")
+        .or_else(|| bytes.strip_suffix(b".db"))
+        .ok_or_else(|| ScanError::Precondition("unsafe snapshot name".into()))?;
+    use std::os::unix::ffi::OsStrExt;
+    for suffix in [b".db.bad".as_slice(), b".db.zst.bad".as_slice()] {
+        let mut sibling = stem.to_vec();
+        sibling.extend_from_slice(suffix);
+        directory.unlink_leaf(std::ffi::OsStr::from_bytes(&sibling))?;
+    }
+    rustix::fs::fsync(directory.fd())?;
     tracing::info!(path=%file.display(), "pruned snapshot");
     Ok(())
 }

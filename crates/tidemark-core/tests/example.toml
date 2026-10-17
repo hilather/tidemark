@@ -92,6 +92,8 @@ min_free_pct   = 5
   recent = 4
   daily  = 14
   weekly = 8
+  # cold_after_recent = true
+  # cold_level = 9  # integer 1..=19; invalid levels are configuration issues
   [retention.samples]
   raw         = "48h"
   five_min    = "35d"

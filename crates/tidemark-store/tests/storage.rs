@@ -468,7 +468,8 @@ fn retention_utc_days_dst_and_iso_weeks_per_root() {
             &SnapshotRetention {
                 recent: 1,
                 daily: 2,
-                weekly: 2
+                weekly: 2,
+                ..Default::default()
             },
             now
         ),
@@ -480,7 +481,8 @@ fn retention_utc_days_dst_and_iso_weeks_per_root() {
             &SnapshotRetention {
                 recent: 0,
                 daily: 0,
-                weekly: 0
+                weekly: 0,
+                ..Default::default()
             },
             now
         )
@@ -499,7 +501,8 @@ fn retention_utc_days_dst_and_iso_weeks_per_root() {
             &SnapshotRetention {
                 recent: 0,
                 daily: 2,
-                weekly: 0
+                weekly: 0,
+                ..Default::default()
             },
             dst_now
         ),
@@ -1009,11 +1012,13 @@ fn retention_preserves_newest_with_expired_windows_for_each_root() {
             recent: 0,
             daily: 14,
             weekly: 8,
+            ..Default::default()
         },
         SnapshotRetention {
             recent: 0,
             daily: 0,
             weekly: 0,
+            ..Default::default()
         },
     ] {
         assert_eq!(
