@@ -65,6 +65,8 @@ pub struct SnapshotWriterV2 {
     check_interval: u64,
     check: Option<Box<dyn FnMut() -> SpaceVerdict + Send>>,
     failed: bool,
+    file_sequence: i64,
+    instance_sequence: i64,
 }
 impl SnapshotWriterV2 {
     /// Create a private temporary file, refusing an existing scan id.
@@ -72,6 +74,7 @@ impl SnapshotWriterV2 {
         Self::create_with_options(dir, meta, WriterOptions::default())
     }
     /// Create a writer with validated chunk and lookup options.
+    /// Staging uses exactly `<scan>.db.stage.tmp`, recognized by abandoned-scan cleanup.
     pub fn create_with_options(
         dir: &Path,
         meta: &SnapshotMeta,
@@ -121,6 +124,8 @@ impl SnapshotWriterV2 {
             check_interval: 100_000,
             check: None,
             failed: false,
+            file_sequence: 0,
+            instance_sequence: 0,
         };
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         drop(file);
@@ -163,13 +168,18 @@ impl SnapshotWriterV2 {
                 .as_ref()
                 .ok_or_else(|| StoreError::Invalid("stage missing".into()))?,
         )?;
-        conn.execute_batch("PRAGMA page_size=32768; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA locking_mode=EXCLUSIVE; PRAGMA temp_store=FILE; PRAGMA cache_size=-8192; PRAGMA user_version=1;")?;
-        conn.execute_batch(
-            SCHEMA
-                .split("-- Created AFTER bulk load")
-                .next()
-                .ok_or_else(|| StoreError::Invalid("missing schema".into()))?,
-        )?;
+        conn.execute_batch("PRAGMA page_size=32768; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA locking_mode=EXCLUSIVE; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-8192; PRAGMA user_version=1;")?;
+        // Reuse the v1 directory column contract, but cluster staging by preorder.
+        let dirs = SCHEMA
+            .split("CREATE TABLE dirs (")
+            .nth(1)
+            .and_then(|s| s.split("CREATE TABLE files").next())
+            .ok_or_else(|| StoreError::Invalid("missing directory schema".into()))?;
+        conn.execute_batch(&format!(
+            "CREATE TABLE dirs ({}",
+            dirs.replace(");", ") WITHOUT ROWID;")
+        ))?;
+        conn.execute_batch(STAGE_SCHEMA)?;
         writer.conn = Some(conn);
         Ok(writer)
     }
@@ -233,17 +243,22 @@ impl SnapshotWriterV2 {
                 for r in chunk {
                     self.before_row()?;
                     self.connection()?
-                        .prepare_cached("INSERT INTO files VALUES (?,?,?,?,?,?,?,?)")?
+                        .prepare_cached("INSERT INTO files VALUES (?,?,?,?,?,?,?,?,?)")?
                         .execute(params![
-                            rusqlite::types::Null,
+                            self.file_sequence,
                             r.dir_id,
-                            r.name.as_ref().map(|n| n.as_bytes()),
+                            r.name.as_ref().map_or(&b""[..], |n| n.as_bytes()),
                             sql_u64(r.ino)?,
                             sql_u64(r.disk)?,
                             sql_u64(r.apparent)?,
                             r.mtime,
-                            r.nlink
+                            r.nlink,
+                            r.name.is_some()
                         ])?;
+                    self.file_sequence = self
+                        .file_sequence
+                        .checked_add(1)
+                        .ok_or_else(|| StoreError::Invalid("too many staged files".into()))?;
                 }
                 self.connection()?.execute_batch("COMMIT")?;
             }
@@ -297,12 +312,18 @@ impl SnapshotWriterV2 {
                 for r in chunk {
                     self.before_row()?;
                     self.connection()?
-                        .prepare_cached("INSERT INTO link_instances VALUES (?,?,?)")?
+                        .prepare_cached("INSERT INTO link_instances VALUES (?,?,?,?,?)")?
                         .execute(params![
                             sql_u64(r.ino)?,
                             r.dir_id,
-                            r.name.as_ref().map(|n| n.as_bytes())
+                            r.name.as_ref().map_or(&b""[..], |n| n.as_bytes()),
+                            r.name.is_some(),
+                            self.instance_sequence
                         ])?;
+                    self.instance_sequence = self
+                        .instance_sequence
+                        .checked_add(1)
+                        .ok_or_else(|| StoreError::Invalid("too many staged instances".into()))?;
                 }
                 self.connection()?.execute_batch("COMMIT")?;
             }
@@ -390,7 +411,8 @@ impl SnapshotWriterV2 {
         }
         result
     }
-    /// Configure periodic space checks; zero means check before every row.
+    /// Configure periodic space checks; zero means check before every input row.
+    /// Finish also checks at conversion boundaries, every chunk, and every 8192 plain rows.
     pub fn space_check_every(&mut self, rows: u64, check: Box<dyn FnMut() -> SpaceVerdict + Send>) {
         self.check_interval = rows.max(1);
         self.rows_since_check = 0;
@@ -426,15 +448,39 @@ impl SnapshotWriterV2 {
         };
         check_cancel()?;
         let output = Connection::open(&self.tmp)?;
-        output.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-8192; PRAGMA temp_store=FILE; PRAGMA user_version=2;")?;
-        self.build_output(&output, &check_cancel)?;
-        for index in [
-            "CREATE INDEX shallow_parent ON shallow_dirs(parent_id)",
-            "CREATE INDEX ls_lca ON link_sets(lca_dir_id)",
-        ] {
-            output.execute_batch(index)?;
+        output.execute_batch("PRAGMA page_size=4096; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-8192; PRAGMA temp_store=MEMORY; PRAGMA user_version=2;")?;
+        // The callback API has no estimate argument. Preserve its configured policy,
+        // and independently check conservative conversion headroom against statvfs.
+        let check = std::cell::RefCell::new(self.check.take());
+        let conversion_checkpoint = || {
             check_cancel()?;
-        }
+            if let Some(check) = check.borrow_mut().as_mut() {
+                if let SpaceVerdict::Refuse { reason } = check() {
+                    return Err(StoreError::Space(reason));
+                }
+            }
+            let stage = self.connection()?;
+            let pages: u32 = stage.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            let page_size: u32 = stage.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            // Staging is retained throughout conversion. Its current allocation is
+            // already reflected in available bytes; allow four more staging sizes
+            // for output (including uncompressible chunks, shallow rows and indexes)
+            // and spans, plus 16 MiB for SQLite page/chunk overhead. Never subtract
+            // output progress: this deliberately overestimates remaining writes.
+            let estimate = u64::from(pages)
+                .saturating_mul(u64::from(page_size))
+                .saturating_mul(4)
+                .saturating_add(16 * 1024 * 1024);
+            let stat =
+                rustix::fs::fstatvfs(File::open(&self.tmp)?).map_err(std::io::Error::from)?;
+            if stat.f_bavail.saturating_mul(stat.f_frsize) < estimate {
+                return Err(StoreError::Space("insufficient conversion headroom".into()));
+            }
+            Ok(())
+        };
+        conversion_checkpoint()?;
+        self.build_output(&output, &conversion_checkpoint)?;
+        conversion_checkpoint()?;
         check_cancel()?;
         write_meta(&output, final_meta)?;
         for (key, value) in [
@@ -481,18 +527,22 @@ impl SnapshotWriterV2 {
         use crate::chunk::*;
         let stage = self.connection()?;
         output.execute_batch(V2_SCHEMA)?;
+        cancelled()?;
         stage.execute_batch(
-            "CREATE TABLE spans(dir_id INTEGER PRIMARY KEY,lo INTEGER NOT NULL,n INTEGER NOT NULL)",
+            "CREATE TABLE spans(dir_id INTEGER PRIMARY KEY,lo INTEGER NOT NULL,n INTEGER NOT NULL) WITHOUT ROWID",
         )?;
+        // Build final secondary indexes while empty, then maintain them on insert.
+        // This avoids SQLite sorters even for arbitrarily large plain tables.
         for index in [
-            "CREATE INDEX stage_files ON files(dir_id,name)",
-            "CREATE INDEX stage_li ON link_instances(ino,dir_id,name)",
+            "CREATE INDEX shallow_parent ON shallow_dirs(parent_id)",
+            "CREATE INDEX ls_lca ON link_sets(lca_dir_id)",
         ] {
-            stage.execute_batch(index)?;
+            cancelled()?;
+            output.execute_batch(index)?;
             cancelled()?;
         }
         // files.id is the zero-based clustered row number in v2; caller ids are discarded.
-        let mut stmt = stage.prepare("SELECT * FROM files ORDER BY dir_id,name")?;
+        let mut stmt = stage.prepare("SELECT id,dir_id,CASE WHEN name_present=0 THEN NULL ELSE name END,ino,disk,apparent,mtime,nlink FROM files ORDER BY dir_id,name_present,name,id")?;
         let mut rows = stmt.query([])?;
         let mut total = 0u32;
         let mut span: Option<(u32, u32, u32)> = None;
@@ -619,7 +669,7 @@ impl SnapshotWriterV2 {
                 ],
             )?;
         }
-        let mut stmt = stage.prepare("SELECT * FROM link_instances ORDER BY ino,dir_id,name")?;
+        let mut stmt = stage.prepare("SELECT ino,dir_id,CASE WHEN name_present=0 THEN NULL ELSE name END FROM link_instances ORDER BY ino,dir_id,name_present,name,seq")?;
         let mut rows = stmt.query([])?;
         let mut total = 0u64;
         loop {
@@ -769,8 +819,13 @@ fn copy_rows(
     let mut insert = output.prepare(&sql)?;
     let mut rows = stmt.query([])?;
     let mut values = Vec::with_capacity(count);
+    cancelled()?;
+    let mut copied = 0usize;
     while let Some(row) = rows.next()? {
-        cancelled()?;
+        if copied.is_multiple_of(crate::chunk::MAX_ROWS) {
+            cancelled()?;
+        }
+        copied += 1;
         values.clear();
         for i in 0..count {
             values.push(row.get::<_, rusqlite::types::Value>(i)?);
@@ -779,6 +834,23 @@ fn copy_rows(
     }
     Ok(())
 }
+
+// Nullable names are represented by (presence, bytes): NULL sorts before names.
+// Sequence suffixes preserve duplicate input rows without retaining a Rust map.
+const STAGE_SCHEMA: &str = r#"
+CREATE TABLE files (id INTEGER NOT NULL, dir_id INTEGER NOT NULL, name BLOB NOT NULL,
+ ino INTEGER NOT NULL, disk INTEGER NOT NULL, apparent INTEGER NOT NULL,
+ mtime INTEGER NOT NULL, nlink INTEGER NOT NULL, name_present INTEGER NOT NULL,
+ PRIMARY KEY(dir_id,name_present,name,id)) WITHOUT ROWID;
+CREATE TABLE link_instances (ino INTEGER NOT NULL,dir_id INTEGER NOT NULL,name BLOB NOT NULL,
+ name_present INTEGER NOT NULL,seq INTEGER NOT NULL,
+ PRIMARY KEY(ino,dir_id,name_present,name,seq)) WITHOUT ROWID;
+CREATE TABLE link_sets (ino INTEGER PRIMARY KEY,nlink INTEGER NOT NULL,found INTEGER NOT NULL,
+ complete INTEGER NOT NULL,disk INTEGER NOT NULL,apparent INTEGER NOT NULL,mtime INTEGER NOT NULL,lca_dir_id INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE skipped (dir_id INTEGER NOT NULL,name BLOB NOT NULL,reason TEXT NOT NULL);
+CREATE TABLE errors (dir_id INTEGER,path BLOB NOT NULL,op TEXT NOT NULL,errno INTEGER NOT NULL);
+CREATE TABLE annotations (dir_id INTEGER NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL);
+"#;
 
 const V2_SCHEMA: &str = r#"CREATE TABLE meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE shallow_dirs (
