@@ -1173,6 +1173,23 @@ fn refresh_keeps_the_own_row_when_its_bytes_grow_past_the_children() {
 }
 
 #[test]
+fn poll_refresh_keeps_dir_id_and_parent_id() {
+    let (_temp, mut b) = browser(3);
+    let id = b.dir.id;
+    let parent_id = b.dir.parent_id;
+    let mut root = b.dir.clone();
+    root.id = id.saturating_add(1);
+    root.parent_id = Some(42);
+    root.t_disk += 1;
+    let t_disk = root.t_disk;
+    let children = b.rows.clone();
+    install_refresh(&mut b, root, children);
+    assert_eq!(b.dir.id, id);
+    assert_eq!(b.dir.parent_id, parent_id);
+    assert_eq!(b.dir.t_disk, t_disk);
+}
+
+#[test]
 fn refresh_keeps_a_child_on_a_later_page() {
     let (_temp, mut b) = browser(1_001);
     let config = tidemark_core::config::Config::default();
@@ -2215,6 +2232,60 @@ fn growth_order_rebuilds_when_predecessor_appears() {
         "{:?}",
         b.rows[0].0.path
     );
+}
+
+#[test]
+fn growth_prepare_skips_rebuild_when_live_rows_present() {
+    let (temp, mut b) = browser(3);
+    let (id, file) = complete_scan(temp.path(), "20251201T000000Z-00000000", 900_000, 0);
+    b.snapshots = vec![(id, file.clone(), 900_000, Some(0))];
+    let aside = file.with_extension("aside");
+    std::fs::rename(&file, &aside).unwrap();
+    b.prepare(140, 24).unwrap();
+    b.state.sort = state::Sort::Growth;
+    b.pages.live = Some(b.rows.clone());
+    b.pages.live_order = Some(state::Sort::Growth);
+    b.pages.live_at = Some(b.clock);
+    b.pages.live_growth.clear();
+    b.state.selected = 2;
+    b.main_selected = 2;
+    std::fs::rename(&aside, &file).unwrap();
+    b.clock += history::COOLDOWN;
+    let rows = b.rows.clone();
+    b.prepare(140, 24).unwrap();
+    assert_eq!(b.state.selected, 2);
+    assert_eq!(b.main_selected, 2);
+    assert_eq!(b.rows, rows);
+    assert!(b.pages.growth.is_none());
+    assert!(b.old.is_some());
+    assert!(b.pages.live.is_some());
+}
+
+#[test]
+fn growth_prepare_resets_main_to_first_page() {
+    let (temp, mut b) = browser_by_size(1_005);
+    let (id, file) = complete_scan(temp.path(), "20251201T000000Z-00000000", 900_000, 0);
+    b.snapshots = vec![(id, file.clone(), 900_000, Some(0))];
+    let aside = file.with_extension("aside");
+    std::fs::rename(&file, &aside).unwrap();
+    b.prepare(140, 24).unwrap();
+    b.state.sort = state::Sort::Growth;
+    b.load().unwrap();
+    assert_eq!(b.rows.len(), PAGE);
+    b.page(false).unwrap();
+    assert_eq!(b.pages.offset, 1_000);
+    assert_eq!(b.state.pane, Pane::Main);
+    std::fs::rename(&aside, &file).unwrap();
+    b.clock += history::COOLDOWN;
+    b.prepare(140, 24).unwrap();
+    assert_eq!(b.pages.offset, 0);
+    assert_eq!(b.state.selected, 0);
+    assert_eq!(b.main_selected, 0);
+    assert_eq!(b.rows.len(), PAGE);
+    assert_eq!(b.rows[0].0.id, 1005);
+    assert_eq!(b.rows[0].1, Some(i128::from(1005) * 4096));
+    assert_eq!(b.pages.growth.as_ref().map(Vec::len), Some(1_005));
+    assert!(b.rows.iter().all(|(row, _)| row.name != b"."));
 }
 
 #[test]

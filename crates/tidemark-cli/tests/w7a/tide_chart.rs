@@ -716,6 +716,36 @@ fn picker_comparison_message_clears_when_predecessor_opens() {
 }
 
 #[test]
+fn picker_comparison_message_unchanged_when_retry_still_fails() {
+    fn retry(corrupt: bool) {
+        let (_temp, mut b) = series();
+        let file = b.snapshots[4].1.clone();
+        let aside = file.with_extension("aside");
+        std::fs::rename(&file, &aside).unwrap();
+        b.pane(Pane::Picker).unwrap();
+        b.state.selected = 5;
+        b.enter().unwrap();
+        assert_eq!(
+            b.message,
+            "Snapshot switched; preceding comparison unavailable"
+        );
+        if corrupt {
+            std::fs::write(&file, b"corrupt").unwrap();
+        }
+        b.clock += history::COOLDOWN;
+        b.prepare(140, 40).unwrap();
+        assert_eq!(
+            b.message,
+            "Snapshot switched; preceding comparison unavailable"
+        );
+        assert!(b.old.is_none());
+        assert_eq!(b.prev_open_failed_at, Some(b.clock));
+    }
+    retry(false);
+    retry(true);
+}
+
+#[test]
 fn chart_snapshots_cover_selections_missing_live_and_fallbacks() {
     let (_temp, mut b) = series();
     pump(&mut b);
