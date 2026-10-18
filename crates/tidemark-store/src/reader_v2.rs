@@ -1159,10 +1159,14 @@ impl Backend {
     ) -> Result<Vec<DirRow>> {
         let root = self.raw(snap, id)?;
         let mut top = TopN::new(limit, Tie::Name)?;
-        // Paths are relative to "/" while walking; the root's own path is
-        // reconstructed once, when the first row is admitted.
+        // Coordinator decision: validating the requested root (its name and
+        // ancestry, via the climb in `path`) wins over the empty-result work
+        // bound, so it runs eagerly, before the walk and independent of
+        // `top.admits`. An empty or zero-limit result may therefore decode the
+        // root's ancestor chunks. Hits below the root still build their paths
+        // lazily, relative to "/" while walking.
+        let base = self.path(snap, &root)?;
         let rel_root = RawPath::new(b"/".to_vec()).map_err(|_| invalid())?;
-        let mut base: Option<RawPath> = None;
         let mut walk = Walk::new(id, root.subtree_end, u64::MAX, &rel_root);
         self.scan(snap, id, root.subtree_end, |v| {
             let rel = walk.step(v.id, v.parent_id, v.subtree_end, v.depth, v.name)?;
@@ -1171,10 +1175,7 @@ impl Backend {
             }
             let k = -i128::from(v.entries);
             if top.admits(k, v.name, v.id) {
-                if base.is_none() {
-                    base = Some(self.path(snap, &root)?);
-                }
-                let b = base.as_ref().map_or(&[][..], |b| b.as_bytes());
+                let b = base.as_bytes();
                 let mut full = Vec::with_capacity(b.len() + rel.len());
                 full.extend_from_slice(b);
                 if rel.len() > 1 {
@@ -3158,11 +3159,12 @@ mod child_cursor_tests {
                 assert_eq!(n0, 0);
                 assert!(w0 <= w1, "subtree({root},{depth}): {w0} > {w1}");
             }
-            // Filtered-out wide queries never rebuild a path.
-            for leaf in [40, 120] {
+            // Filtered-out wide queries validate the root's path eagerly
+            // (at most the review15 counts), but build no hit paths.
+            for (leaf, bound) in [(40, 3), (120, 4)] {
                 let fresh = Snapshot::open(&s.file).unwrap();
                 assert!(fresh.wide_dirs(leaf, 2, 1).unwrap().is_empty());
-                assert!(total(&fresh) <= 2, "wide {leaf}: {}", total(&fresh));
+                assert!(total(&fresh) <= bound, "wide {leaf}: {}", total(&fresh));
             }
         }
     }
@@ -3198,5 +3200,40 @@ mod child_cursor_tests {
         let (_k, snap) = copy(&s, "UPDATE dir_chunks SET data=x'00' WHERE first_id=32;");
         assert!(is_invalid(snap.wide_dirs(0, 0, 0)));
         assert!(is_invalid(snap.subtree_dirs(0, 4, SortKey::Name, 0)));
+    }
+
+    #[test]
+    fn wide_dirs_always_validates_the_requested_root() {
+        type Mutation = fn(&mut [DirRow]);
+        let cases: [(&str, u32, Mutation); 3] = [
+            ("name a/b", 40, |r| r[40].name = b"a/b".to_vec()),
+            ("root name", 0, |r| r[0].name = b"/r\0bad".to_vec()),
+            ("parent 0", 40, |r| r[40].parent_id = Some(0)),
+        ];
+        for plain in [0, 3] {
+            for (what, id, mutate) in cases {
+                let mut rows = balanced121();
+                mutate(&mut rows);
+                let (_d, s) = v2_only(&rows, plain, 16);
+                for (min, limit) in [(0, 0), (0, 1), (2, 1)] {
+                    assert!(
+                        is_invalid(s.wide_dirs(id, min, limit)),
+                        "{what} plain={plain} wide_dirs({id},{min},{limit})"
+                    );
+                }
+                for limit in [0, 1] {
+                    assert!(
+                        is_invalid(s.subtree_dirs(id, 0, SortKey::Name, limit)),
+                        "{what} plain={plain} subtree_dirs({id},0,{limit})"
+                    );
+                    if id == 0 {
+                        assert!(
+                            is_invalid(s.metrics_candidates(0, limit)),
+                            "{what} plain={plain} metrics_candidates(0,{limit})"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
