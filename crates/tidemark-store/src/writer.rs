@@ -120,10 +120,9 @@ impl SnapshotWriter {
                 self.connection()?.execute_batch("BEGIN")?;
                 for r in chunk {
                     self.before_row()?;
-                    debug_assert!(
-                        self.last_dir.is_none_or(|id| r.id > id),
-                        "directory ids must increase"
-                    );
+                    if self.last_dir.is_some_and(|id| r.id <= id) {
+                        return Err(StoreError::Invalid("directory ids must increase".into()));
+                    }
                     self.last_dir = Some(r.id);
                     self.connection()?.prepare_cached("INSERT INTO dirs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")?.execute(params![r.id,r.parent_id,r.subtree_end,r.depth,&r.name,r.path.as_bytes(),r.path_hash,sql_u64(r.ino)?,r.mtime,sql_u64(r.dir_disk)?,sql_u64(r.dir_apparent)?,r.projid,r.entries,r.errors,sql_u64(r.own_files)?,sql_u64(r.own_symlinks)?,sql_u64(r.own_charged)?,sql_u64(r.own_apparent)?,sql_u64(r.t_dirs)?,sql_u64(r.t_files)?,sql_u64(r.t_inodes)?,sql_u64(r.t_disk)?,sql_u64(r.t_apparent)?,sql_u64(r.t_charged)?,sql_u64(r.t_reclaimable)?,sql_u64(r.t_errors)?,sql_u64(r.age0)?,sql_u64(r.age1)?,sql_u64(r.age2)?,sql_u64(r.age3)?,sql_u64(r.age4)?,sql_u64(r.age5)?,r.newest_mtime,r.max_entries])?;
                 }

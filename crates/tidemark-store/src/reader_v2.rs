@@ -1795,7 +1795,7 @@ impl Ord for SharedEntry {
         self.rank().cmp(&other.rank())
     }
 }
-fn instance_row_of(ino: u64, dir_id: u32, name: Option<&[u8]>) -> Result<LinkInstanceRow> {
+pub(super) fn instance_row_of(ino: u64, dir_id: u32, name: Option<&[u8]>) -> Result<LinkInstanceRow> {
     Ok(LinkInstanceRow {
         ino,
         dir_id,
@@ -2181,6 +2181,28 @@ impl Backend {
                 None => return Ok(()),
             }
         }
+    }
+    /// Visit every stored link instance in `(ino, dir_id, name)` order, one chunk at a
+    /// time (memory is bounded by the chunk cache, not by the instance count).
+    pub(super) fn for_each_link_instance(
+        &self,
+        snap: &Snapshot,
+        visit: &mut dyn FnMut(&ChunkLinkInstance) -> Result<()>,
+    ) -> Result<()> {
+        let mut next = next_meta(&snap.conn, Kind::Links, None)?;
+        let mut prev: Option<ChunkLinkInstance> = None;
+        while let Some(m) = next {
+            let (_, rows) = side_load(snap, m, &self.links, decode_links_chunk, link_size)?;
+            if let (Some(before), Some(head)) = (&prev, rows.first()) {
+                check_link_order(before, head)?;
+            }
+            for r in rows.iter() {
+                visit(r)?;
+            }
+            prev = rows.last().cloned();
+            next = next_meta(&snap.conn, Kind::Links, Some(m.last))?;
+        }
+        Ok(())
     }
     fn instance_count(&self, snap: &Snapshot, ino: u64) -> Result<u64> {
         let mut n = 0u64;
