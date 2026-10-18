@@ -2526,3 +2526,376 @@ fn review10_s1_ncdu_export_rejects_invalid_notable_file_name() {
     let snap = Snapshot::open(&file).unwrap();
     assert!(is_invalid(export(&snap)));
 }
+
+// ---- gate-8 fix: ranking ties, shallow paging, shallow tampering ----
+
+/// A root with children named by `names` (the first four also hold a leaf `z`),
+/// every metric equal unless `vary` is set, so only the tie rule orders them.
+fn tied(names: &[&[u8]], vary: bool) -> Vec<DirRow> {
+    let mut rows = vec![dir(0)];
+    for (n, name) in names.iter().enumerate() {
+        let id = rows.len() as u32;
+        let mut row = dir(id);
+        row.name = name.to_vec();
+        row.path = rows[0].path.join(&RawName::new(name.to_vec()).unwrap());
+        row.path_hash = row.path.hash64();
+        row.subtree_end = id;
+        rows.push(row);
+        if n < 4 {
+            let id = rows.len() as u32;
+            let mut leaf = dir(id);
+            leaf.parent_id = Some(id - 1);
+            leaf.depth = 2;
+            leaf.name = b"z".to_vec();
+            leaf.path = rows[id as usize - 1]
+                .path
+                .join(&RawName::new(b"z".to_vec()).unwrap());
+            leaf.path_hash = leaf.path.hash64();
+            leaf.subtree_end = id;
+            rows.last_mut().unwrap().subtree_end = id;
+            rows.push(leaf);
+        }
+    }
+    rows[0].subtree_end = rows.len() as u32 - 1;
+    for row in &mut rows {
+        let m = if vary { u64::from(row.id % 3) } else { 5 };
+        row.t_disk = m;
+        row.t_apparent = m;
+        row.t_charged = m;
+        row.t_reclaimable = m;
+        row.t_files = m;
+        row.t_inodes = m;
+        row.newest_mtime = m as i64;
+        row.entries = m as u32;
+    }
+    rows
+}
+#[test]
+fn ties_and_limits_equal_v1_for_every_sort() {
+    let names: [&[u8]; 12] = [
+        b"a", b"aa", b"a\xff", b"b", b"a\x01", b"\xff", b"aaa", b"ab", b"B", b"a ", b"a\xfe",
+        b"b\x02x",
+    ];
+    for vary in [false, true] {
+        let rows = tied(&names, vary);
+        let n = rows.len();
+        let limits = [0, 1, 2, n - 1, n, n + 1, 1_000_000, 1_000_001];
+        for plain in [0, 1, 3] {
+            let p = pair(&rows, plain, 64, 3);
+            for &limit in &limits {
+                for sort in SORTS {
+                    for depth in [0, 1, 2, u32::MAX] {
+                        same(
+                            "subtree_dirs",
+                            p.one.subtree_dirs(0, depth, sort, limit),
+                            p.two.subtree_dirs(0, depth, sort, limit),
+                        );
+                    }
+                    same(
+                        "children",
+                        p.one.children(0, sort, limit),
+                        p.two.children(0, sort, limit),
+                    );
+                }
+                for min in [0, 3, 6] {
+                    same(
+                        "wide_dirs",
+                        p.one.wide_dirs(0, min, limit),
+                        p.two.wide_dirs(0, min, limit),
+                    );
+                }
+                for depth in [0, 1, 2] {
+                    match (
+                        p.one.metrics_candidates(depth, limit),
+                        p.two.metrics_candidates(depth, limit),
+                    ) {
+                        (Ok(a), Ok(b)) => {
+                            eq_rows(&a.0, &b.0);
+                            eq_rows(&a.1, &b.1);
+                            assert_eq!(a.2, b.2);
+                        }
+                        (Err(_), Err(_)) => {}
+                        _ => panic!("metrics_candidates {depth} {limit}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shallow_children_pages_cover_every_edge() {
+    // Root (depth 0 < plain depth 2) with 41 children and heavy metric ties.
+    let rows = tree(40, 3);
+    let p = pair(&rows, 2, 64, 5);
+    let page = 8;
+    for sort in SORTS {
+        for desc in [false, true] {
+            for filter in [&b""[..], b"b0000", b"a", b"nomatch"] {
+                let all = p
+                    .one
+                    .children_page(0, sort, desc, None, false, 100, filter)
+                    .unwrap();
+                eq_rows(
+                    &all,
+                    &p.two
+                        .children_page(0, sort, desc, None, false, 100, filter)
+                        .unwrap(),
+                );
+                for reverse in [false, true] {
+                    let (mut cursor, mut joined) = (None::<DirRow>, Vec::new());
+                    for _ in 0..20 {
+                        let a = p
+                            .one
+                            .children_page(0, sort, desc, cursor.as_ref(), reverse, page, filter)
+                            .unwrap();
+                        let b = p
+                            .two
+                            .children_page(0, sort, desc, cursor.as_ref(), reverse, page, filter)
+                            .unwrap();
+                        eq_rows(&a, &b);
+                        if a.is_empty() {
+                            break;
+                        }
+                        assert!(a.len() <= page);
+                        cursor = a.last().cloned();
+                        joined.extend(b);
+                    }
+                    if reverse {
+                        joined.reverse();
+                    }
+                    eq_rows(&joined, &all);
+                }
+            }
+        }
+        // `children` agrees with v1 and with the full forward page order for numeric sorts.
+        same(
+            "children",
+            p.one.children(0, sort, 1_000_001),
+            p.two.children(0, sort, 1_000_001),
+        );
+        same(
+            "children 3",
+            p.one.children(0, sort, 3),
+            p.two.children(0, sort, 3),
+        );
+    }
+    assert!(41usize.div_ceil(page) >= 3);
+    for filter in [&b""[..], b"b0000", b"a"] {
+        assert_eq!(
+            p.one.children_count(0, filter).unwrap(),
+            p.two.children_count(0, filter).unwrap()
+        );
+    }
+}
+
+fn g8_tamper(file: &std::path::Path, sql: &str) -> (tempfile::TempDir, Snapshot) {
+    let dir = test_support::private_tempdir().unwrap();
+    let copy = dir.path().join("t.db");
+    std::fs::copy(file, &copy).unwrap();
+    let conn = rusqlite::Connection::open(&copy).unwrap();
+    conn.execute_batch(sql).unwrap();
+    drop(conn);
+    (dir, Snapshot::open(&copy).unwrap())
+}
+fn g8_invalid<T>(r: Result<T, StoreError>) -> bool {
+    matches!(r, Err(StoreError::Invalid(_)))
+}
+/// Every shallow child listing of the root must reject the snapshot.
+fn all_listings_invalid(s: &Snapshot, cursor: &DirRow, what: &str) {
+    assert!(g8_invalid(s.children(0, SortKey::Name, 100)), "{what}");
+    assert!(g8_invalid(s.children_count(0, b"")), "{what}");
+    for sort in SORTS {
+        for desc in [false, true] {
+            assert!(
+                g8_invalid(s.children_page(0, sort, desc, None, false, 8, b"")),
+                "{what} {sort:?}"
+            );
+            assert!(
+                g8_invalid(s.children_page(0, sort, desc, Some(cursor), true, 8, b"")),
+                "{what} {sort:?} cursor"
+            );
+        }
+    }
+}
+
+#[test]
+fn shallow_child_set_and_row_tampering_is_invalid() {
+    let rows = tree(40, 3);
+    let (_keep, file, _s) = g8_v2_file(&rows, 2);
+    let kids: Vec<u32> = rows
+        .iter()
+        .filter(|r| r.parent_id == Some(0))
+        .map(|r| r.id)
+        .collect();
+    assert!(kids.len() > 24, "three pages of eight");
+    let cursor = rows[kids[10] as usize].clone();
+    for (what, id) in [
+        ("first", kids[0]),
+        ("middle", kids[20]),
+        ("last", kids[kids.len() - 1]),
+    ] {
+        let (_k, s) = g8_tamper(&file, &format!("DELETE FROM shallow_dirs WHERE id={id};"));
+        all_listings_invalid(&s, &cursor, what);
+    }
+    let mid = kids[20];
+    for sql in [
+        format!("UPDATE shallow_dirs SET depth=5 WHERE id={mid};"),
+        format!("UPDATE shallow_dirs SET depth=0 WHERE id={mid};"),
+        format!("UPDATE shallow_dirs SET parent_id=1 WHERE id={mid};"),
+        format!("UPDATE shallow_dirs SET parent_id=NULL WHERE id={mid};"),
+        format!("UPDATE shallow_dirs SET subtree_end=subtree_end+1 WHERE id={mid};"),
+        format!("UPDATE shallow_dirs SET subtree_end=id-1 WHERE id={mid};"),
+    ] {
+        let (_k, s) = g8_tamper(&file, &sql);
+        // A moved child leaves the set; a malformed one fails the walk or the row check.
+        assert!(g8_invalid(s.children(0, SortKey::Name, 100)), "{sql}");
+        assert!(
+            g8_invalid(s.children_page(0, SortKey::Disk, true, None, false, 100, b"")),
+            "{sql}"
+        );
+    }
+    // An undecodable metric in a returned row is Invalid, never Sql.
+    for col in ["t_disk", "t_files", "newest_mtime", "own_charged"] {
+        let (_k, s) = g8_tamper(
+            &file,
+            &format!("UPDATE shallow_dirs SET {col}='x' WHERE id={mid};"),
+        );
+        assert!(
+            g8_invalid(s.children_page(0, SortKey::Name, false, None, false, 100, b"")),
+            "{col}"
+        );
+        assert!(
+            g8_invalid(s.children_page(0, SortKey::Disk, true, None, false, 100, b"")),
+            "{col}"
+        );
+        assert!(g8_invalid(s.children(0, SortKey::Disk, 100)), "{col}");
+        assert!(g8_invalid(s.children_count(0, b"")), "{col}");
+    }
+}
+
+#[test]
+fn bad_names_are_invalid_for_shallow_and_scanned_rows() {
+    for bad in [&b""[..], b"/", b"a/b", b".", b"..", b"x\0y"] {
+        for plain in [0, 3] {
+            let mut rows = tree(6, 3);
+            let victim = rows.len() - 3;
+            rows[victim].name = bad.to_vec();
+            let (_keep, _file, p) = g8_v2_file(&rows, plain);
+            let what = format!("{bad:?} plain {plain}");
+            assert!(
+                g8_invalid(p.subtree_dirs(0, 2, SortKey::Disk, 100)),
+                "{what}"
+            );
+            assert!(
+                g8_invalid(p.subtree_dirs(0, u32::MAX, SortKey::Disk, 100)),
+                "{what}"
+            );
+            assert!(
+                g8_invalid(p.children_page(0, SortKey::Disk, true, None, false, 100, b"")),
+                "{what}"
+            );
+            assert!(g8_invalid(p.children(0, SortKey::Disk, 100)), "{what}");
+        }
+    }
+}
+fn g8_v2_file(
+    rows: &[DirRow],
+    plain_depth: u32,
+) -> (tempfile::TempDir, std::path::PathBuf, Snapshot) {
+    let dir = test_support::private_tempdir().unwrap();
+    let mut m = meta();
+    m.root = rows[0].path.clone();
+    m.dirs = rows.len() as u64;
+    let mut w = SnapshotWriterV2::create_with_options(
+        dir.path(),
+        &m,
+        WriterOptions {
+            plain_depth,
+            chunk_dirs: 3,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    w.put_dirs(rows).unwrap();
+    let f = w.finish(&m).unwrap();
+    let s = Snapshot::open(&f).unwrap();
+    (dir, f, s)
+}
+
+// ---- SNAP-gate8-fix2 regressions (review13) ----
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[test]
+fn review13_b1_requested_shallow_root_name_must_match_the_chunk() {
+    let rows = tree(6, 3);
+    let (_keep, file, _s) = g8_v2_file(&rows, 3);
+    let (_k, ok) = g8_tamper(&file, "");
+    assert!(ok.subtree_dirs(1, 0, SortKey::Name, 100).is_ok());
+    for bad in [&b"a/b"[..], b"", b"/", b".", b"..", b"x\0y", b"renamed"] {
+        let (_k, s) = g8_tamper(
+            &file,
+            &format!("UPDATE shallow_dirs SET name=x'{}' WHERE id=1;", hex(bad)),
+        );
+        assert!(
+            g8_invalid(s.subtree_dirs(1, 0, SortKey::Name, 100)),
+            "id 1 {bad:?}"
+        );
+    }
+    for bad in [&b"x\0y"[..], b"/other"] {
+        let (_k, s) = g8_tamper(
+            &file,
+            &format!("UPDATE shallow_dirs SET name=x'{}' WHERE id=0;", hex(bad)),
+        );
+        assert!(
+            g8_invalid(s.subtree_dirs(0, 0, SortKey::Name, 100)),
+            "id 0 {bad:?}"
+        );
+        assert!(g8_invalid(s.metrics_candidates(0, 100)), "id 0 {bad:?}");
+    }
+}
+
+#[test]
+fn review13_s1_children_rejects_a_bad_unreturned_sibling() {
+    let rows = tree(6, 3);
+    let (_keep, file, _s) = g8_v2_file(&rows, 3);
+    let last = rows
+        .iter()
+        .filter(|r| r.parent_id == Some(0))
+        .map(|r| r.id)
+        .max()
+        .unwrap();
+    let (_k, s) = g8_tamper(
+        &file,
+        &format!("UPDATE shallow_dirs SET own_charged='x' WHERE id={last};"),
+    );
+    for limit in [1, 2, 100] {
+        assert!(
+            g8_invalid(s.children(0, SortKey::Name, limit)),
+            "limit {limit}"
+        );
+    }
+    assert!(g8_invalid(s.children_count(0, b"")));
+}
+
+#[test]
+fn review13_n1_missing_parent_still_validates_the_limit() {
+    let rows = tree(5, 3);
+    for plain in [0, 3] {
+        let p = pair(&rows, plain, 64, 4);
+        let missing = rows.len() as u32 + 100;
+        let a = p.one.children(missing, SortKey::Name, usize::MAX);
+        let b = p.two.children(missing, SortKey::Name, usize::MAX);
+        assert!(matches!(a, Err(StoreError::Integer(_))), "{a:?}");
+        assert!(matches!(b, Err(StoreError::Integer(_))), "{b:?}");
+        assert_eq!(a.unwrap_err().to_string(), b.unwrap_err().to_string());
+        assert!(p
+            .two
+            .children(missing, SortKey::Name, 3)
+            .unwrap()
+            .is_empty());
+    }
+}

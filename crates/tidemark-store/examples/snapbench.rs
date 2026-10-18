@@ -18,6 +18,7 @@ use tidemark_store::{
     diff::{diff, DiffMetric},
     export_ncdu,
     writer::SnapshotWriter,
+    writer_v2::SnapshotWriterV2,
     NcduOptions, Snapshot,
 };
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -89,8 +90,8 @@ impl Options {
             return Err("unknown query".into());
         }
         match o.layout.as_str() {
-            "v1" => (),
-            _ => return Err("supported layout: v1".into()),
+            "v1" | "v2" => (),
+            _ => return Err("supported layout: v1, v2".into()),
         }
         Ok(o)
     }
@@ -400,9 +401,9 @@ fn generate(o: &Options, changed: bool) -> Result<Data> {
         deep,
     })
 }
-fn meta(d: &Data, changed: bool) -> Result<SnapshotMeta> {
+fn meta(o: &Options, d: &Data, changed: bool) -> Result<SnapshotMeta> {
     Ok(SnapshotMeta {
-        schema_version: 1,
+        schema_version: if o.layout == "v2" { 2 } else { 1 },
         tool_version: "snapbench-v1".into(),
         scan_id: ScanId::new(NOW + i64::from(changed))?,
         root: d.dirs[0].path.clone(),
@@ -434,25 +435,41 @@ fn meta(d: &Data, changed: bool) -> Result<SnapshotMeta> {
         gate_stats: Default::default(),
     })
 }
+enum W {
+    V1(SnapshotWriter),
+    V2(SnapshotWriterV2),
+}
+macro_rules! put {
+    ($w:expr, $f:ident, $rows:expr) => {
+        match $w {
+            W::V1(w) => w.$f($rows)?,
+            W::V2(w) => w.$f($rows)?,
+        }
+    };
+}
 fn write(o: &Options, d: &Data, changed: bool) -> Result<PathBuf> {
-    let m = meta(d, changed)?;
+    let m = meta(o, d, changed)?;
     let mut w = match o.layout.as_str() {
-        "v1" => SnapshotWriter::create(&o.out, &m)?,
+        "v1" => W::V1(SnapshotWriter::create(&o.out, &m)?),
+        "v2" => W::V2(SnapshotWriterV2::create(&o.out, &m)?),
         _ => return Err("unsupported layout".into()),
     };
     for batch in d.dirs.chunks(4096) {
-        w.put_dirs(batch)?;
+        put!(&mut w, put_dirs, batch);
     }
     for batch in d.files.chunks(4096) {
-        w.put_files(batch)?;
+        put!(&mut w, put_files, batch);
     }
     for batch in d.sets.chunks(4096) {
-        w.put_link_sets(batch)?;
+        put!(&mut w, put_link_sets, batch);
     }
     for batch in d.links.chunks(4096) {
-        w.put_link_instances(batch)?;
+        put!(&mut w, put_link_instances, batch);
     }
-    Ok(w.finish(&m)?)
+    Ok(match w {
+        W::V1(w) => w.finish(&m)?,
+        W::V2(w) => w.finish(&m)?,
+    })
 }
 struct Targets {
     wide: u32,
@@ -512,7 +529,7 @@ fn query(s: &Snapshot, old: &Path, t: &Targets, q: &str) -> Result<()> {
 // Add the v2/cold-file reader path here without changing query bodies.
 fn open(layout: &str, path: &Path) -> Result<Snapshot> {
     match layout {
-        "v1" => Ok(Snapshot::open(path)?),
+        "v1" | "v2" => Ok(Snapshot::open(path)?),
         _ => Err("unsupported layout".into()),
     }
 }
@@ -663,8 +680,15 @@ mod tests {
     }
     #[test]
     fn writer_roundtrip_and_every_query() -> Result<()> {
+        for layout in ["v1", "v2"] {
+            roundtrip_and_every_query(layout)?;
+        }
+        Ok(())
+    }
+    fn roundtrip_and_every_query(layout: &str) -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let mut o = options();
+        o.layout = layout.into();
         o.out = tmp.path().join("snapshots");
         let a = generate(&o, false)?;
         let old = write(&o, &a, false)?;
