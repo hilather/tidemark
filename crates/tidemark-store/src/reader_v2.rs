@@ -297,7 +297,9 @@ impl Backend {
             .prepare(&format!("{SHALLOW_COLUMNS} FROM shallow_dirs WHERE id=?"))?;
         let mut rows = stmt.query([id])?;
         match rows.next()? {
-            Some(row) => Ok(Some(Self::from_shallow(dir_row(row)?))),
+            Some(row) => Ok(Some(Self::from_shallow(
+                dir_row(row).map_err(plain_row_error)?,
+            ))),
             None => Ok(None),
         }
     }
@@ -425,9 +427,34 @@ impl Backend {
                 "{SHALLOW_COLUMNS} FROM shallow_dirs WHERE parent_id=? ORDER BY id"
             ))?;
             let mut rows = stmt.query([id])?;
+            // The shallow copy must be exactly the parent's child set: first child
+            // at id+1, each next child right after the previous subtree, and the
+            // last subtree ending at the parent's.
+            let mut expect = if parent.subtree_end > id {
+                id.checked_add(1)
+            } else {
+                None
+            };
+            let child_depth = parent.depth.checked_add(1).ok_or_else(invalid)?;
             while let Some(row) = rows.next()? {
-                let row = dir_row(row)?;
+                let row = dir_row(row).map_err(plain_row_error)?;
+                if Some(row.id) != expect
+                    || row.parent_id != Some(id)
+                    || row.depth != child_depth
+                    || row.subtree_end < row.id
+                    || row.subtree_end > parent.subtree_end
+                {
+                    return Err(invalid());
+                }
+                expect = if row.subtree_end < parent.subtree_end {
+                    Some(row.subtree_end + 1)
+                } else {
+                    None
+                };
                 visit(Self::from_shallow(row))?;
+            }
+            if expect.is_some() {
+                return Err(invalid());
             }
         } else {
             let mut next = id.checked_add(1);
@@ -443,7 +470,7 @@ impl Backend {
         Ok(())
     }
     /// One page of `parent`'s children in name (= preorder) order, resuming at a
-    /// next-sibling id; see [`Snapshot::children_by_name`].
+    /// next-sibling id and the last name returned; see [`Snapshot::children_by_name`].
     pub(super) fn children_by_name(
         &self,
         snap: &Snapshot,
@@ -458,9 +485,9 @@ impl Backend {
             Err(other) => return Err(other),
         };
         let first = parent.checked_add(1).ok_or_else(invalid)?;
-        let start = match cursor {
-            None => first,
-            Some(ChildCursor(CursorAt::Id(id))) => *id,
+        let (start, cursor_name) = match cursor {
+            None => (first, None),
+            Some(ChildCursor(CursorAt::Id(id, name))) => (*id, Some(name.as_slice())),
             Some(_) => return Err(bad("foreign child cursor")),
         };
         if p.subtree_end <= parent {
@@ -469,22 +496,32 @@ impl Backend {
         if start < first || start > p.subtree_end {
             return Err(bad("child cursor lies outside the parent's subtree"));
         }
-        let mut prev: Option<Vec<u8>> = None;
+        let child_depth = p.depth.checked_add(1).ok_or_else(invalid)?;
+        let mut prev: Option<Vec<u8>> = cursor_name.map(<[u8]>::to_vec);
         let mut taken = 0usize;
-        let mut push = |c: &ChunkDir, out: &mut Vec<ChildEntry>| -> Result<()> {
+        let mut next = start;
+        while next <= p.subtree_end {
+            if taken == limit {
+                let after = prev.ok_or_else(invalid)?;
+                return Ok(Some(ChildCursor(CursorAt::Id(next, after))));
+            }
+            // Name order is preorder order, so the chunks serve every parent.
+            let c = self.raw(snap, next).map_err(required)?;
             let ordered = prev.as_ref().is_none_or(|before| *before < c.name);
-            if c.parent_id != Some(parent)
-                || c.depth != p.depth + 1
+            if c.id != next
+                || c.parent_id != Some(parent)
+                || c.depth != child_depth
                 || c.subtree_end < c.id
                 || c.subtree_end > p.subtree_end
                 || !ordered
+                || RawName::new(c.name.clone()).is_err()
             {
                 return Err(invalid());
             }
             prev = Some(c.name.clone());
             out.push(ChildEntry {
                 id: c.id,
-                name: c.name.clone(),
+                name: c.name,
                 depth: c.depth,
                 subtree_end: c.subtree_end,
                 t_disk: c.t_disk,
@@ -492,30 +529,6 @@ impl Backend {
                 t_files: c.t_files,
                 own_charged: c.own_charged,
             });
-            Ok(())
-        };
-        if p.depth < self.plain_depth {
-            let mut stmt = snap.conn.prepare_cached(&format!(
-                "{SHALLOW_COLUMNS} FROM shallow_dirs WHERE parent_id=?1 AND id>=?2 ORDER BY id LIMIT ?3"
-            ))?;
-            let mut rows = stmt.query(params![parent, start, sql_limit(limit + 1)?])?;
-            while let Some(row) = rows.next()? {
-                let c = Self::from_shallow(dir_row(row)?);
-                if taken == limit {
-                    return Ok(Some(ChildCursor(CursorAt::Id(c.id))));
-                }
-                push(&c, out)?;
-                taken += 1;
-            }
-            return Ok(None);
-        }
-        let mut next = start;
-        while next <= p.subtree_end {
-            if taken == limit {
-                return Ok(Some(ChildCursor(CursorAt::Id(next))));
-            }
-            let c = self.raw(snap, next).map_err(required)?;
-            push(&c, out)?;
             taken += 1;
             next = c.subtree_end.checked_add(1).ok_or_else(invalid)?;
         }
@@ -767,7 +780,7 @@ impl Backend {
                     ))?;
                     let mut rows = stmt.query(params![id, root.subtree_end, i64::try_from(max).map_err(|_| invalid())?])?;
                     while let Some(row) = rows.next()? {
-                        v(Self::from_shallow(dir_row(row)?))?;
+                        v(Self::from_shallow(dir_row(row).map_err(plain_row_error)?))?;
                     }
                     Ok(())
                 },
@@ -831,7 +844,7 @@ impl Backend {
             ))?;
             let mut rows = stmt.query([depth])?;
             while let Some(row) = rows.next()? {
-                visit(Self::from_shallow(dir_row(row)?))?;
+                visit(Self::from_shallow(dir_row(row).map_err(plain_row_error)?))?;
             }
             Ok(())
         } else {
@@ -1660,8 +1673,8 @@ impl Backend {
     }
     /// Visit `(row number, instance)` of one inode in stored order. The visitor
     /// returns `false` to stop. The full `(ino, dir_id, name)` order is checked
-    /// across every chunk boundary the walk crosses, and, when the visitor stops
-    /// early, across the next boundary if the inode's run continues into it.
+    /// across every chunk boundary of the inode's run, also after the visitor has
+    /// stopped (the remaining chunks are decoded but not visited).
     fn li_visit(
         &self,
         snap: &Snapshot,
@@ -1683,6 +1696,7 @@ impl Backend {
             }
         }
         let mut prev: Option<ChunkLinkInstance> = None;
+        let mut stopped = false;
         loop {
             if m.lo > ino {
                 return Ok(());
@@ -1696,25 +1710,11 @@ impl Backend {
                 if r.ino != ino {
                     return Ok(());
                 }
-                if !visit(first + (start + offset) as u64, r)? {
-                    // The rest of the run is trusted only if it follows in order.
-                    if let Some(tail) = rows.last().filter(|t| t.ino == ino) {
-                        if let Some(next) = next_meta(&snap.conn, Kind::Links, Some(m.last))? {
-                            if next.lo <= ino {
-                                let (_, after) = side_load(
-                                    snap,
-                                    next,
-                                    &self.links,
-                                    decode_links_chunk,
-                                    link_size,
-                                )?;
-                                if let Some(head) = after.first() {
-                                    check_link_order(tail, head)?;
-                                }
-                            }
-                        }
-                    }
-                    return Ok(());
+                if !stopped && !visit(first + (start + offset) as u64, r)? {
+                    // Keep walking the inode's chunk range without visiting, so
+                    // every boundary of the run is order-checked before the
+                    // early stop is trusted (bounded by the inode's instances).
+                    stopped = true;
                 }
             }
             if m.hi > ino {
@@ -2324,7 +2324,7 @@ mod child_cursor_tests {
             f.v2.children_by_name(0, Some(&foreign), 3, &mut out),
             Err(StoreError::Invalid(_))
         ));
-        let outside = ChildCursor(CursorAt::Id(10_000));
+        let outside = ChildCursor(CursorAt::Id(10_000, b"x".to_vec()));
         assert!(matches!(
             f.v2.children_by_name(0, Some(&outside), 3, &mut out),
             Err(StoreError::Invalid(_))
@@ -2335,5 +2335,134 @@ mod child_cursor_tests {
             snap.children_by_name(0, None, 100, &mut out),
             Err(StoreError::Invalid(_))
         ));
+    }
+
+    fn v2_only(
+        rows: &[DirRow],
+        plain_depth: u32,
+        chunk_dirs: usize,
+    ) -> (tempfile::TempDir, Snapshot) {
+        let d = test_support::private_tempdir().unwrap();
+        let mut m = crate::test_meta();
+        m.root = rows[0].path.clone();
+        m.dirs = rows.len() as u64;
+        m.schema_version = 2;
+        let mut w = SnapshotWriterV2::create_with_options(
+            d.path(),
+            &m,
+            WriterOptions {
+                plain_depth,
+                chunk_dirs,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        w.put_dirs(rows).unwrap();
+        let f = w.finish(&m).unwrap();
+        (d, Snapshot::open(&f).unwrap())
+    }
+    fn wide(width: u32) -> Vec<DirRow> {
+        let root = RawPath::new(b"/r".to_vec()).unwrap();
+        let mut rows = vec![row(0, None, 0, b"/r", &root, width)];
+        for i in 0..width {
+            let name = format!("b{i:06}").into_bytes();
+            let p = root.join(&RawName::new(name.clone()).unwrap());
+            rows.push(row(1 + i, Some(0), 1, &name, &p, 1 + i));
+        }
+        rows
+    }
+    fn drain(s: &Snapshot, parent: u32, page: usize) -> Result<usize> {
+        let (mut out, mut cursor, mut n) = (Vec::new(), None, 0);
+        loop {
+            out.clear();
+            let next = s.children_by_name(parent, cursor.as_ref(), page, &mut out)?;
+            n += out.len();
+            match next {
+                Some(c) => cursor = Some(c),
+                None => return Ok(n),
+            }
+        }
+    }
+    fn is_invalid<T>(r: Result<T>) -> bool {
+        matches!(r, Err(StoreError::Invalid(_)))
+    }
+
+    #[test]
+    fn b3_names_must_ascend_across_page_boundaries() {
+        // Names of ids 256 and 257 swapped: sorted within each 256-row page, not across.
+        let mut rows = wide(257);
+        let (a, b) = (rows[256].name.clone(), rows[257].name.clone());
+        rows[256].name = b;
+        rows[257].name = a;
+        let (_d, s) = v2_only(&rows, 0, 64);
+        assert!(is_invalid(drain(&s, 0, 256)));
+        assert!(is_invalid(drain(&s, 0, 1000)));
+        let (_d, sound) = v2_only(&wide(257), 0, 64);
+        assert_eq!(drain(&sound, 0, 256).unwrap(), 257);
+    }
+
+    #[test]
+    fn b2_child_names_are_validated() {
+        for bad in [&b"../escaped"[..], b"a/b", b"", b"..", b"x\0y"] {
+            let mut rows = wide(3);
+            rows[2].name = bad.to_vec();
+            // Keep sibling order sound so only the name rule can fire.
+            rows[1].name = b"\x01".to_vec();
+            rows[3].name = b"\xfe".to_vec();
+            let (_d, s) = v2_only(&rows, 0, 2);
+            assert!(is_invalid(drain(&s, 0, 10)), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn b5_depth_overflow_is_invalid_not_a_panic() {
+        let root = RawPath::new(b"/r".to_vec()).unwrap();
+        let a = root.join(&RawName::new(b"a".to_vec()).unwrap());
+        let b = a.join(&RawName::new(b"b".to_vec()).unwrap());
+        let rows = vec![
+            row(0, None, 0, b"/r", &root, 2),
+            row(1, Some(0), u32::MAX, b"a", &a, 2),
+            row(2, Some(1), 1, b"b", &b, 2),
+        ];
+        let (_d, s) = v2_only(&rows, 0, 8);
+        assert!(is_invalid(drain(&s, 1, 10)));
+        assert!(is_invalid(drain(&s, 0, 10)));
+    }
+
+    #[test]
+    fn s2_b4_shallow_rows_are_validated() {
+        let rows = tree(6);
+        let (d, s) = v2_only(&rows, 2, 4);
+        let kids = s.children(0, SortKey::Name, 100).unwrap().len();
+        assert_eq!(kids, 6);
+        let copy = |sql: &str| {
+            let dir = test_support::private_tempdir().unwrap();
+            let file = dir.path().join("t.db");
+            std::fs::copy(&s.file, &file).unwrap();
+            let conn = rusqlite::Connection::open(&file).unwrap();
+            conn.execute_batch(sql).unwrap();
+            drop(conn);
+            (dir, Snapshot::open(&file).unwrap())
+        };
+        // S2: an undecodable shallow row is Invalid, not Sql.
+        let (_k, bogus) = copy("UPDATE shallow_dirs SET t_disk='bogus' WHERE id=1;");
+        assert!(is_invalid(bogus.children(0, SortKey::Name, 100)));
+        assert!(is_invalid(bogus.children_count(0, b"")));
+        // B4: missing first, middle and last child rows.
+        let kids: Vec<u32> = rows
+            .iter()
+            .filter(|r| r.parent_id == Some(0))
+            .map(|r| r.id)
+            .collect();
+        for id in [kids[0], kids[2], kids[5]] {
+            let (_k, snap) = copy(&format!("DELETE FROM shallow_dirs WHERE id={id};"));
+            assert!(is_invalid(snap.children(0, SortKey::Name, 100)), "{id}");
+            assert!(is_invalid(snap.children_count(0, b"")), "{id}");
+            assert!(
+                is_invalid(snap.children_page(0, SortKey::Disk, true, None, false, 10, b"")),
+                "{id}"
+            );
+        }
+        drop(d);
     }
 }

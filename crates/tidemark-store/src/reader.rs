@@ -62,13 +62,14 @@ pub(crate) struct ChildEntry {
     pub t_files: u64,
     pub own_charged: u64,
 }
-/// Resume point of [`Snapshot::children_by_name`]: v2 holds the next sibling id,
-/// v1 the last name returned.
+/// Resume point of [`Snapshot::children_by_name`]: v2 holds the next sibling id and
+/// the last name returned, v1 the last name returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChildCursor(CursorAt);
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CursorAt {
-    Id(u32),
+    /// Next sibling id and the last name returned (the next child must sort after it).
+    Id(u32, Vec<u8>),
     After(Vec<u8>),
 }
 
@@ -575,7 +576,14 @@ impl Snapshot {
     /// Append up to `limit` (at least one) children of `parent` after `cursor`
     /// (`None` = from the first) to `out`, in name-byte order, without
     /// reconstructing paths. Returns the cursor for the next page, or `None` when
-    /// the children are exhausted. Work per page is proportional to the page.
+    /// the children are exhausted.
+    ///
+    /// Cost per page: v2 hops over the directory chunks (name order is preorder
+    /// order), so work is O(page) for every parent, and the cursor also carries the
+    /// last name so the next page is checked to sort after it. v1 has only
+    /// `dirs_parent(parent_id)` (no `(parent_id, name)` index) so each page costs
+    /// O(W log W) inside SQLite for a parent with W children, and mixed v1/v2 diff
+    /// of a very wide v1 directory stays superlinear (accepted, review9 S1).
     #[allow(dead_code)] // consumed by the diff walk (SNAP-diff-walk-fix)
     pub(crate) fn children_by_name(
         &self,
