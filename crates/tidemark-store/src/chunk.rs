@@ -164,6 +164,13 @@ fn put(mut n: u128, out: &mut Vec<u8>) {
 struct Cursor<'a>(&'a [u8]);
 impl<'a> Cursor<'a> {
     fn var(&mut self) -> Result<u128> {
+        // Most columns are small counters: one byte, no continuation bit.
+        if let Some((&b, tail)) = self.0.split_first() {
+            if b < 128 {
+                self.0 = tail;
+                return Ok(u128::from(b));
+            }
+        }
         let mut n = 0;
         // Deltas between two i64 timestamps require up to 65 zig-zag bits.
         for i in 0..10 {
@@ -424,14 +431,129 @@ pub struct DirProjection {
     pub newest_mtime: Vec<i64>,
     /// Values of entries.
     pub entries: Vec<u32>,
+    /// Values of depth.
+    pub depth: Vec<u32>,
+}
+/// One decoded directory row borrowed from its chunk: every column is parsed and
+/// validated, nothing is allocated until [`DirView::to_owned`].
+#[derive(Debug, Clone, Copy)]
+pub struct DirView<'a> {
+    /// Row identifier; directory ids are preorder indices (root = 0).
+    pub id: u32,
+    /// Parent directory id; None for the root.
+    pub parent_id: Option<u32>,
+    /// Last preorder directory id in this subtree, inclusive.
+    pub subtree_end: u32,
+    /// Directory depth relative to the scan root.
+    pub depth: u32,
+    /// Raw name bytes; the root directory row stores the full root path.
+    pub name: &'a [u8],
+    /// Filesystem inode number.
+    pub ino: u64,
+    /// Inode modification time, Unix seconds.
+    pub mtime: i64,
+    /// Directory inode allocated bytes (st_blocks × 512).
+    pub dir_disk: u64,
+    /// Directory inode apparent bytes (st_size).
+    pub dir_apparent: u64,
+    /// XFS project id; None in walk mode.
+    pub projid: Option<u32>,
+    /// All direct entries, including subdirectories and skipped entries.
+    pub entries: u32,
+    /// Errors recorded directly in this directory.
+    pub errors: u32,
+    /// Direct non-directory entries, counting link instances.
+    pub own_files: u64,
+    /// Direct symlink entries (a subset of own_files).
+    pub own_symlinks: u64,
+    /// Directory inode bytes plus single-found inodes and link sets charged here.
+    pub own_charged: u64,
+    /// Apparent bytes of the same inodes as own_charged.
+    pub own_apparent: u64,
+    /// Subtree directory count, including this directory.
+    pub t_dirs: u64,
+    /// Subtree non-directory entry count, counting link instances.
+    pub t_files: u64,
+    /// Distinct non-directory inodes visible in the subtree.
+    pub t_inodes: u64,
+    /// Allocated bytes of distinct visible inodes plus directory inode bytes.
+    pub t_disk: u64,
+    /// Apparent bytes using the same union semantics as t_disk.
+    pub t_apparent: u64,
+    /// Subtree allocated bytes charged at each inode’s directory or link-set LCA.
+    pub t_charged: u64,
+    /// Charged bytes whose complete link sets are inside the subtree.
+    pub t_reclaimable: u64,
+    /// Total subtree error count.
+    pub t_errors: u64,
+    /// Charged bytes with mtime age less than 1 day.
+    pub age0: u64,
+    /// Charged bytes with mtime age 1–7 days.
+    pub age1: u64,
+    /// Charged bytes with mtime age 7–30 days.
+    pub age2: u64,
+    /// Charged bytes with mtime age 30–90 days.
+    pub age3: u64,
+    /// Charged bytes with mtime age 90–365 days.
+    pub age4: u64,
+    /// Charged bytes with mtime age at least 365 days.
+    pub age5: u64,
+    /// Newest mtime of every visible inode in the subtree, Unix seconds.
+    pub newest_mtime: i64,
+    /// Largest direct-entry count of any subtree directory.
+    pub max_entries: u32,
+    /// First notable-file row for this directory.
+    pub file_lo: u32,
+    /// Number of notable-file rows.
+    pub file_count: u32,
+}
+impl DirView<'_> {
+    /// Materialise the row (one allocation, for the name).
+    pub fn to_owned(&self) -> ChunkDir {
+        ChunkDir {
+            id: self.id,
+            parent_id: self.parent_id,
+            subtree_end: self.subtree_end,
+            depth: self.depth,
+            name: self.name.to_vec(),
+            ino: self.ino,
+            mtime: self.mtime,
+            dir_disk: self.dir_disk,
+            dir_apparent: self.dir_apparent,
+            projid: self.projid,
+            entries: self.entries,
+            errors: self.errors,
+            own_files: self.own_files,
+            own_symlinks: self.own_symlinks,
+            own_charged: self.own_charged,
+            own_apparent: self.own_apparent,
+            t_dirs: self.t_dirs,
+            t_files: self.t_files,
+            t_inodes: self.t_inodes,
+            t_disk: self.t_disk,
+            t_apparent: self.t_apparent,
+            t_charged: self.t_charged,
+            t_reclaimable: self.t_reclaimable,
+            t_errors: self.t_errors,
+            age0: self.age0,
+            age1: self.age1,
+            age2: self.age2,
+            age3: self.age3,
+            age4: self.age4,
+            age5: self.age5,
+            newest_mtime: self.newest_mtime,
+            max_entries: self.max_entries,
+            file_lo: self.file_lo,
+            file_count: self.file_count,
+        }
+    }
 }
 /// Decode directory rows; first_id is supplied by the chunk table.
 pub fn decode_dirs(data: &[u8], first_id: u32) -> Result<Vec<ChunkDir>> {
     let mut out = Vec::new();
-    visit_dirs(data, first_id, true, |r, _| {
-        if let Some(row) = r {
-            out.push(row);
-        }
+    visit_dirs(data, first_id, |v| {
+        out.push(v.to_owned());
+        Ok(())
     })?;
     Ok(out)
 }
@@ -439,27 +561,24 @@ pub fn decode_dirs(data: &[u8], first_id: u32) -> Result<Vec<ChunkDir>> {
 /// Every column is still validated, including columns not projected.
 pub fn decode_dir_projection(data: &[u8], first_id: u32) -> Result<DirProjection> {
     let mut out = DirProjection::default();
-    visit_dirs(data, first_id, false, |_, r| {
-        out.t_disk.push(r.t_disk);
-        out.t_reclaimable.push(r.t_reclaimable);
-        out.t_files.push(r.t_files);
-        out.newest_mtime.push(r.newest_mtime);
-        out.entries.push(r.entries);
+    visit_dirs(data, first_id, |v| {
+        out.t_disk.push(v.t_disk);
+        out.t_reclaimable.push(v.t_reclaimable);
+        out.t_files.push(v.t_files);
+        out.newest_mtime.push(v.newest_mtime);
+        out.entries.push(v.entries);
+        out.depth.push(v.depth);
+        Ok(())
     })?;
     Ok(out)
 }
-struct HotRow {
-    t_disk: u64,
-    t_reclaimable: u64,
-    t_files: u64,
-    newest_mtime: i64,
-    entries: u32,
-}
-fn visit_dirs(
+/// Stream every row of a chunk in order as a borrowed view. The whole chunk is
+/// validated (every column, trailing bytes) exactly as [`decode_dirs`] does; the
+/// visitor decides which rows to materialise. A visitor error is returned as is.
+pub fn visit_dirs(
     data: &[u8],
     first_id: u32,
-    names: bool,
-    mut visit: impl FnMut(Option<ChunkDir>, HotRow),
+    mut visit: impl FnMut(&DirView<'_>) -> Result<()>,
 ) -> Result<()> {
     let columns = Columns::open(data, 33)?;
     let mut c = columns.cursors();
@@ -519,54 +638,42 @@ fn visit_dirs(
             .checked_add(narrow(c[31].var()?)?)
             .ok_or_else(invalid)?;
         let file_count = narrow(c[32].var()?)?;
-        let hot = HotRow {
-            t_disk,
-            t_reclaimable,
-            t_files,
+        visit(&DirView {
+            id,
+            parent_id,
+            subtree_end,
+            depth,
+            name,
+            ino: ino_value,
+            mtime: mtime_value,
             newest_mtime,
+            projid,
+            dir_disk,
+            dir_apparent,
             entries,
-        };
-        let row = if names {
-            Some(ChunkDir {
-                id,
-                parent_id,
-                subtree_end,
-                depth,
-                name: name.to_vec(),
-                ino: ino_value,
-                mtime: mtime_value,
-                newest_mtime,
-                projid,
-                dir_disk,
-                dir_apparent,
-                entries,
-                errors,
-                own_files,
-                own_symlinks,
-                own_charged,
-                own_apparent,
-                t_dirs,
-                t_files,
-                t_inodes,
-                t_disk,
-                t_apparent,
-                t_charged,
-                t_reclaimable,
-                t_errors,
-                age0,
-                age1,
-                age2,
-                age3,
-                age4,
-                age5,
-                max_entries,
-                file_lo,
-                file_count,
-            })
-        } else {
-            None
-        };
-        visit(row, hot);
+            errors,
+            own_files,
+            own_symlinks,
+            own_charged,
+            own_apparent,
+            t_dirs,
+            t_files,
+            t_inodes,
+            t_disk,
+            t_apparent,
+            t_charged,
+            t_reclaimable,
+            t_errors,
+            age0,
+            age1,
+            age2,
+            age3,
+            age4,
+            age5,
+            max_entries,
+            file_lo,
+            file_count,
+        })?;
         count += 1;
     }
     finish(&c)
