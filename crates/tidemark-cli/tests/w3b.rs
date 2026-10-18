@@ -68,6 +68,7 @@ fn bulk_show_paths_marks_live_and_gone() {
     m.finished_at += 1;
     m.scan_id = ScanId::new(m.started_at).unwrap();
     m.mode = ScanMode::Bulk;
+    m.schema_version = 1;
     let mut writer =
         SnapshotWriter::create(&state.join("snapshots").join(root_slug(&root)), &m).unwrap();
     let mut dirs = snap.subtree_dirs(0, u32::MAX, SortKey::Name, 100).unwrap();
@@ -228,6 +229,7 @@ fn million_set_cli_timing() {
     meta.started_at += 1;
     meta.finished_at += 1;
     meta.scan_id = ScanId::new(meta.started_at).unwrap();
+    meta.schema_version = 1;
     let mut writer =
         SnapshotWriter::create(&state.join("snapshots").join(root_slug(&root)), &meta).unwrap();
     let mut dirs = snap.subtree_dirs(0, u32::MAX, SortKey::Name, 100).unwrap();
