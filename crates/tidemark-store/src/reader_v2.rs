@@ -132,6 +132,9 @@ pub(super) struct Backend {
     files: RefCell<SideCache<ChunkFile>>,
     links: RefCell<SideCache<ChunkLinkInstance>>,
     paths: RefCell<PathCache>,
+    /// Directory chunks decoded so far (work-bound tests).
+    #[cfg(test)]
+    decodes: std::cell::Cell<u64>,
 }
 #[derive(Eq, PartialEq)]
 struct Hit {
@@ -227,6 +230,8 @@ impl Backend {
             files: RefCell::new(SideCache::new()),
             links: RefCell::new(SideCache::new()),
             paths: RefCell::new(PathCache::default()),
+            #[cfg(test)]
+            decodes: std::cell::Cell::new(0),
         })
     }
     fn chunk(&self, snap: &Snapshot, id: u32) -> Result<Arc<Vec<ChunkDir>>> {
@@ -242,6 +247,8 @@ impl Backend {
         check_neighbours(&snap.conn, found)?;
         let data = chunk_data(&snap.conn, found)?;
         let rows = Arc::new(chunk::decode_dirs(&data, first)?);
+        #[cfg(test)]
+        self.decodes.set(self.decodes.get() + 1);
         if rows.last().map(|r| r.id) != Some(last) {
             return Err(invalid());
         }
@@ -434,6 +441,85 @@ impl Backend {
             }
         }
         Ok(())
+    }
+    /// One page of `parent`'s children in name (= preorder) order, resuming at a
+    /// next-sibling id; see [`Snapshot::children_by_name`].
+    pub(super) fn children_by_name(
+        &self,
+        snap: &Snapshot,
+        parent: u32,
+        cursor: Option<&ChildCursor>,
+        limit: usize,
+        out: &mut Vec<ChildEntry>,
+    ) -> Result<Option<ChildCursor>> {
+        let p = match self.raw(snap, parent) {
+            Ok(p) => p,
+            Err(StoreError::Sql(rusqlite::Error::QueryReturnedNoRows)) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        let first = parent.checked_add(1).ok_or_else(invalid)?;
+        let start = match cursor {
+            None => first,
+            Some(ChildCursor(CursorAt::Id(id))) => *id,
+            Some(_) => return Err(bad("foreign child cursor")),
+        };
+        if p.subtree_end <= parent {
+            return Ok(None);
+        }
+        if start < first || start > p.subtree_end {
+            return Err(bad("child cursor lies outside the parent's subtree"));
+        }
+        let mut prev: Option<Vec<u8>> = None;
+        let mut taken = 0usize;
+        let mut push = |c: &ChunkDir, out: &mut Vec<ChildEntry>| -> Result<()> {
+            let ordered = prev.as_ref().is_none_or(|before| *before < c.name);
+            if c.parent_id != Some(parent)
+                || c.depth != p.depth + 1
+                || c.subtree_end < c.id
+                || c.subtree_end > p.subtree_end
+                || !ordered
+            {
+                return Err(invalid());
+            }
+            prev = Some(c.name.clone());
+            out.push(ChildEntry {
+                id: c.id,
+                name: c.name.clone(),
+                depth: c.depth,
+                subtree_end: c.subtree_end,
+                t_disk: c.t_disk,
+                t_reclaimable: c.t_reclaimable,
+                t_files: c.t_files,
+                own_charged: c.own_charged,
+            });
+            Ok(())
+        };
+        if p.depth < self.plain_depth {
+            let mut stmt = snap.conn.prepare_cached(&format!(
+                "{SHALLOW_COLUMNS} FROM shallow_dirs WHERE parent_id=?1 AND id>=?2 ORDER BY id LIMIT ?3"
+            ))?;
+            let mut rows = stmt.query(params![parent, start, sql_limit(limit + 1)?])?;
+            while let Some(row) = rows.next()? {
+                let c = Self::from_shallow(dir_row(row)?);
+                if taken == limit {
+                    return Ok(Some(ChildCursor(CursorAt::Id(c.id))));
+                }
+                push(&c, out)?;
+                taken += 1;
+            }
+            return Ok(None);
+        }
+        let mut next = start;
+        while next <= p.subtree_end {
+            if taken == limit {
+                return Ok(Some(ChildCursor(CursorAt::Id(next))));
+            }
+            let c = self.raw(snap, next).map_err(required)?;
+            push(&c, out)?;
+            taken += 1;
+            next = c.subtree_end.checked_add(1).ok_or_else(invalid)?;
+        }
+        Ok(None)
     }
     fn range(
         &self,
@@ -1057,6 +1143,23 @@ fn decode_links_chunk(conn: &Connection, m: Meta) -> Result<Vec<ChunkLinkInstanc
     }
     Ok(rows)
 }
+fn link_key(l: &ChunkLinkInstance) -> (u64, u32, bool, &[u8]) {
+    (
+        l.ino,
+        l.dir_id,
+        l.name.is_some(),
+        l.name.as_deref().unwrap_or_default(),
+    )
+}
+/// Adjacent link instances must be in `(ino, dir_id, name)` order (NULL first).
+fn check_link_order(before: &ChunkLinkInstance, after: &ChunkLinkInstance) -> Result<()> {
+    if link_key(before) > link_key(after) {
+        return Err(bad(
+            "li_chunks rows are not ordered across a chunk boundary",
+        ));
+    }
+    Ok(())
+}
 fn file_size(f: &ChunkFile) -> usize {
     f.name.as_ref().map_or(0, Vec::capacity)
 }
@@ -1428,15 +1531,41 @@ impl Backend {
                 "{} WHERE last_dir>=?1 AND first_dir<=?2 ORDER BY first_row",
                 meta_sql(Kind::Files)
             );
+            // The directories claim the contiguous row span `lo_row..hi_row`
+            // (`file_lo` never decreases; an empty directory sits at the running
+            // offset). The chunks read must cover all of it.
+            let (lo_row, hi_row) = {
+                let (a, b) = (self.raw(snap, id)?, self.raw(snap, end)?);
+                let hi = u64::from(b.file_lo) + u64::from(b.file_count);
+                (u64::from(a.file_lo), hi)
+            };
+            if hi_row < lo_row {
+                return Err(bad("directory file spans are not ordered"));
+            }
             let mut stmt = snap.conn.prepare(&sql)?;
             let mut metas = stmt.query(params![id, end])?;
+            let mut expected: Option<u64> = None;
             while let Some(r) = metas.next()? {
                 let m = read_meta(Kind::Files, r)?;
+                match expected {
+                    None if m.first > lo_row && lo_row < hi_row => {
+                        return Err(bad("file_chunks do not cover the directories' file span"))
+                    }
+                    Some(next) if m.first != next => {
+                        return Err(bad("file_chunks intervals overlap or leave a gap"))
+                    }
+                    _ => {}
+                }
+                expected = Some(m.last + 1);
                 let (first, rows) = side_load(snap, m, &self.files, decode_files_chunk, file_size)?;
                 let start = rows.partition_point(|f| f.dir_id < id);
                 for (offset, f) in rows[start..].iter().enumerate() {
                     if f.dir_id > end {
                         break;
+                    }
+                    let row_no = first + (start + offset) as u64;
+                    if row_no < lo_row || row_no >= hi_row {
+                        return Err(bad("file row lies outside its directory's file span"));
                     }
                     if bounds.min.is_some_and(|min| f.disk < min)
                         || bounds.old.is_some_and(|old| f.mtime > old)
@@ -1448,8 +1577,7 @@ impl Backend {
                     if heap.len() >= cap && heap.peek().is_some_and(|w| rev > w.rev) {
                         continue;
                     }
-                    let id =
-                        u32::try_from(first + (start + offset) as u64).map_err(|_| invalid())?;
+                    let id = u32::try_from(row_no).map_err(|_| invalid())?;
                     let entry = FileEntry {
                         rev,
                         dir: self.cached_path(snap, f.dir_id)?,
@@ -1463,6 +1591,9 @@ impl Backend {
                         heap.push(entry);
                     }
                 }
+            }
+            if lo_row < hi_row && expected.is_none_or(|next| next < hi_row) {
+                return Err(bad("file_chunks do not cover the directories' file span"));
             }
         }
         crate::error::check_result_bound(heap.as_slice())?;
@@ -1521,10 +1652,16 @@ impl Backend {
                 lo = m.last + 1;
             }
         }
-        Ok(meta_at(&snap.conn, Kind::Links, lo)?.filter(|m| m.last >= lo))
+        // `lo <= tail.last`: a row no chunk covers is a gap, not an empty result.
+        meta_at(&snap.conn, Kind::Links, lo)?
+            .filter(|m| m.last >= lo)
+            .map(Some)
+            .ok_or_else(|| bad("li_chunks intervals overlap or leave a gap"))
     }
     /// Visit `(row number, instance)` of one inode in stored order. The visitor
-    /// returns `false` to stop.
+    /// returns `false` to stop. The full `(ino, dir_id, name)` order is checked
+    /// across every chunk boundary the walk crosses, and, when the visitor stops
+    /// early, across the next boundary if the inode's run continues into it.
     fn li_visit(
         &self,
         snap: &Snapshot,
@@ -1534,23 +1671,56 @@ impl Backend {
         let Some(mut m) = self.li_lower_bound(snap, ino)? else {
             return Ok(());
         };
+        // The binary search trusts chunk metadata; confirm that the chunk before
+        // the one found really ends below `ino` (this decodes and validates it).
+        if let Some(before) = m.first.checked_sub(1) {
+            let p = meta_at(&snap.conn, Kind::Links, before)?
+                .filter(|p| p.last == before)
+                .ok_or_else(|| bad("li_chunks intervals overlap or leave a gap"))?;
+            let (_, rows) = side_load(snap, p, &self.links, decode_links_chunk, link_size)?;
+            if rows.last().is_none_or(|r| r.ino >= ino) {
+                return Err(bad("li_chunks are not ordered by first_ino"));
+            }
+        }
+        let mut prev: Option<ChunkLinkInstance> = None;
         loop {
             if m.lo > ino {
                 return Ok(());
             }
             let (first, rows) = side_load(snap, m, &self.links, decode_links_chunk, link_size)?;
+            if let (Some(before), Some(head)) = (&prev, rows.first()) {
+                check_link_order(before, head)?;
+            }
             let start = rows.partition_point(|r| r.ino < ino);
             for (offset, r) in rows[start..].iter().enumerate() {
                 if r.ino != ino {
                     return Ok(());
                 }
                 if !visit(first + (start + offset) as u64, r)? {
+                    // The rest of the run is trusted only if it follows in order.
+                    if let Some(tail) = rows.last().filter(|t| t.ino == ino) {
+                        if let Some(next) = next_meta(&snap.conn, Kind::Links, Some(m.last))? {
+                            if next.lo <= ino {
+                                let (_, after) = side_load(
+                                    snap,
+                                    next,
+                                    &self.links,
+                                    decode_links_chunk,
+                                    link_size,
+                                )?;
+                                if let Some(head) = after.first() {
+                                    check_link_order(tail, head)?;
+                                }
+                            }
+                        }
+                    }
                     return Ok(());
                 }
             }
             if m.hi > ino {
                 return Ok(());
             }
+            prev = rows.last().cloned();
             match next_meta(&snap.conn, Kind::Links, Some(m.last))? {
                 Some(next) => m = next,
                 None => return Ok(()),
@@ -1663,7 +1833,7 @@ impl Backend {
             )?;
             let mut sets = stmt.query(params![id, end, incomplete])?;
             while let Some(r) = sets.next()? {
-                let row = link_row(r)?;
+                let row = link_row(r).map_err(super::plain_row_error)?;
                 let rev = u64::MAX - row.disk;
                 if heap.len() >= cap && heap.peek().is_some_and(|w| rev > w.rev) {
                     continue;
@@ -1765,7 +1935,7 @@ impl Backend {
         let mut done = false;
         let mut dirs = Vec::new();
         while let Some(r) = sets.next()? {
-            let row = link_row(r)?;
+            let row = link_row(r).map_err(super::plain_row_error)?;
             dirs.clear();
             loop {
                 while pos < chunk.len() && chunk[pos].ino < row.ino {
@@ -1859,5 +2029,311 @@ impl Backend {
             .into_iter()
             .map(|e| (e.path, u64::MAX - e.rev, e.total))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod child_cursor_tests {
+    use super::*;
+    use crate::writer::SnapshotWriter;
+    use crate::writer_v2::{SnapshotWriterV2, WriterOptions};
+    use std::path::Path;
+
+    fn row(
+        id: u32,
+        parent: Option<u32>,
+        depth: u32,
+        name: &[u8],
+        path: &RawPath,
+        end: u32,
+    ) -> DirRow {
+        let n = u64::from(id);
+        DirRow {
+            id,
+            parent_id: parent,
+            subtree_end: end,
+            depth,
+            name: name.to_vec(),
+            path: path.clone(),
+            path_hash: path.hash64(),
+            ino: n + 1,
+            mtime: 0,
+            dir_disk: 1,
+            dir_apparent: 2,
+            projid: None,
+            entries: 1,
+            errors: 0,
+            own_files: 0,
+            own_symlinks: 0,
+            own_charged: n + 5,
+            own_apparent: 2,
+            t_dirs: 1,
+            t_files: n % 5,
+            t_inodes: 1,
+            t_disk: n + 4096,
+            t_apparent: 2,
+            t_charged: 3,
+            t_reclaimable: n % 3,
+            t_errors: 0,
+            age0: 0,
+            age1: 0,
+            age2: 0,
+            age3: 0,
+            age4: 0,
+            age5: 0,
+            newest_mtime: 0,
+            max_entries: 1,
+        }
+    }
+    /// A root with `width` children `c00000..`; every fourth has two leaf children
+    /// and the first of those a short chain, so subtrees differ in size.
+    fn tree(width: usize) -> Vec<DirRow> {
+        struct Node {
+            name: Vec<u8>,
+            kids: Vec<Node>,
+        }
+        let leaf = |n: &str| Node {
+            name: n.as_bytes().to_vec(),
+            kids: vec![],
+        };
+        let kids = (0..width)
+            .map(|i| Node {
+                name: format!("c{i:05}").into_bytes(),
+                kids: if i % 4 == 0 {
+                    let mut g0 = leaf("g0");
+                    if i == 0 {
+                        g0.kids = vec![Node {
+                            name: b"x".to_vec(),
+                            kids: vec![leaf("y")],
+                        }];
+                    }
+                    vec![g0, leaf("g1")]
+                } else {
+                    vec![]
+                },
+            })
+            .collect();
+        let root = Node {
+            name: b"/r".to_vec(),
+            kids,
+        };
+        // Iterative preorder with an explicit stack: (node, parent, depth, path).
+        let mut out: Vec<DirRow> = Vec::new();
+        let rootp = RawPath::new(b"/r".to_vec()).unwrap();
+        let mut stack = vec![(&root, None::<u32>, 0u32, rootp, 0usize)];
+        let mut open: Vec<u32> = Vec::new();
+        while let Some((node, parent, depth, path, _)) = stack.pop() {
+            let id = out.len() as u32;
+            out.push(row(id, parent, depth, &node.name, &path, id));
+            open.push(id);
+            for kid in node.kids.iter().rev() {
+                let p = path.join(&RawName::new(kid.name.clone()).unwrap());
+                stack.push((kid, Some(id), depth + 1, p, 0));
+            }
+        }
+        // subtree_end: last id of each directory's descendants.
+        for i in (0..out.len()).rev() {
+            if let Some(parent) = out[i].parent_id {
+                let end = out[i].subtree_end;
+                let p = &mut out[parent as usize];
+                p.subtree_end = p.subtree_end.max(end);
+            }
+        }
+        out
+    }
+    struct Fixture {
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+        v1: Snapshot,
+        v2: Snapshot,
+    }
+    fn fixture(rows: Vec<DirRow>, plain_depth: u32, chunk_dirs: usize) -> Fixture {
+        let d1 = test_support::private_tempdir().unwrap();
+        let d2 = test_support::private_tempdir().unwrap();
+        let mut m = crate::test_meta();
+        m.root = rows[0].path.clone();
+        m.dirs = rows.len() as u64;
+        m.schema_version = 1;
+        let mut w = SnapshotWriter::create(d1.path(), &m).unwrap();
+        w.put_dirs(&rows).unwrap();
+        let f1 = w.finish(&m).unwrap();
+        m.schema_version = 2;
+        let mut w = SnapshotWriterV2::create_with_options(
+            d2.path(),
+            &m,
+            WriterOptions {
+                plain_depth,
+                chunk_dirs,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        w.put_dirs(&rows).unwrap();
+        let f2 = w.finish(&m).unwrap();
+        let open = |f: &Path| Snapshot::open(f).unwrap();
+        Fixture {
+            v1: open(&f1),
+            v2: open(&f2),
+            _dirs: (d1, d2),
+        }
+    }
+    fn entry(r: &DirRow) -> ChildEntry {
+        ChildEntry {
+            id: r.id,
+            name: r.name.clone(),
+            depth: r.depth,
+            subtree_end: r.subtree_end,
+            t_disk: r.t_disk,
+            t_reclaimable: r.t_reclaimable,
+            t_files: r.t_files,
+            own_charged: r.own_charged,
+        }
+    }
+    fn pages(s: &Snapshot, parent: u32, page: usize) -> Vec<ChildEntry> {
+        let (mut all, mut cursor) = (Vec::new(), None);
+        loop {
+            let before = all.len();
+            let next = s
+                .children_by_name(parent, cursor.as_ref(), page, &mut all)
+                .unwrap();
+            assert!(all.len() - before <= page.max(1));
+            match next {
+                Some(c) => {
+                    assert!(all.len() > before, "an unfinished page makes progress");
+                    cursor = Some(c);
+                }
+                None => return all,
+            }
+        }
+    }
+    fn check(f: &Fixture, parents: &[u32], page_sizes: &[usize]) {
+        for &parent in parents {
+            let expect: Vec<ChildEntry> =
+                f.v1.children(parent, SortKey::Name, 1_000_000)
+                    .unwrap()
+                    .iter()
+                    .map(entry)
+                    .collect();
+            let by_sql: Vec<ChildEntry> =
+                f.v2.children(parent, SortKey::Name, 1_000_000)
+                    .unwrap()
+                    .iter()
+                    .map(entry)
+                    .collect();
+            assert_eq!(expect, by_sql, "parent {parent}");
+            for &page in page_sizes {
+                assert_eq!(expect, pages(&f.v1, parent, page), "v1 {parent} {page}");
+                assert_eq!(expect, pages(&f.v2, parent, page), "v2 {parent} {page}");
+            }
+        }
+    }
+
+    #[test]
+    fn pages_equal_children_by_name_across_shapes() {
+        let rows = tree(41);
+        let parents: Vec<u32> = rows
+            .iter()
+            .filter(|r| r.subtree_end > r.id)
+            .map(|r| r.id)
+            .chain([u32::MAX - 1, 7777])
+            .collect();
+        for plain_depth in [0, 2, 4] {
+            for chunk_dirs in [1, 3, 5, 4096] {
+                let f = fixture(rows.clone(), plain_depth, chunk_dirs);
+                check(&f, &parents, &[1, 2, 7, 1000]);
+                // A leaf has no children; limit 0 behaves like 1.
+                let leaf = rows.iter().find(|r| r.subtree_end == r.id).unwrap().id;
+                assert!(pages(&f.v2, leaf, 3).is_empty());
+                let mut out = Vec::new();
+                assert!(f
+                    .v2
+                    .children_by_name(0, None, 0, &mut out)
+                    .unwrap()
+                    .is_some());
+                assert_eq!(out.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn five_thousand_children_below_plain_depth() {
+        // Root -> mid (depth 1) -> 5000 children; plain_depth 1 puts mid's children
+        // in the chunks, plain_depth 2 in the shallow table.
+        let mut rows = vec![];
+        let root = RawPath::new(b"/r".to_vec()).unwrap();
+        let mid = root.join(&RawName::new(b"mid".to_vec()).unwrap());
+        rows.push(row(0, None, 0, b"/r", &root, 5001));
+        rows.push(row(1, Some(0), 1, b"mid", &mid, 5001));
+        for i in 0..5000u32 {
+            let name = format!("k{i:05}").into_bytes();
+            let p = mid.join(&RawName::new(name.clone()).unwrap());
+            rows.push(row(2 + i, Some(1), 2, &name, &p, 2 + i));
+        }
+        for plain_depth in [1, 2] {
+            let f = fixture(rows.clone(), plain_depth, 64);
+            check(&f, &[1], &[7, 250, 100_000]);
+        }
+    }
+
+    #[test]
+    fn paging_a_wide_directory_decodes_each_chunk_once() {
+        let width = 5000u32;
+        let mut rows = vec![];
+        let root = RawPath::new(b"/r".to_vec()).unwrap();
+        rows.push(row(0, None, 0, b"/r", &root, width));
+        for i in 0..width {
+            let name = format!("k{i:05}").into_bytes();
+            let p = root.join(&RawName::new(name.clone()).unwrap());
+            rows.push(row(1 + i, Some(0), 1, &name, &p, 1 + i));
+        }
+        let chunk_dirs = 50;
+        let f = fixture(rows, 0, chunk_dirs);
+        let chunks = (width as u64 + 1).div_ceil(chunk_dirs as u64);
+        for page in [1usize, 7, 64] {
+            let backend_decodes = |b: &Backend| b.decodes.get();
+            // A cold cache each time.
+            let fresh = Snapshot::open(&f.v2.file).unwrap();
+            let all = pages(&fresh, 0, page);
+            assert_eq!(all.len(), width as usize);
+            let decoded = backend_decodes(fresh.v2.as_ref().unwrap());
+            // Work is O(W): every chunk decodes about once, not once per page.
+            assert!(
+                decoded <= chunks + 2,
+                "page {page}: {decoded} decodes for {chunks} chunks"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_sibling_structure_is_invalid() {
+        let rows = tree(12);
+        let f = fixture(rows, 0, 4);
+        let file = f.v2.file.clone();
+        let tamper = |sql: &str| {
+            let dir = test_support::private_tempdir().unwrap();
+            let copy = dir.path().join("t.db");
+            std::fs::copy(&file, &copy).unwrap();
+            let conn = rusqlite::Connection::open(&copy).unwrap();
+            conn.execute_batch(sql).unwrap();
+            drop(conn);
+            (dir, Snapshot::open(&copy).unwrap())
+        };
+        // A foreign cursor and an out-of-range cursor are rejected.
+        let mut out = Vec::new();
+        let foreign = ChildCursor(CursorAt::After(b"x".to_vec()));
+        assert!(matches!(
+            f.v2.children_by_name(0, Some(&foreign), 3, &mut out),
+            Err(StoreError::Invalid(_))
+        ));
+        let outside = ChildCursor(CursorAt::Id(10_000));
+        assert!(matches!(
+            f.v2.children_by_name(0, Some(&outside), 3, &mut out),
+            Err(StoreError::Invalid(_))
+        ));
+        let (_keep, snap) = tamper("DELETE FROM dir_chunks WHERE first_id=4;");
+        let mut out = Vec::new();
+        assert!(matches!(
+            snap.children_by_name(0, None, 100, &mut out),
+            Err(StoreError::Invalid(_))
+        ));
     }
 }

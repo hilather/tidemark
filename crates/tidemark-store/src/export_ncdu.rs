@@ -152,15 +152,22 @@ pub fn export_ncdu(
                 }
             }
         } else {
+            // v1 emits by `files.id`, which the scanner assigns in `(disk DESC, dir_id, ino)`
+            // order, i.e. `(disk DESC, ino)` inside one directory. v2 stores name order, so
+            // re-sort the directory's own rows (at most its `file_count`).
+            let mut notable = Vec::new();
             snap.v2_dir_files(id, &mut |file| {
-                if file.nlink != 1 {
-                    return Ok(());
+                if file.nlink == 1 {
+                    if let Some(name) = &file.name {
+                        notable.push((file.disk, file.ino, file.apparent, name.clone()));
+                    }
                 }
-                match &file.name {
-                    Some(name) => emit(name, file.apparent, file.disk, file.ino),
-                    None => Ok(()),
-                }
+                Ok(())
             })?;
+            notable.sort_by_key(|&(disk, ino, ..)| (std::cmp::Reverse(disk), ino));
+            for (disk, ino, apparent, name) in &notable {
+                emit(name, *apparent, *disk, *ino)?;
+            }
         }
         out.write_all(b",")?;
         info(

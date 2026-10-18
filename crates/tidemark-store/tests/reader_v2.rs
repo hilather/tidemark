@@ -1285,7 +1285,99 @@ fn compare_files_and_links(a: &Snapshot, b: &Snapshot, d: &Data) {
         b.link_instances(u64::MAX),
     );
 }
+/// An ncdu export as nested arrays whose `{...}` entries can be put in canonical order.
+enum Ncdu {
+    Atom(Vec<u8>),
+    Array(Vec<Ncdu>),
+}
+fn ncdu_parse(b: &[u8], at: &mut usize) -> Ncdu {
+    match b[*at] {
+        b'[' => {
+            *at += 1;
+            let mut items = Vec::new();
+            while b[*at] != b']' {
+                items.push(ncdu_parse(b, at));
+                if b[*at] == b',' {
+                    *at += 1;
+                }
+            }
+            *at += 1;
+            Ncdu::Array(items)
+        }
+        _ => {
+            let start = *at;
+            let (mut depth, mut quoted) = (0i32, false);
+            loop {
+                let c = b[*at];
+                if quoted {
+                    if c == b'\\' {
+                        *at += 1;
+                    } else if c == b'"' {
+                        quoted = false;
+                    }
+                } else if c == b'"' {
+                    quoted = true;
+                } else if c == b'{' {
+                    depth += 1;
+                } else if c == b'}' {
+                    depth -= 1;
+                } else if depth == 0 && (c == b',' || c == b']') {
+                    break;
+                }
+                *at += 1;
+            }
+            Ncdu::Atom(b[start..*at].to_vec())
+        }
+    }
+}
+/// Re-emits the export with the file entries of every directory sorted by bytes.
+fn ncdu_canonical(node: Ncdu, out: &mut Vec<u8>) {
+    match node {
+        Ncdu::Atom(bytes) => out.extend_from_slice(&bytes),
+        Ncdu::Array(items) => {
+            let (mut atoms, mut arrays) = (Vec::new(), Vec::new());
+            for item in items {
+                match item {
+                    Ncdu::Atom(a) => atoms.push(a),
+                    other => arrays.push(other),
+                }
+            }
+            // The first atom of a directory is its own info; keep it in place.
+            let head = if atoms.is_empty() {
+                None
+            } else {
+                Some(atoms.remove(0))
+            };
+            atoms.sort();
+            out.push(b'[');
+            let mut first = true;
+            for a in head.into_iter().chain(atoms) {
+                if !std::mem::take(&mut first) {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&a);
+            }
+            for sub in arrays {
+                if !std::mem::take(&mut first) {
+                    out.push(b',');
+                }
+                ncdu_canonical(sub, out);
+            }
+            out.push(b']');
+        }
+    }
+}
+fn canonical(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    ncdu_canonical(ncdu_parse(bytes, &mut 0), &mut out);
+    out
+}
+/// Compares the two exports. `strict` demands identical bytes; otherwise each
+/// directory's notable files may differ in order only (sorted-id fixtures).
 fn compare_exports(a: &Snapshot, b: &Snapshot, d: &Data) {
+    compare_exports_with(a, b, d, false);
+}
+fn compare_exports_with(a: &Snapshot, b: &Snapshot, d: &Data, strict: bool) {
     use tidemark_store::{export_ncdu, NcduOptions};
     for row in d.rows.iter().step_by(1 + d.rows.len() / 12) {
         for lossy in [false, true] {
@@ -1298,7 +1390,16 @@ fn compare_exports(a: &Snapshot, b: &Snapshot, d: &Data) {
                 let ra = export_ncdu(a, &row.path, &mut x, &opts);
                 let rb = export_ncdu(b, &row.path, &mut y, &opts);
                 same_debug("export stats", ra, rb);
-                assert_eq!(x, y, "{} {lossy} {max_depth:?}", row.id);
+                if strict {
+                    assert_eq!(x, y, "{} {lossy} {max_depth:?}", row.id);
+                } else {
+                    assert_eq!(
+                        canonical(&x),
+                        canonical(&y),
+                        "{} {lossy} {max_depth:?}",
+                        row.id
+                    );
+                }
             }
         }
     }
@@ -1823,15 +1924,12 @@ fn corrupt_file_chunks_are_invalid_not_panics() {
     ];
     for sql in tampers {
         let (d, _dir, _file, snap) = damaged(sql);
+        // Both queries read the whole file table from the root: each must fail.
         let results = exercise_files(&snap, &d);
-        assert!(all_invalid_or_ok(&results) > 0, "{sql}");
+        assert_eq!(all_invalid_or_ok(&results), results.len(), "{sql}");
         // A cold reader gives the same verdicts as one warmed by earlier queries.
         let again = exercise_files(&snap, &d);
-        assert_eq!(
-            all_invalid_or_ok(&results),
-            all_invalid_or_ok(&again),
-            "{sql}"
-        );
+        assert_eq!(all_invalid_or_ok(&again), again.len(), "{sql}");
     }
 }
 
@@ -1928,25 +2026,26 @@ fn link_instance_lookup_touches_only_its_chunks() {
 
 #[test]
 fn corrupt_link_instance_chunks_are_invalid_not_panics() {
+    // (damage, first row of the chunk it makes unreadable)
     let tampers = [
-        "UPDATE li_chunks SET data=x'00' WHERE first_row=0;",
-        "UPDATE li_chunks SET data=x'0101' WHERE first_row=3;",
-        "UPDATE li_chunks SET data=zeroblob(67108864) WHERE first_row=0;",
-        "UPDATE li_chunks SET data=CAST(zeroblob(67108864) AS TEXT) WHERE first_row=0;",
-        "UPDATE li_chunks SET data='text' WHERE first_row=0;",
-        "UPDATE li_chunks SET data=12 WHERE first_row=3;",
-        "UPDATE li_chunks SET last_row='x' WHERE first_row=3;",
-        "UPDATE li_chunks SET last_row=-1 WHERE first_row=0;",
-        "UPDATE li_chunks SET first_ino='x' WHERE first_row=3;",
-        "UPDATE li_chunks SET first_ino=first_ino+1 WHERE first_row=0;",
-        "UPDATE li_chunks SET last_ino=last_ino+1 WHERE first_row=0;",
-        "UPDATE li_chunks SET last_ino=first_ino-1 WHERE first_row=3;",
-        "UPDATE li_chunks SET first_ino=0, last_ino=0 WHERE first_row=9;",
-        "DELETE FROM li_chunks WHERE first_row=3;",
-        "INSERT INTO li_chunks(first_row,last_row,first_ino,last_ino,data) SELECT 1,3,first_ino,last_ino,data FROM li_chunks WHERE first_row=3;",
-        "UPDATE li_chunks SET last_row=last_row+1 WHERE first_row=0;",
+        ("UPDATE li_chunks SET data=x'00' WHERE first_row=0;", Some(0)),
+        ("UPDATE li_chunks SET data=x'0101' WHERE first_row=3;", Some(3)),
+        ("UPDATE li_chunks SET data=zeroblob(67108864) WHERE first_row=0;", Some(0)),
+        ("UPDATE li_chunks SET data=CAST(zeroblob(67108864) AS TEXT) WHERE first_row=0;", Some(0)),
+        ("UPDATE li_chunks SET data='text' WHERE first_row=0;", Some(0)),
+        ("UPDATE li_chunks SET data=12 WHERE first_row=3;", Some(3)),
+        ("UPDATE li_chunks SET last_row='x' WHERE first_row=3;", Some(3)),
+        ("UPDATE li_chunks SET last_row=-1 WHERE first_row=0;", Some(0)),
+        ("UPDATE li_chunks SET first_ino='x' WHERE first_row=3;", Some(3)),
+        ("UPDATE li_chunks SET first_ino=first_ino+1 WHERE first_row=0;", Some(0)),
+        ("UPDATE li_chunks SET last_ino=last_ino+1 WHERE first_row=0;", Some(0)),
+        ("UPDATE li_chunks SET last_ino=first_ino-1 WHERE first_row=3;", Some(3)),
+        ("UPDATE li_chunks SET first_ino=0, last_ino=0 WHERE first_row=9;", Some(9)),
+        ("DELETE FROM li_chunks WHERE first_row=3;", Some(3)),
+        ("INSERT INTO li_chunks(first_row,last_row,first_ino,last_ino,data) SELECT 1,3,first_ino,last_ino,data FROM li_chunks WHERE first_row=3;", None),
+        ("UPDATE li_chunks SET last_row=last_row+1 WHERE first_row=0;", Some(0)),
     ];
-    for sql in tampers {
+    for (sql, chunk) in tampers {
         let (d, _dir, _file, snap) = damaged(sql);
         let results = exercise_links(&snap, &d);
         assert!(all_invalid_or_ok(&results) > 0, "{sql}");
@@ -1955,6 +2054,39 @@ fn corrupt_link_instance_chunks_are_invalid_not_panics() {
             all_invalid_or_ok(&results),
             all_invalid_or_ok(&again),
             "{sql}"
+        );
+        // Every lookup that reads the damaged chunk must fail, per query: the full
+        // listing for any inode with a row in it, and the pages (which start at the
+        // inode's first row) for inodes that start in it.
+        let Some(first) = chunk else { continue };
+        let mut checked = 0;
+        for &ino in &d.sets.iter().map(|s| s.ino).collect::<Vec<_>>() {
+            let rows: Vec<usize> = (0..d.inst.len())
+                .filter(|&i| d.inst[i].ino == ino)
+                .collect();
+            if !rows.iter().any(|&i| i / 3 == first / 3) {
+                continue;
+            }
+            checked += 1;
+            let r = snap.link_instances(ino);
+            assert!(
+                matches!(r, Err(StoreError::Invalid(_))),
+                "{sql} {ino}: {r:?}"
+            );
+            if rows[0] / 3 == first / 3 {
+                assert!(
+                    is_invalid(snap.link_instances_page(ino, None, false, 5)),
+                    "{sql} {ino} forward"
+                );
+                assert!(
+                    is_invalid(snap.link_instances_page(ino, None, true, 5)),
+                    "{sql} {ino} reverse"
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "{sql}: no inode has a row in the damaged chunk"
         );
     }
 }
@@ -2032,4 +2164,239 @@ fn more_than_a_million_instances_of_one_inode_exceed_the_result_cap_like_v1() {
         p.one.link_instances_page(42, None, true, 1_000_000),
         p.two.link_instances_page(42, None, true, 1_000_000),
     );
+}
+
+// ---- SNAP-queries-fix: review8 regressions ----
+
+/// Applies `sql` to the file behind `snap_dir` (one `.db` inside) and reopens it.
+fn tamper_in_place(dir: &tempfile::TempDir, sql: &str) -> Snapshot {
+    let file = std::fs::read_dir(dir.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let conn = rusqlite::Connection::open(&file).unwrap();
+    conn.execute_batch(sql).unwrap();
+    drop(conn);
+    Snapshot::open(&file).unwrap()
+}
+
+#[test]
+fn b1_swapped_link_chunks_are_invalid_for_every_query() {
+    let mut d = data(tree(6, 4), 11);
+    d.sets.clear();
+    d.inst = ["a", "z"]
+        .iter()
+        .map(|n| LinkInstanceRow {
+            ino: 42,
+            dir_id: 0,
+            name: Some(rname(n.as_bytes())),
+        })
+        .collect();
+    d.inos = vec![42];
+    let p = pair_data(
+        &d,
+        Shape {
+            plain: 2,
+            hash: 64,
+            dirs: 3,
+            files: 3,
+            li: 1,
+        },
+    );
+    let Pair {
+        _one,
+        _two,
+        one,
+        two,
+    } = p;
+    // Sound layout first: the pages walk both chunks.
+    assert_eq!(two.link_instances(42).unwrap().len(), 2);
+    drop((one, two));
+    let snap = tamper_in_place(
+        &_two,
+        "CREATE TEMP TABLE swap AS SELECT first_row,data FROM li_chunks; UPDATE li_chunks SET data=(SELECT s.data FROM swap s WHERE s.first_row=1-li_chunks.first_row);",
+    );
+    let z = LinkInstanceRow {
+        ino: 42,
+        dir_id: 0,
+        name: Some(rname(b"z")),
+    };
+    assert!(is_invalid(snap.link_instances(42)));
+    assert!(is_invalid(snap.link_instances_page(42, None, false, 1)));
+    assert!(is_invalid(snap.link_instances_page(42, None, false, 10)));
+    assert!(is_invalid(snap.link_instances_page(42, None, true, 10)));
+    // The cursor the first forward page of a sound snapshot would return: (rowid 1, z).
+    assert!(is_invalid(snap.link_instances_page(
+        42,
+        Some(&(1, z.clone())),
+        true,
+        10
+    )));
+    assert!(is_invalid(snap.link_instances_page(
+        42,
+        Some(&(1, z)),
+        false,
+        10
+    )));
+}
+
+#[test]
+fn b2_missing_first_or_last_file_chunk_is_invalid_per_query() {
+    let opts = tidemark_store::NcduOptions {
+        utf8_lossy: true,
+        max_depth: None,
+    };
+    for sql in [
+        "DELETE FROM file_chunks WHERE first_row=(SELECT MAX(first_row) FROM file_chunks);",
+        "DELETE FROM file_chunks WHERE first_row=0;",
+        "DELETE FROM file_chunks WHERE first_row=(SELECT MAX(first_row) FROM file_chunks) AND first_row>0;",
+    ] {
+        let (d, _dir, _file, snap) = damaged(sql);
+        let last_dir = d.files.last().unwrap().dir_id;
+        let first_dir = d.files.first().unwrap().dir_id;
+        let default = FileFilter::default();
+        let sizes = FileFilter {
+            min_size: Some(1),
+            ..Default::default()
+        };
+        assert!(is_invalid(snap.subtree_files(0, &default, 100)), "{sql}");
+        assert!(is_invalid(snap.subtree_files(0, &sizes, 3)), "{sql}");
+        assert!(
+            is_invalid(tidemark_store::export_ncdu(
+                &snap,
+                &d.rows[0].path,
+                &mut Vec::new(),
+                &opts
+            )),
+            "{sql}"
+        );
+        // A subtree that owns notable files of a missing chunk fails too.
+        let hit = if sql.contains("first_row=0") && !sql.contains("MAX") {
+            first_dir
+        } else {
+            last_dir
+        };
+        assert!(is_invalid(snap.subtree_files(hit, &default, 100)), "{sql}");
+    }
+}
+
+/// Files with ids assigned like the scanner: `(disk DESC, dir_id, ino)`.
+fn scanner_style(mut d: Data) -> Data {
+    d.files.clear();
+    for dir in 0..d.rows.len().min(4) as u32 {
+        // Name order is the reverse of disk order, ties broken by inode.
+        for (i, (name, disk)) in [
+            (&b"a"[..], 4096u64),
+            (b"m", 8192),
+            (b"z", 8192),
+            (b"zz", 100),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            d.files.push(FileRow {
+                id: 0,
+                dir_id: dir,
+                name: Some(rname(name)),
+                ino: 7000 + u64::from(dir) * 10 + i as u64,
+                disk,
+                apparent: disk - 1,
+                mtime: meta().started_at - 5,
+                nlink: 1,
+            });
+        }
+    }
+    d.files
+        .sort_by_key(|f| (std::cmp::Reverse(f.disk), f.dir_id, f.ino));
+    for (i, f) in d.files.iter_mut().enumerate() {
+        f.id = i as u32;
+    }
+    for r in &mut d.rows {
+        let mine: Vec<&FileRow> = d.files.iter().filter(|f| f.dir_id == r.id).collect();
+        r.own_files = mine.len() as u64;
+        r.own_charged = r.dir_disk + mine.iter().map(|f| f.disk).sum::<u64>();
+        r.own_apparent = r.dir_apparent + mine.iter().map(|f| f.apparent).sum::<u64>();
+    }
+    for i in 0..d.rows.len() {
+        let end = d.rows[i].subtree_end as usize;
+        d.rows[i].t_charged = d.rows[i..=end].iter().map(|r| r.own_charged).sum();
+    }
+    d
+}
+
+#[test]
+fn s1_ncdu_orders_notable_files_like_scanner_assigned_v1_ids() {
+    use tidemark_store::{export_ncdu, NcduOptions};
+    let d = scanner_style(data(tree(6, 4), 11));
+    for (plain, files) in [(2, 3), (0, 1), (4, 100)] {
+        let p = pair_data(
+            &d,
+            Shape {
+                plain,
+                hash: 64,
+                dirs: 3,
+                files,
+                li: 3,
+            },
+        );
+        compare_exports_with(&p.one, &p.two, &d, true);
+        let (mut one, mut two) = (Vec::new(), Vec::new());
+        let opts = NcduOptions {
+            utf8_lossy: true,
+            max_depth: Some(0),
+        };
+        export_ncdu(&p.one, &d.rows[0].path, &mut one, &opts).unwrap();
+        export_ncdu(&p.two, &d.rows[0].path, &mut two, &opts).unwrap();
+        assert_eq!(one, two);
+        let text = String::from_utf8(one).unwrap();
+        let pos = |n: &str| text.find(&format!("{{\"name\":\"{n}\"")).unwrap();
+        // (disk DESC, ino ASC): m and z (8192) before a (4096) before zz (100).
+        assert!(pos("m") < pos("z") && pos("z") < pos("a") && pos("a") < pos("zz"));
+    }
+}
+
+#[test]
+fn s2_malformed_plain_rows_are_invalid_in_v2() {
+    let d = data(tree(6, 4), 11);
+    let note = d.notes[0].dir_id;
+    type Query = Box<dyn Fn(&Snapshot) -> Result<(), StoreError>>;
+    let cases: [(&str, Query); 4] = [
+        (
+            "UPDATE skipped SET reason='bogus';",
+            Box::new(|s| s.skipped_under(0).map(|_| ())),
+        ),
+        (
+            "UPDATE errors SET op='bogus';",
+            Box::new(|s| s.errors_under(0, 100).map(|_| ())),
+        ),
+        (
+            "UPDATE annotations SET value=x'00';",
+            Box::new(move |s| s.annotations(note).map(|_| ())),
+        ),
+        (
+            "UPDATE link_sets SET complete=2;",
+            Box::new(|s| {
+                s.link_sets_under(0, &LinkFilter::default(), 100)
+                    .map(|_| ())
+            }),
+        ),
+    ];
+    for (sql, query) in cases {
+        let p = pair_data(
+            &d,
+            Shape {
+                plain: 2,
+                hash: 64,
+                dirs: 3,
+                files: 3,
+                li: 3,
+            },
+        );
+        let Pair { _one, _two, .. } = p;
+        let snap = tamper_in_place(&_two, sql);
+        let r = query(&snap);
+        assert!(matches!(r, Err(StoreError::Invalid(_))), "{sql}: {r:?}");
+    }
 }
