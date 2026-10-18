@@ -41,7 +41,7 @@
 
 ## Results (foreground, uid 0, offline)
 
-`cargo fmt --check` ok; clippy `--workspace --all-targets -D warnings` clean; store: `--lib` 58 passed, `export_sqlite` 4, `cold` 25, `writer_v2` 14, `storage` 33 (+ `reader_v2` 1 passed in the earlier combined run); cli: `snapshots_export` 3, `surface` 13, `snapshots_cold` 3; `--features privileged --tests` builds; `RUSTDOCFLAGS='-D warnings' cargo doc` clean. Not run: `cargo test --workspace`, `tools/ci.sh` (per task).
+`cargo fmt --check` ok; clippy `--workspace --all-targets -D warnings` clean; store: `--lib` 58 passed, `export_sqlite` 4, `cold` 25, `writer_v2` 14, `reader_v2` 45, `storage` 33; cli: `snapshots_export` 3, `surface` 13, `snapshots_cold` 3; `--features privileged --tests` builds; `RUSTDOCFLAGS='-D warnings' cargo doc` clean. Not run: `cargo test --workspace`, `tools/ci.sh` (per task).
 
 ## Docs
 
