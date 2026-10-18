@@ -507,6 +507,47 @@ pub struct DirView<'a> {
     /// Number of notable-file rows.
     pub file_count: u32,
 }
+impl ChunkDir {
+    /// Borrow the row as a [`DirView`] (no allocation).
+    pub fn view(&self) -> DirView<'_> {
+        DirView {
+            name: self.name.as_slice(),
+            id: self.id,
+            parent_id: self.parent_id,
+            subtree_end: self.subtree_end,
+            depth: self.depth,
+            ino: self.ino,
+            mtime: self.mtime,
+            dir_disk: self.dir_disk,
+            dir_apparent: self.dir_apparent,
+            projid: self.projid,
+            entries: self.entries,
+            errors: self.errors,
+            own_files: self.own_files,
+            own_symlinks: self.own_symlinks,
+            own_charged: self.own_charged,
+            own_apparent: self.own_apparent,
+            t_dirs: self.t_dirs,
+            t_files: self.t_files,
+            t_inodes: self.t_inodes,
+            t_disk: self.t_disk,
+            t_apparent: self.t_apparent,
+            t_charged: self.t_charged,
+            t_reclaimable: self.t_reclaimable,
+            t_errors: self.t_errors,
+            age0: self.age0,
+            age1: self.age1,
+            age2: self.age2,
+            age3: self.age3,
+            age4: self.age4,
+            age5: self.age5,
+            newest_mtime: self.newest_mtime,
+            max_entries: self.max_entries,
+            file_lo: self.file_lo,
+            file_count: self.file_count,
+        }
+    }
+}
 impl DirView<'_> {
     /// Materialise the row (one allocation, for the name).
     pub fn to_owned(&self) -> ChunkDir {
