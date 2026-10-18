@@ -200,3 +200,110 @@ fn export_of_a_cold_snapshot_cleans_up_its_inflated_copy() {
     assert_eq!(leftovers, 0);
     assert!(cold.exists());
 }
+
+#[test]
+fn s1_json_output_after_publishing_a_relative_destination() {
+    let (root, state, out, id) = fixture();
+    let assert = command(state.path(), true)
+        .current_dir(out.path())
+        .args(["snapshots", "export", "--sqlite", &id, "relative.db"])
+        .assert()
+        .success();
+    let value: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(value["data"]["exported"], id.as_str());
+    check_export(&out.path().join("relative.db"), root.path());
+}
+
+#[test]
+fn s6_space_floor_refusal_exits_5() {
+    let (_root, state, out, id) = fixture();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    let hot = catalog.get(&id).unwrap().unwrap().file.unwrap();
+    let cold = tidemark_store::cold::compress_snapshot(&hot, 1, &|| false).unwrap();
+    catalog.point_to_cold(&id, &cold).unwrap();
+    std::fs::remove_file(&hot).unwrap();
+    drop(catalog);
+    config_support::direct_config(state.path(), "[retention]\nmin_free_pct = 100.0\n");
+    command(state.path(), false)
+        .args(["snapshots", "export", "--sqlite", &id])
+        .arg(out.path().join("never.db"))
+        .assert()
+        .code(5);
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn s2_termination_signals_leave_no_temporary_copies() {
+    for signal in ["TERM", "INT", "HUP"] {
+        let root = test_support::private_tempdir().unwrap();
+        for i in 0..6000 {
+            std::fs::create_dir_all(root.path().join(format!("d{i:05}/sub"))).unwrap();
+        }
+        let state = test_support::private_tempdir().unwrap();
+        let out = test_support::private_tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.general.state_dir = state.path().to_owned();
+        scan(&cfg, root.path(), 1_700_000_000);
+        config_support::direct_config(state.path(), "");
+        let list = command(state.path(), true)
+            .args(["snapshots", "list"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let list: serde_json::Value = serde_json::from_slice(&list).unwrap();
+        let id = list["data"][0]["scan_id"].as_str().unwrap().to_owned();
+        let catalog = Catalog::open(state.path(), true).unwrap();
+        let hot = catalog.get(&id).unwrap().unwrap().file.unwrap();
+        let cold = tidemark_store::cold::compress_snapshot(&hot, 1, &|| false).unwrap();
+        catalog.point_to_cold(&id, &cold).unwrap();
+        std::fs::remove_file(&hot).unwrap();
+        drop(catalog);
+
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tidemark"))
+            .arg("--config")
+            .arg(state.path().join("direct-config.toml"))
+            .arg("--state-dir")
+            .arg(state.path())
+            .args(["snapshots", "export", "--sqlite", &id])
+            .arg(out.path().join("o.db"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Signal once the staging copy exists (or the export already finished).
+        let started = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() && started.elapsed().as_secs() < 20 {
+            let staging = std::fs::read_dir(out.path()).unwrap().any(|e| {
+                e.unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tidemark-export-")
+            });
+            if staging {
+                let status = std::process::Command::new("kill")
+                    .arg(format!("-{signal}"))
+                    .arg(child.id().to_string())
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let status = child.wait().unwrap();
+        // Completed before the signal, or stopped cleanly with the interrupted status.
+        assert!(
+            status.success() || status.code() == Some(3),
+            "{signal}: {status:?}"
+        );
+        for entry in std::fs::read_dir(out.path()).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert_eq!(name, "o.db", "{signal}: leftover {name:?}");
+        }
+        let inflate = cold.parent().unwrap().join(".inflate");
+        let leftovers = std::fs::read_dir(inflate).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(leftovers, 0, "{signal}: inflate leftovers");
+    }
+}

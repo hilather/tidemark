@@ -440,11 +440,7 @@ impl Snapshot {
     ) -> Result<()> {
         match &self.v2 {
             Some(backend) => backend.for_each_link_instance(self, &mut |r| {
-                visit(v2::instance_row_of(
-                    r.ino,
-                    r.dir_id,
-                    r.name.as_deref(),
-                )?)
+                visit(v2::instance_row_of(r.ino, r.dir_id, r.name.as_deref())?)
             }),
             None => Err(StoreError::Invalid("not a v2 snapshot".into())),
         }

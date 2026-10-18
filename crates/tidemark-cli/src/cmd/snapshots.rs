@@ -211,14 +211,24 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 .file
                 .as_ref()
                 .ok_or_else(|| crate::CliError::Precondition("snapshot has no file".into()))?;
+            // Resolve once: the published path is the one printed, with no second lookup.
+            let target = &std::path::absolute(target)?;
             refuse_inside_state(target, state)?;
+            // SIGINT/SIGTERM/SIGHUP only set a flag; the export stops between batches and
+            // unwinds, so its staging copy and the cold-inflate leaf are removed.
+            let interrupt = ExportInterrupt::new()?;
             // Cold snapshots are inflated by the reader to a private leaf under
             // `.inflate` and removed when it drops.
             let snapshot = open_snapshot(context, file)
-                .with_context(|| format!("open snapshot: {}", super::display_path(file)))?;
-            let stats = tidemark_store::export_sqlite(&snapshot, target)
                 .map_err(export_error)
-                .with_context(|| format!("export snapshot: {}", super::display_path(target)))?;
+                .with_context(|| format!("open snapshot: {}", super::display_path(file)))?;
+            let stats = tidemark_store::export_sqlite::export_sqlite_cancellable(
+                &snapshot,
+                target,
+                &|| interrupt.flag.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .map_err(export_error)
+            .with_context(|| format!("export snapshot: {}", super::display_path(target)))?;
             if context.json {
                 crate::render::json(
                     "tidemark.snapshots.v1",
@@ -386,11 +396,48 @@ fn export_error(error: tidemark_store::StoreError) -> anyhow::Error {
             crate::CliError::Precondition(format!("no space for export: {reason}")).into()
         }
         StoreError::Io(io)
-            if io.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error()) =>
+            if matches!(
+                io.raw_os_error(),
+                Some(n) if n == rustix::io::Errno::NOSPC.raw_os_error()
+                    || n == rustix::io::Errno::DQUOT.raw_os_error()
+            ) =>
         {
             crate::CliError::Precondition(format!("no space for export: {io}")).into()
         }
+        StoreError::Io(io) if io.kind() == std::io::ErrorKind::Interrupted => {
+            crate::CliError::Partial("export interrupted".into()).into()
+        }
         other => other.into(),
+    }
+}
+/// Termination signals during an export set a flag instead of killing the process.
+struct ExportInterrupt {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ids: Vec<signal_hook::SigId>,
+}
+impl ExportInterrupt {
+    fn new() -> anyhow::Result<Self> {
+        let mut guard = Self {
+            flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ids: Vec::with_capacity(3),
+        };
+        for signal in [
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+            signal_hook::consts::SIGHUP,
+        ] {
+            guard
+                .ids
+                .push(signal_hook::flag::register(signal, guard.flag.clone())?);
+        }
+        Ok(guard)
+    }
+}
+impl Drop for ExportInterrupt {
+    fn drop(&mut self) {
+        for id in self.ids.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
     }
 }
 fn require_absent_daemon(context: &crate::Context) -> anyhow::Result<()> {

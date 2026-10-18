@@ -475,11 +475,17 @@ fn s5_export_is_not_limited_by_the_query_cap() {
     w.put_link_instances(&batch).unwrap();
     let file = w.finish(&m).unwrap();
     let snap = Snapshot::open(&file).unwrap();
-    assert!(snap.link_instances(3000).is_err(), "public query stays capped");
+    assert!(
+        snap.link_instances(3000).is_err(),
+        "public query stays capped"
+    );
     let target = out.path().join("o.db");
     let stats = export_sqlite(&snap, &target).unwrap();
     assert_eq!(stats.link_instances, u64::from(N));
-    assert_eq!(rows(&target, "SELECT count(*) FROM link_instances"), i64::from(N));
+    assert_eq!(
+        rows(&target, "SELECT count(*) FROM link_instances"),
+        i64::from(N)
+    );
 }
 
 #[test]

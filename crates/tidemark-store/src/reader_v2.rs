@@ -1795,7 +1795,11 @@ impl Ord for SharedEntry {
         self.rank().cmp(&other.rank())
     }
 }
-pub(super) fn instance_row_of(ino: u64, dir_id: u32, name: Option<&[u8]>) -> Result<LinkInstanceRow> {
+pub(super) fn instance_row_of(
+    ino: u64,
+    dir_id: u32,
+    name: Option<&[u8]>,
+) -> Result<LinkInstanceRow> {
     Ok(LinkInstanceRow {
         ino,
         dir_id,
