@@ -119,6 +119,7 @@ fn check_neighbours(conn: &Connection, c: ChunkRef) -> Result<()> {
 const MAX_PATH_BYTES: usize = 256 * 1024 * 1024;
 const SHALLOW_COLUMNS: &str = "id,parent_id,subtree_end,depth,name,ino,mtime,dir_disk,dir_apparent,projid,entries,errors,own_files,own_symlinks,own_charged,own_apparent,t_dirs,t_files,t_inodes,t_disk,t_apparent,t_charged,t_reclaimable,t_errors,age0,age1,age2,age3,age4,age5,newest_mtime,max_entries";
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
+type Held = Arc<Vec<ChunkDir>>;
 struct Cached {
     first: u32,
     last: u32,
@@ -493,9 +494,18 @@ impl Backend {
         }
     }
     pub(super) fn raw(&self, snap: &Snapshot, id: u32) -> Result<ChunkDir> {
+        Ok(self.raw_held(snap, id)?.0)
+    }
+    /// `raw`, also returning the decoded chunk so a caller can keep it alive
+    /// past LRU eviction.
+    fn raw_held(&self, snap: &Snapshot, id: u32) -> Result<(ChunkDir, Held)> {
         let rows = self.chunk(snap, id)?;
         let first = rows.first().ok_or_else(invalid)?.id;
-        rows.get((id - first) as usize).cloned().ok_or_else(invalid)
+        let row = rows
+            .get((id - first) as usize)
+            .cloned()
+            .ok_or_else(invalid)?;
+        Ok((row, rows))
     }
     fn path(&self, snap: &Snapshot, row: &ChunkDir) -> Result<RawPath> {
         let mut names = Vec::new();
@@ -1011,8 +1021,8 @@ impl Backend {
     }
     /// The requested root from its directory chunk (the source `dir(id)` uses).
     /// A shallow copy, when present, must agree on id, parent, depth and span.
-    fn authoritative_root(&self, snap: &Snapshot, id: u32) -> Result<ChunkDir> {
-        let root = self.raw(snap, id)?;
+    fn authoritative_root(&self, snap: &Snapshot, id: u32) -> Result<(ChunkDir, Held)> {
+        let (root, held) = self.raw_held(snap, id)?;
         if let Some(shallow) = self.shallow_row(snap, id)? {
             if shallow.id != root.id
                 || shallow.parent_id != root.parent_id
@@ -1028,7 +1038,7 @@ impl Backend {
                 RawName::new(shallow.name).map_err(|_| invalid())?;
             }
         }
-        Ok(root)
+        Ok((root, held))
     }
     /// Streams every row of `lo..=hi` in preorder straight from the codec:
     /// nothing is cached or materialised, chunk coordinates are checked as in
@@ -1037,6 +1047,7 @@ impl Backend {
     fn scan(
         &self,
         snap: &Snapshot,
+        held: &Held,
         lo: u32,
         hi: u32,
         mut visit: impl FnMut(&chunk::DirView<'_>) -> Result<()>,
@@ -1056,9 +1067,19 @@ impl Backend {
             }
             seen = Some(c);
             let mut count = 0u32;
-            // A chunk the LRU already holds was fully validated when decoded:
+            // A chunk the caller holds (the requested root's, kept across the
+            // ancestor climb) or the LRU already holds was fully validated when decoded:
             // reuse it (lookup only; streamed chunks are never inserted).
-            if let Some(rows) = self.cached(c.first, c.last) {
+            let held_hit = held
+                .first()
+                .zip(held.last())
+                .is_some_and(|(a, b)| a.id == c.first && b.id == c.last);
+            let hit = if held_hit {
+                Some(held.clone())
+            } else {
+                self.cached(c.first, c.last)
+            };
+            if let Some(rows) = hit {
                 for r in rows.iter() {
                     count = count.checked_add(1).ok_or_else(invalid)?;
                     if r.id >= lo && r.id <= hi {
@@ -1099,7 +1120,7 @@ impl Backend {
         sort: SortKey,
         limit: usize,
     ) -> Result<Vec<DirRow>> {
-        let root = self.authoritative_root(snap, id)?;
+        let (root, held) = self.authoritative_root(snap, id)?;
         let max = u64::from(root.depth) + u64::from(depth);
         let mut top = TopN::new(limit, Tie::Name)?;
         let base = self.path(snap, &root)?;
@@ -1129,7 +1150,7 @@ impl Backend {
                 }
             }
         } else {
-            self.scan(snap, id, root.subtree_end, |v| {
+            self.scan(snap, &held, id, root.subtree_end, |v| {
                 if u64::from(v.depth) > max {
                     return Ok(());
                 }
@@ -1157,7 +1178,7 @@ impl Backend {
         min: u32,
         limit: usize,
     ) -> Result<Vec<DirRow>> {
-        let root = self.raw(snap, id)?;
+        let (root, held) = self.raw_held(snap, id)?;
         let mut top = TopN::new(limit, Tie::Name)?;
         // Coordinator decision: validating the requested root (its name and
         // ancestry, via the climb in `path`) wins over the empty-result work
@@ -1168,7 +1189,7 @@ impl Backend {
         let base = self.path(snap, &root)?;
         let rel_root = RawPath::new(b"/".to_vec()).map_err(|_| invalid())?;
         let mut walk = Walk::new(id, root.subtree_end, u64::MAX, &rel_root);
-        self.scan(snap, id, root.subtree_end, |v| {
+        self.scan(snap, &held, id, root.subtree_end, |v| {
             let rel = walk.step(v.id, v.parent_id, v.subtree_end, v.depth, v.name)?;
             if v.entries < min {
                 return Ok(());
@@ -1252,7 +1273,7 @@ impl Backend {
                 "metrics candidate limit exceeds 1,000,000-row query cap".into(),
             ));
         }
-        let root = self.authoritative_root(snap, 0)?;
+        let (root, held) = self.authoritative_root(snap, 0)?;
         let base = self.path(snap, &root)?;
         let mut count = 0u64;
         let mut tops = [
@@ -1284,7 +1305,7 @@ impl Backend {
             }
         } else {
             // One pass feeds both rankings.
-            self.scan(snap, 0, root.subtree_end, |v| {
+            self.scan(snap, &held, 0, root.subtree_end, |v| {
                 if v.depth > depth {
                     return Ok(());
                 }
@@ -3166,6 +3187,58 @@ mod child_cursor_tests {
                 assert!(fresh.wide_dirs(leaf, 2, 1).unwrap().is_empty());
                 assert!(total(&fresh) <= bound, "wide {leaf}: {}", total(&fresh));
             }
+        }
+    }
+
+    fn chain_rows(links: u32) -> Vec<DirRow> {
+        let mut path = RawPath::new(b"/r".to_vec()).unwrap();
+        let mut rows = vec![row(0, None, 0, b"/r", &path, links)];
+        for id in 1..=links {
+            let name = format!("c{id}").into_bytes();
+            path = path.join(&RawName::new(name.clone()).unwrap());
+            rows.push(row(id, Some(id - 1), id, &name, &path, links));
+        }
+        rows
+    }
+    /// Depth-eight chain of final children `z`, each ancestor preceded by 4,095 leaves.
+    fn leafy_chain_rows() -> Vec<DirRow> {
+        let mut path = RawPath::new(b"/r".to_vec()).unwrap();
+        let end = 8 * 4096;
+        let mut rows = vec![row(0, None, 0, b"/r", &path, end)];
+        for level in 0..8u32 {
+            let parent = level * 4096;
+            for i in 0..4095u32 {
+                let name = format!("a{i:04}").into_bytes();
+                let p = path.join(&RawName::new(name.clone()).unwrap());
+                let id = parent + 1 + i;
+                rows.push(row(id, Some(parent), level + 1, &name, &p, id));
+            }
+            path = path.join(&RawName::new(b"z".to_vec()).unwrap());
+            let id = parent + 4096;
+            rows.push(row(id, Some(parent), level + 1, b"z", &path, end));
+        }
+        rows
+    }
+
+    #[test]
+    fn wide_dirs_keeps_the_requested_chunk_across_root_validation() {
+        let cases = [
+            (chain_rows(32), 32, 1, 33u64),
+            (chain_rows(33), 33, 1, 34),
+            (leafy_chain_rows(), 32768, 2, 9),
+        ];
+        for (rows, id, plain, bound) in cases {
+            let chunk_dirs = if rows.len() > 100 { 4096 } else { 1 };
+            let f = fixture(rows, plain, chunk_dirs);
+            let fresh = Snapshot::open(&f.v2.file).unwrap();
+            let got = fresh.wide_dirs(id, 0, 1).unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{:?}", f.v1.wide_dirs(id, 0, 1).unwrap())
+            );
+            let work = decodes(&fresh) + scanned(&fresh);
+            assert!(work <= bound, "id {id}: {work} > {bound}");
         }
     }
 
