@@ -3,7 +3,7 @@
 
 use crate::{reader::Snapshot, StoreError};
 use std::io::Write;
-use tidemark_core::path::RawPath;
+use tidemark_core::path::{RawName, RawPath};
 
 /// Name encoding and relative directory depth for an ncdu export.
 pub struct NcduOptions {
@@ -34,7 +34,10 @@ const FILE_PAGE_ROWS: u32 = 256;
 ///
 /// Depth-limited descendants are represented by an aggregate file so the disk
 /// total remains additive. Missing bulk-mode names remain in the aggregate.
-/// Notable files are streamed one row at a time from a per-directory SQL cursor.
+/// v1 notable files are streamed one row at a time from a per-directory SQL cursor.
+/// v2 holds one directory's single-link notable-file names at a time (compact tuples
+/// plus one name arena, bounded by that directory's `file_count`, at most
+/// `max_notable`) to restore the scanner's `(disk DESC, ino)` order.
 pub fn export_ncdu(
     snap: &Snapshot,
     under: &RawPath,
@@ -44,30 +47,30 @@ pub fn export_ncdu(
     let root = snap
         .dir_by_path(under)?
         .ok_or_else(|| StoreError::Invalid("export root absent from snapshot".into()))?;
-    let mut files = snap.v1_conn()?.prepare(
+    // Version 1 pages notable files by stored id; version 2 streams the
+    // directory's contiguous file rows (stored in name order) from its chunks.
+    let files_sql = (!snap.is_v2()).then_some(
         // Preserve the existing source-extracted query-plan test marker:
         // let mut files = snap.conn().prepare(
         "SELECT name, apparent, disk, ino, id FROM files
          WHERE dir_id = ?1 AND nlink = 1 AND name IS NOT NULL
            AND id > ?2
          ORDER BY id LIMIT ?3",
-    )?;
+    );
+    let mut files = files_sql
+        .map(|sql| -> Result<_, StoreError> { Ok(snap.v1_conn()?.prepare(sql)?) })
+        .transpose()?;
     let metadata = serde_json::json!({"progname":"tidemark", "progver":snap.meta().tool_version,
         "timestamp":snap.meta().started_at, "note":"Sizes are the charged (additive) view."});
     write!(out, "[1,2,{metadata},")?;
     let mut stack: Vec<u32> = Vec::new();
     let mut stats = ExportStats::default();
-    let mut directories = snap
-        .v1_conn()?
-        .prepare("SELECT * FROM dirs WHERE id BETWEEN ?1 AND ?2 ORDER BY id")?;
-    let mut directory_rows = directories.query(rusqlite::params![root.id, root.subtree_end])?;
     let mut next_id = root.id;
-    while let Some(row) = directory_rows.next()? {
-        let id: u32 = row.get(0)?;
-        if id < next_id {
-            continue;
-        }
-        let dir = crate::reader::dir_row(row)?;
+    loop {
+        let Some(dir) = snap.dir_lite(next_id)? else {
+            break;
+        };
+        let id = dir.id;
         while stack.last().is_some_and(|end| *end < id) {
             out.write_all(b"]")?;
             stack.pop();
@@ -106,22 +109,8 @@ pub fn export_ncdu(
             .checked_sub(dir.dir_apparent)
             .ok_or_else(|| StoreError::Invalid("own_apparent below dir_apparent".into()))?;
         let mut count = dir.own_files;
-        // IDs are nonnegative; -1 includes id zero on the first page.
-        let mut after = -1i64;
-        loop {
-            let mut rows = files.query(rusqlite::params![id, after, FILE_PAGE_ROWS])?;
-            let mut emitted = 0;
-            while let Some(file) = rows.next()? {
-                let name = file.get_ref(0)?.as_blob().map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Blob,
-                        Box::new(error),
-                    )
-                })?;
-                let file_apparent = crate::error::read_u64(file, 1)?;
-                let file_disk = crate::error::read_u64(file, 2)?;
-                let ino = crate::error::read_u64(file, 3)?;
+        let mut emit =
+            |name: &[u8], file_apparent: u64, file_disk: u64, ino: u64| -> Result<(), StoreError> {
                 disk = disk
                     .checked_sub(file_disk)
                     .ok_or_else(|| StoreError::Invalid("notable disk exceeds own charge".into()))?;
@@ -135,12 +124,59 @@ pub fn export_ncdu(
                 info(out, name, file_apparent, file_disk, ino, None, opts)?;
                 stats.files += 1;
                 add_disk(&mut stats, file_disk)?;
-                emitted += 1;
-                // Retain only the final primary key, never a page or name buffer.
-                after = file.get(4)?;
+                Ok(())
+            };
+        if let Some(files) = files.as_mut() {
+            // IDs are nonnegative; -1 includes id zero on the first page.
+            let mut after = -1i64;
+            loop {
+                let mut rows = files.query(rusqlite::params![id, after, FILE_PAGE_ROWS])?;
+                let mut emitted = 0;
+                while let Some(file) = rows.next()? {
+                    let name = file.get_ref(0)?.as_blob().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })?;
+                    emit(
+                        name,
+                        crate::error::read_u64(file, 1)?,
+                        crate::error::read_u64(file, 2)?,
+                        crate::error::read_u64(file, 3)?,
+                    )?;
+                    emitted += 1;
+                    // Retain only the final primary key, never a page or name buffer.
+                    after = file.get(4)?;
+                }
+                if emitted < FILE_PAGE_ROWS {
+                    break;
+                }
             }
-            if emitted < FILE_PAGE_ROWS {
-                break;
+        } else {
+            // v1 emits by `files.id`, which the scanner assigns in `(disk DESC, dir_id, ino)`
+            // order, i.e. `(disk DESC, ino)` inside one directory. v2 stores name order, so
+            // re-sort this directory's single-link notable files. Memory is bounded by one
+            // directory: compact `(disk, ino, apparent, offset, len)` tuples plus one shared
+            // name arena, at most `file_count` (<= `max_notable`) entries, freed per directory.
+            let mut notable: Vec<(u64, u64, u64, usize, usize)> = Vec::new();
+            let mut arena: Vec<u8> = Vec::new();
+            snap.v2_dir_files(id, &mut |file| {
+                if file.nlink == 1 {
+                    if let Some(name) = &file.name {
+                        if RawName::new(name.clone()).is_err() {
+                            return Err(StoreError::Invalid("invalid v2 file name".into()));
+                        }
+                        notable.push((file.disk, file.ino, file.apparent, arena.len(), name.len()));
+                        arena.extend_from_slice(name);
+                    }
+                }
+                Ok(())
+            })?;
+            notable.sort_by_key(|&(disk, ino, ..)| (std::cmp::Reverse(disk), ino));
+            for &(disk, ino, apparent, offset, len) in &notable {
+                emit(&arena[offset..offset + len], apparent, disk, ino)?;
             }
         }
         out.write_all(b",")?;
@@ -196,18 +232,8 @@ pub fn export_ncdu(
 }
 fn descendant_apparent(snap: &Snapshot, id: u32, end: u32) -> Result<u64, StoreError> {
     // Union t_apparent includes links charged at ancestors outside this subtree.
-    // Stream additive charges instead; checked Rust arithmetic avoids SQL SUM overflow.
-    let mut statement = snap
-        .v1_conn()?
-        .prepare("SELECT own_apparent FROM dirs WHERE id > ?1 AND id <= ?2 ORDER BY id")?;
-    let mut rows = statement.query(rusqlite::params![id, end])?;
-    let mut total = 0u64;
-    while let Some(row) = rows.next()? {
-        total = total
-            .checked_add(crate::error::read_u64(row, 0)?)
-            .ok_or_else(|| StoreError::Integer("descendant apparent total".into()))?;
-    }
-    Ok(total)
+    // Sum additive charges instead; checked Rust arithmetic avoids SQL SUM overflow.
+    snap.own_apparent_sum(id + 1, end) // id < end, so id + 1 cannot overflow
 }
 fn add_disk(stats: &mut ExportStats, disk: u64) -> Result<(), StoreError> {
     stats.disk_bytes = stats

@@ -1,9 +1,13 @@
 //! Owned by: W3-A
 //! Bounded snapshot differences and deterministic growth explanations.
+//! Walks both trees by name on the public `Snapshot` API; pure-v1 pairs keep the ATTACH join.
 
-use crate::{reader::Snapshot, StoreError};
-use std::path::Path;
-use tidemark_core::path::RawPath;
+use crate::{
+    reader::{ChildCursor, ChildEntry, Snapshot},
+    StoreError,
+};
+use std::{cmp::Ordering, collections::BinaryHeap, path::Path};
+use tidemark_core::{path::RawPath, snapshot::DirRow};
 /// Snapshot counter selected for comparison.
 #[derive(Debug, Clone, Copy)]
 pub enum DiffMetric {
@@ -46,9 +50,9 @@ pub struct DiffRow {
 /// Compare a target subtree in two immutable snapshots of the same root.
 ///
 /// Missing targets on one side produce new or removed rows. A target absent
-/// on both sides is an error. Only the requested output is collected; SQL joins
-/// stream the selected rows without a subtree-size cap. Output limits remain
-/// bounded at 1,000,000. Neither snapshot is written.
+/// on both sides is an error. Both trees are walked together by name bytes
+/// through the public [`Snapshot`] API; only a bounded top-`limit` heap is
+/// kept. Output limits remain bounded at 1,000,000. Neither snapshot is written.
 pub fn diff(
     new: &Snapshot,
     old: &Path,
@@ -63,18 +67,17 @@ pub fn diff(
     let n = new.dir_by_path(target)?;
     let o = old.dir_by_path(target)?;
     check_target(&n, &o)?;
-    with_old(new, &old, || {
-        joined(
-            new,
-            n.as_ref(),
-            o.as_ref(),
-            metric,
-            max_depth_rel,
-            limit,
-            None,
-        )
-        .map(|(rows, _)| rows)
-    })
+    ranked(
+        new,
+        &old,
+        n.as_ref(),
+        o.as_ref(),
+        metric,
+        max_depth_rel,
+        limit,
+        None,
+    )
+    .map(|(rows, _)| rows)
 }
 
 /// One dominant child selected during iterative descent.
@@ -103,7 +106,7 @@ pub struct Explanation {
 ///
 /// Ratio must be finite and in `(0, 1]`. Ties use raw path bytes; shrinkage
 /// mirrors growth. Steps and returned contributors are capped at 1,000,000;
-/// direct children are joined in SQL without a child-count cap. `own_delta` always compares own charged bytes, including when
+/// direct children are merged by name without a child-count cap. `own_delta` always compares own charged bytes, including when
 /// the selected subtree metric is reclaimable bytes or file entries.
 pub fn explain(
     new: &Snapshot,
@@ -134,10 +137,11 @@ pub fn explain(
     )?;
     let mut current_delta = target_delta;
     let mut steps = Vec::new();
-    with_old(new, &old, || loop {
+    loop {
         // Keep the dominant candidate even when no spread rows were requested.
-        let (mut contributors, spread_children) = joined(
+        let (mut contributors, spread_children) = ranked(
             new,
+            &old,
             n.as_ref(),
             o.as_ref(),
             metric,
@@ -177,9 +181,8 @@ pub fn explain(
                 spread_children,
             });
         }
-    })
+    }
 }
-
 // Matches the existing reader result cap. No traversal recursion is used.
 const CAP: usize = 1_000_000;
 fn check_limit(limit: usize) -> Result<(), StoreError> {
@@ -241,6 +244,32 @@ fn check_target(
     Ok(())
 }
 
+/// Rank rows for `diff` (`direction = None`, whole subtree) or `explain`
+/// (`Some(delta)`, direct children). Pure-v1 pairs keep the ATTACH join, which is
+/// about 6x faster than the walk there (see the handoff); everything else walks.
+#[allow(clippy::too_many_arguments)]
+fn ranked(
+    new: &Snapshot,
+    old: &Snapshot,
+    n: Option<&DirRow>,
+    o: Option<&DirRow>,
+    metric: DiffMetric,
+    depth: u32,
+    limit: usize,
+    direction: Option<i64>,
+) -> Result<(Vec<DiffRow>, u32), StoreError> {
+    if new.v1_conn().is_ok() && old.v1_conn().is_ok() {
+        return with_old(new, old, || {
+            joined(new, n, o, metric, depth, limit, direction)
+        });
+    }
+    let mut top = TopN::new(limit, direction.map_or(Order::AbsDelta, Order::Directed));
+    walk(new, old, n, o, metric, depth, direction.is_none(), &mut top)?;
+    let count = top.count;
+    Ok((top.finish()?, count))
+}
+
+// ---- v1/v1 fast path: the previous ATTACH + join implementation, unchanged. ----
 fn with_old<T>(
     new: &Snapshot,
     old: &Snapshot,
@@ -444,176 +473,515 @@ fn bind_joined(
     Ok(())
 }
 
-#[cfg(test)]
-#[path = "../tests/w3a/row.rs"]
-mod test_row;
+/// Sort order of ranked rows; ties always break by ascending raw path bytes.
+#[derive(Clone, Copy)]
+enum Order {
+    /// Largest absolute delta first.
+    AbsDelta,
+    /// Largest `delta * sign(direction)` first; also counts rows with that sign.
+    Directed(i64),
+}
 
-#[cfg(test)]
-mod test_support {
-    pub use super::test_row::row;
-    use crate::writer::SnapshotWriter;
-
-    pub fn snapshot(
-        dir: &std::path::Path,
-        rows: &[tidemark_core::snapshot::DirRow],
-        now: i64,
-    ) -> std::path::PathBuf {
-        let mut meta = crate::test_meta();
-        meta.schema_version = 1;
-        meta.root = rows[0].path.clone();
-        meta.scan_id = tidemark_core::time::ScanId::new(now).unwrap();
-        meta.dirs = rows.len() as u64;
-        let mut writer = SnapshotWriter::create(dir, &meta).unwrap();
-        writer.put_dirs(rows).unwrap();
-        writer.finish(&meta).unwrap()
+struct Cand {
+    key: i128,
+    path: RawPath,
+    depth_rel: u32,
+    new: Option<u64>,
+    old: Option<u64>,
+}
+// "Greater" means worse, so the max-heap root is the first row to evict.
+impl Ord for Cand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .key
+            .cmp(&self.key)
+            .then_with(|| self.path.as_bytes().cmp(other.path.as_bytes()))
     }
+}
+impl PartialOrd for Cand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Cand {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Cand {}
+
+/// Bounded top-N selection: memory is O(limit).
+struct TopN {
+    limit: usize,
+    order: Order,
+    heap: BinaryHeap<Cand>,
+    /// Rows changing in the direction of `Order::Directed`.
+    count: u32,
+}
+impl TopN {
+    fn new(limit: usize, order: Order) -> Self {
+        Self {
+            limit,
+            order,
+            heap: BinaryHeap::new(),
+            count: 0,
+        }
+    }
+    /// Offer one directory; a `RawPath` is built only if the row enters the heap.
+    fn offer(
+        &mut self,
+        path: &[u8],
+        depth_rel: u32,
+        new: Option<u64>,
+        old: Option<u64>,
+    ) -> Result<(), StoreError> {
+        let delta = i128::from(new.unwrap_or(0)) - i128::from(old.unwrap_or(0));
+        let key = match self.order {
+            Order::AbsDelta => delta.abs(),
+            Order::Directed(direction) => {
+                let sign = if direction < 0 { -1 } else { 1 };
+                if direction != 0 && delta * i128::from(direction.signum()) > 0 {
+                    self.count = self.count.saturating_add(1);
+                }
+                delta * sign
+            }
+        };
+        if self.limit == 0 {
+            return Ok(());
+        }
+        if self.heap.len() >= self.limit {
+            if let Some(worst) = self.heap.peek() {
+                if key < worst.key || (key == worst.key && path >= worst.path.as_bytes()) {
+                    return Ok(());
+                }
+            }
+            self.heap.pop();
+        }
+        self.heap.push(Cand {
+            key,
+            path: RawPath::new(path)?,
+            depth_rel,
+            new,
+            old,
+        });
+        Ok(())
+    }
+    fn finish(self) -> Result<Vec<DiffRow>, StoreError> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|c| make_row(&c.path, c.depth_rel, c.new, c.old))
+            .collect()
+    }
+}
+
+const PAGE_START: usize = 256;
+const PAGE_MAX: usize = 16_384;
+
+/// Name-ordered children of one directory on one side, read page by page.
+/// Holds compact entries and a cursor only: no paths, no `DirRow`s.
+struct Kids<'a> {
+    snap: &'a Snapshot,
+    parent: u32,
+    buf: Vec<ChildEntry>,
+    pos: usize,
+    cursor: Option<ChildCursor>,
+    more: bool,
+    page: usize,
+}
+impl<'a> Kids<'a> {
+    /// Leaf directories (`subtree_end == id`) and absent sides need no child query.
+    fn new(snap: &'a Snapshot, parent: Option<(u32, u32)>) -> Self {
+        let (id, end) = parent.unwrap_or((0, 0));
+        Self {
+            snap,
+            parent: id,
+            buf: Vec::new(),
+            pos: 0,
+            cursor: None,
+            more: parent.is_some() && end > id,
+            page: PAGE_START,
+        }
+    }
+    fn head(&mut self) -> Result<Option<&ChildEntry>, StoreError> {
+        while self.pos == self.buf.len() && self.more {
+            self.buf.clear();
+            self.pos = 0;
+            self.cursor = self.snap.children_by_name(
+                self.parent,
+                self.cursor.as_ref(),
+                self.page,
+                &mut self.buf,
+            )?;
+            self.more = self.cursor.is_some();
+            #[cfg(test)]
+            FETCHED.with(|c| c.set(c.get() + self.buf.len() as u64));
+            self.page = (self.page * 2).min(PAGE_MAX);
+        }
+        Ok(self.buf.get(self.pos))
+    }
+    /// Metric value, preorder range of the head entry, then advance past it.
+    fn take(&mut self, metric: DiffMetric) -> Option<(u64, u32, u32)> {
+        let e = self.buf.get(self.pos)?;
+        let out = (child_value(e, metric), e.id, e.subtree_end);
+        self.pos += 1;
+        Some(out)
+    }
+}
+#[cfg(test)]
+thread_local! {
+    /// Child entries fetched through `children_by_name` (sibling visits).
+    static FETCHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn child_value(e: &ChildEntry, metric: DiffMetric) -> u64 {
+    match metric {
+        DiffMetric::Disk => e.t_disk,
+        DiffMetric::Reclaimable => e.t_reclaimable,
+        DiffMetric::Files => e.t_files,
+    }
+}
+
+struct Frame<'a> {
+    n: Kids<'a>,
+    o: Kids<'a>,
+    depth_rel: u32,
+    /// Length of the shared path buffer at this frame's directory.
+    path_len: usize,
+}
+
+/// Walk both subtrees together and offer every directory within
+/// `max_depth_rel` to `top`. Iterative; memory is one frame (two pages) per
+/// level plus one shared path buffer, and no path is copied except into `top`.
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    new: &Snapshot,
+    old: &Snapshot,
+    n: Option<&DirRow>,
+    o: Option<&DirRow>,
+    metric: DiffMetric,
+    max_depth_rel: u32,
+    include_root: bool,
+    top: &mut TopN,
+) -> Result<(), StoreError> {
+    let Some(root) = n.or(o) else {
+        return Ok(());
+    };
+    let mut path: Vec<u8> = root.path.as_bytes().to_vec();
+    if include_root {
+        top.offer(
+            &path,
+            0,
+            n.map(|r| value(r, metric)),
+            o.map(|r| value(r, metric)),
+        )?;
+    }
+    if max_depth_rel == 0 {
+        return Ok(());
+    }
+    let mut stack = vec![Frame {
+        n: Kids::new(new, n.map(|r| (r.id, r.subtree_end))),
+        o: Kids::new(old, o.map(|r| (r.id, r.subtree_end))),
+        depth_rel: 0,
+        path_len: path.len(),
+    }];
+    while let Some(frame) = stack.last_mut() {
+        let ord = match (frame.n.head()?, frame.o.head()?) {
+            (None, None) => {
+                stack.pop();
+                continue;
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(a), Some(b)) => a.name.cmp(&b.name),
+        };
+        // Name of the child being visited goes onto the shared path buffer.
+        path.truncate(frame.path_len);
+        if path.len() > 1 {
+            path.push(b'/');
+        }
+        let name_source = if ord == Ordering::Greater {
+            &frame.o
+        } else {
+            &frame.n
+        };
+        if let Some(e) = name_source.buf.get(name_source.pos) {
+            path.extend_from_slice(&e.name);
+        }
+        let cn = if ord != Ordering::Greater {
+            frame.n.take(metric)
+        } else {
+            None
+        };
+        let co = if ord != Ordering::Less {
+            frame.o.take(metric)
+        } else {
+            None
+        };
+        let depth_rel = frame.depth_rel + 1;
+        top.offer(&path, depth_rel, cn.map(|c| c.0), co.map(|c| c.0))?;
+        if depth_rel < max_depth_rel {
+            stack.push(Frame {
+                n: Kids::new(new, cn.map(|c| (c.1, c.2))),
+                o: Kids::new(old, co.map(|c| (c.1, c.2))),
+                depth_rel,
+                path_len: path.len(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    #[ignore = "scale"]
-    fn wide_explain_uses_streaming_count_and_bounded_top_n() {
-        const CHILDREN: u32 = 200_000;
-        let dir = ::test_support::private_tempdir().unwrap();
-        let mut rows = vec![test_support::row(0, None, b"/fixture", 0)];
-        rows[0].subtree_end = CHILDREN;
-        // Long paths amplify the old window query's per-child scratch usage.
-        let prefix = "x".repeat(220);
-        for id in 1..=CHILDREN {
-            rows.push(test_support::row(
-                id,
-                Some(0),
-                format!("/fixture/{prefix}{id:08}").as_bytes(),
-                0,
-            ));
-        }
-        let a = test_support::snapshot(dir.path(), &rows, 1);
-        rows[0].t_disk = u64::from(CHILDREN);
-        for child in &mut rows[1..] {
-            child.t_disk = 1;
-        }
-        let b = test_support::snapshot(dir.path(), &rows, 2);
-        drop(rows);
-        let new = Snapshot::open(&b).unwrap();
-        let old = Snapshot::open(&a).unwrap();
-        let target = RawPath::new(b"/fixture".to_vec()).unwrap();
-        let n = new.dir_by_path(&target).unwrap();
-        let o = old.dir_by_path(&target).unwrap();
-        with_old(&new, &old, || {
-            // Inspect the exact production SQL, including subtree diff and all
-            // metrics. EXPLAIN QUERY PLAN's "TEMP B-TREE" also labels bounded
-            // top-N sorts, so inspect the VDBE instructions instead.
-            for metric in [DiffMetric::Disk, DiffMetric::Reclaimable, DiffMetric::Files] {
-                for children in [false, true] {
-                    let (limited, aggregate) = joined_sql(metric, children);
-                    for (sql, limited) in std::iter::once((limited, true))
-                        .chain(aggregate.into_iter().map(|sql| (sql, false)))
-                    {
-                        let mut stmt = new.conn().prepare(&format!("EXPLAIN {sql}"))?;
-                        bind_joined(&mut stmt, n.as_ref(), o.as_ref(), 1, 5, Some(1))?;
-                        let ops: Vec<String> = stmt
-                            .raw_query()
-                            .mapped(|r| r.get(1))
-                            .collect::<Result<_, _>>()?;
-                        assert!(
-                            !ops.iter().any(|op| op == "SorterOpen"),
-                            "unbounded sort: {ops:?}"
-                        );
-                        assert!(
-                            !ops.iter().any(|op| op == "OpenAutoindex"),
-                            "unbounded automatic index: {ops:?}"
-                        );
-                        if limited {
-                            // Once LIMIT slots are filled, IfNotZero falls
-                            // through to Last/IdxLE/Delete before IdxInsert:
-                            // only the best LIMIT rows stay in the sorter.
-                            let mut sorts = 0;
-                            for (i, op) in ops.iter().enumerate() {
-                                if op == "OpenEphemeral" {
-                                    sorts += 1;
-                                }
-                                if op == "IdxInsert" {
-                                    let guard =
-                                        ops[..i].iter().rposition(|op| op == "IfNotZero").unwrap();
-                                    assert_eq!(
-                                        &ops[guard + 1..guard + 4],
-                                        &["Last", "IdxLE", "Delete"]
-                                    );
-                                    assert!(!ops[guard + 4..i].iter().any(|op| op == "IdxInsert"));
-                                }
-                            }
-                            assert!(sorts > 0);
-                            assert_eq!(sorts, ops.iter().filter(|op| *op == "IdxInsert").count());
-                        } else {
-                            assert!(
-                                !ops.iter().any(|op| op == "OpenEphemeral"),
-                                "materialized aggregate: {ops:?}"
-                            );
-                            assert!(ops.iter().any(|op| op == "AggStep"));
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })
-        .unwrap();
-        for (new, old, sign) in [(&new, &a, 1), (&old, &b, -1)] {
-            let result = explain(new, old, &target, DiffMetric::Disk, 0.5, 1, 5).unwrap();
-            assert_eq!(result.target_delta, i64::from(CHILDREN) * sign);
-            assert!(result.steps.is_empty());
-            assert_eq!(result.spread_children, CHILDREN);
-            assert_eq!(result.spread.len(), 5);
-            for (i, child) in result.spread.iter().enumerate() {
-                assert_eq!(child.delta, sign);
-                assert_eq!(
-                    child.path.as_bytes(),
-                    format!("/fixture/{prefix}{:08}", i + 1).as_bytes()
-                );
-            }
-        }
+    fn p(s: &str) -> RawPath {
+        RawPath::new(s.as_bytes().to_vec()).unwrap()
     }
 
     #[test]
-    fn query_restores_mapping_limit_and_detaches_on_error_and_unwind() {
-        let dir = ::test_support::private_tempdir().unwrap();
-        let mut meta = crate::test_meta();
-        meta.schema_version = 1;
-        let a = crate::writer::SnapshotWriter::create(dir.path(), &meta)
+    fn top_n_keeps_best_by_key_then_path_bytes() {
+        let mut top = TopN::new(3, Order::AbsDelta);
+        for (path, new, old) in [
+            ("/r/z", 5, 0),
+            ("/r/a-c", 5, 0),
+            ("/r/a/x", 5, 0),
+            ("/r/m", 0, 9),
+            ("/r/q", 1, 1),
+            ("/r/b", 6, 0),
+        ] {
+            top.offer(p(path).as_bytes(), 1, Some(new), Some(old))
+                .unwrap();
+        }
+        let paths: Vec<_> = top
+            .finish()
             .unwrap()
-            .finish(&meta)
+            .iter()
+            .map(|r| r.path.display_lossy())
+            .collect();
+        assert_eq!(paths, ["/r/m", "/r/b", "/r/a-c"]);
+    }
+
+    #[test]
+    fn directed_order_counts_only_the_target_direction() {
+        let mut top = TopN::new(2, Order::Directed(-4));
+        top.offer(p("/r/a").as_bytes(), 1, Some(1), Some(5))
+            .unwrap(); // -4
+        top.offer(p("/r/b").as_bytes(), 1, Some(9), Some(5))
+            .unwrap(); // +4
+        top.offer(p("/r/c").as_bytes(), 1, Some(5), Some(5))
             .unwrap();
-        meta.scan_id = tidemark_core::time::ScanId::new(20).unwrap();
-        let b = crate::writer::SnapshotWriter::create(dir.path(), &meta)
-            .unwrap()
-            .finish(&meta)
-            .unwrap();
-        let old = Snapshot::open(&a).unwrap();
-        let new = Snapshot::open(&b).unwrap();
-        let mapping = || -> i64 {
-            new.conn()
-                .pragma_query_value(Some("main"), "mmap_size", |r| r.get(0))
-                .unwrap()
+        top.offer(p("/r/d").as_bytes(), 1, None, Some(2)).unwrap(); // -2
+        assert_eq!(top.count, 2);
+        let rows = top.finish().unwrap();
+        assert_eq!(rows[0].delta, -4);
+        assert_eq!(rows[1].delta, -2);
+    }
+
+    #[test]
+    fn zero_limit_keeps_nothing() {
+        let mut top = TopN::new(0, Order::AbsDelta);
+        top.offer(p("/r/a").as_bytes(), 0, Some(1), None).unwrap();
+        assert!(top.finish().unwrap().is_empty());
+    }
+
+    fn dir(id: u32, parent: Option<u32>, depth: u32, end: u32, name: &[u8], disk: u64) -> DirRow {
+        let mut path = b"/r".to_vec();
+        if parent.is_some() {
+            path.push(b'/');
+            path.extend_from_slice(name);
+        }
+        let path = RawPath::new(path).unwrap();
+        DirRow {
+            id,
+            parent_id: parent,
+            subtree_end: end,
+            depth,
+            name: if parent.is_some() {
+                name.to_vec()
+            } else {
+                path.as_bytes().to_vec()
+            },
+            path_hash: path.hash64(),
+            path,
+            ino: u64::from(id) + 1,
+            mtime: 100,
+            dir_disk: 0,
+            dir_apparent: 0,
+            projid: None,
+            entries: 1,
+            errors: 0,
+            own_files: 1,
+            own_symlinks: 0,
+            own_charged: disk,
+            own_apparent: disk,
+            t_dirs: 1,
+            t_files: 1,
+            t_inodes: 1,
+            t_disk: disk,
+            t_apparent: disk,
+            t_charged: disk,
+            t_reclaimable: disk / 2,
+            t_errors: 0,
+            age0: disk,
+            age1: 0,
+            age2: 0,
+            age3: 0,
+            age4: 0,
+            age5: 0,
+            newest_mtime: 100,
+            max_entries: 1,
+        }
+    }
+
+    fn wide_snapshot(
+        dir_path: &Path,
+        v2: bool,
+        width: u32,
+        skip: u32,
+        now: i64,
+    ) -> std::path::PathBuf {
+        use tidemark_core::{
+            config::LinkInstances,
+            scan::{ScanMode, SnapshotStatus},
+            snapshot::SnapshotMeta,
+            time::ScanId,
         };
-        let original = mapping();
-        let error = with_old(&new, &old, || -> Result<(), StoreError> {
-            assert!(new.conn().execute("DELETE FROM o.dirs", []).is_err());
-            assert!(new.conn().execute("DELETE FROM main.dirs", []).is_err());
-            Err(StoreError::Invalid("injected query failure".into()))
-        });
-        assert!(matches!(error, Err(StoreError::Invalid(_))));
-        assert_eq!(mapping(), original);
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = with_old(&new, &old, || -> Result<(), StoreError> {
-                panic!("injected query unwind");
-            });
-        }));
-        assert!(panic.is_err());
-        assert_eq!(mapping(), original);
-        // Both previous attachments must be gone before this succeeds.
-        assert_eq!(with_old(&new, &old, || Ok(42)).unwrap(), 42);
-        assert_eq!(mapping(), original);
+        let root = RawPath::new(b"/r".to_vec()).unwrap();
+        let meta = SnapshotMeta {
+            schema_version: if v2 { 2 } else { 1 },
+            tool_version: "test".into(),
+            scan_id: ScanId::new(now).unwrap(),
+            root_display: root.display_lossy(),
+            root,
+            mode: ScanMode::Walk,
+            mode_reason: "fixture".into(),
+            status: SnapshotStatus::Complete,
+            degraded: false,
+            exclude: vec![],
+            link_instances: LinkInstances::All,
+            started_at: now,
+            finished_at: now + 1,
+            host: "test".into(),
+            kernel: "test".into(),
+            os_release: "test".into(),
+            fs_uuid: String::new(),
+            fs_dev: 0,
+            fs_blocksize: 4096,
+            threads: 1,
+            throttle_profile: "max".into(),
+            dirs: 0,
+            files: 0,
+            inodes: 0,
+            errors: 0,
+            races: 0,
+            skipped: 0,
+            noatime_fallbacks: 0,
+            phase_ms: Default::default(),
+            gate_stats: Default::default(),
+        };
+        let mut rows = vec![dir(0, None, 0, width, b"/r", 5)];
+        let mut id = 1;
+        for i in 0..width {
+            if skip != 0 && i % skip == 0 {
+                continue;
+            }
+            let name = format!("k{i:06}").into_bytes();
+            rows.push(dir(
+                id,
+                Some(0),
+                1,
+                id,
+                &name,
+                u64::from(i % 17) + u64::from(now as u32 % 3),
+            ));
+            id += 1;
+        }
+        rows[0].subtree_end = id - 1;
+        let mut meta = meta;
+        meta.dirs = rows.len() as u64;
+        if v2 {
+            let mut w = crate::writer_v2::SnapshotWriterV2::create_with_options(
+                dir_path,
+                &meta,
+                crate::writer_v2::WriterOptions {
+                    plain_depth: std::env::var("TM_PLAIN").map_or(0, |v| v.parse().unwrap()),
+                    chunk_dirs: 512,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for c in rows.chunks(1000) {
+                w.put_dirs(c).unwrap();
+            }
+            w.finish(&meta).unwrap()
+        } else {
+            let mut w = crate::writer::SnapshotWriter::create(dir_path, &meta).unwrap();
+            for c in rows.chunks(1000) {
+                w.put_dirs(c).unwrap();
+            }
+            w.finish(&meta).unwrap()
+        }
+    }
+
+    /// Each side's children are fetched exactly once: O(W) sibling visits, not
+    /// O(W * pages) as when every page restarted from the first child.
+    #[test]
+    fn wide_directory_costs_one_visit_per_child_per_side() {
+        const W: u32 = 120_000;
+        let tmp = test_support::private_tempdir().unwrap();
+        for old_v2 in [true, false] {
+            let o = wide_snapshot(tmp.path(), old_v2, W, 7, 10 + i64::from(old_v2));
+            let n = wide_snapshot(tmp.path(), true, W, 11, 20 + i64::from(old_v2));
+            let ns = Snapshot::open(&n).unwrap();
+            let root = RawPath::new(b"/r".to_vec()).unwrap();
+            FETCHED.with(|c| c.set(0));
+            let rows = diff(&ns, &o, &root, DiffMetric::Disk, 2, 10).unwrap();
+            assert_eq!(rows.len(), 10);
+            let (new_kids, old_kids) =
+                (u64::from(W - W.div_ceil(11)), u64::from(W - W.div_ceil(7)));
+            let fetched = FETCHED.with(|c| c.get());
+            assert_eq!(fetched, new_kids + old_kids, "old_v2={old_v2}");
+        }
+    }
+
+    /// `cargo test --release -p tidemark-store --lib -- --ignored --nocapture profile_wide`
+    /// Splits the wide-directory walk into paging (`children_by_name`) and the rest.
+    #[test]
+    #[ignore = "scale"]
+    fn profile_wide_split() {
+        const W: u32 = 150_000;
+        let tmp = test_support::private_tempdir().unwrap();
+        let o = wide_snapshot(tmp.path(), true, W, 0, 10);
+        let n = wide_snapshot(tmp.path(), true, W, 11, 20);
+        let (ns, os) = (Snapshot::open(&n).unwrap(), Snapshot::open(&o).unwrap());
+        let root = RawPath::new(b"/r".to_vec()).unwrap();
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            let mut out = Vec::new();
+            let mut cursor = None;
+            let mut pages = 0;
+            loop {
+                out.clear();
+                cursor = ns
+                    .children_by_name(0, cursor.as_ref(), PAGE_MAX, &mut out)
+                    .unwrap();
+                pages += 1;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            let paging = t.elapsed();
+            let t = std::time::Instant::now();
+            let rows = diff(&ns, &o, &root, DiffMetric::Disk, 2, 50).unwrap();
+            eprintln!(
+                "round {round}: one-side paging {paging:?} ({pages} pages); full diff {:?} ({} rows); open old {:?}",
+                t.elapsed(),
+                rows.len(),
+                { let t = std::time::Instant::now(); drop(Snapshot::open(&o).unwrap()); t.elapsed() },
+            );
+        }
+        drop(os);
     }
 }

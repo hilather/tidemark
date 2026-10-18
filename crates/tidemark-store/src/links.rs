@@ -81,27 +81,24 @@ impl Regions {
         let globs = builder
             .build()
             .map_err(|e| StoreError::Invalid(e.to_string()))?;
-        let mut stmt = snap.v1_conn()?.prepare(
-            "SELECT id,subtree_end,path,depth FROM dirs WHERE id BETWEEN ?1 AND ?2 ORDER BY id",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![root.id, root.subtree_end])?;
         let mut selected = Vec::new();
-        while let Some(row) = rows.next()? {
-            let depth: u32 = row.get(3)?;
-            let bytes: Vec<u8> = row.get(2)?;
+        snap.visit_dir_paths(root.id, root.subtree_end, &mut |dir| {
             let matches = match spec {
-                RegionSpec::Depth(d) => u64::from(depth) == u64::from(root.depth) + u64::from(*d),
+                RegionSpec::Depth(d) => {
+                    u64::from(dir.depth) == u64::from(root.depth) + u64::from(*d)
+                }
                 RegionSpec::Globs(_) => {
-                    globs.is_match_candidate(&globset::Candidate::from_bytes(&bytes))
+                    globs.is_match_candidate(&globset::Candidate::from_bytes(dir.path))
                 }
             };
             if matches {
                 if selected.len() == CAP {
                     return Err(StoreError::Invalid("region cap reached".into()));
                 }
-                selected.push((row.get(0)?, row.get(1)?, RawPath::new(bytes)?));
+                selected.push((dir.id, dir.subtree_end, RawPath::new(dir.path.to_vec())?));
             }
-        }
+            Ok(())
+        })?;
         Ok(Self {
             intervals: intervals(selected.into_iter()),
             under: under.clone(),
@@ -345,6 +342,9 @@ fn stream_sets(
     end: u32,
     mut visit: impl FnMut(&LinkSetHit, &[u32]) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
+    if snap.is_v2() {
+        return snap.v2_stream_sets(start, end, CAP, &mut visit);
+    }
     // Two ordered cursors avoid both a global sort and an index lookup per inode.
     // The primary-key scan remains outermost for byte-path tie ordering at the limit.
     let mut sets_stmt = snap.v1_conn()?.prepare(
@@ -488,7 +488,7 @@ pub fn link_report(
                     if pinned.len() > CAP {
                         return Err(StoreError::Invalid("pinned directory cap".into()));
                     }
-                    cursor = snap.dir(id)?.parent_id;
+                    cursor = snap.parent_of(id)?;
                 }
             }
             if let Some(r) = &regions {
@@ -555,20 +555,25 @@ pub fn link_report(
             .then_with(|| a.b.cmp(&b.b))
     });
     region_pairs.truncate(top);
-    let mut stmt = snap.v1_conn()?.prepare("SELECT path,t_disk-t_reclaimable,t_disk FROM dirs WHERE id BETWEEN ?1 AND ?2 AND t_disk>t_reclaimable ORDER BY t_disk-t_reclaimable DESC,path LIMIT ?3")?;
-    let mut rows = stmt.query(rusqlite::params![
-        root.id,
-        root.subtree_end,
-        crate::error::sql_limit(top)?
-    ])?;
-    let mut most_shared_dirs = Vec::new();
-    while let Some(row) = rows.next()? {
-        most_shared_dirs.push((
-            RawPath::new(row.get::<_, Vec<u8>>(0)?)?,
-            crate::error::read_u64(row, 1)?,
-            crate::error::read_u64(row, 2)?,
-        ));
-    }
+    let most_shared_dirs = if snap.is_v2() {
+        snap.v2_most_shared(root.id, root.subtree_end, top)?
+    } else {
+        let mut stmt = snap.v1_conn()?.prepare("SELECT path,t_disk-t_reclaimable,t_disk FROM dirs WHERE id BETWEEN ?1 AND ?2 AND t_disk>t_reclaimable ORDER BY t_disk-t_reclaimable DESC,path LIMIT ?3")?;
+        let mut rows = stmt.query(rusqlite::params![
+            root.id,
+            root.subtree_end,
+            crate::error::sql_limit(top)?
+        ])?;
+        let mut found = Vec::new();
+        while let Some(row) = rows.next()? {
+            found.push((
+                RawPath::new(row.get::<_, Vec<u8>>(0)?)?,
+                crate::error::read_u64(row, 1)?,
+                crate::error::read_u64(row, 2)?,
+            ));
+        }
+        found
+    };
     Ok(LinkReport {
         totals,
         crossing,
