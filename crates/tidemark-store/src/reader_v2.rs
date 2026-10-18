@@ -120,6 +120,13 @@ const MAX_PATH_BYTES: usize = 256 * 1024 * 1024;
 const SHALLOW_COLUMNS: &str = "id,parent_id,subtree_end,depth,name,ino,mtime,dir_disk,dir_apparent,projid,entries,errors,own_files,own_symlinks,own_charged,own_apparent,t_dirs,t_files,t_inodes,t_disk,t_apparent,t_charged,t_reclaimable,t_errors,age0,age1,age2,age3,age4,age5,newest_mtime,max_entries";
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 type Held = Arc<Vec<ChunkDir>>;
+/// A query's requested directory: its chunk row and the decoded chunk it came
+/// from, kept alive so an ancestor climb cannot evict it before the scan reuses
+/// it (review17 S1). Built only by `Backend::requested`.
+struct Root {
+    row: ChunkDir,
+    held: Held,
+}
 struct Cached {
     first: u32,
     last: u32,
@@ -271,21 +278,23 @@ fn view_key(v: &chunk::DirView<'_>, sort: SortKey) -> i128 {
 /// Validates a depth-limited preorder as it streams past (contiguity, parent
 /// links, depths, subtree spans, names) and builds every row's path from the
 /// walk root's path, as `visit_paths` does. Rows deeper than `limit` are not
-/// offered; the walk root's own path is `base`.
-struct Walk {
+/// offered; the walk root's own path is `base`. The first row offered must be
+/// `root` itself (the requested directory, already checked by `requested`), so
+/// no row of the walk is exempt from validation.
+struct Walk<'r> {
+    root: &'r ChunkDir,
     limit: u64,
-    end: u32,
     next: u64,
     started: bool,
     stack: Vec<(u32, u32, u32, usize)>,
     buf: Vec<u8>,
 }
-impl Walk {
-    fn new(lo: u32, end: u32, limit: u64, base: &RawPath) -> Self {
+impl<'r> Walk<'r> {
+    fn new(root: &'r ChunkDir, limit: u64, base: &RawPath) -> Self {
         Self {
+            root,
             limit,
-            end,
-            next: u64::from(lo),
+            next: u64::from(root.id),
             started: false,
             stack: Vec::new(),
             buf: base.as_bytes().to_vec(),
@@ -300,7 +309,7 @@ impl Walk {
         depth: u32,
         name: &[u8],
     ) -> Result<&[u8]> {
-        if u64::from(id) != self.next || subtree_end < id || subtree_end > self.end {
+        if u64::from(id) != self.next || subtree_end < id || subtree_end > self.root.subtree_end {
             return Err(invalid());
         }
         while self.stack.last().is_some_and(|p| p.1 < id) {
@@ -326,7 +335,17 @@ impl Walk {
                 }
             }
             None if self.started => return Err(invalid()),
-            None => {}
+            None => {
+                let r = self.root;
+                if id != r.id
+                    || parent_id != r.parent_id
+                    || subtree_end != r.subtree_end
+                    || depth != r.depth
+                    || name != r.name.as_slice()
+                {
+                    return Err(invalid());
+                }
+            }
         }
         self.started = true;
         self.next = if u64::from(depth) < self.limit && subtree_end > id {
@@ -338,7 +357,7 @@ impl Walk {
         Ok(&self.buf)
     }
     fn finish(&self) -> Result<()> {
-        if self.started && self.next == u64::from(self.end) + 1 {
+        if self.started && self.next == u64::from(self.root.subtree_end) + 1 {
             Ok(())
         } else {
             Err(invalid())
@@ -609,12 +628,74 @@ impl Backend {
         }
         Ok(None)
     }
-    /// The parent of a child listing; `None` for an absent id (an empty listing in v1).
-    fn listing_parent(&self, snap: &Snapshot, id: u32) -> Result<Option<ChunkDir>> {
+    // ---- the requested directory ----
+    //
+    // Every directory query starts from one requested id and checks the same
+    // things about it, in the same order, before reading anything else:
+    //
+    // 1. `requested`: the row from its chunk (`Root::held` keeps that chunk
+    //    alive, so an ancestor climb cannot evict it before a scan reuses it);
+    //    the shallow copy must exist exactly when `depth <= plain_depth` and
+    //    agree on id, parent, depth, span and name; the name must be a valid
+    //    component (a valid root path for id 0, which must have depth 0).
+    //    This never decodes another chunk.
+    // 2. `root_path`: the full path, climbing every ancestor (link, depth, span
+    //    and name checked by `path`), shared through the path cache. It may
+    //    decode ancestor chunks. Which queries climb, and when, is the only
+    //    per-query policy (coordinator decisions, reviews 14–18):
+    //    - `subtree_dirs`, `wide_dirs`, `metrics_candidates`, `children_page`:
+    //      eagerly, before any row is enumerated, so a rejection never depends
+    //      on the limit, the filter or whether a row is admitted;
+    //    - `children`: on the first admitted row (no production caller; the
+    //      pre-rewrite reader climbed per returned row);
+    //    - `children_count`: never (it returns no path).
+    // 3. Enumeration: every sibling or walked row is checked whether or not it
+    //    is admitted (`hop_children`, `visit_shallow_children`, `Walk`); only
+    //    the shallow `children_page` narrows this to the rows it returns, with
+    //    `check_shallow_children` covering the child set.
+    //
+    // Argument checks stay where v1 performs them: before the lookup for the
+    // child listings (v1 never reads the parent), after it for the range
+    // queries (v1's `dir(id)` runs first).
+
+    /// The requested directory of a query (step 1 above); a missing id is the
+    /// SQL "no rows" error, as `dir(id)` reports it.
+    fn requested(&self, snap: &Snapshot, id: u32) -> Result<Root> {
+        let (row, held) = self.raw_held(snap, id)?;
+        match self.shallow_row(snap, id)? {
+            Some(shallow) => {
+                if shallow.id != row.id
+                    || shallow.parent_id != row.parent_id
+                    || shallow.depth != row.depth
+                    || shallow.subtree_end != row.subtree_end
+                    || shallow.name != row.name
+                {
+                    return Err(invalid());
+                }
+            }
+            None if row.depth <= self.plain_depth => return Err(invalid()),
+            None => {}
+        }
+        if row.id == 0 {
+            if row.depth != 0 {
+                return Err(invalid());
+            }
+            RawPath::new(row.name.clone()).map_err(|_| invalid())?;
+        } else if !valid_name(&row.name) {
+            return Err(invalid());
+        }
+        Ok(Root { row, held })
+    }
+    /// `requested` for a child listing: `None` for an absent id (an empty listing in v1).
+    fn listing_root(&self, snap: &Snapshot, id: u32) -> Result<Option<Root>> {
         if !self.locate(snap, id)?.is_some_and(|c| c.last >= id) {
             return Ok(None);
         }
-        Ok(Some(self.raw(snap, id)?))
+        self.requested(snap, id).map(Some)
+    }
+    /// The validated full path of a requested directory (step 2 above).
+    fn root_path(&self, snap: &Snapshot, root: &Root) -> Result<Arc<RawPath>> {
+        self.path_of(snap, &root.row)
     }
     /// The shallow copy must hold exactly `parent`'s child set: first child at
     /// id+1, each next child right after the previous subtree, and the last
@@ -650,17 +731,25 @@ impl Backend {
         Ok(())
     }
     /// Visits the children of a parent at or below the plain depth by hopping
-    /// over sibling subtrees inside the decoded chunks.
+    /// over sibling subtrees inside the decoded chunks. Every child is checked
+    /// as `visit_shallow_children` checks a shallow one (parent, depth, span,
+    /// name), whether or not the caller keeps it.
     fn hop_children(
         &self,
         snap: &Snapshot,
         parent: &ChunkDir,
         mut visit: impl FnMut(ChunkDir) -> Result<()>,
     ) -> Result<()> {
+        let child_depth = parent.depth.checked_add(1).ok_or_else(invalid)?;
         let mut next = parent.id.checked_add(1);
         while let Some(child_id) = next.filter(|n| *n <= parent.subtree_end) {
             let child = self.raw(snap, child_id).map_err(required)?;
-            if child.parent_id != Some(parent.id) || child.subtree_end > parent.subtree_end {
+            if child.parent_id != Some(parent.id)
+                || child.depth != child_depth
+                || child.subtree_end < child.id
+                || child.subtree_end > parent.subtree_end
+                || !valid_name(&child.name)
+            {
                 return Err(invalid());
             }
             next = child.subtree_end.checked_add(1);
@@ -798,9 +887,10 @@ impl Backend {
         limit: usize,
     ) -> Result<Vec<DirRow>> {
         let mut top = TopN::new(limit, Tie::Name)?;
-        let Some(parent) = self.listing_parent(snap, id)? else {
+        let Some(root) = self.listing_root(snap, id)? else {
             return Ok(Vec::new());
         };
+        let parent = &root.row;
         // The parent's path is rebuilt only once a row is going to be returned.
         let mut base: Option<Arc<RawPath>> = None;
         let visit = |c: ChunkDir| {
@@ -808,9 +898,9 @@ impl Backend {
             if top.admits(k, &c.name, c.id) {
                 let b = match &base {
                     Some(b) => b,
-                    None => base.insert(self.cached_path(snap, id)?),
+                    None => base.insert(self.root_path(snap, &root)?),
                 };
-                let path = Self::child_path(&parent, b, &c)?;
+                let path = Self::child_path(parent, b, &c)?;
                 top.push(Hit {
                     key: k,
                     tie: Tie::Name,
@@ -822,14 +912,15 @@ impl Backend {
         };
         if parent.depth < self.plain_depth {
             // Every sibling is decoded (one pass), as `children_count` does.
-            self.visit_shallow_children(snap, &parent, visit)?;
+            self.visit_shallow_children(snap, parent, visit)?;
         } else {
-            self.hop_children(snap, &parent, visit)?;
+            self.hop_children(snap, parent, visit)?;
         }
         self.finish(top)
     }
     /// Every child of a shallow parent as a full row, checked like
-    /// `check_shallow_children` (one pass; undecodable rows are `Invalid`).
+    /// `check_shallow_children` plus its name (one pass; undecodable rows are
+    /// `Invalid`).
     fn visit_shallow_children(
         &self,
         snap: &Snapshot,
@@ -853,6 +944,7 @@ impl Backend {
                 || c.depth != child_depth
                 || c.subtree_end < c.id
                 || c.subtree_end > parent.subtree_end
+                || !valid_name(&c.name)
             {
                 return Err(invalid());
             }
@@ -869,9 +961,10 @@ impl Backend {
         Ok(())
     }
     pub(super) fn children_count(&self, snap: &Snapshot, id: u32, filter: &[u8]) -> Result<u64> {
-        let Some(parent) = self.listing_parent(snap, id)? else {
+        let Some(root) = self.listing_root(snap, id)? else {
             return Ok(0);
         };
+        let parent = &root.row;
         let mut count = 0;
         let tally = |c: ChunkDir| {
             if contains(&c.name, filter) {
@@ -880,9 +973,9 @@ impl Backend {
             Ok(())
         };
         if parent.depth < self.plain_depth {
-            self.visit_shallow_children(snap, &parent, tally)?;
+            self.visit_shallow_children(snap, parent, tally)?;
         } else {
-            self.hop_children(snap, &parent, tally)?;
+            self.hop_children(snap, parent, tally)?;
         }
         Ok(count)
     }
@@ -932,14 +1025,17 @@ impl Backend {
         } else {
             reverse
         };
-        let Some(parent) = self.listing_parent(snap, id)? else {
+        let Some(root) = self.listing_root(snap, id)? else {
             return Ok(Vec::new());
         };
-        let base = self.cached_path(snap, id)?;
+        let parent = &root.row;
+        // Eager (policy above): an empty, filtered-out or zero-limit page
+        // still rejects a malformed parent name or ancestry.
+        let base = self.root_path(snap, &root)?;
         if parent.depth < self.plain_depth {
             // SQLite's bounded sorter picks the page (the v1 statement on the
             // shallow table); the child set itself is checked separately.
-            self.check_shallow_children(snap, &parent)?;
+            self.check_shallow_children(snap, parent)?;
             let key_value = match (cursor, sort) {
                 (None, _) => rusqlite::types::Value::Null,
                 (Some(r), SortKey::Name) => rusqlite::types::Value::Blob(r.name.clone()),
@@ -975,14 +1071,14 @@ impl Backend {
             let mut out = Vec::new();
             while let Some(row) = rows.next()? {
                 let c = shallow_dir(row).map_err(plain_row_error)?;
-                let path = Self::child_path(&parent, &base, &c)?;
+                let path = Self::child_path(parent, &base, &c)?;
                 out.push(self.materialized(c, path));
             }
             return Ok(out);
         }
         let tie = if name_desc { Tie::NameDesc } else { Tie::Name };
         let mut top = TopN::new(limit, tie)?;
-        self.hop_children(snap, &parent, |c| {
+        self.hop_children(snap, parent, |c| {
             if !contains(&c.name, filter) {
                 return Ok(());
             }
@@ -1007,7 +1103,7 @@ impl Backend {
                 key(&c, sort)
             };
             if top.admits(k, &c.name, c.id) {
-                let path = Self::child_path(&parent, &base, &c)?;
+                let path = Self::child_path(parent, &base, &c)?;
                 top.push(Hit {
                     key: k,
                     tie,
@@ -1018,27 +1114,6 @@ impl Backend {
             Ok(())
         })?;
         self.finish(top)
-    }
-    /// The requested root from its directory chunk (the source `dir(id)` uses).
-    /// A shallow copy, when present, must agree on id, parent, depth and span.
-    fn authoritative_root(&self, snap: &Snapshot, id: u32) -> Result<(ChunkDir, Held)> {
-        let (root, held) = self.raw_held(snap, id)?;
-        if let Some(shallow) = self.shallow_row(snap, id)? {
-            if shallow.id != root.id
-                || shallow.parent_id != root.parent_id
-                || shallow.depth != root.depth
-                || shallow.subtree_end != root.subtree_end
-                || shallow.name != root.name
-            {
-                return Err(invalid());
-            }
-            if root.id == 0 {
-                RawPath::new(shallow.name).map_err(|_| invalid())?;
-            } else {
-                RawName::new(shallow.name).map_err(|_| invalid())?;
-            }
-        }
-        Ok((root, held))
     }
     /// Streams every row of `lo..=hi` in preorder straight from the codec:
     /// nothing is cached or materialised, chunk coordinates are checked as in
@@ -1120,19 +1195,19 @@ impl Backend {
         sort: SortKey,
         limit: usize,
     ) -> Result<Vec<DirRow>> {
-        let (root, held) = self.authoritative_root(snap, id)?;
-        let max = u64::from(root.depth) + u64::from(depth);
+        let root = self.requested(snap, id)?;
+        let base = self.root_path(snap, &root)?;
         let mut top = TopN::new(limit, Tie::Name)?;
-        let base = self.path(snap, &root)?;
-        let mut walk = Walk::new(id, root.subtree_end, max, &base);
-        if max <= u64::from(self.plain_depth) && root.depth <= self.plain_depth {
+        let max = u64::from(root.row.depth) + u64::from(depth);
+        let mut walk = Walk::new(&root.row, max, &base);
+        if max <= u64::from(self.plain_depth) {
             // Every requested row is a shallow row: no chunk is decoded.
             let mut stmt = snap.conn.prepare_cached(&format!(
                 "SELECT {SHALLOW_COLUMNS} FROM shallow_dirs WHERE id>=? AND id<=? AND depth<=? ORDER BY id"
             ))?;
             let mut rows = stmt.query(params![
                 id,
-                root.subtree_end,
+                root.row.subtree_end,
                 i64::try_from(max).map_err(|_| invalid())?
             ])?;
             while let Some(row) = rows.next()? {
@@ -1150,7 +1225,7 @@ impl Backend {
                 }
             }
         } else {
-            self.scan(snap, &held, id, root.subtree_end, |v| {
+            self.scan(snap, &root.held, id, root.row.subtree_end, |v| {
                 if u64::from(v.depth) > max {
                     return Ok(());
                 }
@@ -1178,18 +1253,15 @@ impl Backend {
         min: u32,
         limit: usize,
     ) -> Result<Vec<DirRow>> {
-        let (root, held) = self.raw_held(snap, id)?;
+        // Eager root validation (policy above): an empty, filtered-out or
+        // zero-limit result may decode the root's ancestor chunks. Hits below
+        // the root build their paths lazily, relative to "/" while walking.
+        let root = self.requested(snap, id)?;
+        let base = self.root_path(snap, &root)?;
         let mut top = TopN::new(limit, Tie::Name)?;
-        // Coordinator decision: validating the requested root (its name and
-        // ancestry, via the climb in `path`) wins over the empty-result work
-        // bound, so it runs eagerly, before the walk and independent of
-        // `top.admits`. An empty or zero-limit result may therefore decode the
-        // root's ancestor chunks. Hits below the root still build their paths
-        // lazily, relative to "/" while walking.
-        let base = self.path(snap, &root)?;
         let rel_root = RawPath::new(b"/".to_vec()).map_err(|_| invalid())?;
-        let mut walk = Walk::new(id, root.subtree_end, u64::MAX, &rel_root);
-        self.scan(snap, &held, id, root.subtree_end, |v| {
+        let mut walk = Walk::new(&root.row, u64::MAX, &rel_root);
+        self.scan(snap, &root.held, id, root.row.subtree_end, |v| {
             let rel = walk.step(v.id, v.parent_id, v.subtree_end, v.depth, v.name)?;
             if v.entries < min {
                 return Ok(());
@@ -1273,14 +1345,14 @@ impl Backend {
                 "metrics candidate limit exceeds 1,000,000-row query cap".into(),
             ));
         }
-        let (root, held) = self.authoritative_root(snap, 0)?;
-        let base = self.path(snap, &root)?;
+        let root = self.requested(snap, 0)?;
+        let base = self.root_path(snap, &root)?;
         let mut count = 0u64;
         let mut tops = [
             (SortKey::Disk, TopN::new(limit, Tie::Path)?),
             (SortKey::Reclaimable, TopN::new(limit, Tie::Path)?),
         ];
-        let mut walk = Walk::new(0, root.subtree_end, u64::from(depth), &base);
+        let mut walk = Walk::new(&root.row, u64::from(depth), &base);
         if depth <= self.plain_depth {
             let mut stmt = snap.conn.prepare_cached(&format!(
                 "SELECT {SHALLOW_COLUMNS} FROM shallow_dirs WHERE depth<=? ORDER BY id"
@@ -1305,7 +1377,7 @@ impl Backend {
             }
         } else {
             // One pass feeds both rankings.
-            self.scan(snap, &held, 0, root.subtree_end, |v| {
+            self.scan(snap, &root.held, 0, root.row.subtree_end, |v| {
                 if v.depth > depth {
                     return Ok(());
                 }
@@ -1737,12 +1809,19 @@ fn instance_row_of(ino: u64, dir_id: u32, name: Option<&[u8]>) -> Result<LinkIns
 impl Backend {
     /// Cached, shared reconstruction of one directory's path.
     fn cached_path(&self, snap: &Snapshot, id: u32) -> Result<Arc<RawPath>> {
-        let hit = self.paths.borrow().map.get(&id).cloned();
-        if let Some(path) = hit {
+        if let Some(path) = self.paths.borrow().map.get(&id).cloned() {
             return Ok(path);
         }
         let row = self.raw(snap, id).map_err(required)?;
-        let path = Arc::new(self.path(snap, &row)?);
+        self.path_of(snap, &row)
+    }
+    /// `cached_path` for a row already in hand (no chunk lookup for the row itself).
+    fn path_of(&self, snap: &Snapshot, row: &ChunkDir) -> Result<Arc<RawPath>> {
+        let id = row.id;
+        if let Some(path) = self.paths.borrow().map.get(&id).cloned() {
+            return Ok(path);
+        }
+        let path = Arc::new(self.path(snap, row)?);
         let size = path.as_bytes().len();
         if size <= PATH_CACHE_BYTES {
             let mut cache = self.paths.borrow_mut();
@@ -2957,8 +3036,25 @@ mod child_cursor_tests {
     type Step<'a> = (u32, Option<u32>, u32, u32, &'a [u8]);
     /// Runs a `Walk` over the rows and returns every path it produced.
     fn walk_paths(base: &[u8], end: u32, limit: u64, rows: &[Step<'_>]) -> Result<Vec<Vec<u8>>> {
+        walk_from(&(0, None, end, 0, b"/r"), base, limit, rows)
+    }
+    /// Runs a `Walk` anchored on `root` (the requested row) over `rows`.
+    fn walk_from(
+        root: &Step<'_>,
+        base: &[u8],
+        limit: u64,
+        rows: &[Step<'_>],
+    ) -> Result<Vec<Vec<u8>>> {
         let base = RawPath::new(base.to_vec()).unwrap();
-        let mut walk = Walk::new(0, end, limit, &base);
+        let root = ChunkDir {
+            id: root.0,
+            parent_id: root.1,
+            subtree_end: root.2,
+            depth: root.3,
+            name: root.4.to_vec(),
+            ..ChunkDir::default()
+        };
+        let mut walk = Walk::new(&root, limit, &base);
         let mut out = Vec::new();
         for &(id, parent, subtree_end, depth, name) in rows {
             out.push(walk.step(id, parent, subtree_end, depth, name)?.to_vec());
@@ -3022,6 +3118,20 @@ mod child_cursor_tests {
             r.pop();
         })));
         assert!(is_invalid(mutate(&|r| r.clear())));
+        // The first row must be the requested row itself: every column.
+        let root = ok[0];
+        assert!(walk_from(&root, b"/r", u64::MAX, &ok).is_ok());
+        let sub: Vec<Step<'_>> = ok[1..3].to_vec();
+        assert!(walk_from(&ok[1], b"/r/a", u64::MAX, &sub).is_ok());
+        for (what, bad) in [
+            ("name", (0, None, 4, 0, &b"/x"[..])),
+            ("span", (0, None, 3, 0, &b"/r"[..])),
+            ("depth", (0, None, 4, 1, &b"/r"[..])),
+            ("parent", (0, Some(0), 4, 0, &b"/r"[..])),
+        ] {
+            assert!(is_invalid(walk_from(&bad, b"/r", u64::MAX, &ok)), "{what}");
+        }
+        assert!(is_invalid(walk_from(&ok[1], b"/r/a", u64::MAX, &ok[2..3])));
     }
 
     fn tampered(s: &Snapshot, sql: &str) -> (tempfile::TempDir, Snapshot) {
@@ -3186,6 +3296,26 @@ mod child_cursor_tests {
                 let fresh = Snapshot::open(&s.file).unwrap();
                 assert!(fresh.wide_dirs(leaf, 2, 1).unwrap().is_empty());
                 assert!(total(&fresh) <= bound, "wide {leaf}: {}", total(&fresh));
+            }
+            // An empty child page (leaf, zero limit, nothing matching the
+            // filter) validates the parent's path eagerly too: the same bound
+            // as a wide query, never more. `children_count` never climbs.
+            for (parent, bound) in [(40, 3), (120, 4), (37, 3)] {
+                for (limit, filter) in [(8, &b""[..]), (0, b""), (8, b"zz")] {
+                    let fresh = Snapshot::open(&s.file).unwrap();
+                    let page = fresh
+                        .children_page(parent, SortKey::Name, false, None, false, limit, filter)
+                        .unwrap();
+                    assert!(page.is_empty() || parent == 37);
+                    assert!(
+                        total(&fresh) <= bound,
+                        "page {parent} {limit} {filter:?}: {}",
+                        total(&fresh)
+                    );
+                }
+                let fresh = Snapshot::open(&s.file).unwrap();
+                fresh.children_count(parent, b"").unwrap();
+                assert!(total(&fresh) <= 1, "count {parent}: {}", total(&fresh));
             }
         }
     }
