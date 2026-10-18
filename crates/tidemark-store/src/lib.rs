@@ -13,6 +13,8 @@ pub mod chunk;
 pub mod diff;
 /// export_ncdu module skeleton.
 pub mod export_ncdu;
+/// Export of any snapshot as a v1-schema SQLite database.
+pub mod export_sqlite;
 /// links module skeleton.
 pub mod links;
 /// reader module skeleton.
@@ -75,5 +77,7 @@ fn test_meta() -> tidemark_core::snapshot::SnapshotMeta {
 
 /// Streaming ncdu export.
 pub use export_ncdu::{export_ncdu, ExportStats, NcduOptions};
+/// Materialise a snapshot as a v1-schema SQLite database.
+pub use export_sqlite::{export_sqlite, SqliteExportStats};
 /// Snapshot reader used by query interfaces.
 pub use reader::Snapshot;
