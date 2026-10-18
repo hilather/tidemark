@@ -1,11 +1,11 @@
 //! Owned by: WSNAP-reader2-core
 //! Bounded chunk-backed directory queries for immutable v2 snapshots.
 use super::*;
-use crate::chunk::{self, ChunkDir, HashWidth};
+use crate::chunk::{self, ChunkDir, ChunkFile, ChunkLinkInstance, HashWidth};
 use std::{
     cell::RefCell,
     cmp::Ordering,
-    collections::{BinaryHeap, VecDeque},
+    collections::{BinaryHeap, HashMap, VecDeque},
     sync::Arc,
 };
 
@@ -117,7 +117,7 @@ fn check_neighbours(conn: &Connection, c: ChunkRef) -> Result<()> {
 // Paths may exceed PATH_MAX when scanners use directory-relative syscalls.
 // Bound reconstruction independently of tree depth and without recursion.
 const MAX_PATH_BYTES: usize = 256 * 1024 * 1024;
-const SHALLOW_COLUMNS: &str = "SELECT id,parent_id,subtree_end,depth,name,x'2f',0,ino,mtime,dir_disk,dir_apparent,projid,entries,errors,own_files,own_symlinks,own_charged,own_apparent,t_dirs,t_files,t_inodes,t_disk,t_apparent,t_charged,t_reclaimable,t_errors,age0,age1,age2,age3,age4,age5,newest_mtime,max_entries";
+const SHALLOW_COLUMNS: &str = super::LITE_COLUMNS;
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 struct Cached {
     first: u32,
@@ -129,6 +129,9 @@ pub(super) struct Backend {
     plain_depth: u32,
     hash: HashWidth,
     cache: RefCell<VecDeque<Cached>>,
+    files: RefCell<SideCache<ChunkFile>>,
+    links: RefCell<SideCache<ChunkLinkInstance>>,
+    paths: RefCell<PathCache>,
 }
 #[derive(Eq, PartialEq)]
 struct Hit {
@@ -221,6 +224,9 @@ impl Backend {
             plain_depth: get("plain_depth")?,
             hash: HashWidth::new(get("hash_width")?)?,
             cache: RefCell::new(VecDeque::new()),
+            files: RefCell::new(SideCache::new()),
+            links: RefCell::new(SideCache::new()),
+            paths: RefCell::new(PathCache::default()),
         })
     }
     fn chunk(&self, snap: &Snapshot, id: u32) -> Result<Arc<Vec<ChunkDir>>> {
@@ -288,7 +294,7 @@ impl Backend {
             None => Ok(None),
         }
     }
-    fn raw(&self, snap: &Snapshot, id: u32) -> Result<ChunkDir> {
+    pub(super) fn raw(&self, snap: &Snapshot, id: u32) -> Result<ChunkDir> {
         let rows = self.chunk(snap, id)?;
         let first = rows.first().ok_or_else(invalid)?.id;
         rows.get((id - first) as usize).cloned().ok_or_else(invalid)
@@ -853,5 +859,1005 @@ impl Backend {
         let used = query(SortKey::Disk)?;
         let reclaim = query(SortKey::Reclaimable)?;
         Ok((used, reclaim, count / 2, snap.file.clone()))
+    }
+}
+
+// ---- notable files, link instances and path streaming ----
+//
+// File and link-instance chunks are located through their own metadata
+// columns. Decoded chunks of both kinds are kept in two small caches (at most
+// `SIDE_CACHE_CHUNKS` chunks and `SIDE_CACHE_BYTES` each), on top of the
+// directory cache above; reconstructed directory paths are cached separately
+// (`PATH_CACHE_BYTES`).
+const SIDE_CACHE_CHUNKS: usize = 4;
+const SIDE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const PATH_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Files,
+    Links,
+}
+impl Kind {
+    fn table(self) -> &'static str {
+        match self {
+            Kind::Files => "file_chunks",
+            Kind::Links => "li_chunks",
+        }
+    }
+    fn keys(self) -> (&'static str, &'static str) {
+        match self {
+            Kind::Files => ("first_dir", "last_dir"),
+            Kind::Links => ("first_ino", "last_ino"),
+        }
+    }
+}
+/// Chunk coordinates read without materialising the BLOB.
+#[derive(Clone, Copy)]
+struct Meta {
+    first: u64,
+    last: u64,
+    lo: u64,
+    hi: u64,
+    len: usize,
+}
+fn nonneg(v: rusqlite::Result<i64>, what: &str) -> Result<u64> {
+    v.ok()
+        .and_then(|v| u64::try_from(v).ok())
+        .ok_or_else(|| bad(what))
+}
+fn meta_sql(kind: Kind) -> String {
+    let (lo, hi) = kind.keys();
+    format!(
+        "SELECT first_row,last_row,{lo},{hi},CASE WHEN typeof(data)='blob' THEN length(data) END,typeof(data) FROM {}",
+        kind.table()
+    )
+}
+fn read_meta(kind: Kind, r: &Row<'_>) -> Result<Meta> {
+    let t = kind.table();
+    let (lo_name, hi_name) = kind.keys();
+    let first = nonneg(r.get(0), &format!("{t}.first_row out of range"))?;
+    let last = nonneg(r.get(1), &format!("{t}.last_row out of range"))?;
+    let lo = nonneg(r.get(2), &format!("{t}.{lo_name} out of range"))?;
+    let hi = nonneg(r.get(3), &format!("{t}.{hi_name} out of range"))?;
+    // `length(data)` is evaluated only for BLOBs: on TEXT it reads the payload.
+    if r.get::<_, String>(5).as_deref() != Ok("blob") {
+        return Err(bad(&format!("{t}.data is not a blob")));
+    }
+    let len = r
+        .get::<_, Option<i64>>(4)
+        .ok()
+        .flatten()
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| bad(&format!("{t}.data is not a blob")))?;
+    if last < first {
+        return Err(bad(&format!("{t}.last_row precedes first_row")));
+    }
+    if hi < lo {
+        return Err(bad(&format!("{t}.{hi_name} precedes {lo_name}")));
+    }
+    if kind == Kind::Files && (last > u64::from(u32::MAX) || hi > u64::from(u32::MAX)) {
+        return Err(bad(&format!("{t} row or directory id out of range")));
+    }
+    Ok(Meta {
+        first,
+        last,
+        lo,
+        hi,
+        len,
+    })
+}
+/// The chunk with the greatest `first_row <= row`.
+fn meta_at(conn: &Connection, kind: Kind, row: u64) -> Result<Option<Meta>> {
+    let sql = format!(
+        "{} WHERE first_row<=? ORDER BY first_row DESC LIMIT 1",
+        meta_sql(kind)
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut rows = stmt.query([sql_u64(row)?])?;
+    rows.next()?.map(|r| read_meta(kind, r)).transpose()
+}
+/// The chunk after `last` (or the first chunk), which must start exactly there.
+fn next_meta(conn: &Connection, kind: Kind, last: Option<u64>) -> Result<Option<Meta>> {
+    let after = match last {
+        Some(last) => Some(last.checked_add(1).ok_or_else(|| bad("row overflow"))?),
+        None => None,
+    };
+    let sql = format!(
+        "{} WHERE first_row>=? ORDER BY first_row LIMIT 1",
+        meta_sql(kind)
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut rows = stmt.query([sql_u64(after.unwrap_or(0))?])?;
+    let found = rows.next()?.map(|r| read_meta(kind, r)).transpose()?;
+    match found {
+        Some(m) if m.first != after.unwrap_or(0) => Err(bad(&format!(
+            "{} intervals overlap or leave a gap",
+            kind.table()
+        ))),
+        other => Ok(other),
+    }
+}
+/// A chunk is usable only when contiguous and ordered with both neighbours.
+fn check_adjacent(conn: &Connection, kind: Kind, m: Meta) -> Result<()> {
+    let t = kind.table();
+    let (lo, hi) = kind.keys();
+    let gap = || bad(&format!("{t} intervals overlap or leave a gap"));
+    let order = || bad(&format!("{t} chunks are not ordered by {lo}"));
+    let prev = conn
+        .prepare_cached(&format!(
+            "SELECT last_row,{hi} FROM {t} WHERE first_row<? ORDER BY first_row DESC LIMIT 1"
+        ))?
+        .query_row([sql_u64(m.first)?], |r| {
+            Ok((r.get::<_, i64>(0), r.get::<_, i64>(1)))
+        })
+        .optional()?;
+    match prev {
+        None if m.first != 0 => return Err(bad(&format!("{t} does not start at row 0"))),
+        Some((last, prev_hi)) => {
+            let last = nonneg(last, &format!("{t}.last_row out of range"))?;
+            if last.checked_add(1) != Some(m.first) {
+                return Err(gap());
+            }
+            if nonneg(prev_hi, &format!("{t}.{hi} out of range"))? > m.lo {
+                return Err(order());
+            }
+        }
+        None => {}
+    }
+    let next = conn
+        .prepare_cached(&format!(
+            "SELECT first_row,{lo} FROM {t} WHERE first_row>? ORDER BY first_row LIMIT 1"
+        ))?
+        .query_row([sql_u64(m.first)?], |r| {
+            Ok((r.get::<_, i64>(0), r.get::<_, i64>(1)))
+        })
+        .optional()?;
+    if let Some((first, next_lo)) = next {
+        if m.last.checked_add(1) != Some(nonneg(first, &format!("{t}.first_row out of range"))?) {
+            return Err(gap());
+        }
+        if nonneg(next_lo, &format!("{t}.{lo} out of range"))? < m.hi {
+            return Err(order());
+        }
+    }
+    Ok(())
+}
+fn side_data(conn: &Connection, kind: Kind, m: Meta) -> Result<Vec<u8>> {
+    let t = kind.table();
+    if m.len > MAX_CHUNK_BLOB {
+        return Err(bad(&format!("{t}.data exceeds codec input ceiling")));
+    }
+    let data = conn
+        .prepare_cached(&format!("SELECT data FROM {t} WHERE first_row=?"))?
+        .query_row([sql_u64(m.first)?], |r| Ok(r.get::<_, Vec<u8>>(0)))
+        .optional()?
+        .ok_or_else(missing)?;
+    data.map_err(|_| bad(&format!("{t}.data is not a blob")))
+}
+fn decode_files_chunk(conn: &Connection, m: Meta) -> Result<Vec<ChunkFile>> {
+    check_adjacent(conn, Kind::Files, m)?;
+    let rows = chunk::decode_files(&side_data(conn, Kind::Files, m)?)?;
+    let agrees = u64::try_from(rows.len()).is_ok_and(|n| n == m.last - m.first + 1)
+        && rows.first().map(|r| u64::from(r.dir_id)) == Some(m.lo)
+        && rows.last().map(|r| u64::from(r.dir_id)) == Some(m.hi);
+    if !agrees {
+        return Err(bad("file_chunks metadata disagrees with chunk data"));
+    }
+    Ok(rows)
+}
+fn decode_links_chunk(conn: &Connection, m: Meta) -> Result<Vec<ChunkLinkInstance>> {
+    check_adjacent(conn, Kind::Links, m)?;
+    let rows = chunk::decode_link_instances(&side_data(conn, Kind::Links, m)?)?;
+    let agrees = u64::try_from(rows.len()).is_ok_and(|n| n == m.last - m.first + 1)
+        && rows.first().map(|r| r.ino) == Some(m.lo)
+        && rows.last().map(|r| r.ino) == Some(m.hi);
+    if !agrees {
+        return Err(bad("li_chunks metadata disagrees with chunk data"));
+    }
+    Ok(rows)
+}
+fn file_size(f: &ChunkFile) -> usize {
+    f.name.as_ref().map_or(0, Vec::capacity)
+}
+fn link_size(l: &ChunkLinkInstance) -> usize {
+    l.name.as_ref().map_or(0, Vec::capacity)
+}
+
+struct Slot<T> {
+    first: u64,
+    last: u64,
+    rows: Arc<Vec<T>>,
+    bytes: usize,
+}
+struct SideCache<T>(VecDeque<Slot<T>>);
+impl<T> SideCache<T> {
+    fn new() -> Self {
+        Self(VecDeque::new())
+    }
+    fn find(&mut self, row: u64) -> Option<(u64, Arc<Vec<T>>)> {
+        let i = self
+            .0
+            .iter()
+            .position(|s| s.first <= row && row <= s.last)?;
+        let slot = self.0.remove(i)?;
+        let hit = (slot.first, slot.rows.clone());
+        self.0.push_front(slot);
+        Some(hit)
+    }
+    fn insert(&mut self, slot: Slot<T>) {
+        if slot.bytes > SIDE_CACHE_BYTES {
+            return;
+        }
+        while self.0.len() >= SIDE_CACHE_CHUNKS
+            || self.0.iter().map(|s| s.bytes).sum::<usize>() + slot.bytes > SIDE_CACHE_BYTES
+        {
+            self.0.pop_back();
+        }
+        self.0.push_front(slot);
+    }
+}
+fn side_load<T>(
+    snap: &Snapshot,
+    m: Meta,
+    cache: &RefCell<SideCache<T>>,
+    decode: fn(&Connection, Meta) -> Result<Vec<T>>,
+    size: fn(&T) -> usize,
+) -> Result<(u64, Arc<Vec<T>>)> {
+    let cached = cache.borrow_mut().find(m.first);
+    if let Some(hit) = cached {
+        return Ok(hit);
+    }
+    let rows = Arc::new(decode(&snap.conn, m)?);
+    let bytes = rows.capacity() * std::mem::size_of::<T>() + rows.iter().map(size).sum::<usize>();
+    cache.borrow_mut().insert(Slot {
+        first: m.first,
+        last: m.last,
+        rows: rows.clone(),
+        bytes,
+    });
+    Ok((m.first, rows))
+}
+fn side_chunk<T>(
+    snap: &Snapshot,
+    kind: Kind,
+    row: u64,
+    cache: &RefCell<SideCache<T>>,
+    decode: fn(&Connection, Meta) -> Result<Vec<T>>,
+    size: fn(&T) -> usize,
+) -> Result<(u64, Arc<Vec<T>>)> {
+    let cached = cache.borrow_mut().find(row);
+    if let Some(hit) = cached {
+        return Ok(hit);
+    }
+    let m = meta_at(&snap.conn, kind, row)?
+        .filter(|m| m.last >= row)
+        .ok_or_else(|| bad(&format!("{} does not cover row {row}", kind.table())))?;
+    side_load(snap, m, cache, decode, size)
+}
+#[derive(Default)]
+struct PathCache {
+    map: HashMap<u32, Arc<RawPath>>,
+    bytes: usize,
+}
+fn valid_name(name: &[u8]) -> bool {
+    !name.is_empty() && !name.contains(&b'/') && !name.contains(&0) && name != b"." && name != b".."
+}
+
+/// Bounds of a notable-file query, already converted to SQL integer ranges.
+pub(super) struct FileBounds {
+    pub(super) min: Option<u64>,
+    pub(super) old: Option<i64>,
+    pub(super) new: Option<i64>,
+}
+struct FileEntry {
+    rev: u64,
+    dir: Arc<RawPath>,
+    id: u32,
+    file: ChunkFile,
+}
+impl FileEntry {
+    fn rank(&self) -> (u64, &[u8], &Option<Vec<u8>>, u32) {
+        (self.rev, self.dir.as_bytes(), &self.file.name, self.id)
+    }
+}
+impl PartialEq for FileEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank() == other.rank()
+    }
+}
+impl Eq for FileEntry {}
+impl PartialOrd for FileEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for FileEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+struct SetEntry {
+    rev: u64,
+    path: Arc<RawPath>,
+    row: LinkSetRow,
+    count: u64,
+}
+impl SetEntry {
+    fn rank(&self) -> (u64, &[u8], u64) {
+        (self.rev, self.path.as_bytes(), self.row.ino)
+    }
+}
+impl PartialEq for SetEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank() == other.rank()
+    }
+}
+impl Eq for SetEntry {}
+impl PartialOrd for SetEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SetEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+struct SharedEntry {
+    rev: u64,
+    path: RawPath,
+    id: u32,
+    total: u64,
+}
+impl SharedEntry {
+    fn rank(&self) -> (u64, &[u8], u32) {
+        (self.rev, self.path.as_bytes(), self.id)
+    }
+}
+impl PartialEq for SharedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank() == other.rank()
+    }
+}
+impl Eq for SharedEntry {}
+impl PartialOrd for SharedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SharedEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+fn instance_row_of(ino: u64, dir_id: u32, name: Option<&[u8]>) -> Result<LinkInstanceRow> {
+    Ok(LinkInstanceRow {
+        ino,
+        dir_id,
+        name: name
+            .map(|n| RawName::new(n.to_vec()))
+            .transpose()
+            .map_err(|_| invalid())?,
+    })
+}
+
+impl Backend {
+    /// Cached, shared reconstruction of one directory's path.
+    fn cached_path(&self, snap: &Snapshot, id: u32) -> Result<Arc<RawPath>> {
+        let hit = self.paths.borrow().map.get(&id).cloned();
+        if let Some(path) = hit {
+            return Ok(path);
+        }
+        let row = self.raw(snap, id).map_err(required)?;
+        let path = Arc::new(self.path(snap, &row)?);
+        let size = path.as_bytes().len();
+        if size <= PATH_CACHE_BYTES {
+            let mut cache = self.paths.borrow_mut();
+            if cache.bytes + size > PATH_CACHE_BYTES || cache.map.len() >= 65536 {
+                cache.map.clear();
+                cache.bytes = 0;
+            }
+            cache.bytes += size;
+            cache.map.insert(id, path.clone());
+        }
+        Ok(path)
+    }
+    /// Directory metadata without path reconstruction; `None` past the last id.
+    pub(super) fn dir_lite(&self, snap: &Snapshot, id: u32) -> Result<Option<DirRow>> {
+        // The chunk cache answers without SQL; only a miss consults `dir_chunks`.
+        let r = match self.raw(snap, id) {
+            Ok(r) => r,
+            Err(StoreError::Sql(rusqlite::Error::QueryReturnedNoRows)) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        let path = RawPath::new(b"/".to_vec()).map_err(|_| invalid())?;
+        Ok(Some(self.materialize_with(r, path)))
+    }
+    fn materialize_with(&self, r: ChunkDir, path: RawPath) -> DirRow {
+        DirRow {
+            id: r.id,
+            parent_id: r.parent_id,
+            subtree_end: r.subtree_end,
+            depth: r.depth,
+            name: r.name,
+            ino: r.ino,
+            mtime: r.mtime,
+            dir_disk: r.dir_disk,
+            dir_apparent: r.dir_apparent,
+            projid: r.projid,
+            entries: r.entries,
+            errors: r.errors,
+            own_files: r.own_files,
+            own_symlinks: r.own_symlinks,
+            own_charged: r.own_charged,
+            own_apparent: r.own_apparent,
+            t_dirs: r.t_dirs,
+            t_files: r.t_files,
+            t_inodes: r.t_inodes,
+            t_disk: r.t_disk,
+            t_apparent: r.t_apparent,
+            t_charged: r.t_charged,
+            t_reclaimable: r.t_reclaimable,
+            t_errors: r.t_errors,
+            age0: r.age0,
+            age1: r.age1,
+            age2: r.age2,
+            age3: r.age3,
+            age4: r.age4,
+            age5: r.age5,
+            newest_mtime: r.newest_mtime,
+            max_entries: r.max_entries,
+            path_hash: 0,
+            path,
+        }
+    }
+    pub(super) fn parent_of(&self, snap: &Snapshot, id: u32) -> Result<Option<u32>> {
+        Ok(self.raw(snap, id)?.parent_id)
+    }
+    /// Sum of `own_apparent` over `lo..=hi`.
+    pub(super) fn own_apparent_sum(&self, snap: &Snapshot, lo: u32, hi: u32) -> Result<u64> {
+        let mut total = 0u64;
+        self.range(snap, lo, hi, |r| {
+            total = total
+                .checked_add(r.own_apparent)
+                .ok_or_else(|| StoreError::Integer("descendant apparent total".into()))?;
+            Ok(())
+        })?;
+        Ok(total)
+    }
+    /// Visit every directory of `lo..=hi` in preorder with its path bytes.
+    pub(super) fn visit_paths(
+        &self,
+        snap: &Snapshot,
+        lo: u32,
+        hi: u32,
+        visit: &mut dyn FnMut(super::DirPath<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let first = self.raw(snap, lo)?;
+        let mut buf = self.path(snap, &first)?.as_bytes().to_vec();
+        let mut stack = vec![(first.depth, buf.len())];
+        visit(super::DirPath {
+            id: first.id,
+            subtree_end: first.subtree_end,
+            depth: first.depth,
+            path: &buf,
+        })?;
+        let Some(next) = lo.checked_add(1).filter(|n| *n <= hi) else {
+            return Ok(());
+        };
+        self.range(snap, next, hi, |row| {
+            while stack.last().is_some_and(|&(d, _)| d >= row.depth) {
+                stack.pop();
+            }
+            let &(depth, len) = stack.last().ok_or_else(invalid)?;
+            if depth.checked_add(1) != Some(row.depth) || !valid_name(&row.name) {
+                return Err(invalid());
+            }
+            buf.truncate(len);
+            if buf.len() > 1 {
+                buf.push(b'/');
+            }
+            buf.extend_from_slice(&row.name);
+            if buf.len() > MAX_PATH_BYTES {
+                return Err(invalid());
+            }
+            stack.push((row.depth, buf.len()));
+            visit(super::DirPath {
+                id: row.id,
+                subtree_end: row.subtree_end,
+                depth: row.depth,
+                path: &buf,
+            })
+        })
+    }
+
+    // ---- notable files ----
+    fn file_rows_at(&self, snap: &Snapshot, row: u64) -> Result<(u64, Arc<Vec<ChunkFile>>)> {
+        side_chunk(
+            snap,
+            Kind::Files,
+            row,
+            &self.files,
+            decode_files_chunk,
+            file_size,
+        )
+    }
+    /// Stream the notable files of one directory, in stored (name) order.
+    pub(super) fn dir_files(
+        &self,
+        snap: &Snapshot,
+        id: u32,
+        visit: &mut dyn FnMut(&ChunkFile) -> Result<()>,
+    ) -> Result<()> {
+        let d = self.raw(snap, id)?;
+        let mut row = u64::from(d.file_lo);
+        let end = row + u64::from(d.file_count);
+        while row < end {
+            let (first, rows) = self.file_rows_at(snap, row)?;
+            let start = usize::try_from(row - first).map_err(|_| invalid())?;
+            let take = usize::try_from(end - row)
+                .map_err(|_| invalid())?
+                .min(rows.len().saturating_sub(start));
+            if take == 0 {
+                return Err(invalid());
+            }
+            for f in &rows[start..start + take] {
+                if f.dir_id != id {
+                    return Err(invalid());
+                }
+                visit(f)?;
+            }
+            row += take as u64;
+        }
+        Ok(())
+    }
+    pub(super) fn subtree_files(
+        &self,
+        snap: &Snapshot,
+        id: u32,
+        end: u32,
+        bounds: &FileBounds,
+        limit: usize,
+    ) -> Result<Vec<FileHit>> {
+        sql_limit(limit)?;
+        let cap = limit.min(crate::error::MAX_QUERY_ROWS + 1);
+        let mut heap = BinaryHeap::<FileEntry>::new();
+        if cap > 0 {
+            let sql = format!(
+                "{} WHERE last_dir>=?1 AND first_dir<=?2 ORDER BY first_row",
+                meta_sql(Kind::Files)
+            );
+            let mut stmt = snap.conn.prepare(&sql)?;
+            let mut metas = stmt.query(params![id, end])?;
+            while let Some(r) = metas.next()? {
+                let m = read_meta(Kind::Files, r)?;
+                let (first, rows) = side_load(snap, m, &self.files, decode_files_chunk, file_size)?;
+                let start = rows.partition_point(|f| f.dir_id < id);
+                for (offset, f) in rows[start..].iter().enumerate() {
+                    if f.dir_id > end {
+                        break;
+                    }
+                    if bounds.min.is_some_and(|min| f.disk < min)
+                        || bounds.old.is_some_and(|old| f.mtime > old)
+                        || bounds.new.is_some_and(|new| f.mtime < new)
+                    {
+                        continue;
+                    }
+                    let rev = u64::MAX - f.disk;
+                    if heap.len() >= cap && heap.peek().is_some_and(|w| rev > w.rev) {
+                        continue;
+                    }
+                    let id =
+                        u32::try_from(first + (start + offset) as u64).map_err(|_| invalid())?;
+                    let entry = FileEntry {
+                        rev,
+                        dir: self.cached_path(snap, f.dir_id)?,
+                        id,
+                        file: f.clone(),
+                    };
+                    if heap.len() < cap {
+                        heap.push(entry);
+                    } else if heap.peek().is_some_and(|w| entry < *w) {
+                        heap.pop();
+                        heap.push(entry);
+                    }
+                }
+            }
+        }
+        crate::error::check_result_bound(heap.as_slice())?;
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|e| {
+                let name = e
+                    .file
+                    .name
+                    .map(RawName::new)
+                    .transpose()
+                    .map_err(|_| invalid())?;
+                let path = name.as_ref().map(|n| e.dir.join(n));
+                Ok(FileHit {
+                    row: FileRow {
+                        id: e.id,
+                        dir_id: e.file.dir_id,
+                        name,
+                        ino: e.file.ino,
+                        disk: e.file.disk,
+                        apparent: e.file.apparent,
+                        mtime: e.file.mtime,
+                        nlink: e.file.nlink,
+                    },
+                    path,
+                })
+            })
+            .collect()
+    }
+
+    // ---- link instances ----
+    /// The first chunk whose last inode is at least `ino`, by binary search on
+    /// row numbers (chunk metadata only, no payload reads).
+    fn li_lower_bound(&self, snap: &Snapshot, ino: u64) -> Result<Option<Meta>> {
+        let sql = format!("{} ORDER BY first_row DESC LIMIT 1", meta_sql(Kind::Links));
+        let tail = {
+            let mut stmt = snap.conn.prepare_cached(&sql)?;
+            let mut rows = stmt.query([])?;
+            rows.next()?
+                .map(|r| read_meta(Kind::Links, r))
+                .transpose()?
+        };
+        let Some(tail) = tail else { return Ok(None) };
+        if tail.hi < ino {
+            return Ok(None);
+        }
+        let (mut lo, mut hi) = (0u64, tail.last);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let m = meta_at(&snap.conn, Kind::Links, mid)?
+                .filter(|m| m.last >= mid)
+                .ok_or_else(|| bad("li_chunks intervals overlap or leave a gap"))?;
+            if m.hi >= ino {
+                hi = m.first;
+            } else {
+                lo = m.last + 1;
+            }
+        }
+        Ok(meta_at(&snap.conn, Kind::Links, lo)?.filter(|m| m.last >= lo))
+    }
+    /// Visit `(row number, instance)` of one inode in stored order. The visitor
+    /// returns `false` to stop.
+    fn li_visit(
+        &self,
+        snap: &Snapshot,
+        ino: u64,
+        mut visit: impl FnMut(u64, &ChunkLinkInstance) -> Result<bool>,
+    ) -> Result<()> {
+        let Some(mut m) = self.li_lower_bound(snap, ino)? else {
+            return Ok(());
+        };
+        loop {
+            if m.lo > ino {
+                return Ok(());
+            }
+            let (first, rows) = side_load(snap, m, &self.links, decode_links_chunk, link_size)?;
+            let start = rows.partition_point(|r| r.ino < ino);
+            for (offset, r) in rows[start..].iter().enumerate() {
+                if r.ino != ino {
+                    return Ok(());
+                }
+                if !visit(first + (start + offset) as u64, r)? {
+                    return Ok(());
+                }
+            }
+            if m.hi > ino {
+                return Ok(());
+            }
+            match next_meta(&snap.conn, Kind::Links, Some(m.last))? {
+                Some(next) => m = next,
+                None => return Ok(()),
+            }
+        }
+    }
+    fn instance_count(&self, snap: &Snapshot, ino: u64) -> Result<u64> {
+        let mut n = 0u64;
+        self.li_visit(snap, ino, |_, _| {
+            n += 1;
+            Ok(true)
+        })?;
+        Ok(n)
+    }
+    pub(super) fn link_instances(&self, snap: &Snapshot, ino: u64) -> Result<Vec<LinkInstanceRow>> {
+        sql_u64(ino)?;
+        let mut out = Vec::new();
+        self.li_visit(snap, ino, |_, r| {
+            out.push(instance_row_of(r.ino, r.dir_id, r.name.as_deref())?);
+            Ok(out.len() <= crate::error::MAX_QUERY_ROWS)
+        })?;
+        crate::error::check_result_bound(&out)?;
+        Ok(out)
+    }
+    pub(super) fn link_instances_page(
+        &self,
+        snap: &Snapshot,
+        ino: u64,
+        cursor: Option<&(i64, LinkInstanceRow)>,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<Vec<(i64, LinkInstanceRow)>> {
+        if limit > crate::error::MAX_QUERY_ROWS {
+            return Err(StoreError::Invalid("link page exceeds query cap".into()));
+        }
+        sql_u64(ino)?;
+        sql_limit(limit)?;
+        let after = cursor.map(|c| {
+            (
+                c.1.dir_id,
+                c.1.name.is_some(),
+                c.1.name.as_ref().map_or(&[][..], |n| n.as_bytes()),
+                c.0,
+            )
+        });
+        let mut forward = Vec::new();
+        let mut tail = VecDeque::new();
+        if limit > 0 {
+            self.li_visit(snap, ino, |row, r| {
+                // v1's rowid is one-based; stored order here is the sorted order.
+                let rowid = i64::try_from(row)
+                    .ok()
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or_else(invalid)?;
+                let key = (
+                    r.dir_id,
+                    r.name.is_some(),
+                    r.name.as_deref().unwrap_or_default(),
+                    rowid,
+                );
+                if let Some(after) = after {
+                    let ord = key.cmp(&after);
+                    if reverse && ord != Ordering::Less {
+                        return Ok(false);
+                    }
+                    if !reverse && ord != Ordering::Greater {
+                        return Ok(true);
+                    }
+                }
+                let item = (rowid, instance_row_of(r.ino, r.dir_id, r.name.as_deref())?);
+                if reverse {
+                    tail.push_back(item);
+                    if tail.len() > limit {
+                        tail.pop_front();
+                    }
+                    Ok(true)
+                } else {
+                    forward.push(item);
+                    Ok(forward.len() < limit)
+                }
+            })?;
+        }
+        Ok(if reverse {
+            tail.into_iter().rev().collect()
+        } else {
+            forward
+        })
+    }
+
+    // ---- link sets ----
+    /// Link sets charged in `id..=end`, ranked by disk, LCA path bytes and inode.
+    /// `region` maps an instance directory to its region (`None` = outside)
+    /// when the query only wants sets spanning two or more regions.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn link_sets_under(
+        &self,
+        snap: &Snapshot,
+        id: u32,
+        end: u32,
+        incomplete: bool,
+        limit: usize,
+        region: Option<&mut dyn FnMut(u32) -> Result<Option<u32>>>,
+    ) -> Result<Vec<LinkSetHit>> {
+        let cap = limit.min(crate::error::MAX_QUERY_ROWS + 1);
+        let mut heap = BinaryHeap::<SetEntry>::new();
+        let mut region = region;
+        if cap > 0 {
+            let mut stmt = snap.conn.prepare(
+                "SELECT ino,nlink,found,complete,disk,apparent,mtime,lca_dir_id FROM link_sets WHERE lca_dir_id BETWEEN ?1 AND ?2 AND (?3=0 OR complete=0) ORDER BY lca_dir_id,ino",
+            )?;
+            let mut sets = stmt.query(params![id, end, incomplete])?;
+            while let Some(r) = sets.next()? {
+                let row = link_row(r)?;
+                let rev = u64::MAX - row.disk;
+                if heap.len() >= cap && heap.peek().is_some_and(|w| rev > w.rev) {
+                    continue;
+                }
+                let path = self.cached_path(snap, row.lca_dir_id)?;
+                if heap.len() >= cap {
+                    let better = heap.peek().is_some_and(|w| {
+                        (rev, path.as_bytes(), row.ino) < (w.rev, w.path.as_bytes(), w.row.ino)
+                    });
+                    if !better {
+                        continue;
+                    }
+                }
+                if let Some(region) = region.as_deref_mut() {
+                    let mut first: Option<Option<u32>> = None;
+                    let mut crossing = false;
+                    self.li_visit(snap, row.ino, |_, i| {
+                        let here = region(i.dir_id)?;
+                        match first {
+                            None => first = Some(here),
+                            Some(previous) if previous != here => {
+                                crossing = true;
+                                return Ok(false);
+                            }
+                            _ => {}
+                        }
+                        Ok(true)
+                    })?;
+                    if !crossing {
+                        continue;
+                    }
+                }
+                let count = self.instance_count(snap, row.ino)?;
+                if heap.len() >= cap {
+                    heap.pop();
+                }
+                heap.push(SetEntry {
+                    rev,
+                    path,
+                    row,
+                    count,
+                });
+            }
+        }
+        crate::error::check_result_bound(heap.as_slice())?;
+        Ok(heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|e| LinkSetHit {
+                row: e.row,
+                lca_path: (*e.path).clone(),
+                instance_count: e.count,
+            })
+            .collect())
+    }
+    /// The ancestor of `dir_id` at `depth` inside `id..=end`, or `None`.
+    pub(super) fn region_at_depth(
+        &self,
+        snap: &Snapshot,
+        dir_id: u32,
+        depth: u64,
+        id: u32,
+        end: u32,
+    ) -> Result<Option<u32>> {
+        let mut row = match self.raw(snap, dir_id) {
+            Ok(row) => row,
+            Err(StoreError::Sql(rusqlite::Error::QueryReturnedNoRows)) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        if u64::from(row.depth) < depth {
+            return Ok(None);
+        }
+        while u64::from(row.depth) > depth {
+            let parent = row.parent_id.ok_or_else(invalid)?;
+            if parent >= row.id {
+                return Err(invalid());
+            }
+            row = self.raw(snap, parent).map_err(required)?;
+        }
+        Ok((row.id >= id && row.id <= end).then_some(row.id))
+    }
+    /// Stream link sets in inode order with their stored instance directories.
+    pub(super) fn stream_sets(
+        &self,
+        snap: &Snapshot,
+        start: u32,
+        end: u32,
+        cap: usize,
+        visit: &mut dyn FnMut(&LinkSetHit, &[u32]) -> Result<()>,
+    ) -> Result<()> {
+        let mut stmt = snap.conn.prepare(
+            "SELECT ino,nlink,found,complete,disk,apparent,mtime,lca_dir_id FROM link_sets NOT INDEXED WHERE lca_dir_id BETWEEN ?1 AND ?2 ORDER BY ino",
+        )?;
+        let mut sets = stmt.query(params![start, end])?;
+        // Forward-only cursor over the inode-ordered instance chunks.
+        let mut chunk: Vec<ChunkLinkInstance> = Vec::new();
+        let mut pos = 0usize;
+        let mut last: Option<u64> = None;
+        let mut done = false;
+        let mut dirs = Vec::new();
+        while let Some(r) = sets.next()? {
+            let row = link_row(r)?;
+            dirs.clear();
+            loop {
+                while pos < chunk.len() && chunk[pos].ino < row.ino {
+                    pos += 1;
+                }
+                while pos < chunk.len() && chunk[pos].ino == row.ino {
+                    if dirs.len() == cap {
+                        return Err(StoreError::Invalid("per-set instance cap reached".into()));
+                    }
+                    dirs.push(chunk[pos].dir_id);
+                    pos += 1;
+                }
+                if pos < chunk.len() || done {
+                    break;
+                }
+                // Skip whole chunks below the wanted inode without decoding them.
+                loop {
+                    match next_meta(&snap.conn, Kind::Links, last)? {
+                        None => {
+                            done = true;
+                            break;
+                        }
+                        Some(m) => {
+                            last = Some(m.last);
+                            if m.hi < row.ino {
+                                continue;
+                            }
+                            chunk = decode_links_chunk(&snap.conn, m)?;
+                            pos = 0;
+                            break;
+                        }
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+            let hit = LinkSetHit {
+                lca_path: (*self.cached_path(snap, row.lca_dir_id)?).clone(),
+                row,
+                instance_count: dirs.len() as u64,
+            };
+            visit(&hit, &dirs)?;
+        }
+        Ok(())
+    }
+    /// Directories with `t_disk > t_reclaimable`, most shared bytes first.
+    pub(super) fn most_shared(
+        &self,
+        snap: &Snapshot,
+        lo: u32,
+        hi: u32,
+        limit: usize,
+    ) -> Result<Vec<(RawPath, u64, u64)>> {
+        sql_limit(limit)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut heap = BinaryHeap::<SharedEntry>::new();
+        self.projected_chunks(snap, lo, hi, |first, p| {
+            for offset in 0..p.entries.len() {
+                let id = first
+                    .checked_add(u32::try_from(offset).map_err(|_| invalid())?)
+                    .ok_or_else(invalid)?;
+                if id < lo || id > hi || p.t_disk[offset] <= p.t_reclaimable[offset] {
+                    continue;
+                }
+                let shared = p.t_disk[offset] - p.t_reclaimable[offset];
+                let rev = u64::MAX - shared;
+                if heap.len() >= limit && heap.peek().is_some_and(|w| rev > w.rev) {
+                    continue;
+                }
+                let row = self.raw(snap, id)?;
+                let entry = SharedEntry {
+                    rev,
+                    path: self.path(snap, &row)?,
+                    id,
+                    total: p.t_disk[offset],
+                };
+                if heap.len() < limit {
+                    heap.push(entry);
+                } else if heap.peek().is_some_and(|w| entry < *w) {
+                    heap.pop();
+                    heap.push(entry);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|e| (e.path, u64::MAX - e.rev, e.total))
+            .collect())
     }
 }
