@@ -134,16 +134,27 @@ CARGO_NET_OFFLINE=true timeout 1500 cargo run --offline --release \
   --seed 42 --out /proc/self/fd/3/. --query all --json
 ```
 
-| Query | Fresh median ms | Fresh p95 ms | Warm median ms | Warm p95 ms | v1 limit (fresh / warm) |
-|---|---:|---:|---:|---:|---|
-| children_root | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
-| children_wide | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
-| top2 | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
-| top4 | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
-| files_root | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
-| files_subtree | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
-| path12 | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
-| diff | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
-| ncdu | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
+Measured on integration `61abc4c` (the v2 reader now on main), host release build, OS page cache not dropped.
 
-Snapshot sizes and peak RSS: TBD (coordinator host run).
+| Query | Mode | v1 median ms | v1 p95 ms | v2 median ms | v2 p95 ms | Limit ms | Result |
+|---|---|---|---|---|---|---|---|
+| children_root | fresh_open | 9.2 | 424.2 | 3.1 | 3.4 | 100.0 | pass |
+| children_root | warm | 8.5 | 8.7 | 1.6 | 1.6 | 100.0 | pass |
+| children_wide | fresh_open | 15.6 | 25.4 | 44.5 | 45.2 | 100.0 | pass |
+| children_wide | warm | 14.6 | 14.7 | 41.1 | 44.6 | 100.0 | pass |
+| top2 | fresh_open | 773.3 | 895.5 | 473.9 | 509.2 | 966.7 | pass |
+| top2 | warm | 760.6 | 791.8 | 476.9 | 482.3 | 950.7 | pass |
+| top4 | fresh_open | 767.3 | 778.5 | 501.6 | 509.6 | 959.1 | pass |
+| top4 | warm | 803.5 | 826.8 | 513.3 | 521.3 | 1004.3 | pass |
+| files_root | fresh_open | 879.9 | 902.6 | 204.3 | 212.4 | 1099.9 | pass |
+| files_root | warm | 934.2 | 942.2 | 25.3 | 25.7 | 1167.8 | pass |
+| files_subtree | fresh_open | 1.1 | 1.3 | 4.8 | 4.9 | 100.0 | pass |
+| files_subtree | warm | 0.4 | 0.5 | 0.0 | 0.0 | 100.0 | pass |
+| path12 | fresh_open | 0.5 | 0.5 | 2.4 | 2.6 | 100.0 | pass |
+| path12 | warm | 0.0 | 0.0 | 0.0 | 0.0 | 100.0 | pass |
+| diff | fresh_open | 4453.2 | 4492.9 | 2660.1 | 2837.3 | 5566.5 | pass |
+| diff | warm | 4319.5 | 4491.6 | 2590.8 | 3020.2 | 5399.4 | pass |
+| ncdu | fresh_open | 72584.6 | 73225.9 | 1296.4 | 1362.5 | 90730.8 | pass |
+| ncdu | warm | 72094.1 | 73986.6 | 1365.4 | 1415.9 | 90117.6 | pass |
+
+Snapshot bytes (old + changed copy): v1 600,735,744 + 600,735,744; v2 93,171,712 + 93,184,000. Process peak RSS (includes generating the fixture): v1 1,916,436 KiB; v2 1,012,076 KiB.

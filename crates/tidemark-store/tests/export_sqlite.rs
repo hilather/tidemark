@@ -81,7 +81,7 @@ fn dir(id: u32) -> DirRow {
         mtime: 5 + i64::from(id),
         dir_disk: 4096,
         dir_apparent: 6,
-        projid: (id % 2 == 0).then_some(id),
+        projid: id.is_multiple_of(2).then_some(id),
         entries: 3,
         errors: id % 2,
         own_files: n + 1,

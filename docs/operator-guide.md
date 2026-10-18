@@ -441,3 +441,14 @@ cold_after_recent = false
 Existing cold snapshots remain readable. `tidemark snapshots prune --dry-run` previews both deletions and compressions; omit `--dry-run` to apply them with the daemon stopped. Compression space refusals leave the hot snapshot available.
 
 New scans write snapshot format v2, which gives smaller files. Existing v1 snapshots remain readable and need no migration; no operator action is needed.
+
+## Exporting a snapshot to SQLite
+
+New scans write the compact v2 format, which has no `path` column and is not meant for hand-written SQL. To analyse a snapshot with plain `sqlite3`, or to copy it off the box, materialise a v1-schema database:
+
+```sh
+sudo tidemark snapshots export --sqlite <ID> /var/tmp/scan.db
+sqlite3 /var/tmp/scan.db 'SELECT path, t_disk FROM dirs ORDER BY t_disk DESC LIMIT 10'
+```
+
+`<ID>` is a scan id from `tidemark snapshots list`; `--root ROOT` additionally checks that the snapshot belongs to that root. The output works from v1, v2 and cold snapshots alike. It is a normal v1 snapshot, so `dirs.path`, `dirs.path_hash` and the v1 indexes are present, and the file has mode 0600. The output path must not exist: the command refuses to overwrite and leaves an existing file untouched. It is built in a private staging directory beside the output and published only when complete, so a failure leaves no partial file. Choose a destination outside the Tidemark state directory with room for roughly the size of a v1 snapshot; a full disk exits 5. The command does not change the catalog or the stored snapshot.
