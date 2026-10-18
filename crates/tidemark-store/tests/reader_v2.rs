@@ -2822,3 +2822,80 @@ fn g8_v2_file(
     let s = Snapshot::open(&f).unwrap();
     (dir, f, s)
 }
+
+// ---- SNAP-gate8-fix2 regressions (review13) ----
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[test]
+fn review13_b1_requested_shallow_root_name_must_match_the_chunk() {
+    let rows = tree(6, 3);
+    let (_keep, file, _s) = g8_v2_file(&rows, 3);
+    let (_k, ok) = g8_tamper(&file, "");
+    assert!(ok.subtree_dirs(1, 0, SortKey::Name, 100).is_ok());
+    for bad in [&b"a/b"[..], b"", b"/", b".", b"..", b"x\0y", b"renamed"] {
+        let (_k, s) = g8_tamper(
+            &file,
+            &format!("UPDATE shallow_dirs SET name=x'{}' WHERE id=1;", hex(bad)),
+        );
+        assert!(
+            g8_invalid(s.subtree_dirs(1, 0, SortKey::Name, 100)),
+            "id 1 {bad:?}"
+        );
+    }
+    for bad in [&b"x\0y"[..], b"/other"] {
+        let (_k, s) = g8_tamper(
+            &file,
+            &format!("UPDATE shallow_dirs SET name=x'{}' WHERE id=0;", hex(bad)),
+        );
+        assert!(
+            g8_invalid(s.subtree_dirs(0, 0, SortKey::Name, 100)),
+            "id 0 {bad:?}"
+        );
+        assert!(g8_invalid(s.metrics_candidates(0, 100)), "id 0 {bad:?}");
+    }
+}
+
+#[test]
+fn review13_s1_children_rejects_a_bad_unreturned_sibling() {
+    let rows = tree(6, 3);
+    let (_keep, file, _s) = g8_v2_file(&rows, 3);
+    let last = rows
+        .iter()
+        .filter(|r| r.parent_id == Some(0))
+        .map(|r| r.id)
+        .max()
+        .unwrap();
+    let (_k, s) = g8_tamper(
+        &file,
+        &format!("UPDATE shallow_dirs SET own_charged='x' WHERE id={last};"),
+    );
+    for limit in [1, 2, 100] {
+        assert!(
+            g8_invalid(s.children(0, SortKey::Name, limit)),
+            "limit {limit}"
+        );
+    }
+    assert!(g8_invalid(s.children_count(0, b"")));
+}
+
+#[test]
+fn review13_n1_missing_parent_still_validates_the_limit() {
+    let rows = tree(5, 3);
+    for plain in [0, 3] {
+        let p = pair(&rows, plain, 64, 4);
+        let missing = rows.len() as u32 + 100;
+        let a = p.one.children(missing, SortKey::Name, usize::MAX);
+        let b = p.two.children(missing, SortKey::Name, usize::MAX);
+        assert!(matches!(a, Err(StoreError::Integer(_))), "{a:?}");
+        assert!(matches!(b, Err(StoreError::Integer(_))), "{b:?}");
+        assert_eq!(a.unwrap_err().to_string(), b.unwrap_err().to_string());
+        assert!(p
+            .two
+            .children(missing, SortKey::Name, 3)
+            .unwrap()
+            .is_empty());
+    }
+}

@@ -457,6 +457,12 @@ impl Backend {
         }
         Ok(rows)
     }
+    /// The cached chunk covering exactly `first..=last`, without touching LRU order.
+    fn cached(&self, first: u32, last: u32) -> Option<Arc<Vec<ChunkDir>>> {
+        let cache = self.cache.borrow();
+        let hit = cache.iter().find(|c| c.first == first && c.last == last)?;
+        Some(hit.rows.clone())
+    }
     fn locate(&self, snap: &Snapshot, id: u32) -> Result<Option<ChunkRef>> {
         snap.conn
             .query_row(
@@ -781,31 +787,12 @@ impl Backend {
         sort: SortKey,
         limit: usize,
     ) -> Result<Vec<DirRow>> {
+        let mut top = TopN::new(limit, Tie::Name)?;
         let Some(parent) = self.listing_parent(snap, id)? else {
             return Ok(Vec::new());
         };
         let base = self.cached_path(snap, id)?;
-        if parent.depth < self.plain_depth {
-            self.check_shallow_children(snap, &parent)?;
-            let mut stmt = snap.conn.prepare_cached(&format!(
-                "SELECT {SHALLOW_COLUMNS} FROM shallow_dirs WHERE parent_id=? ORDER BY {}, id LIMIT ?",
-                order(sort)
-            ))?;
-            let mut rows = stmt.query(params![id, sql_limit(limit)?])?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next()? {
-                if out.len() > crate::error::MAX_QUERY_ROWS {
-                    break;
-                }
-                let c = shallow_dir(row).map_err(plain_row_error)?;
-                let path = Self::child_path(&parent, &base, &c)?;
-                out.push(self.materialized(c, path));
-            }
-            crate::error::check_result_bound(&out)?;
-            return Ok(out);
-        }
-        let mut top = TopN::new(limit, Tie::Name)?;
-        self.hop_children(snap, &parent, |c| {
+        let visit = |c: ChunkDir| {
             let k = -key(&c, sort);
             if top.admits(k, &c.name, c.id) {
                 let path = Self::child_path(&parent, &base, &c)?;
@@ -817,7 +804,13 @@ impl Backend {
                 });
             }
             Ok(())
-        })?;
+        };
+        if parent.depth < self.plain_depth {
+            // Every sibling is decoded (one pass), as `children_count` does.
+            self.visit_shallow_children(snap, &parent, visit)?;
+        } else {
+            self.hop_children(snap, &parent, visit)?;
+        }
         self.finish(top)
     }
     /// Every child of a shallow parent as a full row, checked like
@@ -1020,8 +1013,14 @@ impl Backend {
                 || shallow.parent_id != root.parent_id
                 || shallow.depth != root.depth
                 || shallow.subtree_end != root.subtree_end
+                || shallow.name != root.name
             {
                 return Err(invalid());
+            }
+            if root.id == 0 {
+                RawPath::new(shallow.name).map_err(|_| invalid())?;
+            } else {
+                RawName::new(shallow.name).map_err(|_| invalid())?;
             }
         }
         Ok(root)
@@ -1051,17 +1050,28 @@ impl Backend {
                 check_neighbours(&snap.conn, c)?;
             }
             seen = Some(c);
-            let data = chunk_data(&snap.conn, c)?;
-            #[cfg(test)]
-            self.scanned.set(self.scanned.get() + 1);
             let mut count = 0u32;
-            chunk::visit_dirs(&data, c.first, |v| {
-                count = count.checked_add(1).ok_or_else(invalid)?;
-                if v.id >= lo && v.id <= hi {
-                    visit(v)?;
+            // A chunk the LRU already holds was fully validated when decoded:
+            // reuse it (lookup only; streamed chunks are never inserted).
+            if let Some(rows) = self.cached(c.first, c.last) {
+                for r in rows.iter() {
+                    count = count.checked_add(1).ok_or_else(invalid)?;
+                    if r.id >= lo && r.id <= hi {
+                        visit(&r.view())?;
+                    }
                 }
-                Ok(())
-            })?;
+            } else {
+                let data = chunk_data(&snap.conn, c)?;
+                #[cfg(test)]
+                self.scanned.set(self.scanned.get() + 1);
+                chunk::visit_dirs(&data, c.first, |v| {
+                    count = count.checked_add(1).ok_or_else(invalid)?;
+                    if v.id >= lo && v.id <= hi {
+                        visit(v)?;
+                    }
+                    Ok(())
+                })?;
+            }
             if count == 0 || c.first.checked_add(count - 1) != Some(c.last) {
                 return Err(invalid());
             }
@@ -1221,38 +1231,43 @@ impl Backend {
         let root = self.authoritative_root(snap, 0)?;
         let base = self.path(snap, &root)?;
         let mut count = 0u64;
-        let mut results = Vec::with_capacity(2);
-        for sort in [SortKey::Disk, SortKey::Reclaimable] {
-            let mut top = TopN::new(limit, Tie::Path)?;
-            let mut walk = Walk::new(0, root.subtree_end, u64::from(depth), &base);
-            if depth <= self.plain_depth {
-                let mut stmt = snap.conn.prepare_cached(&format!(
-                    "SELECT {SHALLOW_COLUMNS} FROM shallow_dirs WHERE depth<=? ORDER BY id"
-                ))?;
-                let mut rows = stmt.query([depth])?;
-                while let Some(row) = rows.next()? {
-                    let r = shallow_dir(row).map_err(plain_row_error)?;
-                    let path = walk.step(r.id, r.parent_id, r.subtree_end, r.depth, &r.name)?;
-                    count += 1;
-                    let k = -key(&r, sort);
+        let mut tops = [
+            (SortKey::Disk, TopN::new(limit, Tie::Path)?),
+            (SortKey::Reclaimable, TopN::new(limit, Tie::Path)?),
+        ];
+        let mut walk = Walk::new(0, root.subtree_end, u64::from(depth), &base);
+        if depth <= self.plain_depth {
+            let mut stmt = snap.conn.prepare_cached(&format!(
+                "SELECT {SHALLOW_COLUMNS} FROM shallow_dirs WHERE depth<=? ORDER BY id"
+            ))?;
+            let mut rows = stmt.query([depth])?;
+            while let Some(row) = rows.next()? {
+                let r = shallow_dir(row).map_err(plain_row_error)?;
+                let path = walk.step(r.id, r.parent_id, r.subtree_end, r.depth, &r.name)?;
+                count += 1;
+                for (sort, top) in tops.iter_mut() {
+                    let k = -key(&r, *sort);
                     if top.admits(k, path, r.id) {
                         let path = RawPath::new(path.to_vec()).map_err(|_| invalid())?;
                         top.push(Hit {
                             key: k,
                             tie: Tie::Path,
-                            row: r,
+                            row: r.clone(),
                             path,
                         });
                     }
                 }
-            } else {
-                self.scan(snap, 0, root.subtree_end, |v| {
-                    if v.depth > depth {
-                        return Ok(());
-                    }
-                    let path = walk.step(v.id, v.parent_id, v.subtree_end, v.depth, v.name)?;
-                    count += 1;
-                    let k = -view_key(v, sort);
+            }
+        } else {
+            // One pass feeds both rankings.
+            self.scan(snap, 0, root.subtree_end, |v| {
+                if v.depth > depth {
+                    return Ok(());
+                }
+                let path = walk.step(v.id, v.parent_id, v.subtree_end, v.depth, v.name)?;
+                count += 1;
+                for (sort, top) in tops.iter_mut() {
+                    let k = -view_key(v, *sort);
                     if top.admits(k, path, v.id) {
                         let path = RawPath::new(path.to_vec()).map_err(|_| invalid())?;
                         top.push(Hit {
@@ -1262,15 +1277,18 @@ impl Backend {
                             path,
                         });
                     }
-                    Ok(())
-                })?;
-            }
-            walk.finish()?;
+                }
+                Ok(())
+            })?;
+        }
+        walk.finish()?;
+        let mut results = Vec::with_capacity(2);
+        for (_, top) in tops {
             results.push(self.finish(top)?);
         }
         let reclaim = results.pop().ok_or_else(invalid)?;
         let used = results.pop().ok_or_else(invalid)?;
-        Ok((used, reclaim, count / 2, snap.file.clone()))
+        Ok((used, reclaim, count, snap.file.clone()))
     }
 }
 
@@ -3067,7 +3085,31 @@ mod child_cursor_tests {
             fresh.subtree_dirs(0, 4, SortKey::Disk, 1000).unwrap().len(),
             121
         );
-        assert_eq!(scanned(&fresh), 121u64.div_ceil(16));
+        // The root chunk is decoded once (cached by `raw`); the scan reuses it.
+        assert_eq!(scanned(&fresh) + decodes(&fresh), 121u64.div_ceil(16));
         assert!(decodes(&fresh) <= 1, "{} decodes", decodes(&fresh));
+    }
+
+    #[test]
+    fn deep_queries_decode_each_chunk_at_most_once_and_reuse_the_cache() {
+        let (_d, s) = v2_only(&balanced121(), 0, 16);
+        let total = |s: &Snapshot| decodes(s) + scanned(s);
+        let fresh = Snapshot::open(&s.file).unwrap();
+        assert_eq!(
+            fresh.subtree_dirs(0, 4, SortKey::Name, 1000).unwrap().len(),
+            121
+        );
+        assert!(total(&fresh) <= 8, "{} chunk decodes", total(&fresh));
+        let fresh = Snapshot::open(&s.file).unwrap();
+        let (used, reclaim, count, _) = fresh.metrics_candidates(4, 1000).unwrap();
+        assert_eq!((used.len(), reclaim.len(), count), (121, 121, 121));
+        assert!(total(&fresh) <= 8, "{} chunk decodes", total(&fresh));
+        // The root chunk is in the LRU: scanning it again streams nothing for it.
+        let fresh = Snapshot::open(&s.file).unwrap();
+        fresh.dir(0).unwrap();
+        let before = (decodes(&fresh), scanned(&fresh));
+        fresh.subtree_dirs(0, 4, SortKey::Name, 1000).unwrap();
+        assert_eq!(decodes(&fresh), before.0);
+        assert_eq!(scanned(&fresh), before.1 + 7);
     }
 }
