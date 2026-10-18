@@ -2594,9 +2594,9 @@ mod child_cursor_tests {
         assert_eq!(rows.len(), 121);
         for i in (0..rows.len()).rev() {
             let mut end = i as u32;
-            for j in i + 1..rows.len() {
-                if rows[j].parent_id == Some(i as u32) {
-                    end = rows[j].subtree_end;
+            for r in rows.iter().skip(i + 1) {
+                if r.parent_id == Some(i as u32) {
+                    end = r.subtree_end;
                 }
             }
             rows[i].subtree_end = end;
