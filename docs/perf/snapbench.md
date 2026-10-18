@@ -8,7 +8,7 @@ clock of 1,780,000,000 Unix seconds. The default fixture has 2,000,000 directori
 same-directory pairs). Two directories have 100,001 direct children each; most
 remaining branches have six-directory stems and leaves at depth seven. An exact
 1,000-directory subtree and a depth-12 path are included. Names are sorted raw
-bytes with lengths 4, 8, 17 and 40, repeating source/archive/data suffixes.
+bytes with lengths 4, 8, 17 and 41, repeating source/archive/data suffixes.
 Allocated sizes follow a bounded, 512-byte-rounded log-normal distribution;
 mtimes span two years, with charged age buckets and subtree totals rolled up.
 The writer is the public scan-path `SnapshotWriter`, including its indexes and
@@ -115,3 +115,35 @@ and `open` dispatch; query bodies and timing/reporting stay shared. No v2 reader
 or actual cold-file path is available in this baseline checkout. The future v2
 acceptance threshold is `max(1.25 × v1, 100 ms)` per corresponding query; no v2
 comparison is claimed here.
+
+## v2
+
+The method is unchanged: same generator, seed, fixture shape, queries, repetition
+counts and statistics. The layout is selected with `--layout v2`
+(the default remains `v1`); the original and comparison snapshots are both written in
+the selected layout. The acceptance rule from the design (`docs/design/15-snapshot-v2.md`
+§8) is v2 ≤ max(1.25 × v1, 100 ms) per query, compared on the same host in the same
+session.
+
+```sh
+mkdir -m 700 /tmp/tidemark-snapbench-v2
+exec 3</tmp/tidemark-snapbench-v2
+CARGO_NET_OFFLINE=true timeout 1500 cargo run --offline --release \
+  -p tidemark-store --example snapbench -- \
+  --layout v2 --dirs 2000000 --files 200000 --links 500000 \
+  --seed 42 --out /proc/self/fd/3/. --query all --json
+```
+
+| Query | Fresh median ms | Fresh p95 ms | Warm median ms | Warm p95 ms | v1 limit (fresh / warm) |
+|---|---:|---:|---:|---:|---|
+| children_root | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
+| children_wide | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
+| top2 | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
+| top4 | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
+| files_root | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
+| files_subtree | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
+| path12 | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
+| diff | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
+| ncdu | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD (coordinator host run) | TBD |
+
+Snapshot sizes and peak RSS: TBD (coordinator host run).
