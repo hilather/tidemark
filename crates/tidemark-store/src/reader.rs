@@ -49,6 +49,16 @@ pub struct Snapshot {
     _inflated: Option<crate::cold::Inflated>,
 }
 
+/// Directory columns without path data; `path` is the placeholder `/` and the hash is 0.
+pub(crate) const LITE_COLUMNS: &str = "SELECT id,parent_id,subtree_end,depth,name,x'2f',0,ino,mtime,dir_disk,dir_apparent,projid,entries,errors,own_files,own_symlinks,own_charged,own_apparent,t_dirs,t_files,t_inodes,t_disk,t_apparent,t_charged,t_reclaimable,t_errors,age0,age1,age2,age3,age4,age5,newest_mtime,max_entries";
+/// A directory visited in preorder together with its raw path bytes.
+pub(crate) struct DirPath<'a> {
+    pub(crate) id: u32,
+    pub(crate) subtree_end: u32,
+    pub(crate) depth: u32,
+    pub(crate) path: &'a [u8],
+}
+
 fn decode_path(bytes: Vec<u8>) -> rusqlite::Result<RawPath> {
     RawPath::new(bytes).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
@@ -286,6 +296,123 @@ impl Snapshot {
         }
         Ok(&self.conn)
     }
+    /// Whether this snapshot uses the columnar v2 layout.
+    pub(crate) fn is_v2(&self) -> bool {
+        self.v2.is_some()
+    }
+    /// Depth and last preorder id of a directory's subtree; an error when `id` is absent.
+    fn bounds_of(&self, id: u32) -> Result<(u32, u32)> {
+        match &self.v2 {
+            Some(backend) => {
+                let row = backend.raw(self, id)?;
+                Ok((row.depth, row.subtree_end))
+            }
+            None => {
+                let row = self.dir(id)?;
+                Ok((row.depth, row.subtree_end))
+            }
+        }
+    }
+    /// Directory columns without path reconstruction (placeholder `path`, zero hash);
+    /// `None` when `id` does not exist.
+    pub(crate) fn dir_lite(&self, id: u32) -> Result<Option<DirRow>> {
+        if let Some(backend) = &self.v2 {
+            return backend.dir_lite(self, id);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                &format!("{LITE_COLUMNS} FROM dirs WHERE id=?"),
+                [id],
+                dir_row,
+            )
+            .optional()?)
+    }
+    /// Parent of a directory.
+    pub(crate) fn parent_of(&self, id: u32) -> Result<Option<u32>> {
+        match &self.v2 {
+            Some(backend) => backend.parent_of(self, id),
+            None => Ok(self.dir(id)?.parent_id),
+        }
+    }
+    /// Sum of `own_apparent` over the inclusive id range.
+    pub(crate) fn own_apparent_sum(&self, lo: u32, hi: u32) -> Result<u64> {
+        if let Some(backend) = &self.v2 {
+            return backend.own_apparent_sum(self, lo, hi);
+        }
+        let mut statement = self
+            .conn
+            .prepare("SELECT own_apparent FROM dirs WHERE id >= ?1 AND id <= ?2 ORDER BY id")?;
+        let mut rows = statement.query(params![lo, hi])?;
+        let mut total = 0u64;
+        while let Some(row) = rows.next()? {
+            total = total
+                .checked_add(crate::error::read_u64(row, 0)?)
+                .ok_or_else(|| StoreError::Integer("descendant apparent total".into()))?;
+        }
+        Ok(total)
+    }
+    /// Visit the directories of an inclusive id range in preorder with raw path bytes.
+    pub(crate) fn visit_dir_paths(
+        &self,
+        lo: u32,
+        hi: u32,
+        visit: &mut dyn FnMut(DirPath<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(backend) = &self.v2 {
+            return backend.visit_paths(self, lo, hi, visit);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id,subtree_end,path,depth FROM dirs WHERE id BETWEEN ?1 AND ?2 ORDER BY id",
+        )?;
+        let mut rows = stmt.query(params![lo, hi])?;
+        while let Some(row) = rows.next()? {
+            let bytes: Vec<u8> = row.get(2)?;
+            visit(DirPath {
+                id: row.get(0)?,
+                subtree_end: row.get(1)?,
+                depth: row.get(3)?,
+                path: &bytes,
+            })?;
+        }
+        Ok(())
+    }
+    /// Stream the notable files of a v2 directory in stored order.
+    pub(crate) fn v2_dir_files(
+        &self,
+        id: u32,
+        visit: &mut dyn FnMut(&crate::chunk::ChunkFile) -> Result<()>,
+    ) -> Result<()> {
+        match &self.v2 {
+            Some(backend) => backend.dir_files(self, id, visit),
+            None => Err(StoreError::Invalid("not a v2 snapshot".into())),
+        }
+    }
+    /// Stream link sets under a v2 range, in inode order, with instance directories.
+    pub(crate) fn v2_stream_sets(
+        &self,
+        start: u32,
+        end: u32,
+        cap: usize,
+        visit: &mut dyn FnMut(&LinkSetHit, &[u32]) -> Result<()>,
+    ) -> Result<()> {
+        match &self.v2 {
+            Some(backend) => backend.stream_sets(self, start, end, cap, visit),
+            None => Err(StoreError::Invalid("not a v2 snapshot".into())),
+        }
+    }
+    /// Directories with unshared bytes pinned by link sets, most shared first.
+    pub(crate) fn v2_most_shared(
+        &self,
+        lo: u32,
+        hi: u32,
+        limit: usize,
+    ) -> Result<Vec<(RawPath, u64, u64)>> {
+        match &self.v2 {
+            Some(backend) => backend.most_shared(self, lo, hi, limit),
+            None => Err(StoreError::Invalid("not a v2 snapshot".into())),
+        }
+    }
     /// The durable catalog file this reader was opened from.
     #[allow(dead_code)] // Sibling query owners adopt this seam in their follow-up tasks.
     pub(crate) fn file(&self) -> &std::path::Path {
@@ -506,7 +633,9 @@ impl Snapshot {
         reverse: bool,
         limit: usize,
     ) -> Result<Vec<(i64, LinkInstanceRow)>> {
-        self.v1_conn()?;
+        if let Some(backend) = &self.v2 {
+            return backend.link_instances_page(self, ino, cursor, reverse, limit);
+        }
         if limit > crate::error::MAX_QUERY_ROWS {
             return Err(StoreError::Invalid("link page exceeds query cap".into()));
         }
@@ -611,8 +740,7 @@ impl Snapshot {
         filter: &FileFilter,
         limit: usize,
     ) -> Result<Vec<FileHit>> {
-        self.v1_conn()?;
-        let d = self.dir(id)?;
+        let (_, end) = self.bounds_of(id)?;
         let cutoff = |age: Option<std::time::Duration>| -> Result<Option<i64>> {
             age.map(|age| {
                 let secs = sql_u64(age.as_secs())?;
@@ -626,20 +754,18 @@ impl Snapshot {
         let old = cutoff(filter.older_than)?;
         let new = cutoff(filter.newer_than)?;
         let min = filter.min_size.map(sql_u64).transpose()?;
+        if let Some(backend) = &self.v2 {
+            let bounds = v2::FileBounds {
+                min: filter.min_size,
+                old,
+                new,
+            };
+            return backend.subtree_files(self, id, end, &bounds, limit);
+        }
         let mut stmt=self.conn.prepare("SELECT f.*,d.path FROM files f JOIN dirs d ON f.dir_id=d.id WHERE d.id BETWEEN ? AND ? AND (? IS NULL OR f.disk>=?) AND (? IS NULL OR f.mtime<=?) AND (? IS NULL OR f.mtime>=?) ORDER BY f.disk DESC,d.path,f.name,f.id LIMIT ?")?;
         let result = stmt
             .query_map(
-                params![
-                    id,
-                    d.subtree_end,
-                    min,
-                    min,
-                    old,
-                    old,
-                    new,
-                    new,
-                    sql_limit(limit)?
-                ],
+                params![id, end, min, min, old, old, new, new, sql_limit(limit)?],
                 |r| {
                     let row = file_row(r)?;
                     let dir = decode_path(r.get(8)?)?;
@@ -680,13 +806,12 @@ impl Snapshot {
         filter: &LinkFilter,
         limit: usize,
     ) -> Result<Vec<LinkSetHit>> {
-        self.v1_conn()?;
         if !filter.boundary.is_empty() && filter.boundary_depth.is_some() {
             return Err(StoreError::Invalid(
                 "boundary globs and depth are mutually exclusive".into(),
             ));
         }
-        let d = self.dir(id)?;
+        let (base_depth, end) = self.bounds_of(id)?;
         if !filter.boundary.is_empty() {
             crate::error::check_result_bound(&filter.boundary)?;
             let mut builder = globset::GlobSetBuilder::new();
@@ -701,28 +826,38 @@ impl Snapshot {
             let globs = builder
                 .build()
                 .map_err(|e| StoreError::Invalid(e.to_string()))?;
-            let mut stmt = self.conn.prepare(
-                "SELECT id,subtree_end,path FROM dirs WHERE id BETWEEN ? AND ? ORDER BY id",
-            )?;
-            let mut rows = stmt.query(params![id, d.subtree_end])?;
-            let mut regions = Vec::new();
+            let mut regions: Vec<(u32, Option<u32>)> = Vec::new();
             let mut stack: Vec<(u32, u32)> = Vec::new();
-            while let Some(row) = rows.next()? {
-                let dir_id: u32 = row.get(0)?;
-                let end: u32 = row.get(1)?;
-                let bytes: Vec<u8> = row.get(2)?;
-                while stack.last().is_some_and(|&(_, end)| end < dir_id) {
+            self.visit_dir_paths(id, end, &mut |dir| {
+                while stack.last().is_some_and(|&(_, end)| end < dir.id) {
                     stack.pop();
                 }
-                if globs.is_match_candidate(&globset::Candidate::from_bytes(&bytes)) {
-                    stack.push((dir_id, end));
+                if globs.is_match_candidate(&globset::Candidate::from_bytes(dir.path)) {
+                    stack.push((dir.id, dir.subtree_end));
                 }
-                regions.push((dir_id, stack.last().map(|&(id, _)| id)));
+                regions.push((dir.id, stack.last().map(|&(id, _)| id)));
                 crate::error::check_result_bound(&regions)?;
+                Ok(())
+            })?;
+            let region_of = |dir_id: u32| {
+                regions
+                    .binary_search_by_key(&dir_id, |&(id, _)| id)
+                    .ok()
+                    .and_then(|i| regions[i].1)
+            };
+            if let Some(backend) = &self.v2 {
+                return backend.link_sets_under(
+                    self,
+                    id,
+                    end,
+                    filter.incomplete,
+                    limit,
+                    Some(&mut |dir_id| Ok(region_of(dir_id))),
+                );
             }
             // Stream candidates in the normal order; apply the result limit after crossing.
             let mut candidates = self.conn.prepare("SELECT l.*,d.path,(SELECT COUNT(*) FROM link_instances i WHERE i.ino=l.ino) FROM link_sets l JOIN dirs d ON d.id=l.lca_dir_id WHERE d.id BETWEEN ?1 AND ?2 AND (?3=0 OR l.complete=0) ORDER BY l.disk DESC,d.path,l.ino")?;
-            let mut rows = candidates.query(params![id, d.subtree_end, filter.incomplete])?;
+            let mut rows = candidates.query(params![id, end, filter.incomplete])?;
             let mut result = Vec::new();
             while result.len() < limit {
                 let Some(row) = rows.next()? else {
@@ -741,10 +876,7 @@ impl Snapshot {
                 let mut crossing = false;
                 while let Some(instance) = instance_rows.next()? {
                     let instance_id: u32 = instance.get(0)?;
-                    let region = regions
-                        .binary_search_by_key(&instance_id, |&(id, _)| id)
-                        .ok()
-                        .and_then(|i| regions[i].1);
+                    let region = region_of(instance_id);
                     match first {
                         None => first = Some(region),
                         Some(previous) if previous != region => {
@@ -763,27 +895,41 @@ impl Snapshot {
         }
         let depth = filter
             .boundary_depth
-            .map(|rel| u64::from(d.depth) + u64::from(rel))
+            .map(|rel| u64::from(base_depth) + u64::from(rel))
             .map(sql_u64)
             .transpose()?;
+        let limit_sql = sql_limit(limit)?;
+        if let Some(backend) = &self.v2 {
+            return match depth {
+                Some(depth) => backend.link_sets_under(
+                    self,
+                    id,
+                    end,
+                    filter.incomplete,
+                    limit,
+                    Some(&mut |dir_id| {
+                        backend.region_at_depth(
+                            self,
+                            dir_id,
+                            u64::try_from(depth)
+                                .map_err(|_| StoreError::Integer("depth".into()))?,
+                            id,
+                            end,
+                        )
+                    }),
+                ),
+                None => backend.link_sets_under(self, id, end, filter.incomplete, limit, None),
+            };
+        }
         let mut stmt=self.conn.prepare("SELECT l.*,d.path,(SELECT COUNT(*) FROM link_instances i WHERE i.ino=l.ino) FROM link_sets l JOIN dirs d ON d.id=l.lca_dir_id WHERE d.id BETWEEN ?1 AND ?2 AND (?3=0 OR l.complete=0) AND (?5 IS NULL OR (SELECT COUNT(DISTINCT COALESCE((SELECT region.id FROM dirs region WHERE region.depth=?5 AND region.id BETWEEN ?1 AND ?2 AND i.dir_id BETWEEN region.id AND region.subtree_end ORDER BY region.id DESC LIMIT 1),-1)) FROM link_instances i WHERE i.ino=l.ino)>1) ORDER BY l.disk DESC,d.path,l.ino LIMIT ?4")?;
         let result = stmt
-            .query_map(
-                params![
-                    id,
-                    d.subtree_end,
-                    filter.incomplete,
-                    sql_limit(limit)?,
-                    depth
-                ],
-                |r| {
-                    Ok(LinkSetHit {
-                        row: link_row(r)?,
-                        lca_path: decode_path(r.get(8)?)?,
-                        instance_count: crate::error::read_u64(r, 9)?,
-                    })
-                },
-            )?
+            .query_map(params![id, end, filter.incomplete, limit_sql, depth], |r| {
+                Ok(LinkSetHit {
+                    row: link_row(r)?,
+                    lca_path: decode_path(r.get(8)?)?,
+                    instance_count: crate::error::read_u64(r, 9)?,
+                })
+            })?
             .take(crate::error::MAX_QUERY_ROWS + 1)
             .collect::<rusqlite::Result<Vec<_>>>()?;
         crate::error::check_result_bound(&result)?;
@@ -791,7 +937,9 @@ impl Snapshot {
     }
     /// Fetch stored hard-link instances in deterministic byte-name order.
     pub fn link_instances(&self, ino: u64) -> Result<Vec<LinkInstanceRow>> {
-        self.v1_conn()?;
+        if let Some(backend) = &self.v2 {
+            return backend.link_instances(self, ino);
+        }
         let mut stmt = self
             .conn
             .prepare("SELECT * FROM link_instances WHERE ino=? ORDER BY dir_id,name")?;
@@ -804,13 +952,12 @@ impl Snapshot {
     }
     /// Fetch skipped entries in the inclusive subtree.
     pub fn skipped_under(&self, id: u32) -> Result<Vec<SkipRow>> {
-        self.v1_conn()?;
-        let d = self.dir(id)?;
+        let (_, end) = self.bounds_of(id)?;
         let mut stmt = self.conn.prepare(
             "SELECT * FROM skipped WHERE dir_id BETWEEN ? AND ? ORDER BY dir_id,name,reason",
         )?;
         let result = stmt
-            .query_map(params![id, d.subtree_end], skip_row)?
+            .query_map(params![id, end], skip_row)?
             .take(crate::error::MAX_QUERY_ROWS + 1)
             .collect::<rusqlite::Result<Vec<_>>>()?;
         crate::error::check_result_bound(&result)?;
@@ -818,11 +965,10 @@ impl Snapshot {
     }
     /// Fetch errors in the subtree, including unknown-parent errors at the root.
     pub fn errors_under(&self, id: u32, limit: usize) -> Result<Vec<ErrorRow>> {
-        self.v1_conn()?;
-        let d = self.dir(id)?;
+        let (_, end) = self.bounds_of(id)?;
         let mut stmt=self.conn.prepare("SELECT * FROM errors WHERE dir_id BETWEEN ? AND ? OR (?=0 AND dir_id IS NULL) ORDER BY path,op,errno LIMIT ?")?;
         let result = stmt
-            .query_map(params![id, d.subtree_end, id, sql_limit(limit)?], error_row)?
+            .query_map(params![id, end, id, sql_limit(limit)?], error_row)?
             .take(crate::error::MAX_QUERY_ROWS + 1)
             .collect::<rusqlite::Result<Vec<_>>>()?;
         crate::error::check_result_bound(&result)?;
@@ -830,7 +976,6 @@ impl Snapshot {
     }
     /// Fetch annotation key/value pairs for one directory in lexical order.
     pub fn annotations(&self, id: u32) -> Result<Vec<(String, String)>> {
-        self.v1_conn()?;
         let mut stmt = self
             .conn
             .prepare("SELECT key,value FROM annotations WHERE dir_id=? ORDER BY key,value")?;
