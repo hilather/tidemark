@@ -42,9 +42,9 @@ fn scan_publishes_v2_equal_to_v1_reading() {
     let root = test_support::private_tempdir().unwrap();
     std::fs::create_dir_all(root.path().join("a/b/c/d")).unwrap();
     std::fs::create_dir_all(root.path().join("z")).unwrap();
-    test_support::private_write(root.path().join("a/b/c/d/f"), &[1u8; 5000]).unwrap();
-    test_support::private_write(root.path().join("a/g"), &[2u8; 700]).unwrap();
-    test_support::private_write(root.path().join("z/h"), &[3u8; 9000]).unwrap();
+    test_support::private_write(root.path().join("a/b/c/d/f"), [1u8; 5000]).unwrap();
+    test_support::private_write(root.path().join("a/g"), [2u8; 700]).unwrap();
+    test_support::private_write(root.path().join("z/h"), [3u8; 9000]).unwrap();
     let mut cfg = Config::default();
     cfg.general.state_dir = state.path().to_owned();
     let req = ScanRequest {
