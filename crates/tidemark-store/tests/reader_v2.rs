@@ -2454,3 +2454,75 @@ fn s2_malformed_plain_rows_are_invalid_in_v2() {
         assert!(matches!(r, Err(StoreError::Invalid(_))), "{sql}: {r:?}");
     }
 }
+
+#[test]
+fn review10_s1_ncdu_export_rejects_invalid_notable_file_name() {
+    let mut d = data(tree(2, 1), 1);
+    d.files.clear();
+    d.files.push(FileRow {
+        id: 0,
+        dir_id: 0,
+        name: Some(rname(b"a")),
+        ino: 9000,
+        disk: 100,
+        apparent: 100,
+        mtime: 1_000_000,
+        nlink: 1,
+    });
+    for r in &mut d.rows {
+        let mine: Vec<&FileRow> = d.files.iter().filter(|f| f.dir_id == r.id).collect();
+        r.own_files = mine.len() as u64;
+        r.own_charged = r.dir_disk + mine.iter().map(|f| f.disk).sum::<u64>();
+        r.own_apparent = r.dir_apparent + mine.iter().map(|f| f.apparent).sum::<u64>();
+    }
+    for i in 0..d.rows.len() {
+        let end = d.rows[i].subtree_end as usize;
+        d.rows[i].t_charged = d.rows[i..=end].iter().map(|r| r.own_charged).sum();
+    }
+    d.sets.clear();
+    d.inst.clear();
+    d.inos.clear();
+    let p = pair_data(
+        &d,
+        Shape {
+            plain: 2,
+            hash: 64,
+            dirs: 3,
+            files: 7,
+            li: 4,
+        },
+    );
+    let opts = tidemark_store::NcduOptions {
+        utf8_lossy: false,
+        max_depth: None,
+    };
+    let export =
+        |s: &Snapshot| tidemark_store::export_ncdu(s, &d.rows[0].path, &mut Vec::new(), &opts);
+    export(&p.two).unwrap();
+    let Pair {
+        _one, _two, two, ..
+    } = p;
+    drop(two);
+    let file = std::fs::read_dir(_two.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let conn = rusqlite::Connection::open(&file).unwrap();
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT data FROM file_chunks ORDER BY first_row LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut files = tidemark_store::chunk::decode_files(&blob).unwrap();
+    files[0].name = Some(b"../escaped".to_vec());
+    let blob = tidemark_store::chunk::encode_files(&files).unwrap();
+    conn.execute("UPDATE file_chunks SET data=? WHERE first_row=0", [blob])
+        .unwrap();
+    drop(conn);
+    let snap = Snapshot::open(&file).unwrap();
+    assert!(is_invalid(export(&snap)));
+}
