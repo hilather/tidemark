@@ -432,6 +432,19 @@ impl Snapshot {
             None => Err(StoreError::Invalid("not a v2 snapshot".into())),
         }
     }
+    /// Stream every stored v2 link instance, uncapped, in `(ino, dir_id, name)` order.
+    /// Used only by export; the public query cap does not apply.
+    pub(crate) fn v2_for_each_link_instance(
+        &self,
+        visit: &mut dyn FnMut(LinkInstanceRow) -> Result<()>,
+    ) -> Result<()> {
+        match &self.v2 {
+            Some(backend) => backend.for_each_link_instance(self, &mut |r| {
+                visit(v2::instance_row_of(r.ino, r.dir_id, r.name.as_deref())?)
+            }),
+            None => Err(StoreError::Invalid("not a v2 snapshot".into())),
+        }
+    }
     /// Stream link sets under a v2 range, in inode order, with instance directories.
     pub(crate) fn v2_stream_sets(
         &self,

@@ -364,3 +364,158 @@ fn cold_snapshot_exports_like_its_hot_source() {
     assert_eq!(dump(&o), dump(&hot_out));
     assert_eq!(user_version(&o), 1);
 }
+
+fn rows(db: &Path, sql: &str) -> i64 {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row(sql, [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn b1_staging_never_touches_a_preexisting_entry() {
+    let a = test_support::private_tempdir().unwrap();
+    let out = test_support::private_tempdir().unwrap();
+    let snap = Snapshot::open(&write_v2(a.path())).unwrap();
+    // The names the previous implementation used (and similar guesses) must stay untouched.
+    let old = out.path().join(format!(
+        ".tidemark-export-{}-{}",
+        std::process::id(),
+        snap.meta().scan_id
+    ));
+    fs::create_dir(&old).unwrap();
+    fs::write(old.join("preexisting-sentinel"), b"x").unwrap();
+    export_sqlite(&snap, &out.path().join("new.db")).unwrap();
+    assert!(old.join("preexisting-sentinel").exists());
+    assert!(out.path().join("new.db").exists());
+    // Only the sentinel directory and the output remain: staging cleaned up.
+    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 2);
+}
+
+#[test]
+fn s2_cancellation_stops_and_leaves_nothing() {
+    use std::cell::Cell;
+    let a = test_support::private_tempdir().unwrap();
+    let out = test_support::private_tempdir().unwrap();
+    let snap = Snapshot::open(&write_v1(a.path())).unwrap();
+    let polls = Cell::new(0);
+    let result = tidemark_store::export_sqlite::export_sqlite_cancellable(
+        &snap,
+        &out.path().join("never.db"),
+        &|| {
+            polls.set(polls.get() + 1);
+            polls.get() > 2
+        },
+    );
+    match result {
+        Err(StoreError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::Interrupted),
+        other => panic!("expected Interrupted, got {other:?}"),
+    }
+    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn s4_v2_instances_without_link_sets_are_exported() {
+    let a = test_support::private_tempdir().unwrap();
+    let out = test_support::private_tempdir().unwrap();
+    let m = meta(2);
+    let mut w = SnapshotWriterV2::create_with_options(
+        a.path(),
+        &m,
+        WriterOptions {
+            plain_depth: 1,
+            chunk_dirs: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    w.put_dirs(&dirs()).unwrap();
+    w.put_files(&files()).unwrap();
+    w.put_link_instances(&instances()).unwrap();
+    let file = w.finish(&m).unwrap();
+    let snap = Snapshot::open(&file).unwrap();
+    let target = out.path().join("o.db");
+    let stats = export_sqlite(&snap, &target).unwrap();
+    assert_eq!(stats.link_instances, 4);
+    assert_eq!(rows(&target, "SELECT count(*) FROM link_instances"), 4);
+    assert_eq!(rows(&target, "SELECT count(*) FROM link_sets"), 0);
+}
+
+#[test]
+fn s5_export_is_not_limited_by_the_query_cap() {
+    let a = test_support::private_tempdir().unwrap();
+    let out = test_support::private_tempdir().unwrap();
+    let m = meta(1);
+    let mut w = SnapshotWriter::create(a.path(), &m).unwrap();
+    w.put_dirs(&dirs()).unwrap();
+    const N: u32 = 1_000_001;
+    w.put_link_sets(&[LinkSetRow {
+        ino: 3000,
+        nlink: N,
+        found: N,
+        complete: true,
+        disk: 4096,
+        apparent: 10,
+        mtime: 3,
+        lca_dir_id: 0,
+    }])
+    .unwrap();
+    let mut batch = Vec::new();
+    for n in 0..N {
+        batch.push(LinkInstanceRow {
+            ino: 3000,
+            dir_id: 1,
+            name: Some(name(format!("n{n:08}").as_bytes())),
+        });
+        if batch.len() == 50_000 {
+            w.put_link_instances(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    w.put_link_instances(&batch).unwrap();
+    let file = w.finish(&m).unwrap();
+    let snap = Snapshot::open(&file).unwrap();
+    assert!(
+        snap.link_instances(3000).is_err(),
+        "public query stays capped"
+    );
+    let target = out.path().join("o.db");
+    let stats = export_sqlite(&snap, &target).unwrap();
+    assert_eq!(stats.link_instances, u64::from(N));
+    assert_eq!(
+        rows(&target, "SELECT count(*) FROM link_instances"),
+        i64::from(N)
+    );
+}
+
+#[test]
+fn s7_non_increasing_directory_ids_are_an_error_not_a_panic() {
+    let a = test_support::private_tempdir().unwrap();
+    let out = test_support::private_tempdir().unwrap();
+    let file = write_v1(a.path());
+    {
+        let c = rusqlite::Connection::open(&file).unwrap();
+        c.execute_batch(
+            "ALTER TABLE dirs RENAME TO old_dirs;
+             CREATE TABLE dirs AS SELECT * FROM old_dirs;
+             INSERT INTO dirs SELECT * FROM old_dirs WHERE id=0;
+             DROP TABLE old_dirs;",
+        )
+        .unwrap();
+    }
+    let snap = Snapshot::open(&file).unwrap();
+    match export_sqlite(&snap, &out.path().join("o.db")) {
+        Err(StoreError::Invalid(_)) => {}
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn s7_writer_rejects_non_increasing_directory_ids() {
+    let a = test_support::private_tempdir().unwrap();
+    let mut w = SnapshotWriter::create(a.path(), &meta(1)).unwrap();
+    let mut rows = dirs();
+    rows.push(rows[0].clone());
+    assert!(matches!(w.put_dirs(&rows), Err(StoreError::Invalid(_))));
+}

@@ -10,7 +10,7 @@ use rusqlite::params;
 use std::path::{Path, PathBuf};
 use tidemark_core::{
     path::RawName,
-    snapshot::{AnnotationRow, DirRow, FileRow, LinkSetRow},
+    snapshot::{AnnotationRow, DirRow, FileRow, LinkInstanceRow, LinkSetRow},
 };
 
 /// Rows copied by [`export_sqlite`].
@@ -35,12 +35,89 @@ pub struct SqliteExportStats {
 /// Rows buffered between writer calls; memory is bounded by this, not by tree size.
 const BATCH: usize = 10_000;
 
-/// Removes the private staging directory on every exit path.
-struct Staging(PathBuf);
+/// A private staging directory this export created (and only this one).
+///
+/// The directory is created exclusively (`mkdir` fails on any existing entry, which is
+/// then never touched); its device/inode are recorded so cleanup removes only the
+/// directory it created, never a different entry that later appears under the name.
+struct Staging {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+impl Staging {
+    /// Create a fresh 0700 directory with an unpredictable name under `parent`.
+    fn create(parent: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        for attempt in 0..64u32 {
+            let path = parent.join(format!(".tidemark-export-{:016x}", random_token(attempt)));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+            return match std::fs::symlink_metadata(&path) {
+                Ok(m) => Ok(Self {
+                    path,
+                    dev: m.dev(),
+                    ino: m.ino(),
+                }),
+                Err(e) => {
+                    // Just created by this call and still empty.
+                    let _ = std::fs::remove_dir(&path);
+                    Err(e)
+                }
+            };
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a unique staging directory",
+        ))
+    }
+}
 impl Drop for Staging {
     fn drop(&mut self) {
-        // The directory was created by this export and holds only its own files.
-        let _ = std::fs::remove_dir_all(&self.0);
+        use std::os::unix::fs::MetadataExt;
+        // Remove only the directory this export created.
+        if let Ok(m) = std::fs::symlink_metadata(&self.path) {
+            if m.is_dir() && m.dev() == self.dev && m.ino() == self.ino {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+}
+fn random_token(salt: u32) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    h.write_u32(salt);
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.finish()
+}
+
+fn interrupted() -> StoreError {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "export interrupted").into()
+}
+fn check(cancel: &dyn Fn() -> bool) -> Result<(), StoreError> {
+    if cancel() {
+        Err(interrupted())
+    } else {
+        Ok(())
+    }
+}
+/// Disk-full from the destination database is a space failure.
+fn classify(error: StoreError) -> StoreError {
+    match error {
+        StoreError::Sql(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::DiskFull =>
+        {
+            StoreError::Space("destination disk full".into())
+        }
+        other => other,
     }
 }
 
@@ -57,6 +134,24 @@ impl Drop for Staging {
 /// notable files in name order without ids, so exported file ids are assigned in
 /// directory order; v1 file ids are preserved.
 pub fn export_sqlite(snapshot: &Snapshot, out: &Path) -> Result<SqliteExportStats, StoreError> {
+    export_sqlite_cancellable(snapshot, out, &|| false)
+}
+
+/// [`export_sqlite`] that polls `cancel` between batches; once it returns `true` the export
+/// stops with an `Io(Interrupted)` error and removes everything it created.
+pub fn export_sqlite_cancellable(
+    snapshot: &Snapshot,
+    out: &Path,
+    cancel: &dyn Fn() -> bool,
+) -> Result<SqliteExportStats, StoreError> {
+    export_inner(snapshot, out, cancel).map_err(classify)
+}
+
+fn export_inner(
+    snapshot: &Snapshot,
+    out: &Path,
+    cancel: &dyn Fn() -> bool,
+) -> Result<SqliteExportStats, StoreError> {
     if std::fs::symlink_metadata(out).is_ok() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -74,20 +169,14 @@ pub fn export_sqlite(snapshot: &Snapshot, out: &Path) -> Result<SqliteExportStat
     let parent = std::fs::canonicalize(parent)?;
     let final_path = parent.join(name);
 
-    let staging = Staging(parent.join(format!(
-        ".tidemark-export-{}-{}",
-        std::process::id(),
-        snapshot.meta().scan_id
-    )));
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(&staging.0)?;
-    }
+    check(cancel)?;
+    let staging = Staging::create(&parent)?;
     let mut meta = snapshot.meta().clone();
     meta.schema_version = 1;
-    let mut writer = SnapshotWriter::create(&staging.0, &meta)?;
+    let mut writer = SnapshotWriter::create(&staging.path, &meta)?;
     let mut stats = SqliteExportStats::default();
-    copy_all(snapshot, &mut writer, &mut stats)?;
+    copy_all(snapshot, &mut writer, &mut stats, cancel)?;
+    check(cancel)?;
     let built = writer.finish(&meta)?;
     rustix::fs::renameat_with(
         rustix::fs::CWD,
@@ -106,19 +195,32 @@ fn copy_all(
     snap: &Snapshot,
     writer: &mut SnapshotWriter,
     stats: &mut SqliteExportStats,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<(), StoreError> {
     let last_dir = snap.root()?.subtree_end;
-    // dirs, in id order.
+    // dirs, in id order (validated strictly increasing before the writer sees them).
     let mut batch: Vec<DirRow> = Vec::with_capacity(BATCH);
+    let mut last_id: Option<u32> = None;
     let mut flush_dirs = |batch: &mut Vec<DirRow>, stats: &mut SqliteExportStats| {
+        check(cancel)?;
         stats.dirs += batch.len() as u64;
         let result = writer.put_dirs(batch);
         batch.clear();
         result
     };
+    let mut push_dir = |batch: &mut Vec<DirRow>, row: DirRow| {
+        if last_id.is_some_and(|id| row.id <= id) {
+            return Err(StoreError::Invalid(
+                "directory ids are not strictly increasing".into(),
+            ));
+        }
+        last_id = Some(row.id);
+        batch.push(row);
+        Ok(())
+    };
     if snap.is_v2() {
         for id in 0..=last_dir {
-            batch.push(snap.dir(id)?);
+            push_dir(&mut batch, snap.dir(id)?)?;
             if batch.len() >= BATCH {
                 flush_dirs(&mut batch, stats)?;
             }
@@ -127,7 +229,7 @@ fn copy_all(
         let mut stmt = snap.conn().prepare("SELECT * FROM dirs ORDER BY id")?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
-            batch.push(dir_row(r)?);
+            push_dir(&mut batch, dir_row(r)?)?;
             if batch.len() >= BATCH {
                 flush_dirs(&mut batch, stats)?;
             }
@@ -135,7 +237,7 @@ fn copy_all(
     }
     flush_dirs(&mut batch, stats)?;
 
-    // files.
+    // files (the buffer never exceeds BATCH rows, even inside one wide directory).
     let mut files: Vec<FileRow> = Vec::with_capacity(BATCH);
     if snap.is_v2() {
         let mut next_id = 0u32;
@@ -155,13 +257,15 @@ fn copy_all(
                 next_id = next_id
                     .checked_add(1)
                     .ok_or_else(|| StoreError::Integer("file id".into()))?;
+                if files.len() >= BATCH {
+                    check(cancel)?;
+                    stats.files += files.len() as u64;
+                    writer.put_files(&files)?;
+                    files.clear();
+                }
                 Ok(())
             })?;
-            if files.len() >= BATCH {
-                stats.files += files.len() as u64;
-                writer.put_files(&files)?;
-                files.clear();
-            }
+            check(cancel)?;
         }
     } else {
         let mut stmt = snap.conn().prepare("SELECT * FROM files ORDER BY id")?;
@@ -169,6 +273,7 @@ fn copy_all(
         while let Some(r) = rows.next()? {
             files.push(file_row(r)?);
             if files.len() >= BATCH {
+                check(cancel)?;
                 stats.files += files.len() as u64;
                 writer.put_files(&files)?;
                 files.clear();
@@ -197,39 +302,41 @@ fn copy_all(
             .map_err(plain)?;
         let Some(last) = sets.last() else { break };
         after = i64::try_from(last.ino).map_err(|_| StoreError::Integer("ino".into()))?;
-        let mut instances = Vec::new();
-        for set in &sets {
-            instances.extend(snap.link_instances(set.ino)?);
-            if instances.len() >= BATCH {
-                stats.link_instances += instances.len() as u64;
-                writer.put_link_instances(&instances)?;
-                instances.clear();
-            }
-        }
-        stats.link_instances += instances.len() as u64;
-        writer.put_link_instances(&instances)?;
         stats.link_sets += sets.len() as u64;
         writer.put_link_sets(&sets)?;
+        check(cancel)?;
     }
-    // Instances of inodes without a link_sets row cannot be reached through the sets;
-    // v1 sources can hold them (unresolved partial scans), so copy leftovers explicitly.
-    if !snap.is_v2() {
-        let mut stmt = snap.conn().prepare(
-            "SELECT ino,dir_id,name FROM link_instances WHERE ino NOT IN (SELECT ino FROM link_sets) ORDER BY ino,dir_id,name",
-        )?;
+    // Every stored instance, streamed in (ino, dir_id, name) order and uncapped, including
+    // instances of inodes without a `link_sets` row (unresolved partial scans hold them).
+    let mut batch: Vec<LinkInstanceRow> = Vec::with_capacity(BATCH);
+    if snap.is_v2() {
+        snap.v2_for_each_link_instance(&mut |row| {
+            batch.push(row);
+            if batch.len() >= BATCH {
+                check(cancel)?;
+                stats.link_instances += batch.len() as u64;
+                writer.put_link_instances(&batch)?;
+                batch.clear();
+            }
+            Ok(())
+        })?;
+    } else {
+        let mut stmt = snap
+            .conn()
+            .prepare("SELECT ino,dir_id,name FROM link_instances ORDER BY ino,dir_id,name,rowid")?;
         let mut rows = stmt.query([])?;
-        let mut batch = Vec::new();
         while let Some(r) = rows.next()? {
             batch.push(crate::reader::instance_row(r)?);
             if batch.len() >= BATCH {
+                check(cancel)?;
                 stats.link_instances += batch.len() as u64;
                 writer.put_link_instances(&batch)?;
                 batch.clear();
             }
         }
-        stats.link_instances += batch.len() as u64;
-        writer.put_link_instances(&batch)?;
     }
+    stats.link_instances += batch.len() as u64;
+    writer.put_link_instances(&batch)?;
 
     // skipped / errors / annotations: plain tables, keyset on rowid.
     macro_rules! copy_plain {
@@ -246,6 +353,7 @@ fn copy_all(
                 if batch.is_empty() {
                     break;
                 }
+                check(cancel)?;
                 stats.$count += batch.len() as u64;
                 writer.$put(&batch)?;
             }
