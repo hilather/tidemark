@@ -684,6 +684,62 @@ fn ties_order_by_raw_path_bytes_not_preorder() {
     );
 }
 
+/// Writes a v2 snapshot from rows that `edit` has corrupted.
+fn write_edited(
+    dir: &std::path::Path,
+    t: &Tree,
+    now: i64,
+    edit: &dyn Fn(&mut Vec<DirRow>),
+) -> PathBuf {
+    let mut rows = rows_of(ROOT, t);
+    edit(&mut rows);
+    let mut m = meta(RawPath::new(ROOT.to_vec()).unwrap(), now);
+    m.dirs = rows.len() as u64;
+    m.schema_version = 2;
+    let options = WriterOptions {
+        plain_depth: 0,
+        chunk_dirs: 64,
+        ..WriterOptions::default()
+    };
+    let mut w = SnapshotWriterV2::create_with_options(dir, &m, options).unwrap();
+    for c in rows.chunks(5) {
+        w.put_dirs(c).unwrap();
+    }
+    w.finish(&m).unwrap()
+}
+
+#[test]
+fn corrupt_sibling_names_are_invalid_not_wrong_diffs() {
+    let mut tree = Tree::new();
+    tree.insert(vec![], 1);
+    for i in 0..257u32 {
+        tree.insert(vec![format!("b{i:06}").into_bytes()], u64::from(i % 7) + 1);
+    }
+    let dir = test_support::private_tempdir().unwrap();
+    let old = write(dir.path(), ROOT, &tree, 10, Kind::V2, 3);
+    let root = path_of(ROOT, &vec![]);
+    let run = |now: i64, edit: &dyn Fn(&mut Vec<DirRow>)| {
+        let d = test_support::private_tempdir().unwrap();
+        let file = write_edited(d.path(), &tree, now, edit);
+        let snap = open(&file);
+        let r = diff(&snap, &old, &root, DiffMetric::Disk, 3, 10);
+        drop(d);
+        r
+    };
+    // Sound control.
+    assert!(run(20, &|_| {}).is_ok());
+    // B3: names of ids 256 and 257 swapped across the 256-row page boundary.
+    let r = run(21, &|rows| {
+        let (a, b) = (rows[256].name.clone(), rows[257].name.clone());
+        rows[256].name = b;
+        rows[257].name = a;
+    });
+    assert!(matches!(r, Err(tidemark_store::StoreError::Invalid(_))));
+    // B2: a child named `../escaped` is never normalised into a path.
+    let r = run(22, &|rows| rows[2].name = b"../escaped".to_vec());
+    assert!(matches!(r, Err(tidemark_store::StoreError::Invalid(_))));
+}
+
 #[test]
 fn wide_directory_crosses_page_boundaries() {
     // More children than the first pages hold, with interleaved add/remove/change.

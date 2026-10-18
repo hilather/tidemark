@@ -2243,6 +2243,60 @@ fn b1_swapped_link_chunks_are_invalid_for_every_query() {
 }
 
 #[test]
+fn b1_misordered_boundary_beyond_the_next_chunk_is_invalid() {
+    let mut d = data(tree(6, 4), 11);
+    d.sets.clear();
+    // Three one-row chunks `z`, `zz`, `a`: only the second boundary is disordered.
+    let names = ["z", "zz", "a"];
+    d.inst = names
+        .iter()
+        .map(|n| LinkInstanceRow {
+            ino: 42,
+            dir_id: 0,
+            name: Some(rname(n.as_bytes())),
+        })
+        .collect();
+    d.inos = vec![42];
+    let p = pair_data(
+        &d,
+        Shape {
+            plain: 2,
+            hash: 64,
+            dirs: 3,
+            files: 3,
+            li: 1,
+        },
+    );
+    let Pair { _two, one, two, .. } = p;
+    drop((one, two));
+    // The writer sorts, so make the stored order `z, zz, a` by rewriting the chunks.
+    let snap = tamper_in_place(
+        &_two,
+        "CREATE TEMP TABLE rot AS SELECT first_row,data FROM li_chunks; UPDATE li_chunks SET data=(SELECT s.data FROM rot s WHERE s.first_row=(li_chunks.first_row+1)%3);",
+    );
+    let z = LinkInstanceRow {
+        ino: 42,
+        dir_id: 0,
+        name: Some(rname(b"z")),
+    };
+    assert!(is_invalid(snap.link_instances(42)));
+    assert!(is_invalid(snap.link_instances_page(42, None, false, 1)));
+    assert!(is_invalid(snap.link_instances_page(42, None, true, 1)));
+    assert!(is_invalid(snap.link_instances_page(
+        42,
+        Some(&(1, z.clone())),
+        true,
+        1
+    )));
+    assert!(is_invalid(snap.link_instances_page(
+        42,
+        Some(&(1, z)),
+        false,
+        1
+    )));
+}
+
+#[test]
 fn b2_missing_first_or_last_file_chunk_is_invalid_per_query() {
     let opts = tidemark_store::NcduOptions {
         utf8_lossy: true,
