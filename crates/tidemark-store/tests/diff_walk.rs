@@ -161,11 +161,16 @@ fn write(dir: &std::path::Path, root: &[u8], t: &Tree, now: i64, kind: Kind, opt
     let v2 = matches!(kind, Kind::V2 | Kind::ColdV2);
     m.schema_version = if v2 { 2 } else { 1 };
     let hot = if v2 {
-        let options = WriterOptions {
-            plain_depth: (opt % 3) as u32,
-            hash_width: if opt.is_multiple_of(2) { 64 } else { 32 },
-            chunk_dirs: 1 + (opt % 4) as usize,
-            ..WriterOptions::default()
+        // `u64::MAX` selects the production defaults (scale runs).
+        let options = if opt == u64::MAX {
+            WriterOptions::default()
+        } else {
+            WriterOptions {
+                plain_depth: (opt % 3) as u32,
+                hash_width: if opt.is_multiple_of(2) { 64 } else { 32 },
+                chunk_dirs: 1 + (opt % 4) as usize,
+                ..WriterOptions::default()
+            }
         };
         let mut w = SnapshotWriterV2::create_with_options(dir, &m, options).unwrap();
         for c in rows.chunks(5) {
@@ -765,6 +770,154 @@ fn wide_directory_crosses_page_boundaries() {
     }
 }
 
+/// Independent oracle for a flat directory: root plus depth-1 children, ranked by |delta| then path.
+fn flat_oracle(old: &Tree, new: &Tree, limit: usize) -> Vec<Flat> {
+    let mut keys: Vec<&Comps> = new.keys().chain(old.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let mut rows: Vec<(i128, Flat)> = keys
+        .into_iter()
+        .map(|k| {
+            let (nv, ov) = (new.get(k).copied(), old.get(k).copied());
+            let delta = nv.unwrap_or(0) as i64 - ov.unwrap_or(0) as i64;
+            let p = path_of(ROOT, k).as_bytes().to_vec();
+            (
+                (delta as i128).abs(),
+                (p, k.len() as u32, nv, ov, delta, class(nv, ov)),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1 .0.cmp(&b.1 .0)));
+    rows.truncate(limit);
+    rows.into_iter().map(|r| r.1).collect()
+}
+
+#[test]
+fn directory_with_120k_children_matches_oracle_for_v2_pairs() {
+    const W: u32 = 120_000;
+    let mut old = Tree::new();
+    let mut new = Tree::new();
+    old.insert(vec![], 7);
+    new.insert(vec![], 7);
+    for i in 0..W {
+        let name = format!("c{i:06}").into_bytes();
+        if i % 7 != 0 {
+            old.insert(vec![name.clone()], u64::from(i % 1013));
+        }
+        if i % 11 != 0 {
+            new.insert(vec![name], u64::from((i * 3) % 1019));
+        }
+    }
+    let dir = test_support::private_tempdir().unwrap();
+    for (nk, ok) in [(Kind::V2, Kind::V2), (Kind::V2, Kind::V1)] {
+        let o = write(dir.path(), ROOT, &old, 10 + ok as i64, ok, 1);
+        let n = write(
+            dir.path(),
+            ROOT,
+            &new,
+            100 + nk as i64 * 10 + ok as i64,
+            nk,
+            2,
+        );
+        let ns = open(&n);
+        let t = path_of(ROOT, &vec![]);
+        for limit in [50, 1] {
+            let got: Vec<_> = diff(&ns, &o, &t, DiffMetric::Disk, 3, limit)
+                .unwrap()
+                .iter()
+                .map(flat)
+                .collect();
+            assert_eq!(got, flat_oracle(&old, &new, limit), "{nk:?}/{ok:?} {limit}");
+        }
+    }
+}
+
+fn vm_hwm_kib() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+const CHAIN_DEPTH: usize = 4096;
+
+/// Child half of `deep_single_child_chain_diffs_in_bounded_memory`: runs only
+/// when re-executed with `TM_CHAIN_NEW`/`TM_CHAIN_OLD` set, so its peak RSS is its own.
+#[test]
+fn deep_chain_child() {
+    let (Some(n), Some(o)) = (
+        std::env::var_os("TM_CHAIN_NEW"),
+        std::env::var_os("TM_CHAIN_OLD"),
+    ) else {
+        return;
+    };
+    let ns = open(std::path::Path::new(&n));
+    let rows = diff(
+        &ns,
+        std::path::Path::new(&o),
+        &path_of(ROOT, &vec![]),
+        DiffMetric::Disk,
+        u32::MAX,
+        1,
+    )
+    .unwrap();
+    // Every directory changes by 5; ties go to the shortest path, i.e. the root.
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].delta, 5);
+    let hwm = vm_hwm_kib();
+    // Old walk kept ~2 * 256 * D^2 / 2 path bytes (> 4 GiB); the new one needs a few MiB.
+    assert!(hwm < 192 * 1024, "VmHWM {hwm} KiB");
+}
+
+#[test]
+fn deep_single_child_chain_diffs_in_bounded_memory() {
+    let build = |dir: &std::path::Path, bump: u64, now: i64| -> PathBuf {
+        let mut m = meta(RawPath::new(ROOT.to_vec()).unwrap(), now);
+        m.schema_version = 2;
+        m.dirs = CHAIN_DEPTH as u64 + 1;
+        let mut w = SnapshotWriterV2::create(dir, &m).unwrap();
+        let mut path = ROOT.to_vec();
+        let mut batch = Vec::new();
+        for depth in 0..=CHAIN_DEPTH {
+            let name = format!("{depth:0>255}").into_bytes();
+            if depth > 0 {
+                path.push(b'/');
+                path.extend_from_slice(&name);
+            }
+            let mut r = row(
+                depth as u32,
+                depth.checked_sub(1).map(|p| p as u32),
+                &path,
+                100 + bump,
+            );
+            r.depth = depth as u32;
+            r.subtree_end = CHAIN_DEPTH as u32;
+            r.name = if depth > 0 { name } else { path.clone() };
+            batch.push(r);
+            if batch.len() == 64 {
+                w.put_dirs(&batch).unwrap();
+                batch.clear();
+            }
+        }
+        w.put_dirs(&batch).unwrap();
+        w.finish(&m).unwrap()
+    };
+    let dir = test_support::private_tempdir().unwrap();
+    let o = build(dir.path(), 0, 10);
+    let n = build(dir.path(), 5, 20);
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "deep_chain_child", "--nocapture"])
+        .env("TM_CHAIN_NEW", &n)
+        .env("TM_CHAIN_OLD", &o)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `cargo test --release -p tidemark-store --test diff_walk -- --ignored --nocapture scale`
 /// Streams a 2,000,101-directory tree (100 x 20 x 999) and a copy with 1% of directories changed,
 /// then times the old ATTACH+join SQL (v1/v1) against the walk (v1/v1, v2/v2).
@@ -897,5 +1050,83 @@ fn scale_diff_old_sql_vs_walk() {
                     .len()
             },
         );
+    }
+}
+
+/// `cargo test --release -p tidemark-store --test diff_walk -- --ignored --nocapture scale_wide`
+/// One 150,000-child directory, 1% changed: v1/v1 old SQL against v2/v2 walk.
+#[test]
+#[ignore = "scale"]
+fn scale_wide_directory_old_sql_vs_walk() {
+    const W: u32 = 150_000;
+    let mut old = Tree::new();
+    let mut new = Tree::new();
+    old.insert(vec![], 1);
+    new.insert(vec![], 1);
+    for i in 0..W {
+        let name = format!("c{i:06}").into_bytes();
+        old.insert(vec![name.clone()], 1000 + u64::from(i % 97));
+        new.insert(
+            vec![name],
+            1000 + u64::from(i % 97)
+                + if i % 100 == 7 {
+                    1 + u64::from(i % 13)
+                } else {
+                    0
+                },
+        );
+    }
+    let dir = test_support::private_tempdir().unwrap();
+    let root = path_of(ROOT, &vec![]);
+    let time = |label: &str, f: &mut dyn FnMut() -> usize| {
+        let mut ms = vec![];
+        let mut rows = 0;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            rows = f();
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "{label}: rows={rows} median={:.1}ms min={:.1}ms max={:.1}ms",
+            ms[2], ms[0], ms[4]
+        );
+    };
+    for kind in [Kind::V1, Kind::V2] {
+        let o = write(dir.path(), ROOT, &old, 1000 + kind as i64, kind, u64::MAX);
+        let n = write(dir.path(), ROOT, &new, 2000 + kind as i64, kind, u64::MAX);
+        let ns = open(&n);
+        if kind == Kind::V1 {
+            let os = open(&o);
+            let (nr, or) = (
+                ns.dir_by_path(&root).unwrap(),
+                os.dir_by_path(&root).unwrap(),
+            );
+            time("wide v1/v1 old SQL (ATTACH join)", &mut || {
+                sql_reference(
+                    &n,
+                    &o,
+                    nr.as_ref(),
+                    or.as_ref(),
+                    DiffMetric::Disk,
+                    u32::MAX,
+                    50,
+                    None,
+                )
+                .0
+                .len()
+            });
+        } else {
+            time("wide v2/v2 walk (warm)", &mut || {
+                diff(&ns, &o, &root, DiffMetric::Disk, u32::MAX, 50)
+                    .unwrap()
+                    .len()
+            });
+            time("wide v2/v2 walk (fresh open)", &mut || {
+                diff(&open(&n), &o, &root, DiffMetric::Disk, u32::MAX, 50)
+                    .unwrap()
+                    .len()
+            });
+        }
     }
 }
