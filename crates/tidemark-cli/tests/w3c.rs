@@ -130,10 +130,12 @@ fn export_mode_overwrite_state_protection_and_wide_json() {
     let mut row = snap.root().unwrap();
     row.dir_disk = 1;
     row.own_charged = 0;
+    let mut v1_meta = snap.meta().clone();
+    v1_meta.schema_version = 1;
     let mut writer =
-        tidemark_store::writer::SnapshotWriter::create(malformed.path(), snap.meta()).unwrap();
+        tidemark_store::writer::SnapshotWriter::create(malformed.path(), &v1_meta).unwrap();
     writer.put_dirs(&[row]).unwrap();
-    let bad_snapshot = writer.finish(snap.meta()).unwrap();
+    let bad_snapshot = writer.finish(&v1_meta).unwrap();
     let snapshots: Vec<_> = std::fs::read_dir(
         temp.path()
             .join("state/snapshots")

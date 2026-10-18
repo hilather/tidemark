@@ -439,3 +439,5 @@ cold_after_recent = false
 ```
 
 Existing cold snapshots remain readable. `tidemark snapshots prune --dry-run` previews both deletions and compressions; omit `--dry-run` to apply them with the daemon stopped. Compression space refusals leave the hot snapshot available.
+
+New scans write snapshot format v2, which gives smaller files. Existing v1 snapshots remain readable and need no migration; no operator action is needed.

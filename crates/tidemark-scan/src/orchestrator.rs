@@ -175,7 +175,7 @@ fn run_scan_with_environment(
             .unwrap_or(used / 20);
         let estimate = match previous.as_ref().and_then(|p| p.file.as_ref()) {
             Some(file) => snapshot_length(file)?.saturating_mul(5).div_ceil(4),
-            None => dirs_estimate.saturating_mul(300),
+            None => dirs_estimate.saturating_mul(64),
         };
         guard_and_prune(
             &cfg.general.state_dir,
@@ -493,7 +493,7 @@ fn run_scan_with_environment(
                 scan_gate.stop_sampling();
                 let stats = scan_gate.stats();
                 let mut meta = tidemark_core::snapshot::SnapshotMeta {
-                    schema_version: 1,
+                    schema_version: 2,
                     tool_version: env!("CARGO_PKG_VERSION").into(),
                     scan_id: id,
                     root: req.root.clone(),
@@ -535,7 +535,14 @@ fn run_scan_with_environment(
                 };
                 let catalog =
                     tidemark_store::catalog::Catalog::open(&cfg.general.state_dir, false)?;
-                let mut writer = create_writer(&dir, &catalog, &mut meta, entry, recorder)?;
+                let mut writer = create_writer(
+                    &dir,
+                    &catalog,
+                    &mut meta,
+                    entry,
+                    recorder,
+                    root_cfg.series_depth,
+                )?;
                 drop(catalog);
                 let state_dir = cfg.general.state_dir.clone();
                 let policy = cfg.retention.clone();
@@ -658,7 +665,7 @@ pub enum ScanError {
     Core(#[from] tidemark_core::error::CoreError),
     /// Storage operation failed.
     #[error(transparent)]
-    Store(#[from] tidemark_store::StoreError),
+    Store(tidemark_store::StoreError),
     /// Aggregation failed.
     #[error(transparent)]
     Agg(#[from] crate::agg::AggError),
@@ -1018,7 +1025,7 @@ impl PartialOrd for SeriesRow {
     }
 }
 struct WriterSink<'a> {
-    writer: &'a mut tidemark_store::writer::SnapshotWriter,
+    writer: &'a mut tidemark_store::writer_v2::SnapshotWriterV2,
     series: std::collections::BinaryHeap<std::cmp::Reverse<SeriesRow>>,
     depth: u32,
     cancel: &'a AtomicBool,
@@ -1339,9 +1346,18 @@ fn create_writer(
     meta: &mut tidemark_core::snapshot::SnapshotMeta,
     entry: &mut ScanEntry,
     recorder: &dyn ScanRecorder,
-) -> Result<tidemark_store::writer::SnapshotWriter, ScanError> {
+    series_depth: u32,
+) -> Result<tidemark_store::writer_v2::SnapshotWriterV2, ScanError> {
+    let options = tidemark_store::writer_v2::WriterOptions {
+        plain_depth: series_depth.max(2),
+        ..Default::default()
+    };
     for _ in 0..1024 {
-        match tidemark_store::writer::SnapshotWriter::create(dir, meta) {
+        match tidemark_store::writer_v2::SnapshotWriterV2::create_with_options(
+            dir,
+            meta,
+            options.clone(),
+        ) {
             Ok(writer) => return Ok(writer),
             Err(tidemark_store::StoreError::Io(e))
                 if e.kind() == std::io::ErrorKind::AlreadyExists =>
@@ -1428,8 +1444,21 @@ fn record_walk_phase(phases: &mut std::collections::BTreeMap<String, u64>, elaps
         .or_insert_with(|| milliseconds(elapsed));
 }
 
+impl From<tidemark_store::StoreError> for ScanError {
+    /// Space refusals from the store keep the `NoSpace` category.
+    fn from(e: tidemark_store::StoreError) -> Self {
+        match e {
+            tidemark_store::StoreError::Space(msg) => {
+                tracing::warn!(%msg, "state space refused");
+                ScanError::NoSpace
+            }
+            other => ScanError::Store(other),
+        }
+    }
+}
+
 fn finish_snapshot(
-    writer: tidemark_store::writer::SnapshotWriter,
+    writer: tidemark_store::writer_v2::SnapshotWriterV2,
     meta: &tidemark_core::snapshot::SnapshotMeta,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<PathBuf, ScanError> {
@@ -1440,7 +1469,7 @@ fn finish_snapshot(
         {
             ScanError::PublicationCollision
         }
-        _ => ScanError::Store(e),
+        e => e.into(),
     })
 }
 
@@ -2139,7 +2168,7 @@ mod tests {
                 SnapshotStatus::Complete
             };
             let dir = existing.parent().unwrap();
-            let writer = tidemark_store::writer::SnapshotWriter::create(dir, &meta).unwrap();
+            let writer = tidemark_store::writer_v2::SnapshotWriterV2::create(dir, &meta).unwrap();
             let cancel = AtomicBool::new(keep_partial);
             meta.status =
                 publication_status(meta.status, ScanMode::Walk, keep_partial, &cancel).unwrap();
@@ -2211,7 +2240,7 @@ mod tests {
         let mut meta = snapshot.meta().clone();
         meta.scan_id = tidemark_core::time::ScanId::new(meta.started_at + 1).unwrap();
         let dir = outcome.file.as_ref().unwrap().parent().unwrap();
-        let writer = tidemark_store::writer::SnapshotWriter::create(dir, &meta).unwrap();
+        let writer = tidemark_store::writer_v2::SnapshotWriterV2::create(dir, &meta).unwrap();
         let existing = dir.join(format!("{}.db", meta.scan_id));
         let temporary = dir.join(format!("{}.db.tmp", meta.scan_id));
         ::test_support::private_write(&existing, b"existing snapshot must survive").unwrap();
@@ -2228,7 +2257,8 @@ mod tests {
             use crate::agg::RowSink;
             meta.scan_id = tidemark_core::time::ScanId::new(meta.started_at + 2).unwrap();
             let tmp = dir.join(format!("{}.db.tmp", meta.scan_id));
-            let mut writer = tidemark_store::writer::SnapshotWriter::create(dir, &meta).unwrap();
+            let mut writer =
+                tidemark_store::writer_v2::SnapshotWriterV2::create(dir, &meta).unwrap();
             let cancel = AtomicBool::new(false);
             {
                 let mut sink = WriterSink {
