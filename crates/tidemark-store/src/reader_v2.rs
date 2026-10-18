@@ -791,11 +791,16 @@ impl Backend {
         let Some(parent) = self.listing_parent(snap, id)? else {
             return Ok(Vec::new());
         };
-        let base = self.cached_path(snap, id)?;
+        // The parent's path is rebuilt only once a row is going to be returned.
+        let mut base: Option<Arc<RawPath>> = None;
         let visit = |c: ChunkDir| {
             let k = -key(&c, sort);
             if top.admits(k, &c.name, c.id) {
-                let path = Self::child_path(&parent, &base, &c)?;
+                let b = match &base {
+                    Some(b) => b,
+                    None => base.insert(self.cached_path(snap, id)?),
+                };
+                let path = Self::child_path(&parent, b, &c)?;
                 top.push(Hit {
                     key: k,
                     tie: Tie::Name,
@@ -1096,8 +1101,11 @@ impl Backend {
     ) -> Result<Vec<DirRow>> {
         let root = self.authoritative_root(snap, id)?;
         let max = u64::from(root.depth) + u64::from(depth);
-        let base = self.path(snap, &root)?;
         let mut top = TopN::new(limit, Tie::Name)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let base = self.path(snap, &root)?;
         let mut walk = Walk::new(id, root.subtree_end, max, &base);
         if max <= u64::from(self.plain_depth) && root.depth <= self.plain_depth {
             // Every requested row is a shallow row: no chunk is decoded.
@@ -1153,8 +1161,11 @@ impl Backend {
         limit: usize,
     ) -> Result<Vec<DirRow>> {
         let root = self.raw(snap, id)?;
-        let base = self.path(snap, &root)?;
         let mut top = TopN::new(limit, Tie::Name)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let base = self.path(snap, &root)?;
         let mut walk = Walk::new(id, root.subtree_end, u64::MAX, &base);
         self.scan(snap, id, root.subtree_end, |v| {
             let path = walk.step(v.id, v.parent_id, v.subtree_end, v.depth, v.name)?;
@@ -3111,5 +3122,30 @@ mod child_cursor_tests {
         fresh.subtree_dirs(0, 4, SortKey::Name, 1000).unwrap();
         assert_eq!(decodes(&fresh), before.0);
         assert_eq!(scanned(&fresh), before.1 + 7);
+    }
+
+    #[test]
+    fn empty_results_do_no_extra_chunk_work() {
+        for plain in [0, 3] {
+            let (_d, s) = v2_only(&balanced121(), plain, 16);
+            let total = |s: &Snapshot| decodes(s) + scanned(s);
+            for limit in [0, 1, 1000] {
+                let fresh = Snapshot::open(&s.file).unwrap();
+                assert!(fresh.children(40, SortKey::Name, limit).unwrap().is_empty());
+                assert!(total(&fresh) <= 1, "children {limit}: {}", total(&fresh));
+            }
+            let fresh = Snapshot::open(&s.file).unwrap();
+            assert!(fresh
+                .subtree_dirs(0, 4, SortKey::Disk, 0)
+                .unwrap()
+                .is_empty());
+            assert!(total(&fresh) <= 1, "root: {}", total(&fresh));
+            let fresh = Snapshot::open(&s.file).unwrap();
+            assert!(fresh
+                .subtree_dirs(40, 0, SortKey::Name, 0)
+                .unwrap()
+                .is_empty());
+            assert!(total(&fresh) <= 1, "leaf: {}", total(&fresh));
+        }
     }
 }
