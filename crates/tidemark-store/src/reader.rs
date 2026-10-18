@@ -49,6 +49,29 @@ pub struct Snapshot {
     _inflated: Option<crate::cold::Inflated>,
 }
 
+/// One direct child as the diff walk needs it: no path, only compact metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the diff walk (SNAP-diff-walk-fix)
+pub(crate) struct ChildEntry {
+    pub id: u32,
+    pub name: Vec<u8>,
+    pub depth: u32,
+    pub subtree_end: u32,
+    pub t_disk: u64,
+    pub t_reclaimable: u64,
+    pub t_files: u64,
+    pub own_charged: u64,
+}
+/// Resume point of [`Snapshot::children_by_name`]: v2 holds the next sibling id,
+/// v1 the last name returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildCursor(CursorAt);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CursorAt {
+    Id(u32),
+    After(Vec<u8>),
+}
+
 /// Directory columns without path data; `path` is the placeholder `/` and the hash is 0.
 pub(crate) const LITE_COLUMNS: &str = "SELECT id,parent_id,subtree_end,depth,name,x'2f',0,ino,mtime,dir_disk,dir_apparent,projid,entries,errors,own_files,own_symlinks,own_charged,own_apparent,t_dirs,t_files,t_inodes,t_disk,t_apparent,t_charged,t_reclaimable,t_errors,age0,age1,age2,age3,age4,age5,newest_mtime,max_entries";
 /// A directory visited in preorder together with its raw path bytes.
@@ -79,6 +102,18 @@ pub(crate) fn decode_bool(r: &Row<'_>, i: usize) -> rusqlite::Result<bool> {
         0 => Ok(false),
         1 => Ok(true),
         _ => Err(rusqlite::Error::IntegralValueOutOfRange(i, r.get(i)?)),
+    }
+}
+/// Classifies a failure to read a plain-table row of a v2 snapshot: a row that
+/// cannot be decoded is invalid storage, other failures stay SQL errors.
+pub(crate) fn plain_row_error(error: rusqlite::Error) -> StoreError {
+    match error {
+        rusqlite::Error::FromSqlConversionFailure(..)
+        | rusqlite::Error::InvalidColumnType(..)
+        | rusqlite::Error::IntegralValueOutOfRange(..) => {
+            StoreError::Invalid(format!("invalid v2 snapshot: undecodable row ({error})"))
+        }
+        other => StoreError::Sql(other),
     }
 }
 pub(crate) fn dir_row(r: &Row<'_>) -> rusqlite::Result<DirRow> {
@@ -328,6 +363,14 @@ impl Snapshot {
             )
             .optional()?)
     }
+    /// v2 plain-table decode failures are `Invalid`; v1 keeps its `Sql` category.
+    fn plain_error(&self, error: rusqlite::Error) -> StoreError {
+        if self.v2.is_some() {
+            plain_row_error(error)
+        } else {
+            StoreError::Sql(error)
+        }
+    }
     /// Parent of a directory.
     pub(crate) fn parent_of(&self, id: u32) -> Result<Option<u32>> {
         match &self.v2 {
@@ -528,6 +571,56 @@ impl Snapshot {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         crate::error::check_result_bound(&result)?;
         Ok(result)
+    }
+    /// Append up to `limit` (at least one) children of `parent` after `cursor`
+    /// (`None` = from the first) to `out`, in name-byte order, without
+    /// reconstructing paths. Returns the cursor for the next page, or `None` when
+    /// the children are exhausted. Work per page is proportional to the page.
+    #[allow(dead_code)] // consumed by the diff walk (SNAP-diff-walk-fix)
+    pub(crate) fn children_by_name(
+        &self,
+        parent: u32,
+        cursor: Option<&ChildCursor>,
+        limit: usize,
+        out: &mut Vec<ChildEntry>,
+    ) -> Result<Option<ChildCursor>> {
+        if limit > crate::error::MAX_QUERY_ROWS {
+            return Err(StoreError::Invalid("child page exceeds query cap".into()));
+        }
+        let limit = limit.max(1);
+        if let Some(backend) = &self.v2 {
+            return backend.children_by_name(self, parent, cursor, limit, out);
+        }
+        let after = match cursor {
+            None => None,
+            Some(ChildCursor(CursorAt::After(name))) => Some(name.as_slice()),
+            Some(_) => return Err(StoreError::Invalid("foreign child cursor".into())),
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id,name,depth,subtree_end,t_disk,t_reclaimable,t_files,own_charged FROM dirs WHERE parent_id=?1 AND (?2 IS NULL OR name>?2) ORDER BY name LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(params![parent, after, sql_limit(limit + 1)?])?;
+        let mut taken = 0;
+        let mut last: Option<Vec<u8>> = None;
+        while let Some(r) = rows.next()? {
+            if taken == limit {
+                return Ok(last.map(|name| ChildCursor(CursorAt::After(name))));
+            }
+            let name: Vec<u8> = r.get(1)?;
+            out.push(ChildEntry {
+                id: r.get(0)?,
+                name: name.clone(),
+                depth: r.get(2)?,
+                subtree_end: r.get(3)?,
+                t_disk: crate::error::read_u64(r, 4)?,
+                t_reclaimable: crate::error::read_u64(r, 5)?,
+                t_files: crate::error::read_u64(r, 6)?,
+                own_charged: crate::error::read_u64(r, 7)?,
+            });
+            last = Some(name);
+            taken += 1;
+        }
+        Ok(None)
     }
     /// Count direct children matching a raw-byte substring; empty matches all.
     pub fn children_count(&self, id: u32, filter: &[u8]) -> Result<u64> {
@@ -959,7 +1052,8 @@ impl Snapshot {
         let result = stmt
             .query_map(params![id, end], skip_row)?
             .take(crate::error::MAX_QUERY_ROWS + 1)
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| self.plain_error(e))?;
         crate::error::check_result_bound(&result)?;
         Ok(result)
     }
@@ -970,7 +1064,8 @@ impl Snapshot {
         let result = stmt
             .query_map(params![id, end, id, sql_limit(limit)?], error_row)?
             .take(crate::error::MAX_QUERY_ROWS + 1)
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| self.plain_error(e))?;
         crate::error::check_result_bound(&result)?;
         Ok(result)
     }
@@ -982,7 +1077,8 @@ impl Snapshot {
         let result = stmt
             .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
             .take(crate::error::MAX_QUERY_ROWS + 1)
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| self.plain_error(e))?;
         crate::error::check_result_bound(&result)?;
         Ok(result)
     }
