@@ -48,4 +48,8 @@ Above the threshold; cause in "Needs from coordinator". No `perf` available; spl
 - Only 5-run medians from the existing test harness (it hard-codes 5 runs).
 
 ## Test counts
-`cargo test -p tidemark-store --lib --test diff_walk`: 39 lib passed (1 ignored), 8 diff_walk passed (2 ignored scale). Workspace-wide counts: see report.
+`cargo test -p tidemark-store --lib --test diff_walk`: 39 lib passed (1 ignored), 8 diff_walk passed (2 ignored scale). Whole `tidemark-store` package: all suites pass (39+25+2+12+8+4+3+33+4+... , 0 failed).
+fmt, clippy `-D warnings` (workspace, all targets), `cargo doc -D warnings` and `--features privileged --tests` build are clean.
+`cargo test --workspace` in this sandbox fails 8 targets outside my scope (tidemarkd socket/READY tests, tidemark-cli e2e/rules,
+tidemark-fs `foreign_directory_fallback_count`: sandbox maps `/` to uid 65534 and has no usable sockets); none touch `tidemark-store`.
+`tools/ci.sh` not run for the same reason.
