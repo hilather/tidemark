@@ -906,7 +906,7 @@ mod tests {
                 dir_path,
                 &meta,
                 crate::writer_v2::WriterOptions {
-                    plain_depth: 0,
+                    plain_depth: std::env::var("TM_PLAIN").map_or(0, |v| v.parse().unwrap()),
                     chunk_dirs: 512,
                     ..Default::default()
                 },
