@@ -931,7 +931,9 @@ impl Browser {
             && self.state.sort == state::Sort::Growth
             && self.pages.live.is_none()
         {
-            // One rebuild on the None→Some transition. Main may reset to 0.
+            // One rebuild on the None→Some transition, only when no live rows are showing.
+            // Main: seek_boundary(false) — offset 0, cursor cleared, reverse false,
+            // selected and main_selected 0 (first page of the new growth order).
             // Any other pane keeps the depth subject and its list cursor.
             if self.state.pane != Pane::Main {
                 let target = self.depth_target();
@@ -940,7 +942,7 @@ impl Browser {
                     self.remember_missing();
                 }
             } else {
-                self.load()?;
+                self.seek_boundary(false)?;
             }
         }
         self.history
