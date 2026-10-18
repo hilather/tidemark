@@ -117,7 +117,7 @@ fn check_neighbours(conn: &Connection, c: ChunkRef) -> Result<()> {
 // Paths may exceed PATH_MAX when scanners use directory-relative syscalls.
 // Bound reconstruction independently of tree depth and without recursion.
 const MAX_PATH_BYTES: usize = 256 * 1024 * 1024;
-const SHALLOW_COLUMNS: &str = super::LITE_COLUMNS;
+const SHALLOW_COLUMNS: &str = "id,parent_id,subtree_end,depth,name,ino,mtime,dir_disk,dir_apparent,projid,entries,errors,own_files,own_symlinks,own_charged,own_apparent,t_dirs,t_files,t_inodes,t_disk,t_apparent,t_charged,t_reclaimable,t_errors,age0,age1,age2,age3,age4,age5,newest_mtime,max_entries";
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 struct Cached {
     first: u32,
@@ -135,20 +135,112 @@ pub(super) struct Backend {
     /// Directory chunks decoded so far (work-bound tests).
     #[cfg(test)]
     decodes: std::cell::Cell<u64>,
+    /// Directory chunks streamed by `scan` so far (work-bound tests).
+    #[cfg(test)]
+    scanned: std::cell::Cell<u64>,
 }
-#[derive(Eq, PartialEq)]
+// ---- ranking ----
+
+/// Tie order after the primary key: raw name bytes ascending (v1
+/// `ORDER BY metric DESC, name, id`), descending (reverse name pages), or path
+/// bytes (`metrics_candidates`: `ORDER BY metric DESC, path, id`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tie {
+    Name,
+    NameDesc,
+    Path,
+}
+/// A ranked candidate carrying its reconstructed path; no key material is cloned.
 struct Hit {
-    key: (i128, Vec<u8>, u32),
+    key: i128,
+    tie: Tie,
     row: ChunkDir,
+    path: RawPath,
+}
+impl Hit {
+    fn rank(&self) -> (i128, &[u8], u32) {
+        let bytes = match self.tie {
+            Tie::Path => self.path.as_bytes(),
+            Tie::Name | Tie::NameDesc => self.row.name.as_slice(),
+        };
+        (self.key, bytes, self.row.id)
+    }
+}
+fn rank_cmp(a: (i128, &[u8], u32), b: (i128, &[u8], u32), tie: Tie) -> Ordering {
+    a.0.cmp(&b.0)
+        .then_with(|| match tie {
+            Tie::NameDesc => b.1.cmp(a.1),
+            Tie::Name | Tie::Path => a.1.cmp(b.1),
+        })
+        .then_with(|| a.2.cmp(&b.2))
 }
 impl Ord for Hit {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
+        rank_cmp(self.rank(), other.rank(), self.tie)
     }
 }
 impl PartialOrd for Hit {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+impl PartialEq for Hit {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Hit {}
+/// Bounded top-N over candidates offered in any order: a vector until `cap`
+/// candidates are held, then a max-heap evicting the worst. `sql_limit`, the
+/// `MAX_QUERY_ROWS` cap and the result bound apply exactly as in v1.
+struct TopN {
+    cap: usize,
+    tie: Tie,
+    vec: Vec<Hit>,
+    heap: BinaryHeap<Hit>,
+}
+impl TopN {
+    fn new(limit: usize, tie: Tie) -> Result<Self> {
+        sql_limit(limit)?;
+        Ok(Self {
+            cap: limit.min(crate::error::MAX_QUERY_ROWS + 1),
+            tie,
+            vec: Vec::new(),
+            heap: BinaryHeap::new(),
+        })
+    }
+    /// Whether a candidate ranked `(key, tie bytes, id)` would enter the result.
+    fn admits(&self, key: i128, bytes: &[u8], id: u32) -> bool {
+        if self.cap == 0 {
+            return false;
+        }
+        match self.heap.peek() {
+            Some(worst) => rank_cmp((key, bytes, id), worst.rank(), self.tie) == Ordering::Less,
+            None => true,
+        }
+    }
+    /// Insert a candidate that `admits` accepted.
+    fn push(&mut self, hit: Hit) {
+        if self.heap.is_empty() {
+            self.vec.push(hit);
+            if self.vec.len() == self.cap {
+                self.heap = BinaryHeap::from(std::mem::take(&mut self.vec));
+            }
+        } else {
+            self.heap.pop();
+            self.heap.push(hit);
+        }
+    }
+    fn finish(self) -> Result<Vec<Hit>> {
+        if self.heap.is_empty() {
+            crate::error::check_result_bound(&self.vec)?;
+            let mut hits = self.vec;
+            hits.sort_unstable();
+            Ok(hits)
+        } else {
+            crate::error::check_result_bound(self.heap.as_slice())?;
+            Ok(self.heap.into_sorted_vec())
+        }
     }
 }
 fn key(row: &ChunkDir, sort: SortKey) -> i128 {
@@ -163,39 +255,72 @@ fn key(row: &ChunkDir, sort: SortKey) -> i128 {
         SortKey::Name => 0,
     }
 }
-/// Validates a depth-limited shallow preorder as it streams past: parent links,
-/// depths, subtree spans and contiguity (rows deeper than `limit` are absent).
-struct ShallowWalk {
-    limit: u32,
+fn view_key(v: &chunk::DirView<'_>, sort: SortKey) -> i128 {
+    match sort {
+        SortKey::Disk => v.t_disk.into(),
+        SortKey::Apparent => v.t_apparent.into(),
+        SortKey::Charged => v.t_charged.into(),
+        SortKey::Reclaimable => v.t_reclaimable.into(),
+        SortKey::Files => v.t_files.into(),
+        SortKey::Inodes => v.t_inodes.into(),
+        SortKey::Newest => v.newest_mtime.into(),
+        SortKey::Name => 0,
+    }
+}
+/// Validates a depth-limited preorder as it streams past (contiguity, parent
+/// links, depths, subtree spans, names) and builds every row's path from the
+/// walk root's path, as `visit_paths` does. Rows deeper than `limit` are not
+/// offered; the walk root's own path is `base`.
+struct Walk {
+    limit: u64,
     end: u32,
     next: u64,
     started: bool,
-    stack: Vec<(u32, u32, u32)>,
+    stack: Vec<(u32, u32, u32, usize)>,
+    buf: Vec<u8>,
 }
-impl ShallowWalk {
-    fn new(lo: u32, end: u32, limit: u32) -> Self {
+impl Walk {
+    fn new(lo: u32, end: u32, limit: u64, base: &RawPath) -> Self {
         Self {
             limit,
             end,
             next: u64::from(lo),
             started: false,
             stack: Vec::new(),
+            buf: base.as_bytes().to_vec(),
         }
     }
-    fn check(&mut self, r: &ChunkDir) -> Result<()> {
-        if u64::from(r.id) != self.next || r.subtree_end < r.id || r.subtree_end > self.end {
+    /// Checks the next row and returns its path bytes (valid until the next step).
+    fn step(
+        &mut self,
+        id: u32,
+        parent_id: Option<u32>,
+        subtree_end: u32,
+        depth: u32,
+        name: &[u8],
+    ) -> Result<&[u8]> {
+        if u64::from(id) != self.next || subtree_end < id || subtree_end > self.end {
             return Err(invalid());
         }
-        while self.stack.last().is_some_and(|p| p.1 < r.id) {
+        while self.stack.last().is_some_and(|p| p.1 < id) {
             self.stack.pop();
         }
         match self.stack.last() {
-            Some(&(pid, pend, pdepth)) => {
-                if r.parent_id != Some(pid)
-                    || Some(r.depth) != pdepth.checked_add(1)
-                    || r.id > pend
-                    || r.subtree_end > pend
+            Some(&(pid, pend, pdepth, len)) => {
+                if parent_id != Some(pid)
+                    || Some(depth) != pdepth.checked_add(1)
+                    || id > pend
+                    || subtree_end > pend
+                    || !valid_name(name)
                 {
+                    return Err(invalid());
+                }
+                self.buf.truncate(len);
+                if self.buf.len() > 1 {
+                    self.buf.push(b'/');
+                }
+                self.buf.extend_from_slice(name);
+                if self.buf.len() > MAX_PATH_BYTES {
                     return Err(invalid());
                 }
             }
@@ -203,13 +328,13 @@ impl ShallowWalk {
             None => {}
         }
         self.started = true;
-        self.next = if r.depth < self.limit && r.subtree_end > r.id {
-            u64::from(r.id) + 1
+        self.next = if u64::from(depth) < self.limit && subtree_end > id {
+            u64::from(id) + 1
         } else {
-            u64::from(r.subtree_end) + 1
+            u64::from(subtree_end) + 1
         };
-        self.stack.push((r.id, r.subtree_end, r.depth));
-        Ok(())
+        self.stack.push((id, subtree_end, depth, self.buf.len()));
+        Ok(&self.buf)
     }
     fn finish(&self) -> Result<()> {
         if self.started && self.next == u64::from(self.end) + 1 {
@@ -219,51 +344,50 @@ impl ShallowWalk {
         }
     }
 }
-fn max_u32(v: u64) -> Result<u32> {
-    u32::try_from(v).map_err(|_| invalid())
-}
 fn contains(name: &[u8], filter: &[u8]) -> bool {
     filter.is_empty() || name.windows(filter.len()).any(|w| w == filter)
 }
+/// Decodes a `shallow_dirs` row selected as `SHALLOW_COLUMNS` (no path columns).
+fn shallow_dir(r: &Row<'_>) -> rusqlite::Result<ChunkDir> {
+    use crate::error::read_u64 as u;
+    Ok(ChunkDir {
+        id: r.get(0)?,
+        parent_id: r.get(1)?,
+        subtree_end: r.get(2)?,
+        depth: r.get(3)?,
+        name: r.get(4)?,
+        ino: u(r, 5)?,
+        mtime: r.get(6)?,
+        dir_disk: u(r, 7)?,
+        dir_apparent: u(r, 8)?,
+        projid: r.get(9)?,
+        entries: r.get(10)?,
+        errors: r.get(11)?,
+        own_files: u(r, 12)?,
+        own_symlinks: u(r, 13)?,
+        own_charged: u(r, 14)?,
+        own_apparent: u(r, 15)?,
+        t_dirs: u(r, 16)?,
+        t_files: u(r, 17)?,
+        t_inodes: u(r, 18)?,
+        t_disk: u(r, 19)?,
+        t_apparent: u(r, 20)?,
+        t_charged: u(r, 21)?,
+        t_reclaimable: u(r, 22)?,
+        t_errors: u(r, 23)?,
+        age0: u(r, 24)?,
+        age1: u(r, 25)?,
+        age2: u(r, 26)?,
+        age3: u(r, 27)?,
+        age4: u(r, 28)?,
+        age5: u(r, 29)?,
+        newest_mtime: r.get(30)?,
+        max_entries: r.get(31)?,
+        file_lo: 0,
+        file_count: 0,
+    })
+}
 impl Backend {
-    fn from_shallow(row: DirRow) -> ChunkDir {
-        ChunkDir {
-            id: row.id,
-            parent_id: row.parent_id,
-            subtree_end: row.subtree_end,
-            depth: row.depth,
-            name: row.name,
-            ino: row.ino,
-            mtime: row.mtime,
-            dir_disk: row.dir_disk,
-            dir_apparent: row.dir_apparent,
-            projid: row.projid,
-            entries: row.entries,
-            errors: row.errors,
-            own_files: row.own_files,
-            own_symlinks: row.own_symlinks,
-            own_charged: row.own_charged,
-            own_apparent: row.own_apparent,
-            t_dirs: row.t_dirs,
-            t_files: row.t_files,
-            t_inodes: row.t_inodes,
-            t_disk: row.t_disk,
-            t_apparent: row.t_apparent,
-            t_charged: row.t_charged,
-            t_reclaimable: row.t_reclaimable,
-            t_errors: row.t_errors,
-            age0: row.age0,
-            age1: row.age1,
-            age2: row.age2,
-            age3: row.age3,
-            age4: row.age4,
-            age5: row.age5,
-            newest_mtime: row.newest_mtime,
-            max_entries: row.max_entries,
-            file_lo: 0,
-            file_count: 0,
-        }
-    }
     pub(super) fn open(conn: &Connection) -> Result<Self> {
         let get = |key| -> Result<u32> {
             let s = conn
@@ -291,6 +415,8 @@ impl Backend {
             paths: RefCell::new(PathCache::default()),
             #[cfg(test)]
             decodes: std::cell::Cell::new(0),
+            #[cfg(test)]
+            scanned: std::cell::Cell::new(0),
         })
     }
     fn chunk(&self, snap: &Snapshot, id: u32) -> Result<Arc<Vec<ChunkDir>>> {
@@ -351,14 +477,12 @@ impl Backend {
     }
     // Shallow rows (depth <= plain_depth) come from SQL without touching chunks.
     fn shallow_row(&self, snap: &Snapshot, id: u32) -> Result<Option<ChunkDir>> {
-        let mut stmt = snap
-            .conn
-            .prepare(&format!("{SHALLOW_COLUMNS} FROM shallow_dirs WHERE id=?"))?;
+        let mut stmt = snap.conn.prepare_cached(&format!(
+            "SELECT {SHALLOW_COLUMNS} FROM shallow_dirs WHERE id=?"
+        ))?;
         let mut rows = stmt.query([id])?;
         match rows.next()? {
-            Some(row) => Ok(Some(Self::from_shallow(
-                dir_row(row).map_err(plain_row_error)?,
-            ))),
+            Some(row) => Ok(Some(shallow_dir(row).map_err(plain_row_error)?)),
             None => Ok(None),
         }
     }
@@ -469,64 +593,100 @@ impl Backend {
         }
         Ok(None)
     }
-    fn visit_children(
-        &self,
-        snap: &Snapshot,
-        id: u32,
-        mut visit: impl FnMut(ChunkDir) -> Result<()>,
-    ) -> Result<()> {
-        // Missing parent is an empty listing in v1.
-        let exists = self.locate(snap, id)?.is_some_and(|c| c.last >= id);
-        if !exists {
-            return Ok(());
+    /// The parent of a child listing; `None` for an absent id (an empty listing in v1).
+    fn listing_parent(&self, snap: &Snapshot, id: u32) -> Result<Option<ChunkDir>> {
+        if !self.locate(snap, id)?.is_some_and(|c| c.last >= id) {
+            return Ok(None);
         }
-        let parent = self.raw(snap, id)?;
-        if parent.depth < self.plain_depth {
-            let mut stmt = snap.conn.prepare(&format!(
-                "{SHALLOW_COLUMNS} FROM shallow_dirs WHERE parent_id=? ORDER BY id"
-            ))?;
-            let mut rows = stmt.query([id])?;
-            // The shallow copy must be exactly the parent's child set: first child
-            // at id+1, each next child right after the previous subtree, and the
-            // last subtree ending at the parent's.
-            let mut expect = if parent.subtree_end > id {
-                id.checked_add(1)
+        Ok(Some(self.raw(snap, id)?))
+    }
+    /// The shallow copy must hold exactly `parent`'s child set: first child at
+    /// id+1, each next child right after the previous subtree, and the last
+    /// subtree ending at the parent's. Reads three integers per child.
+    fn check_shallow_children(&self, snap: &Snapshot, parent: &ChunkDir) -> Result<()> {
+        let mut stmt = snap.conn.prepare_cached(
+            "SELECT id,subtree_end,depth FROM shallow_dirs WHERE parent_id=? ORDER BY id",
+        )?;
+        let mut rows = stmt.query([parent.id])?;
+        let mut expect = if parent.subtree_end > parent.id {
+            parent.id.checked_add(1)
+        } else {
+            None
+        };
+        let child_depth = parent.depth.checked_add(1).ok_or_else(invalid)?;
+        while let Some(row) = rows.next()? {
+            let cols = (|| -> rusqlite::Result<(u32, u32, u32)> {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })();
+            let (id, end, depth) = cols.map_err(plain_row_error)?;
+            if Some(id) != expect || depth != child_depth || end < id || end > parent.subtree_end {
+                return Err(invalid());
+            }
+            expect = if end < parent.subtree_end {
+                Some(end + 1)
             } else {
                 None
             };
-            let child_depth = parent.depth.checked_add(1).ok_or_else(invalid)?;
-            while let Some(row) = rows.next()? {
-                let row = dir_row(row).map_err(plain_row_error)?;
-                if Some(row.id) != expect
-                    || row.parent_id != Some(id)
-                    || row.depth != child_depth
-                    || row.subtree_end < row.id
-                    || row.subtree_end > parent.subtree_end
-                {
-                    return Err(invalid());
-                }
-                expect = if row.subtree_end < parent.subtree_end {
-                    Some(row.subtree_end + 1)
-                } else {
-                    None
-                };
-                visit(Self::from_shallow(row))?;
-            }
-            if expect.is_some() {
-                return Err(invalid());
-            }
-        } else {
-            let mut next = id.checked_add(1);
-            while let Some(child_id) = next.filter(|n| *n <= parent.subtree_end) {
-                let child = self.raw(snap, child_id).map_err(required)?;
-                if child.parent_id != Some(id) || child.subtree_end > parent.subtree_end {
-                    return Err(invalid());
-                }
-                next = child.subtree_end.checked_add(1);
-                visit(child)?;
-            }
+        }
+        if expect.is_some() {
+            return Err(invalid());
         }
         Ok(())
+    }
+    /// Visits the children of a parent at or below the plain depth by hopping
+    /// over sibling subtrees inside the decoded chunks.
+    fn hop_children(
+        &self,
+        snap: &Snapshot,
+        parent: &ChunkDir,
+        mut visit: impl FnMut(ChunkDir) -> Result<()>,
+    ) -> Result<()> {
+        let mut next = parent.id.checked_add(1);
+        while let Some(child_id) = next.filter(|n| *n <= parent.subtree_end) {
+            let child = self.raw(snap, child_id).map_err(required)?;
+            if child.parent_id != Some(parent.id) || child.subtree_end > parent.subtree_end {
+                return Err(invalid());
+            }
+            next = child.subtree_end.checked_add(1);
+            visit(child)?;
+        }
+        Ok(())
+    }
+    /// A child checked against its parent; its path is the parent's plus the name.
+    fn child_path(parent: &ChunkDir, base: &RawPath, c: &ChunkDir) -> Result<RawPath> {
+        if c.parent_id != Some(parent.id)
+            || Some(c.depth) != parent.depth.checked_add(1)
+            || c.id <= parent.id
+            || c.id > parent.subtree_end
+            || c.subtree_end < c.id
+            || c.subtree_end > parent.subtree_end
+            || !valid_name(&c.name)
+        {
+            return Err(invalid());
+        }
+        let mut bytes = Vec::with_capacity(base.as_bytes().len() + 1 + c.name.len());
+        bytes.extend_from_slice(base.as_bytes());
+        if bytes.len() > 1 {
+            bytes.push(b'/');
+        }
+        bytes.extend_from_slice(&c.name);
+        if bytes.len() > MAX_PATH_BYTES {
+            return Err(invalid());
+        }
+        RawPath::new(bytes).map_err(|_| invalid())
+    }
+    fn materialized(&self, row: ChunkDir, path: RawPath) -> DirRow {
+        let mut d = self.materialize_with(row, path);
+        d.path_hash = d.path.hash64();
+        d
+    }
+    fn finish(&self, top: TopN) -> Result<Vec<DirRow>> {
+        let out = top
+            .finish()?
+            .into_iter()
+            .map(|h| self.materialized(h.row, h.path))
+            .collect();
+        Ok(out)
     }
     /// One page of `parent`'s children in name (= preorder) order, resuming at a
     /// next-sibling id and the last name returned; see [`Snapshot::children_by_name`].
@@ -614,38 +774,6 @@ impl Backend {
         }
         Ok(())
     }
-    fn collect(
-        &self,
-        snap: &Snapshot,
-        limit: usize,
-        feed: impl FnOnce(&mut dyn FnMut(ChunkDir) -> Result<()>) -> Result<()>,
-        key: impl Fn(&ChunkDir) -> Result<(i128, Vec<u8>, u32)>,
-    ) -> Result<Vec<DirRow>> {
-        sql_limit(limit)?;
-        let cap = limit.min(crate::error::MAX_QUERY_ROWS + 1);
-        let mut heap = BinaryHeap::<Hit>::new();
-        feed(&mut |row| {
-            if cap == 0 {
-                return Ok(());
-            }
-            let hit = Hit {
-                key: key(&row)?,
-                row,
-            };
-            if heap.len() < cap {
-                heap.push(hit);
-            } else if heap.peek().is_some_and(|worst| hit.key < worst.key) {
-                heap.pop();
-                heap.push(hit);
-            }
-            Ok(())
-        })?;
-        crate::error::check_result_bound(heap.as_slice())?;
-        heap.into_sorted_vec()
-            .into_iter()
-            .map(|hit| self.materialize(snap, hit.row))
-            .collect()
-    }
     pub(super) fn children(
         &self,
         snap: &Snapshot,
@@ -653,21 +781,101 @@ impl Backend {
         sort: SortKey,
         limit: usize,
     ) -> Result<Vec<DirRow>> {
-        self.collect(
-            snap,
-            limit,
-            |v| self.visit_children(snap, id, v),
-            |r| Ok((-key(r, sort), r.name.clone(), r.id)),
-        )
-    }
-    pub(super) fn children_count(&self, snap: &Snapshot, id: u32, filter: &[u8]) -> Result<u64> {
-        let mut count = 0;
-        self.visit_children(snap, id, |r| {
-            if contains(&r.name, filter) {
-                count += 1;
+        let Some(parent) = self.listing_parent(snap, id)? else {
+            return Ok(Vec::new());
+        };
+        let base = self.cached_path(snap, id)?;
+        if parent.depth < self.plain_depth {
+            self.check_shallow_children(snap, &parent)?;
+            let mut stmt = snap.conn.prepare_cached(&format!(
+                "SELECT {SHALLOW_COLUMNS} FROM shallow_dirs WHERE parent_id=? ORDER BY {}, id LIMIT ?",
+                order(sort)
+            ))?;
+            let mut rows = stmt.query(params![id, sql_limit(limit)?])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                if out.len() > crate::error::MAX_QUERY_ROWS {
+                    break;
+                }
+                let c = shallow_dir(row).map_err(plain_row_error)?;
+                let path = Self::child_path(&parent, &base, &c)?;
+                out.push(self.materialized(c, path));
+            }
+            crate::error::check_result_bound(&out)?;
+            return Ok(out);
+        }
+        let mut top = TopN::new(limit, Tie::Name)?;
+        self.hop_children(snap, &parent, |c| {
+            let k = -key(&c, sort);
+            if top.admits(k, &c.name, c.id) {
+                let path = Self::child_path(&parent, &base, &c)?;
+                top.push(Hit {
+                    key: k,
+                    tie: Tie::Name,
+                    row: c,
+                    path,
+                });
             }
             Ok(())
         })?;
+        self.finish(top)
+    }
+    /// Every child of a shallow parent as a full row, checked like
+    /// `check_shallow_children` (one pass; undecodable rows are `Invalid`).
+    fn visit_shallow_children(
+        &self,
+        snap: &Snapshot,
+        parent: &ChunkDir,
+        mut visit: impl FnMut(ChunkDir) -> Result<()>,
+    ) -> Result<()> {
+        let mut stmt = snap.conn.prepare_cached(&format!(
+            "SELECT {SHALLOW_COLUMNS} FROM shallow_dirs WHERE parent_id=? ORDER BY id"
+        ))?;
+        let mut rows = stmt.query([parent.id])?;
+        let mut expect = if parent.subtree_end > parent.id {
+            parent.id.checked_add(1)
+        } else {
+            None
+        };
+        let child_depth = parent.depth.checked_add(1).ok_or_else(invalid)?;
+        while let Some(row) = rows.next()? {
+            let c = shallow_dir(row).map_err(plain_row_error)?;
+            if Some(c.id) != expect
+                || c.parent_id != Some(parent.id)
+                || c.depth != child_depth
+                || c.subtree_end < c.id
+                || c.subtree_end > parent.subtree_end
+            {
+                return Err(invalid());
+            }
+            expect = if c.subtree_end < parent.subtree_end {
+                Some(c.subtree_end + 1)
+            } else {
+                None
+            };
+            visit(c)?;
+        }
+        if expect.is_some() {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+    pub(super) fn children_count(&self, snap: &Snapshot, id: u32, filter: &[u8]) -> Result<u64> {
+        let Some(parent) = self.listing_parent(snap, id)? else {
+            return Ok(0);
+        };
+        let mut count = 0;
+        let tally = |c: ChunkDir| {
+            if contains(&c.name, filter) {
+                count += 1;
+            }
+            Ok(())
+        };
+        if parent.depth < self.plain_depth {
+            self.visit_shallow_children(snap, &parent, tally)?;
+        } else {
+            self.hop_children(snap, &parent, tally)?;
+        }
         Ok(count)
     }
     #[allow(clippy::too_many_arguments)]
@@ -685,6 +893,16 @@ impl Backend {
         if limit > crate::error::MAX_QUERY_ROWS {
             return Err(StoreError::Invalid("child page exceeds query cap".into()));
         }
+        let column = match sort {
+            SortKey::Disk => "t_disk",
+            SortKey::Apparent => "t_apparent",
+            SortKey::Reclaimable => "t_reclaimable",
+            SortKey::Charged => "t_charged",
+            SortKey::Files => "t_files",
+            SortKey::Inodes => "t_inodes",
+            SortKey::Newest => "newest_mtime",
+            SortKey::Name => "name",
+        };
         // Use the v1 cursor conversions, including rejecting out-of-domain caller values.
         let cursor_key = cursor
             .map(|r| -> Result<i128> {
@@ -700,119 +918,98 @@ impl Backend {
                 })
             })
             .transpose()?;
-        let compare = |r: &ChunkDir| {
-            let primary = if descending ^ reverse {
-                -key(r, sort)
-            } else {
-                key(r, sort)
-            };
-            let mut name = r.name.clone();
-            // Bytewise descending order cannot be represented by complementing bytes
-            // (prefix names reverse too), so use an explicit rank encoding with terminator.
-            if if sort == SortKey::Name {
-                descending ^ reverse
-            } else {
-                reverse
-            } {
-                name = r
-                    .name
-                    .iter()
-                    .flat_map(|b| [0, 255 - *b])
-                    .chain([1])
-                    .collect();
-            }
-            (primary, name, 0)
+        let primary_desc = descending ^ reverse;
+        let name_desc = if sort == SortKey::Name {
+            primary_desc
+        } else {
+            reverse
         };
-        self.collect(
-            snap,
-            limit,
-            |v| {
-                self.visit_children(snap, id, |r| {
-                    if !contains(&r.name, filter) {
-                        return Ok(());
-                    }
-                    if let (Some(c), Some(k)) = (cursor, cursor_key) {
-                        let mut cmp = key(&r, sort).cmp(&k);
-                        if descending ^ reverse {
-                            cmp = cmp.reverse();
-                        }
-                        if cmp == Ordering::Equal {
-                            cmp = r.name.cmp(&c.name);
-                            if if sort == SortKey::Name {
-                                descending ^ reverse
-                            } else {
-                                reverse
-                            } {
-                                cmp = cmp.reverse();
-                            }
-                        }
-                        if cmp != Ordering::Greater {
-                            return Ok(());
-                        }
-                    }
-                    v(r)
-                })
-            },
-            |r| Ok(compare(r)),
-        )
-    }
-    // Metric range scans compare projected keys before materializing names or
-    // full rows. Equal keys still decode names to preserve v1's tie ordering.
-    fn projected_subtree(
-        &self,
-        snap: &Snapshot,
-        lo: u32,
-        hi: u32,
-        max_depth: u64,
-        sort: SortKey,
-        limit: usize,
-    ) -> Result<Vec<DirRow>> {
-        sql_limit(limit)?;
-        let cap = limit.min(crate::error::MAX_QUERY_ROWS + 1);
-        if cap == 0 {
+        let Some(parent) = self.listing_parent(snap, id)? else {
             return Ok(Vec::new());
+        };
+        let base = self.cached_path(snap, id)?;
+        if parent.depth < self.plain_depth {
+            // SQLite's bounded sorter picks the page (the v1 statement on the
+            // shallow table); the child set itself is checked separately.
+            self.check_shallow_children(snap, &parent)?;
+            let key_value = match (cursor, sort) {
+                (None, _) => rusqlite::types::Value::Null,
+                (Some(r), SortKey::Name) => rusqlite::types::Value::Blob(r.name.clone()),
+                (Some(_), _) => rusqlite::types::Value::Integer(
+                    i64::try_from(cursor_key.unwrap_or(0)).map_err(|_| invalid())?,
+                ),
+            };
+            let cmp = if primary_desc { "<" } else { ">" };
+            let name_cmp = if name_desc { "<" } else { ">" };
+            let direction = if primary_desc { "DESC" } else { "ASC" };
+            let name_direction = if name_desc { "DESC" } else { "ASC" };
+            // Omit the cursor predicate entirely for the first page.
+            let after = if cursor.is_some() {
+                format!(" AND ({column}{cmp}?3 OR ({column}=?3 AND name{name_cmp}?4))")
+            } else {
+                String::new()
+            };
+            let columns = SHALLOW_COLUMNS
+                .split(',')
+                .map(|c| format!("s.{c}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut stmt = snap.conn.prepare_cached(&format!(
+                "WITH page AS (SELECT id FROM shallow_dirs WHERE parent_id=?1 AND (length(?2)=0 OR instr(name,?2)>0){after} ORDER BY {column} {direction},name {name_direction} LIMIT ?5) SELECT {columns} FROM page JOIN shallow_dirs s ON s.id=page.id ORDER BY {column} {direction},name {name_direction}"
+            ))?;
+            let mut rows = stmt.query(params![
+                id,
+                filter,
+                key_value,
+                cursor.map(|r| r.name.as_slice()).unwrap_or_default(),
+                sql_limit(limit)?
+            ])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                let c = shallow_dir(row).map_err(plain_row_error)?;
+                let path = Self::child_path(&parent, &base, &c)?;
+                out.push(self.materialized(c, path));
+            }
+            return Ok(out);
         }
-        let mut heap = BinaryHeap::<Hit>::new();
-        self.projected_chunks(snap, lo, hi, |first, p| {
-            for offset in 0..p.entries.len() {
-                let id = first
-                    .checked_add(u32::try_from(offset).map_err(|_| invalid())?)
-                    .ok_or_else(invalid)?;
-                if id < lo || id > hi {
-                    continue;
+        let tie = if name_desc { Tie::NameDesc } else { Tie::Name };
+        let mut top = TopN::new(limit, tie)?;
+        self.hop_children(snap, &parent, |c| {
+            if !contains(&c.name, filter) {
+                return Ok(());
+            }
+            if let (Some(cur), Some(k)) = (cursor, cursor_key) {
+                let mut cmp = key(&c, sort).cmp(&k);
+                if primary_desc {
+                    cmp = cmp.reverse();
                 }
-                let value: i128 = match sort {
-                    SortKey::Disk => p.t_disk[offset].into(),
-                    SortKey::Reclaimable => p.t_reclaimable[offset].into(),
-                    SortKey::Files => p.t_files[offset].into(),
-                    SortKey::Newest => p.newest_mtime[offset].into(),
-                    _ => return Err(invalid()),
-                };
-                if heap.len() == cap && heap.peek().is_some_and(|worst| -value > worst.key.0) {
-                    continue;
+                if cmp == Ordering::Equal {
+                    cmp = c.name.cmp(&cur.name);
+                    if name_desc {
+                        cmp = cmp.reverse();
+                    }
                 }
-                let row = self.raw(snap, id)?;
-                if u64::from(row.depth) > max_depth {
-                    continue;
+                if cmp != Ordering::Greater {
+                    return Ok(());
                 }
-                let hit = Hit {
-                    key: (-value, row.name.clone(), id),
-                    row,
-                };
-                if heap.len() < cap {
-                    heap.push(hit);
-                } else if heap.peek().is_some_and(|worst| hit.key < worst.key) {
-                    heap.pop();
-                    heap.push(hit);
-                }
+            }
+            let k = if primary_desc {
+                -key(&c, sort)
+            } else {
+                key(&c, sort)
+            };
+            if top.admits(k, &c.name, c.id) {
+                let path = Self::child_path(&parent, &base, &c)?;
+                top.push(Hit {
+                    key: k,
+                    tie,
+                    row: c,
+                    path,
+                });
             }
             Ok(())
         })?;
-        crate::error::check_result_bound(heap.as_slice())?;
-        heap.into_sorted_vec()
-            .into_iter()
-            .map(|h| self.materialize(snap, h.row))
-            .collect()
+        self.finish(top)
     }
     /// The requested root from its directory chunk (the source `dir(id)` uses).
     /// A shallow copy, when present, must agree on id, parent, depth and span.
@@ -829,6 +1026,56 @@ impl Backend {
         }
         Ok(root)
     }
+    /// Streams every row of `lo..=hi` in preorder straight from the codec:
+    /// nothing is cached or materialised, chunk coordinates are checked as in
+    /// `projected_chunks` (no gaps or overlaps, neighbours of the first and last
+    /// chunk, table bounds agreeing with the decoded row count).
+    fn scan(
+        &self,
+        snap: &Snapshot,
+        lo: u32,
+        hi: u32,
+        mut visit: impl FnMut(&chunk::DirView<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let mut stmt = snap.conn.prepare_cached("SELECT first_id,last_id,CASE WHEN typeof(data)='blob' THEN length(data) END,typeof(data) FROM dir_chunks WHERE first_id >= (SELECT first_id FROM dir_chunks WHERE first_id<=?1 ORDER BY first_id DESC LIMIT 1) AND first_id<=?2 ORDER BY first_id")?;
+        let mut chunks = stmt.query(params![lo, hi])?;
+        let mut expected = None;
+        let mut covered = false;
+        let mut seen = None;
+        while let Some(chunk) = chunks.next()? {
+            let c = chunk_ref(chunk.get(0), chunk.get(1), chunk.get(2), chunk.get(3))?;
+            if expected.is_some_and(|id| id != c.first) {
+                return Err(bad("dir_chunks intervals overlap or leave a gap"));
+            }
+            if seen.is_none() {
+                check_neighbours(&snap.conn, c)?;
+            }
+            seen = Some(c);
+            let data = chunk_data(&snap.conn, c)?;
+            #[cfg(test)]
+            self.scanned.set(self.scanned.get() + 1);
+            let mut count = 0u32;
+            chunk::visit_dirs(&data, c.first, |v| {
+                count = count.checked_add(1).ok_or_else(invalid)?;
+                if v.id >= lo && v.id <= hi {
+                    visit(v)?;
+                }
+                Ok(())
+            })?;
+            if count == 0 || c.first.checked_add(count - 1) != Some(c.last) {
+                return Err(invalid());
+            }
+            covered = c.last >= hi;
+            expected = c.last.checked_add(1);
+        }
+        if let Some(c) = seen {
+            check_neighbours(&snap.conn, c)?;
+        }
+        if !covered {
+            return Err(invalid());
+        }
+        Ok(())
+    }
     pub(super) fn subtree_dirs(
         &self,
         snap: &Snapshot,
@@ -839,47 +1086,54 @@ impl Backend {
     ) -> Result<Vec<DirRow>> {
         let root = self.authoritative_root(snap, id)?;
         let max = u64::from(root.depth) + u64::from(depth);
+        let base = self.path(snap, &root)?;
+        let mut top = TopN::new(limit, Tie::Name)?;
+        let mut walk = Walk::new(id, root.subtree_end, max, &base);
         if max <= u64::from(self.plain_depth) && root.depth <= self.plain_depth {
             // Every requested row is a shallow row: no chunk is decoded.
-            return self.collect(
-                snap,
-                limit,
-                |v| {
-                    let mut stmt = snap.conn.prepare(&format!(
-                        "{SHALLOW_COLUMNS} FROM shallow_dirs WHERE id>=? AND id<=? AND depth<=? ORDER BY id"
-                    ))?;
-                    let mut rows = stmt.query(params![id, root.subtree_end, i64::try_from(max).map_err(|_| invalid())?])?;
-                    let mut walk = ShallowWalk::new(id, root.subtree_end, max_u32(max)?);
-                    while let Some(row) = rows.next()? {
-                        let r = Self::from_shallow(dir_row(row).map_err(plain_row_error)?);
-                        walk.check(&r)?;
-                        v(r)?;
-                    }
-                    walk.finish()
-                },
-                |r| Ok((-key(r, sort), r.name.clone(), r.id)),
-            );
+            let mut stmt = snap.conn.prepare_cached(&format!(
+                "SELECT {SHALLOW_COLUMNS} FROM shallow_dirs WHERE id>=? AND id<=? AND depth<=? ORDER BY id"
+            ))?;
+            let mut rows = stmt.query(params![
+                id,
+                root.subtree_end,
+                i64::try_from(max).map_err(|_| invalid())?
+            ])?;
+            while let Some(row) = rows.next()? {
+                let r = shallow_dir(row).map_err(plain_row_error)?;
+                let path = walk.step(r.id, r.parent_id, r.subtree_end, r.depth, &r.name)?;
+                let k = -key(&r, sort);
+                if top.admits(k, &r.name, r.id) {
+                    let path = RawPath::new(path.to_vec()).map_err(|_| invalid())?;
+                    top.push(Hit {
+                        key: k,
+                        tie: Tie::Name,
+                        row: r,
+                        path,
+                    });
+                }
+            }
+        } else {
+            self.scan(snap, id, root.subtree_end, |v| {
+                if u64::from(v.depth) > max {
+                    return Ok(());
+                }
+                let path = walk.step(v.id, v.parent_id, v.subtree_end, v.depth, v.name)?;
+                let k = -view_key(v, sort);
+                if top.admits(k, v.name, v.id) {
+                    let path = RawPath::new(path.to_vec()).map_err(|_| invalid())?;
+                    top.push(Hit {
+                        key: k,
+                        tie: Tie::Name,
+                        row: v.to_owned(),
+                        path,
+                    });
+                }
+                Ok(())
+            })?;
         }
-        if matches!(
-            sort,
-            SortKey::Disk | SortKey::Reclaimable | SortKey::Files | SortKey::Newest
-        ) {
-            return self.projected_subtree(snap, id, root.subtree_end, max, sort, limit);
-        }
-        self.collect(
-            snap,
-            limit,
-            |v| {
-                self.range(snap, id, root.subtree_end, |r| {
-                    if u64::from(r.depth) <= max {
-                        v(r)
-                    } else {
-                        Ok(())
-                    }
-                })
-            },
-            |r| Ok((-key(r, sort), r.name.clone(), r.id)),
-        )
+        walk.finish()?;
+        self.finish(top)
     }
     pub(super) fn wide_dirs(
         &self,
@@ -889,49 +1143,28 @@ impl Backend {
         limit: usize,
     ) -> Result<Vec<DirRow>> {
         let root = self.raw(snap, id)?;
-        self.collect(
-            snap,
-            limit,
-            |v| {
-                self.entries_range(snap, id, root.subtree_end, min, |r| {
-                    if r.entries >= min {
-                        v(r)
-                    } else {
-                        Ok(())
-                    }
-                })
-            },
-            |r| Ok((-i128::from(r.entries), r.name.clone(), r.id)),
-        )
-    }
-    fn eligible(
-        &self,
-        snap: &Snapshot,
-        depth: u32,
-        hi: u32,
-        mut visit: impl FnMut(ChunkDir) -> Result<()>,
-    ) -> Result<()> {
-        if depth <= self.plain_depth {
-            let mut stmt = snap.conn.prepare(&format!(
-                "{SHALLOW_COLUMNS} FROM shallow_dirs WHERE depth<=? ORDER BY id"
-            ))?;
-            let mut rows = stmt.query([depth])?;
-            let mut walk = ShallowWalk::new(0, hi, depth);
-            while let Some(row) = rows.next()? {
-                let r = Self::from_shallow(dir_row(row).map_err(plain_row_error)?);
-                walk.check(&r)?;
-                visit(r)?;
+        let base = self.path(snap, &root)?;
+        let mut top = TopN::new(limit, Tie::Name)?;
+        let mut walk = Walk::new(id, root.subtree_end, u64::MAX, &base);
+        self.scan(snap, id, root.subtree_end, |v| {
+            let path = walk.step(v.id, v.parent_id, v.subtree_end, v.depth, v.name)?;
+            if v.entries < min {
+                return Ok(());
             }
-            walk.finish()
-        } else {
-            self.range(snap, 0, hi, |r| {
-                if r.depth <= depth {
-                    visit(r)
-                } else {
-                    Ok(())
-                }
-            })
-        }
+            let k = -i128::from(v.entries);
+            if top.admits(k, v.name, v.id) {
+                let path = RawPath::new(path.to_vec()).map_err(|_| invalid())?;
+                top.push(Hit {
+                    key: k,
+                    tie: Tie::Name,
+                    row: v.to_owned(),
+                    path,
+                });
+            }
+            Ok(())
+        })?;
+        walk.finish()?;
+        self.finish(top)
     }
     // Every projected chunk is fully validated by the codec. The directory
     // table bounds must agree, and no gaps are allowed inside a range.
@@ -974,30 +1207,6 @@ impl Backend {
         }
         Ok(())
     }
-    // Avoid allocating full rows/names for excluded entries thresholds.
-    fn entries_range(
-        &self,
-        snap: &Snapshot,
-        lo: u32,
-        hi: u32,
-        min: u32,
-        mut visit: impl FnMut(ChunkDir) -> Result<()>,
-    ) -> Result<()> {
-        if min == 0 {
-            return self.range(snap, lo, hi, visit);
-        }
-        self.projected_chunks(snap, lo, hi, |first, p| {
-            for (offset, entries) in p.entries.into_iter().enumerate() {
-                let id = first
-                    .checked_add(u32::try_from(offset).map_err(|_| invalid())?)
-                    .ok_or_else(invalid)?;
-                if id >= lo && id <= hi && entries >= min {
-                    visit(self.raw(snap, id)?)?;
-                }
-            }
-            Ok(())
-        })
-    }
     pub(super) fn metrics_candidates(
         &self,
         snap: &Snapshot,
@@ -1010,26 +1219,57 @@ impl Backend {
             ));
         }
         let root = self.authoritative_root(snap, 0)?;
-        let mut count = 0;
-        let mut query = |sort| {
-            self.collect(
-                snap,
-                limit,
-                |v| {
-                    self.eligible(snap, depth, root.subtree_end, |r| {
-                        if r.depth <= depth {
-                            count += 1;
-                            v(r)
-                        } else {
-                            Ok(())
-                        }
-                    })
-                },
-                |r| Ok((-key(r, sort), self.path(snap, r)?.as_bytes().to_vec(), r.id)),
-            )
-        };
-        let used = query(SortKey::Disk)?;
-        let reclaim = query(SortKey::Reclaimable)?;
+        let base = self.path(snap, &root)?;
+        let mut count = 0u64;
+        let mut results = Vec::with_capacity(2);
+        for sort in [SortKey::Disk, SortKey::Reclaimable] {
+            let mut top = TopN::new(limit, Tie::Path)?;
+            let mut walk = Walk::new(0, root.subtree_end, u64::from(depth), &base);
+            if depth <= self.plain_depth {
+                let mut stmt = snap.conn.prepare_cached(&format!(
+                    "SELECT {SHALLOW_COLUMNS} FROM shallow_dirs WHERE depth<=? ORDER BY id"
+                ))?;
+                let mut rows = stmt.query([depth])?;
+                while let Some(row) = rows.next()? {
+                    let r = shallow_dir(row).map_err(plain_row_error)?;
+                    let path = walk.step(r.id, r.parent_id, r.subtree_end, r.depth, &r.name)?;
+                    count += 1;
+                    let k = -key(&r, sort);
+                    if top.admits(k, path, r.id) {
+                        let path = RawPath::new(path.to_vec()).map_err(|_| invalid())?;
+                        top.push(Hit {
+                            key: k,
+                            tie: Tie::Path,
+                            row: r,
+                            path,
+                        });
+                    }
+                }
+            } else {
+                self.scan(snap, 0, root.subtree_end, |v| {
+                    if v.depth > depth {
+                        return Ok(());
+                    }
+                    let path = walk.step(v.id, v.parent_id, v.subtree_end, v.depth, v.name)?;
+                    count += 1;
+                    let k = -view_key(v, sort);
+                    if top.admits(k, path, v.id) {
+                        let path = RawPath::new(path.to_vec()).map_err(|_| invalid())?;
+                        top.push(Hit {
+                            key: k,
+                            tie: Tie::Path,
+                            row: v.to_owned(),
+                            path,
+                        });
+                    }
+                    Ok(())
+                })?;
+            }
+            walk.finish()?;
+            results.push(self.finish(top)?);
+        }
+        let reclaim = results.pop().ok_or_else(invalid)?;
+        let used = results.pop().ok_or_else(invalid)?;
         Ok((used, reclaim, count / 2, snap.file.clone()))
     }
 }
@@ -2647,5 +2887,187 @@ mod child_cursor_tests {
         assert_eq!(s.subtree_dirs(0, 3, SortKey::Name, 1000).unwrap().len(), 40);
         let (_k, snap) = copy(&s, "UPDATE shallow_dirs SET depth=1 WHERE id=0;");
         assert!(is_invalid(snap.subtree_dirs(0, 3, SortKey::Name, 1000)));
+    }
+
+    // ---- gate-8 fix: walk, scan and work bounds ----
+
+    type Step<'a> = (u32, Option<u32>, u32, u32, &'a [u8]);
+    /// Runs a `Walk` over the rows and returns every path it produced.
+    fn walk_paths(base: &[u8], end: u32, limit: u64, rows: &[Step<'_>]) -> Result<Vec<Vec<u8>>> {
+        let base = RawPath::new(base.to_vec()).unwrap();
+        let mut walk = Walk::new(0, end, limit, &base);
+        let mut out = Vec::new();
+        for &(id, parent, subtree_end, depth, name) in rows {
+            out.push(walk.step(id, parent, subtree_end, depth, name)?.to_vec());
+        }
+        walk.finish()?;
+        Ok(out)
+    }
+    /// Preorder `/`, `/a` (with child `a1`), `/b`, `/c`: ids 0..=4.
+    fn walk_rows() -> Vec<Step<'static>> {
+        vec![
+            (0, None, 4, 0, b"/r"),
+            (1, Some(0), 2, 1, b"a"),
+            (2, Some(1), 2, 2, b"a1"),
+            (3, Some(0), 3, 1, b"b"),
+            (4, Some(0), 4, 1, b"c"),
+        ]
+    }
+
+    #[test]
+    fn walk_builds_paths_and_skips_below_the_limit() {
+        let rows = walk_rows();
+        // Depth limit 1: row 2 is hopped over, so it is not offered.
+        let kept: Vec<Step<'_>> = rows.iter().copied().filter(|r| r.0 != 2).collect();
+        let p = walk_paths(b"/", 4, 1, &kept).unwrap();
+        assert_eq!(p, [&b"/"[..], b"/a", b"/b", b"/c"]);
+        let p = walk_paths(b"/x", 4, 1, &kept).unwrap();
+        assert_eq!(p, [&b"/x"[..], b"/x/a", b"/x/b", b"/x/c"]);
+        let p = walk_paths(b"/x", 4, u64::MAX, &rows).unwrap();
+        assert_eq!(p[2], b"/x/a/a1");
+        assert_eq!(p[3], b"/x/b");
+    }
+
+    #[test]
+    fn walk_rejects_every_structural_violation() {
+        let ok = walk_rows();
+        let mutate = |f: &dyn Fn(&mut Vec<Step<'static>>)| {
+            let mut rows = ok.clone();
+            f(&mut rows);
+            walk_paths(b"/r", 4, u64::MAX, &rows)
+        };
+        assert!(walk_paths(b"/r", 4, u64::MAX, &ok).is_ok());
+        // Gap: id 2 missing.
+        assert!(is_invalid(mutate(&|r| {
+            r.remove(2);
+        })));
+        // Wrong parent, wrong depth, span beyond the parent's, span beyond the walk.
+        assert!(is_invalid(mutate(&|r| r[2].1 = Some(0))));
+        assert!(is_invalid(mutate(&|r| r[2].3 = 1)));
+        assert!(is_invalid(mutate(&|r| r[2].3 = 3)));
+        assert!(is_invalid(mutate(&|r| r[1].2 = 3)));
+        assert!(is_invalid(mutate(&|r| r[4].2 = 5)));
+        assert!(is_invalid(mutate(&|r| r[4].2 = 3)));
+        // A second root.
+        assert!(is_invalid(mutate(&|r| r[3].1 = None)));
+        // Names.
+        for name in [&b""[..], b".", b"..", b"a/b", b"a\0"] {
+            assert!(is_invalid(mutate(&|r| r[3].4 = name)), "{name:?}");
+        }
+        // Short walk and an empty walk.
+        assert!(is_invalid(mutate(&|r| {
+            r.pop();
+        })));
+        assert!(is_invalid(mutate(&|r| r.clear())));
+    }
+
+    fn tampered(s: &Snapshot, sql: &str) -> (tempfile::TempDir, Snapshot) {
+        let dir = test_support::private_tempdir().unwrap();
+        let file = dir.path().join("t.db");
+        std::fs::copy(&s.file, &file).unwrap();
+        let conn = rusqlite::Connection::open(&file).unwrap();
+        conn.execute_batch(sql).unwrap();
+        drop(conn);
+        (dir, Snapshot::open(&file).unwrap())
+    }
+    fn deep_queries(s: &Snapshot) -> [bool; 3] {
+        [
+            is_invalid(s.subtree_dirs(0, u32::MAX, SortKey::Disk, 100)),
+            is_invalid(s.wide_dirs(0, 0, 100)),
+            is_invalid(s.metrics_candidates(3, 100)),
+        ]
+    }
+
+    #[test]
+    fn scan_rejects_tampered_chunks() {
+        let (_d, s) = v2_only(&tree(12), 0, 4);
+        assert_eq!(deep_queries(&s), [false; 3]);
+        for sql in [
+            "UPDATE dir_chunks SET data=x'00' WHERE first_id=4;",
+            "UPDATE dir_chunks SET last_id=last_id+1 WHERE first_id=4;",
+            "DELETE FROM dir_chunks WHERE first_id=4;",
+            "UPDATE dir_chunks SET first_id=3 WHERE first_id=4;",
+            "UPDATE dir_chunks SET data=zeroblob(42*1024*1024) WHERE first_id=4;",
+        ] {
+            let (_k, bad) = tampered(&s, sql);
+            assert_eq!(deep_queries(&bad), [true; 3], "{sql}");
+        }
+    }
+
+    #[test]
+    fn scan_from_a_subtree_root_touches_only_its_chunks() {
+        // tree(12), chunks of 4: ids 1..=5 (c00000 and its kids) span chunks 0 and 1.
+        let rows = tree(12);
+        assert_eq!(rows[1].subtree_end, 5);
+        let (_d, s) = v2_only(&rows, 0, 4);
+        let expect = s.wide_dirs(1, 0, 100).unwrap();
+        assert_eq!(expect.len(), 5);
+        let (_k, outside) = tampered(&s, "UPDATE dir_chunks SET data=x'00' WHERE first_id>=8;");
+        assert_eq!(outside.wide_dirs(1, 0, 100).unwrap(), expect);
+        assert_eq!(
+            outside
+                .subtree_dirs(1, u32::MAX, SortKey::Disk, 100)
+                .unwrap()
+                .len(),
+            5
+        );
+        let (_k, inside) = tampered(&s, "UPDATE dir_chunks SET data=x'00' WHERE first_id=4;");
+        assert!(is_invalid(inside.wide_dirs(1, 0, 100)));
+    }
+
+    fn decodes(s: &Snapshot) -> u64 {
+        s.v2.as_ref().unwrap().decodes.get()
+    }
+    fn scanned(s: &Snapshot) -> u64 {
+        s.v2.as_ref().unwrap().scanned.get()
+    }
+
+    #[test]
+    fn shallow_work_is_bounded_by_the_root_chunk() {
+        let (_d, s) = v2_only(&balanced121(), 3, 16);
+        let fresh = Snapshot::open(&s.file).unwrap();
+        assert_eq!(
+            fresh.subtree_dirs(0, 3, SortKey::Disk, 1000).unwrap().len(),
+            40
+        );
+        assert!(decodes(&fresh) <= 1, "{} decodes", decodes(&fresh));
+        assert_eq!(scanned(&fresh), 0);
+        let fresh = Snapshot::open(&s.file).unwrap();
+        assert!(!fresh.metrics_candidates(3, 1000).unwrap().0.is_empty());
+        assert!(decodes(&fresh) <= 1, "{} decodes", decodes(&fresh));
+        assert_eq!(scanned(&fresh), 0);
+        // A 5,000-child parent below the plain depth: one page costs at most one chunk.
+        let mut rows = vec![];
+        let root = RawPath::new(b"/r".to_vec()).unwrap();
+        let mid = root.join(&RawName::new(b"mid".to_vec()).unwrap());
+        rows.push(row(0, None, 0, b"/r", &root, 5001));
+        rows.push(row(1, Some(0), 1, b"mid", &mid, 5001));
+        for i in 0..5000u32 {
+            let name = format!("k{i:05}").into_bytes();
+            let p = mid.join(&RawName::new(name.clone()).unwrap());
+            rows.push(row(2 + i, Some(1), 2, &name, &p, 2 + i));
+        }
+        let (_d, s) = v2_only(&rows, 2, 64);
+        for sort in [SortKey::Name, SortKey::Disk] {
+            let fresh = Snapshot::open(&s.file).unwrap();
+            let page = fresh
+                .children_page(1, sort, true, None, false, 50, b"")
+                .unwrap();
+            assert_eq!(page.len(), 50);
+            assert!(decodes(&fresh) <= 1, "{} decodes", decodes(&fresh));
+            assert_eq!(scanned(&fresh), 0);
+        }
+    }
+
+    #[test]
+    fn deep_subtree_scan_streams_each_chunk_once() {
+        let (_d, s) = v2_only(&balanced121(), 0, 16);
+        let fresh = Snapshot::open(&s.file).unwrap();
+        assert_eq!(
+            fresh.subtree_dirs(0, 4, SortKey::Disk, 1000).unwrap().len(),
+            121
+        );
+        assert_eq!(scanned(&fresh), 121u64.div_ceil(16));
+        assert!(decodes(&fresh) <= 1, "{} decodes", decodes(&fresh));
     }
 }
