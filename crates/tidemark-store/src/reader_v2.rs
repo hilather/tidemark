@@ -163,6 +163,65 @@ fn key(row: &ChunkDir, sort: SortKey) -> i128 {
         SortKey::Name => 0,
     }
 }
+/// Validates a depth-limited shallow preorder as it streams past: parent links,
+/// depths, subtree spans and contiguity (rows deeper than `limit` are absent).
+struct ShallowWalk {
+    limit: u32,
+    end: u32,
+    next: u64,
+    started: bool,
+    stack: Vec<(u32, u32, u32)>,
+}
+impl ShallowWalk {
+    fn new(lo: u32, end: u32, limit: u32) -> Self {
+        Self {
+            limit,
+            end,
+            next: u64::from(lo),
+            started: false,
+            stack: Vec::new(),
+        }
+    }
+    fn check(&mut self, r: &ChunkDir) -> Result<()> {
+        if u64::from(r.id) != self.next || r.subtree_end < r.id || r.subtree_end > self.end {
+            return Err(invalid());
+        }
+        while self.stack.last().is_some_and(|p| p.1 < r.id) {
+            self.stack.pop();
+        }
+        match self.stack.last() {
+            Some(&(pid, pend, pdepth)) => {
+                if r.parent_id != Some(pid)
+                    || Some(r.depth) != pdepth.checked_add(1)
+                    || r.id > pend
+                    || r.subtree_end > pend
+                {
+                    return Err(invalid());
+                }
+            }
+            None if self.started => return Err(invalid()),
+            None => {}
+        }
+        self.started = true;
+        self.next = if r.depth < self.limit && r.subtree_end > r.id {
+            u64::from(r.id) + 1
+        } else {
+            u64::from(r.subtree_end) + 1
+        };
+        self.stack.push((r.id, r.subtree_end, r.depth));
+        Ok(())
+    }
+    fn finish(&self) -> Result<()> {
+        if self.started && self.next == u64::from(self.end) + 1 {
+            Ok(())
+        } else {
+            Err(invalid())
+        }
+    }
+}
+fn max_u32(v: u64) -> Result<u32> {
+    u32::try_from(v).map_err(|_| invalid())
+}
 fn contains(name: &[u8], filter: &[u8]) -> bool {
     filter.is_empty() || name.windows(filter.len()).any(|w| w == filter)
 }
@@ -779,10 +838,13 @@ impl Backend {
                         "{SHALLOW_COLUMNS} FROM shallow_dirs WHERE id>=? AND id<=? AND depth<=? ORDER BY id"
                     ))?;
                     let mut rows = stmt.query(params![id, root.subtree_end, i64::try_from(max).map_err(|_| invalid())?])?;
+                    let mut walk = ShallowWalk::new(id, root.subtree_end, max_u32(max)?);
                     while let Some(row) = rows.next()? {
-                        v(Self::from_shallow(dir_row(row).map_err(plain_row_error)?))?;
+                        let r = Self::from_shallow(dir_row(row).map_err(plain_row_error)?);
+                        walk.check(&r)?;
+                        v(r)?;
                     }
-                    Ok(())
+                    walk.finish()
                 },
                 |r| Ok((-key(r, sort), r.name.clone(), r.id)),
             );
@@ -843,10 +905,13 @@ impl Backend {
                 "{SHALLOW_COLUMNS} FROM shallow_dirs WHERE depth<=? ORDER BY id"
             ))?;
             let mut rows = stmt.query([depth])?;
+            let mut walk = ShallowWalk::new(0, hi, depth);
             while let Some(row) = rows.next()? {
-                visit(Self::from_shallow(dir_row(row).map_err(plain_row_error)?))?;
+                let r = Self::from_shallow(dir_row(row).map_err(plain_row_error)?);
+                walk.check(&r)?;
+                visit(r)?;
             }
-            Ok(())
+            walk.finish()
         } else {
             self.range(snap, 0, hi, |r| {
                 if r.depth <= depth {
@@ -2464,5 +2529,41 @@ mod child_cursor_tests {
             );
         }
         drop(d);
+    }
+
+    #[test]
+    fn review10_b1_shallow_subtree_and_metrics_rows_are_validated() {
+        let copy = |s: &Snapshot, sql: &str| {
+            let dir = test_support::private_tempdir().unwrap();
+            let file = dir.path().join("t.db");
+            std::fs::copy(&s.file, &file).unwrap();
+            let conn = rusqlite::Connection::open(&file).unwrap();
+            conn.execute_batch(sql).unwrap();
+            drop(conn);
+            (dir, Snapshot::open(&file).unwrap())
+        };
+        for width in [1, 2] {
+            let rows = tree(width);
+            let (_d, s) = v2_only(&rows, 2, 4);
+            assert!(s.subtree_dirs(0, 1, SortKey::Name, 100).is_ok());
+            assert!(s.metrics_candidates(1, 100).is_ok());
+            // Deleted first child row: contiguity breaks.
+            let (_k, snap) = copy(&s, "DELETE FROM shallow_dirs WHERE id=1;");
+            assert!(is_invalid(snap.subtree_dirs(0, 1, SortKey::Name, 100)));
+            assert!(is_invalid(snap.metrics_candidates(1, 100)));
+        }
+        // A depth-2 row moved under the root keeps its chunk and the true span.
+        let rows = tree(2);
+        let (_d, s) = v2_only(&rows, 2, 4);
+        let (_k, snap) = copy(
+            &s,
+            "UPDATE shallow_dirs SET parent_id=0,depth=1 WHERE id=2;",
+        );
+        assert!(is_invalid(snap.subtree_dirs(0, 1, SortKey::Name, 100)));
+        assert!(is_invalid(snap.subtree_dirs(0, 2, SortKey::Name, 100)));
+        assert!(is_invalid(snap.metrics_candidates(2, 100)));
+        // Deleting the last in-range row leaves the enumeration short.
+        let (_k, snap) = copy(&s, "DELETE FROM shallow_dirs WHERE id=6;");
+        assert!(is_invalid(snap.subtree_dirs(0, 1, SortKey::Name, 100)));
     }
 }

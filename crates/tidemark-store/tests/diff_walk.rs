@@ -1186,3 +1186,23 @@ fn scale_wide_directory_old_sql_vs_walk() {
         }
     }
 }
+
+#[test]
+fn review10_b2_mixed_diff_rejects_invalid_v1_child_name() {
+    let mut tree = Tree::new();
+    tree.insert(vec![], 1);
+    tree.insert(vec![b"a".to_vec()], 1);
+    tree.insert(vec![b"b".to_vec()], 2);
+    let nd = test_support::private_tempdir().unwrap();
+    let od = test_support::private_tempdir().unwrap();
+    let new = write(nd.path(), ROOT, &tree, 20, Kind::V2, 3);
+    let old = write(od.path(), ROOT, &tree, 10, Kind::V1, 0);
+    let root = path_of(ROOT, &vec![]);
+    assert!(diff(&open(&new), &old, &root, DiffMetric::Disk, 3, 10).is_ok());
+    let conn = rusqlite::Connection::open(&old).unwrap();
+    conn.execute_batch("UPDATE dirs SET name=CAST('../escaped' AS BLOB) WHERE id=1;")
+        .unwrap();
+    drop(conn);
+    let r = diff(&open(&new), &old, &root, DiffMetric::Disk, 3, 10);
+    assert!(matches!(r, Err(tidemark_store::StoreError::Invalid(_))));
+}

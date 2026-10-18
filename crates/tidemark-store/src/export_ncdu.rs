@@ -3,7 +3,7 @@
 
 use crate::{reader::Snapshot, StoreError};
 use std::io::Write;
-use tidemark_core::path::RawPath;
+use tidemark_core::path::{RawName, RawPath};
 
 /// Name encoding and relative directory depth for an ncdu export.
 pub struct NcduOptions {
@@ -165,6 +165,9 @@ pub fn export_ncdu(
             snap.v2_dir_files(id, &mut |file| {
                 if file.nlink == 1 {
                     if let Some(name) = &file.name {
+                        if RawName::new(name.clone()).is_err() {
+                            return Err(StoreError::Invalid("invalid v2 file name".into()));
+                        }
                         notable.push((file.disk, file.ino, file.apparent, arena.len(), name.len()));
                         arena.extend_from_slice(name);
                     }

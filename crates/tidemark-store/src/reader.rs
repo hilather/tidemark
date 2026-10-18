@@ -615,6 +615,9 @@ impl Snapshot {
                 return Ok(last.map(|name| ChildCursor(CursorAt::After(name))));
             }
             let name: Vec<u8> = r.get(1)?;
+            if RawName::new(name.clone()).is_err() {
+                return Err(StoreError::Invalid("invalid v1 child name".into()));
+            }
             out.push(ChildEntry {
                 id: r.get(0)?,
                 name: name.clone(),
