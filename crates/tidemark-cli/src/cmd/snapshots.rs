@@ -28,6 +28,21 @@ pub enum Command {
         #[arg(long, value_name = "ROOT")]
         root: Option<std::path::PathBuf>,
     },
+    /// Export a snapshot to a new SQLite database file (v1 schema, with `dirs.path`).
+    Export {
+        /// Write a v1-schema SQLite database (mode 0600; the output must not exist).
+        #[arg(long, required = true)]
+        sqlite: bool,
+        /// Snapshot ID to export.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// New database file to create.
+        #[arg(value_name = "OUT")]
+        out: std::path::PathBuf,
+        /// Root path to scan or select.
+        #[arg(long, value_name = "ROOT")]
+        root: Option<std::path::PathBuf>,
+    },
     /// Prune the snapshot catalog.
     Prune {
         /// Root path to scan or select.
@@ -49,7 +64,9 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     use tidemark_store::catalog::Catalog;
     let state = &context.config.general.state_dir;
     let (root_arg, mutation) = match &args.command {
-        Command::List { root } | Command::Show { root, .. } => (root, false),
+        Command::List { root } | Command::Show { root, .. } | Command::Export { root, .. } => {
+            (root, false)
+        }
         Command::Prune { root, dry_run } => (root, !dry_run),
         Command::RebuildCatalog { root } => (root, true),
     };
@@ -178,6 +195,54 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 writeln!(out, "{}", serde_json::to_string_pretty(&data)?)?;
             }
         }
+        Command::Export {
+            id, out: target, ..
+        } => {
+            let e = catalog
+                .get(id)?
+                .ok_or_else(|| crate::CliError::Precondition(format!("snapshot {id} not found")))?;
+            if root.as_ref().is_some_and(|r| r != &e.root) {
+                return Err(crate::CliError::Precondition(
+                    "snapshot belongs to a different root".into(),
+                )
+                .into());
+            }
+            let file = e
+                .file
+                .as_ref()
+                .ok_or_else(|| crate::CliError::Precondition("snapshot has no file".into()))?;
+            refuse_inside_state(target, state)?;
+            // Cold snapshots are inflated by the reader to a private leaf under
+            // `.inflate` and removed when it drops.
+            let snapshot = open_snapshot(context, file)
+                .with_context(|| format!("open snapshot: {}", super::display_path(file)))?;
+            let stats = tidemark_store::export_sqlite(&snapshot, target)
+                .map_err(export_error)
+                .with_context(|| format!("export snapshot: {}", super::display_path(target)))?;
+            if context.json {
+                crate::render::json(
+                    "tidemark.snapshots.v1",
+                    serde_json::json!({"exported":id,"out":tidemark_core::path::RawPath::from_path(target)?.to_json(),
+                        "dirs":stats.dirs,"files":stats.files,"link_sets":stats.link_sets,
+                        "link_instances":stats.link_instances,"skipped":stats.skipped,
+                        "errors":stats.errors,"annotations":stats.annotations}),
+                    &mut out,
+                )?;
+            } else {
+                use std::io::Write;
+                writeln!(
+                    out,
+                    "Exported {id} to {}: {} {}, {} {}, {} link {}",
+                    super::display_path(target),
+                    stats.dirs,
+                    crate::render::unit(stats.dirs, "directory", "directories"),
+                    stats.files,
+                    crate::render::unit(stats.files, "file", "files"),
+                    stats.link_sets,
+                    crate::render::unit(stats.link_sets, "set", "sets"),
+                )?;
+            }
+        }
         Command::Prune { dry_run, .. } => {
             let entries = catalog.list(root.as_ref())?;
             let mut ids = Vec::new();
@@ -295,6 +360,38 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+/// Exports never land inside the state directory, which only Tidemark writes.
+fn refuse_inside_state(target: &std::path::Path, state: &std::path::Path) -> anyhow::Result<()> {
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let (Ok(parent), Ok(state)) = (std::fs::canonicalize(parent), std::fs::canonicalize(state))
+    else {
+        return Ok(());
+    };
+    if parent.starts_with(&state) {
+        return Err(
+            crate::CliError::Precondition("refusing export inside state_dir".into()).into(),
+        );
+    }
+    Ok(())
+}
+/// Space exhaustion exits 5; everything else keeps its runtime classification.
+fn export_error(error: tidemark_store::StoreError) -> anyhow::Error {
+    use tidemark_store::StoreError;
+    match error {
+        StoreError::Space(reason) => {
+            crate::CliError::Precondition(format!("no space for export: {reason}")).into()
+        }
+        StoreError::Io(io)
+            if io.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error()) =>
+        {
+            crate::CliError::Precondition(format!("no space for export: {io}")).into()
+        }
+        other => other.into(),
+    }
 }
 fn require_absent_daemon(context: &crate::Context) -> anyhow::Result<()> {
     if super::scan::daemon_connection(context)?.is_some() {
