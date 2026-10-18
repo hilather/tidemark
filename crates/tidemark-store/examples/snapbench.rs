@@ -680,8 +680,15 @@ mod tests {
     }
     #[test]
     fn writer_roundtrip_and_every_query() -> Result<()> {
+        for layout in ["v1", "v2"] {
+            roundtrip_and_every_query(layout)?;
+        }
+        Ok(())
+    }
+    fn roundtrip_and_every_query(layout: &str) -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let mut o = options();
+        o.layout = layout.into();
         o.out = tmp.path().join("snapshots");
         let a = generate(&o, false)?;
         let old = write(&o, &a, false)?;

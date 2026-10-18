@@ -135,6 +135,9 @@ pub(super) struct Backend {
     /// Directory chunks decoded so far (work-bound tests).
     #[cfg(test)]
     decodes: std::cell::Cell<u64>,
+    /// Directory chunks streamed by `scan` so far (work-bound tests).
+    #[cfg(test)]
+    scanned: std::cell::Cell<u64>,
 }
 // ---- ranking ----
 
@@ -412,6 +415,8 @@ impl Backend {
             paths: RefCell::new(PathCache::default()),
             #[cfg(test)]
             decodes: std::cell::Cell::new(0),
+            #[cfg(test)]
+            scanned: std::cell::Cell::new(0),
         })
     }
     fn chunk(&self, snap: &Snapshot, id: u32) -> Result<Arc<Vec<ChunkDir>>> {
@@ -1047,6 +1052,8 @@ impl Backend {
             }
             seen = Some(c);
             let data = chunk_data(&snap.conn, c)?;
+            #[cfg(test)]
+            self.scanned.set(self.scanned.get() + 1);
             let mut count = 0u32;
             chunk::visit_dirs(&data, c.first, |v| {
                 count = count.checked_add(1).ok_or_else(invalid)?;
@@ -2880,5 +2887,187 @@ mod child_cursor_tests {
         assert_eq!(s.subtree_dirs(0, 3, SortKey::Name, 1000).unwrap().len(), 40);
         let (_k, snap) = copy(&s, "UPDATE shallow_dirs SET depth=1 WHERE id=0;");
         assert!(is_invalid(snap.subtree_dirs(0, 3, SortKey::Name, 1000)));
+    }
+
+    // ---- gate-8 fix: walk, scan and work bounds ----
+
+    type Step<'a> = (u32, Option<u32>, u32, u32, &'a [u8]);
+    /// Runs a `Walk` over the rows and returns every path it produced.
+    fn walk_paths(base: &[u8], end: u32, limit: u64, rows: &[Step<'_>]) -> Result<Vec<Vec<u8>>> {
+        let base = RawPath::new(base.to_vec()).unwrap();
+        let mut walk = Walk::new(0, end, limit, &base);
+        let mut out = Vec::new();
+        for &(id, parent, subtree_end, depth, name) in rows {
+            out.push(walk.step(id, parent, subtree_end, depth, name)?.to_vec());
+        }
+        walk.finish()?;
+        Ok(out)
+    }
+    /// Preorder `/`, `/a` (with child `a1`), `/b`, `/c`: ids 0..=4.
+    fn walk_rows() -> Vec<Step<'static>> {
+        vec![
+            (0, None, 4, 0, b"/r"),
+            (1, Some(0), 2, 1, b"a"),
+            (2, Some(1), 2, 2, b"a1"),
+            (3, Some(0), 3, 1, b"b"),
+            (4, Some(0), 4, 1, b"c"),
+        ]
+    }
+
+    #[test]
+    fn walk_builds_paths_and_skips_below_the_limit() {
+        let rows = walk_rows();
+        // Depth limit 1: row 2 is hopped over, so it is not offered.
+        let kept: Vec<Step<'_>> = rows.iter().copied().filter(|r| r.0 != 2).collect();
+        let p = walk_paths(b"/", 4, 1, &kept).unwrap();
+        assert_eq!(p, [&b"/"[..], b"/a", b"/b", b"/c"]);
+        let p = walk_paths(b"/x", 4, 1, &kept).unwrap();
+        assert_eq!(p, [&b"/x"[..], b"/x/a", b"/x/b", b"/x/c"]);
+        let p = walk_paths(b"/x", 4, u64::MAX, &rows).unwrap();
+        assert_eq!(p[2], b"/x/a/a1");
+        assert_eq!(p[3], b"/x/b");
+    }
+
+    #[test]
+    fn walk_rejects_every_structural_violation() {
+        let ok = walk_rows();
+        let mutate = |f: &dyn Fn(&mut Vec<Step<'static>>)| {
+            let mut rows = ok.clone();
+            f(&mut rows);
+            walk_paths(b"/r", 4, u64::MAX, &rows)
+        };
+        assert!(walk_paths(b"/r", 4, u64::MAX, &ok).is_ok());
+        // Gap: id 2 missing.
+        assert!(is_invalid(mutate(&|r| {
+            r.remove(2);
+        })));
+        // Wrong parent, wrong depth, span beyond the parent's, span beyond the walk.
+        assert!(is_invalid(mutate(&|r| r[2].1 = Some(0))));
+        assert!(is_invalid(mutate(&|r| r[2].3 = 1)));
+        assert!(is_invalid(mutate(&|r| r[2].3 = 3)));
+        assert!(is_invalid(mutate(&|r| r[1].2 = 3)));
+        assert!(is_invalid(mutate(&|r| r[4].2 = 5)));
+        assert!(is_invalid(mutate(&|r| r[4].2 = 3)));
+        // A second root.
+        assert!(is_invalid(mutate(&|r| r[3].1 = None)));
+        // Names.
+        for name in [&b""[..], b".", b"..", b"a/b", b"a\0"] {
+            assert!(is_invalid(mutate(&|r| r[3].4 = name)), "{name:?}");
+        }
+        // Short walk and an empty walk.
+        assert!(is_invalid(mutate(&|r| {
+            r.pop();
+        })));
+        assert!(is_invalid(mutate(&|r| r.clear())));
+    }
+
+    fn tampered(s: &Snapshot, sql: &str) -> (tempfile::TempDir, Snapshot) {
+        let dir = test_support::private_tempdir().unwrap();
+        let file = dir.path().join("t.db");
+        std::fs::copy(&s.file, &file).unwrap();
+        let conn = rusqlite::Connection::open(&file).unwrap();
+        conn.execute_batch(sql).unwrap();
+        drop(conn);
+        (dir, Snapshot::open(&file).unwrap())
+    }
+    fn deep_queries(s: &Snapshot) -> [bool; 3] {
+        [
+            is_invalid(s.subtree_dirs(0, u32::MAX, SortKey::Disk, 100)),
+            is_invalid(s.wide_dirs(0, 0, 100)),
+            is_invalid(s.metrics_candidates(3, 100)),
+        ]
+    }
+
+    #[test]
+    fn scan_rejects_tampered_chunks() {
+        let (_d, s) = v2_only(&tree(12), 0, 4);
+        assert_eq!(deep_queries(&s), [false; 3]);
+        for sql in [
+            "UPDATE dir_chunks SET data=x'00' WHERE first_id=4;",
+            "UPDATE dir_chunks SET last_id=last_id+1 WHERE first_id=4;",
+            "DELETE FROM dir_chunks WHERE first_id=4;",
+            "UPDATE dir_chunks SET first_id=3 WHERE first_id=4;",
+            "UPDATE dir_chunks SET data=zeroblob(42*1024*1024) WHERE first_id=4;",
+        ] {
+            let (_k, bad) = tampered(&s, sql);
+            assert_eq!(deep_queries(&bad), [true; 3], "{sql}");
+        }
+    }
+
+    #[test]
+    fn scan_from_a_subtree_root_touches_only_its_chunks() {
+        // tree(12), chunks of 4: ids 1..=5 (c00000 and its kids) span chunks 0 and 1.
+        let rows = tree(12);
+        assert_eq!(rows[1].subtree_end, 5);
+        let (_d, s) = v2_only(&rows, 0, 4);
+        let expect = s.wide_dirs(1, 0, 100).unwrap();
+        assert_eq!(expect.len(), 5);
+        let (_k, outside) = tampered(&s, "UPDATE dir_chunks SET data=x'00' WHERE first_id>=8;");
+        assert_eq!(outside.wide_dirs(1, 0, 100).unwrap(), expect);
+        assert_eq!(
+            outside
+                .subtree_dirs(1, u32::MAX, SortKey::Disk, 100)
+                .unwrap()
+                .len(),
+            5
+        );
+        let (_k, inside) = tampered(&s, "UPDATE dir_chunks SET data=x'00' WHERE first_id=4;");
+        assert!(is_invalid(inside.wide_dirs(1, 0, 100)));
+    }
+
+    fn decodes(s: &Snapshot) -> u64 {
+        s.v2.as_ref().unwrap().decodes.get()
+    }
+    fn scanned(s: &Snapshot) -> u64 {
+        s.v2.as_ref().unwrap().scanned.get()
+    }
+
+    #[test]
+    fn shallow_work_is_bounded_by_the_root_chunk() {
+        let (_d, s) = v2_only(&balanced121(), 3, 16);
+        let fresh = Snapshot::open(&s.file).unwrap();
+        assert_eq!(
+            fresh.subtree_dirs(0, 3, SortKey::Disk, 1000).unwrap().len(),
+            40
+        );
+        assert!(decodes(&fresh) <= 1, "{} decodes", decodes(&fresh));
+        assert_eq!(scanned(&fresh), 0);
+        let fresh = Snapshot::open(&s.file).unwrap();
+        assert!(!fresh.metrics_candidates(3, 1000).unwrap().0.is_empty());
+        assert!(decodes(&fresh) <= 1, "{} decodes", decodes(&fresh));
+        assert_eq!(scanned(&fresh), 0);
+        // A 5,000-child parent below the plain depth: one page costs at most one chunk.
+        let mut rows = vec![];
+        let root = RawPath::new(b"/r".to_vec()).unwrap();
+        let mid = root.join(&RawName::new(b"mid".to_vec()).unwrap());
+        rows.push(row(0, None, 0, b"/r", &root, 5001));
+        rows.push(row(1, Some(0), 1, b"mid", &mid, 5001));
+        for i in 0..5000u32 {
+            let name = format!("k{i:05}").into_bytes();
+            let p = mid.join(&RawName::new(name.clone()).unwrap());
+            rows.push(row(2 + i, Some(1), 2, &name, &p, 2 + i));
+        }
+        let (_d, s) = v2_only(&rows, 2, 64);
+        for sort in [SortKey::Name, SortKey::Disk] {
+            let fresh = Snapshot::open(&s.file).unwrap();
+            let page = fresh
+                .children_page(1, sort, true, None, false, 50, b"")
+                .unwrap();
+            assert_eq!(page.len(), 50);
+            assert!(decodes(&fresh) <= 1, "{} decodes", decodes(&fresh));
+            assert_eq!(scanned(&fresh), 0);
+        }
+    }
+
+    #[test]
+    fn deep_subtree_scan_streams_each_chunk_once() {
+        let (_d, s) = v2_only(&balanced121(), 0, 16);
+        let fresh = Snapshot::open(&s.file).unwrap();
+        assert_eq!(
+            fresh.subtree_dirs(0, 4, SortKey::Disk, 1000).unwrap().len(),
+            121
+        );
+        assert_eq!(scanned(&fresh), 121u64.div_ceil(16));
+        assert!(decodes(&fresh) <= 1, "{} decodes", decodes(&fresh));
     }
 }

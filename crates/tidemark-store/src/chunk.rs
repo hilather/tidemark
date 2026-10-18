@@ -946,6 +946,40 @@ mod tests {
             prop_assert_eq!(decode_link_instances(&encode_link_instances(&rows).unwrap()).unwrap(), rows);
         }
     }
+    #[test]
+    fn projection_depth_and_streaming_view_match_the_decoder() {
+        let mut rows: Vec<ChunkDir> = (0..4096u32)
+            .map(|i| ChunkDir {
+                name: format!("n{}", i % 97).into_bytes(),
+                t_disk: u64::from(i) * 3,
+                entries: i % 11,
+                ..ChunkDir::default()
+            })
+            .collect();
+        sequence(&mut rows, 7);
+        let data = encode_dirs(&rows).unwrap();
+        let depths: Vec<u32> = rows.iter().map(|r| r.depth).collect();
+        assert_eq!(decode_dir_projection(&data, 7).unwrap().depth, depths);
+        let decoded = decode_dirs(&data, 7).unwrap();
+        let mut seen = 0usize;
+        visit_dirs(&data, 7, |v| {
+            assert_eq!(v.id, 7 + seen as u32, "rows arrive in order");
+            assert_eq!(v.to_owned(), decoded[seen]);
+            assert_eq!(v.name, decoded[seen].name.as_slice());
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 4096);
+        // A visitor error stops the stream and is returned unchanged.
+        let mut calls = 0;
+        let r = visit_dirs(&data, 7, |_| {
+            calls += 1;
+            Err(StoreError::Invalid("stop".into()))
+        });
+        assert!(matches!(r, Err(StoreError::Invalid(_))));
+        assert_eq!(calls, 1);
+    }
     fn is_invalid<T>(r: Result<T>) {
         assert!(matches!(r, Err(StoreError::Invalid(_))));
     }
