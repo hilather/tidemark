@@ -665,7 +665,7 @@ pub enum ScanError {
     Core(#[from] tidemark_core::error::CoreError),
     /// Storage operation failed.
     #[error(transparent)]
-    Store(#[from] tidemark_store::StoreError),
+    Store(tidemark_store::StoreError),
     /// Aggregation failed.
     #[error(transparent)]
     Agg(#[from] crate::agg::AggError),
@@ -1444,6 +1444,19 @@ fn record_walk_phase(phases: &mut std::collections::BTreeMap<String, u64>, elaps
         .or_insert_with(|| milliseconds(elapsed));
 }
 
+impl From<tidemark_store::StoreError> for ScanError {
+    /// Space refusals from the store keep the `NoSpace` category.
+    fn from(e: tidemark_store::StoreError) -> Self {
+        match e {
+            tidemark_store::StoreError::Space(msg) => {
+                tracing::warn!(%msg, "state space refused");
+                ScanError::NoSpace
+            }
+            other => ScanError::Store(other),
+        }
+    }
+}
+
 fn finish_snapshot(
     writer: tidemark_store::writer_v2::SnapshotWriterV2,
     meta: &tidemark_core::snapshot::SnapshotMeta,
@@ -1456,7 +1469,7 @@ fn finish_snapshot(
         {
             ScanError::PublicationCollision
         }
-        _ => ScanError::Store(e),
+        e => e.into(),
     })
 }
 
