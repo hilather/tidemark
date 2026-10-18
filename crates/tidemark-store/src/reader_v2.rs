@@ -814,6 +814,21 @@ impl Backend {
             .map(|h| self.materialize(snap, h.row))
             .collect()
     }
+    /// The requested root from its directory chunk (the source `dir(id)` uses).
+    /// A shallow copy, when present, must agree on id, parent, depth and span.
+    fn authoritative_root(&self, snap: &Snapshot, id: u32) -> Result<ChunkDir> {
+        let root = self.raw(snap, id)?;
+        if let Some(shallow) = self.shallow_row(snap, id)? {
+            if shallow.id != root.id
+                || shallow.parent_id != root.parent_id
+                || shallow.depth != root.depth
+                || shallow.subtree_end != root.subtree_end
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(root)
+    }
     pub(super) fn subtree_dirs(
         &self,
         snap: &Snapshot,
@@ -822,11 +837,7 @@ impl Backend {
         sort: SortKey,
         limit: usize,
     ) -> Result<Vec<DirRow>> {
-        let shallow_root = self.shallow_row(snap, id)?;
-        let root = match shallow_root {
-            Some(root) => root,
-            None => self.raw(snap, id)?,
-        };
+        let root = self.authoritative_root(snap, id)?;
         let max = u64::from(root.depth) + u64::from(depth);
         if max <= u64::from(self.plain_depth) && root.depth <= self.plain_depth {
             // Every requested row is a shallow row: no chunk is decoded.
@@ -998,10 +1009,7 @@ impl Backend {
                 "metrics candidate limit exceeds 1,000,000-row query cap".into(),
             ));
         }
-        let root = match self.shallow_row(snap, 0)? {
-            Some(root) => root,
-            None => self.raw(snap, 0)?,
-        };
+        let root = self.authoritative_root(snap, 0)?;
         let mut count = 0;
         let mut query = |sort| {
             self.collect(
@@ -2565,5 +2573,79 @@ mod child_cursor_tests {
         // Deleting the last in-range row leaves the enumeration short.
         let (_k, snap) = copy(&s, "DELETE FROM shallow_dirs WHERE id=6;");
         assert!(is_invalid(snap.subtree_dirs(0, 1, SortKey::Name, 100)));
+    }
+
+    /// Balanced three-way tree to depth 4 (121 directories).
+    fn balanced121() -> Vec<DirRow> {
+        let mut rows: Vec<DirRow> = Vec::new();
+        let rootp = RawPath::new(b"/r".to_vec()).unwrap();
+        let mut stack = vec![(None::<u32>, 0u32, b"/r".to_vec(), rootp)];
+        while let Some((parent, depth, name, path)) = stack.pop() {
+            let id = rows.len() as u32;
+            rows.push(row(id, parent, depth, &name, &path, id));
+            if depth < 4 {
+                for k in (0..3).rev() {
+                    let n = format!("n{k}").into_bytes();
+                    let p = path.join(&RawName::new(n.clone()).unwrap());
+                    stack.push((Some(id), depth + 1, n, p));
+                }
+            }
+        }
+        assert_eq!(rows.len(), 121);
+        for i in (0..rows.len()).rev() {
+            let mut end = i as u32;
+            for j in i + 1..rows.len() {
+                if rows[j].parent_id == Some(i as u32) {
+                    end = rows[j].subtree_end;
+                }
+            }
+            rows[i].subtree_end = end;
+        }
+        rows
+    }
+
+    #[test]
+    fn fix5_valid_subtree_results_match_v1() {
+        let f = fixture(balanced121(), 3, 16);
+        for (root, depth) in [
+            (0, 0),
+            (0, 3),
+            (0, 4),
+            (0, u32::MAX),
+            (1, 2),
+            (5, 1),
+            (40, 9),
+        ] {
+            for sort in [SortKey::Name, SortKey::Disk] {
+                let a = f.v1.subtree_dirs(root, depth, sort, 1000).unwrap();
+                let b = f.v2.subtree_dirs(root, depth, sort, 1000).unwrap();
+                assert_eq!(a, b, "root {root} depth {depth}");
+            }
+        }
+    }
+
+    #[test]
+    fn fix5_subtree_root_bounds_come_from_the_chunk() {
+        let copy = |s: &Snapshot, sql: &str| {
+            let dir = test_support::private_tempdir().unwrap();
+            let file = dir.path().join("t.db");
+            std::fs::copy(&s.file, &file).unwrap();
+            let conn = rusqlite::Connection::open(&file).unwrap();
+            conn.execute_batch(sql).unwrap();
+            drop(conn);
+            (dir, Snapshot::open(&file).unwrap())
+        };
+        // (a) root plus one child, truncated shallow span.
+        let rows = tree(1);
+        let (_d, s) = v2_only(&rows, 2, 4);
+        let (_k, snap) = copy(&s, "UPDATE shallow_dirs SET subtree_end=0 WHERE id=0;");
+        assert!(is_invalid(snap.subtree_dirs(0, 1, SortKey::Name, 100)));
+        assert!(is_invalid(snap.metrics_candidates(1, 100)));
+        // (b) wrong shallow depth on the root of a 121-dir tree.
+        let rows = balanced121();
+        let (_d, s) = v2_only(&rows, 3, 16);
+        assert_eq!(s.subtree_dirs(0, 3, SortKey::Name, 1000).unwrap().len(), 40);
+        let (_k, snap) = copy(&s, "UPDATE shallow_dirs SET depth=1 WHERE id=0;");
+        assert!(is_invalid(snap.subtree_dirs(0, 3, SortKey::Name, 1000)));
     }
 }
