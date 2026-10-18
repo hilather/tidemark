@@ -2899,3 +2899,158 @@ fn review13_n1_missing_parent_still_validates_the_limit() {
             .is_empty());
     }
 }
+
+// ---- the requested directory: one contract for every query ----
+
+/// Every query taking a directory id checks the requested row itself before
+/// reading anything else: its shallow copy (when the depth says one must exist)
+/// agrees on every structural column and the name, and the name is valid. This
+/// costs no chunk decode, so it holds at every limit, including 0, and for
+/// child listings that return nothing.
+#[test]
+fn every_query_checks_the_requested_row() {
+    let rows = tree(40, 3);
+    // `tree`: ids 1..=3 are a chain `a/a/a`; ids 4..=43 are the root's wide
+    // children; id 3 is a leaf at depth 3, id 43 a leaf at depth 1.
+    let (_keep, file, _s) = g8_v2_file(&rows, 2);
+    for sql in [
+        "UPDATE shallow_dirs SET depth=5 WHERE id=1;",
+        "UPDATE shallow_dirs SET subtree_end=43 WHERE id=1;",
+        "UPDATE shallow_dirs SET parent_id=4 WHERE id=1;",
+        "UPDATE shallow_dirs SET name=x'7878' WHERE id=1;",
+        "DELETE FROM shallow_dirs WHERE id=1;",
+    ] {
+        let (_k, s) = g8_tamper(&file, sql);
+        for limit in [0, 1] {
+            assert!(
+                g8_invalid(s.children(1, SortKey::Name, limit)),
+                "{sql} {limit}"
+            );
+            assert!(g8_invalid(s.wide_dirs(1, 0, limit)), "{sql} {limit}");
+            assert!(
+                g8_invalid(s.children_page(1, SortKey::Name, false, None, false, limit, b"")),
+                "{sql} {limit}"
+            );
+            assert!(
+                g8_invalid(s.subtree_dirs(1, 0, SortKey::Name, limit)),
+                "{sql} {limit}"
+            );
+        }
+        assert!(g8_invalid(s.children_count(1, b"")), "{sql}");
+        // A sibling whose own copy is intact is unaffected (its parent's
+        // listing is not: the child-set check sees the tampered row).
+        assert_eq!(s.children_count(5, b"").unwrap(), 0, "{sql}");
+        assert_eq!(s.wide_dirs(5, 0, 10).unwrap().len(), 1, "{sql}");
+        if !sql.contains("name") {
+            assert!(g8_invalid(s.children_count(0, b"")), "{sql}");
+        }
+    }
+    // A malformed name on the requested row is rejected even by listings that
+    // return nothing (a leaf, or limit 0), shallow or deep.
+    for (leaf, plain) in [(43, 2), (43, 0), (3, 2), (3, 0)] {
+        for bad in [&b""[..], b"a/b", b".", b"..", b"x\0y"] {
+            let mut rows = tree(40, 3);
+            rows[leaf].name = bad.to_vec();
+            let (_keep, _file, s) = g8_v2_file(&rows, plain);
+            let what = format!("leaf {leaf} plain {plain} name {bad:?}");
+            for limit in [0, 1] {
+                assert!(
+                    g8_invalid(s.children(leaf as u32, SortKey::Name, limit)),
+                    "{what} {limit}"
+                );
+                assert!(
+                    g8_invalid(s.children_page(
+                        leaf as u32,
+                        SortKey::Name,
+                        false,
+                        None,
+                        false,
+                        limit,
+                        b""
+                    )),
+                    "{what} {limit}"
+                );
+            }
+            assert!(g8_invalid(s.children_count(leaf as u32, b"")), "{what}");
+        }
+    }
+}
+
+/// A child page validates the requested parent's name and ancestry eagerly:
+/// an empty page (leaf, limit 0, nothing matching the filter) rejects a
+/// malformed parent exactly as a full page does. Pins the policy a lazy
+/// climb would break (the tempting fix for its decode count).
+#[test]
+fn children_page_validates_the_parent_on_empty_pages() {
+    type Mutation = fn(&mut [DirRow]);
+    let cases: [(&str, usize, Mutation); 4] = [
+        ("leaf name", 3, |r| r[3].name = b"a/b".to_vec()),
+        ("leaf ancestry", 3, |r| r[3].parent_id = Some(0)),
+        ("ancestor name", 3, |r| r[1].name = b"x\0y".to_vec()),
+        ("internal name", 2, |r| r[2].name = b".".to_vec()),
+    ];
+    for plain in [0, 2] {
+        for (what, id, mutate) in cases {
+            let mut rows = tree(40, 3);
+            mutate(&mut rows);
+            let (_keep, _file, s) = g8_v2_file(&rows, plain);
+            for (limit, filter) in [(0, &b""[..]), (8, b""), (8, b"zz")] {
+                for reverse in [false, true] {
+                    assert!(
+                        g8_invalid(s.children_page(
+                            id as u32,
+                            SortKey::Disk,
+                            true,
+                            None,
+                            reverse,
+                            limit,
+                            filter
+                        )),
+                        "{what} plain {plain} limit {limit} filter {filter:?} reverse {reverse}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Siblings are checked whether or not they are selected: for a parent at or
+/// below the plain depth (chunk hopping) as for a shallow one, a child with the
+/// wrong depth, a span outside the parent's or a malformed name is rejected at
+/// limit 0, by `children_count`, and when the filter excludes it. The shallow
+/// `children_page` keeps its accepted narrowing (returned rows only).
+#[test]
+fn siblings_are_checked_before_selection() {
+    type Mutation = fn(&mut [DirRow]);
+    // Id 43 is the root's last child (name `b000039\xff`, sorts last).
+    let cases: [(&str, Mutation); 3] = [
+        ("depth", |r| r[43].depth = 7),
+        ("name", |r| r[43].name = b"b000039/x".to_vec()),
+        ("span", |r| r[43].subtree_end = 44),
+    ];
+    for plain in [0, 2] {
+        for (what, mutate) in cases {
+            let mut rows = tree(40, 3);
+            mutate(&mut rows);
+            let (_keep, _file, s) = g8_v2_file(&rows, plain);
+            let tag = format!("{what} plain {plain}");
+            // The bad child is never selected here (limit 0, first by name, filtered out).
+            assert!(g8_invalid(s.children(0, SortKey::Name, 0)), "{tag}");
+            assert!(g8_invalid(s.children(0, SortKey::Name, 1)), "{tag}");
+            assert!(g8_invalid(s.children_count(0, b"a-")), "{tag}");
+            let page = s.children_page(0, SortKey::Name, false, None, false, 1, b"a-");
+            if plain == 0 || what != "name" {
+                assert!(g8_invalid(page), "{tag}");
+            } else {
+                // Shallow page: the child-set check covers depth and span; the
+                // accepted narrowing leaves an unreturned row's name undecoded.
+                assert_eq!(page.unwrap().len(), 1, "{tag}");
+            }
+            // A page that returns the bad child rejects it in both branches.
+            assert!(
+                g8_invalid(s.children_page(0, SortKey::Name, true, None, false, 1, b"")),
+                "{tag}"
+            );
+        }
+    }
+}
