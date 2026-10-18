@@ -1102,9 +1102,6 @@ impl Backend {
         let root = self.authoritative_root(snap, id)?;
         let max = u64::from(root.depth) + u64::from(depth);
         let mut top = TopN::new(limit, Tie::Name)?;
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
         let base = self.path(snap, &root)?;
         let mut walk = Walk::new(id, root.subtree_end, max, &base);
         if max <= u64::from(self.plain_depth) && root.depth <= self.plain_depth {
@@ -1162,19 +1159,34 @@ impl Backend {
     ) -> Result<Vec<DirRow>> {
         let root = self.raw(snap, id)?;
         let mut top = TopN::new(limit, Tie::Name)?;
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let base = self.path(snap, &root)?;
-        let mut walk = Walk::new(id, root.subtree_end, u64::MAX, &base);
+        // Paths are relative to "/" while walking; the root's own path is
+        // reconstructed once, when the first row is admitted.
+        let rel_root = RawPath::new(b"/".to_vec()).map_err(|_| invalid())?;
+        let mut base: Option<RawPath> = None;
+        let mut walk = Walk::new(id, root.subtree_end, u64::MAX, &rel_root);
         self.scan(snap, id, root.subtree_end, |v| {
-            let path = walk.step(v.id, v.parent_id, v.subtree_end, v.depth, v.name)?;
+            let rel = walk.step(v.id, v.parent_id, v.subtree_end, v.depth, v.name)?;
             if v.entries < min {
                 return Ok(());
             }
             let k = -i128::from(v.entries);
             if top.admits(k, v.name, v.id) {
-                let path = RawPath::new(path.to_vec()).map_err(|_| invalid())?;
+                if base.is_none() {
+                    base = Some(self.path(snap, &root)?);
+                }
+                let b = base.as_ref().map_or(&[][..], |b| b.as_bytes());
+                let mut full = Vec::with_capacity(b.len() + rel.len());
+                full.extend_from_slice(b);
+                if rel.len() > 1 {
+                    if full.len() > 1 {
+                        full.push(b'/');
+                    }
+                    full.extend_from_slice(&rel[1..]);
+                }
+                if full.len() > MAX_PATH_BYTES {
+                    return Err(invalid());
+                }
+                let path = RawPath::new(full).map_err(|_| invalid())?;
                 top.push(Hit {
                     key: k,
                     tie: Tie::Name,
@@ -3134,18 +3146,57 @@ mod child_cursor_tests {
                 assert!(fresh.children(40, SortKey::Name, limit).unwrap().is_empty());
                 assert!(total(&fresh) <= 1, "children {limit}: {}", total(&fresh));
             }
-            let fresh = Snapshot::open(&s.file).unwrap();
-            assert!(fresh
-                .subtree_dirs(0, 4, SortKey::Disk, 0)
-                .unwrap()
-                .is_empty());
-            assert!(total(&fresh) <= 1, "root: {}", total(&fresh));
-            let fresh = Snapshot::open(&s.file).unwrap();
-            assert!(fresh
-                .subtree_dirs(40, 0, SortKey::Name, 0)
-                .unwrap()
-                .is_empty());
-            assert!(total(&fresh) <= 1, "leaf: {}", total(&fresh));
+            // Zero limit runs the same enumeration and checks as limit 1.
+            for (root, depth) in [(0, 4), (40, 0)] {
+                let work = |limit| {
+                    let fresh = Snapshot::open(&s.file).unwrap();
+                    let r = fresh.subtree_dirs(root, depth, SortKey::Disk, limit);
+                    (r.unwrap().len(), total(&fresh))
+                };
+                let (n0, w0) = work(0);
+                let (_, w1) = work(1);
+                assert_eq!(n0, 0);
+                assert!(w0 <= w1, "subtree({root},{depth}): {w0} > {w1}");
+            }
+            // Filtered-out wide queries never rebuild a path.
+            for leaf in [40, 120] {
+                let fresh = Snapshot::open(&s.file).unwrap();
+                assert!(fresh.wide_dirs(leaf, 2, 1).unwrap().is_empty());
+                assert!(total(&fresh) <= 2, "wide {leaf}: {}", total(&fresh));
+            }
         }
+    }
+
+    #[test]
+    fn zero_limit_keeps_corruption_checks() {
+        let copy = |s: &Snapshot, sql: &str| {
+            let dir = test_support::private_tempdir().unwrap();
+            let file = dir.path().join("t.db");
+            std::fs::copy(&s.file, &file).unwrap();
+            let conn = rusqlite::Connection::open(&file).unwrap();
+            conn.execute_batch(sql).unwrap();
+            drop(conn);
+            (dir, Snapshot::open(&file).unwrap())
+        };
+        let (_d, s) = v2_only(&balanced121(), 2, 16);
+        for sql in [
+            "DELETE FROM shallow_dirs WHERE id=41;",
+            "UPDATE shallow_dirs SET own_charged='x' WHERE id=41;",
+            "UPDATE shallow_dirs SET depth=2 WHERE id=41;",
+        ] {
+            let (_k, snap) = copy(&s, sql);
+            assert!(
+                is_invalid(snap.subtree_dirs(0, 1, SortKey::Name, 0)),
+                "{sql}"
+            );
+            assert!(
+                is_invalid(snap.subtree_dirs(0, 1, SortKey::Name, 1)),
+                "{sql}"
+            );
+        }
+        let (_d, s) = v2_only(&balanced121(), 0, 16);
+        let (_k, snap) = copy(&s, "UPDATE dir_chunks SET data=x'00' WHERE first_id=32;");
+        assert!(is_invalid(snap.wide_dirs(0, 0, 0)));
+        assert!(is_invalid(snap.subtree_dirs(0, 4, SortKey::Name, 0)));
     }
 }
