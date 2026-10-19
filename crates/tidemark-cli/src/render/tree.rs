@@ -15,10 +15,12 @@ pub struct Directory {
     /// Why `delta` is null even though an older snapshot was selected.
     ///
     /// Present only for a skipped inflation. `free_space_floor` means inflating
-    /// that snapshot would breach `retention.min_free_pct`. Omitted when `delta`
-    /// is known and when no older snapshot was selected, so a missing predecessor
-    /// stays `delta: null` with no `delta_skipped` field. `tidemark.top.v1` emits
-    /// this on each row.
+    /// that snapshot would breach the free-space floor (`retention.min_free_pct`
+    /// and the mandatory 2 GiB floor). A `max_state_size` refusal is not a skip:
+    /// the command fails and this field is absent. Omitted when `delta` is known
+    /// and when no older snapshot was selected, so a missing predecessor stays
+    /// `delta: null` with no `delta_skipped` field. `tidemark.top.v1` emits this
+    /// on each row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_skipped: Option<&'static str>,
     /// Live disk bytes from a gentle walk.

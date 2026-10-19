@@ -616,3 +616,68 @@ fn cold_commands_enforce_configured_min_free_pct() {
         "plain top json did not mark the floor skip: {doc}"
     );
 }
+
+#[test]
+fn plain_top_max_state_size_refusal_exits_1() {
+    let root = test_support::private_tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("child")).unwrap();
+    let state = test_support::private_tempdir().unwrap();
+    let canon = tidemark_fs::canon::canonicalize(root.path()).unwrap();
+    let query = canon.as_path();
+    let mut cfg = Config::default();
+    cfg.general.state_dir = state.path().to_owned();
+    cfg.retention.snapshots.cold_after_recent = false;
+    let now = tidemark_core::time::unix_now();
+    for stamp in [now - 86_400, now] {
+        match run_fixture_scan(&cfg, query, stamp) {
+            Ok(()) => {}
+            Err(ScanError::NoSpace) => {
+                eprintln!("skipped: fixture scan was refused by the free-space floor");
+                return;
+            }
+            Err(error) => panic!("fixture scan failed: {error}"),
+        }
+    }
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    let mut entries = catalog.list(None).unwrap();
+    entries.sort_by_key(|entry| entry.started_at);
+    assert_eq!(entries.len(), 2);
+    let older_id = entries[0].scan_id.clone();
+    let hot = entries[0].file.clone().unwrap();
+    let cold = tidemark_store::cold::compress_snapshot(&hot, 1, &|| false).unwrap();
+    catalog.point_to_cold(&older_id, &cold).unwrap();
+    std::fs::remove_file(&hot).unwrap();
+    drop(catalog);
+    // Larger than the 64 KiB cap, and far below the free-space floor, so the
+    // cap is the rule that refuses inflation.
+    let mut bytes = std::fs::read(&cold).unwrap();
+    bytes[8..16].copy_from_slice(&(128u64 << 10).to_le_bytes());
+    std::fs::write(&cold, bytes).unwrap();
+    config_support::direct_config(
+        state.path(),
+        "[retention]\nmin_free_pct = 5.0\nmax_state_size = \"64KiB\"\n",
+    );
+    let cap = "maximum state size would be exceeded";
+    for json in [false, true] {
+        let output = command(state.path(), json)
+            .args(["top", "--depth", "1", &query.display().to_string()])
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        assert!(
+            stdout.is_empty(),
+            "cap refusal wrote stdout (json={json}): {stdout}"
+        );
+        assert!(
+            stderr.contains(cap),
+            "cap refusal did not report the state cap (json={json}): {stderr}"
+        );
+        assert!(
+            !stderr.contains("min_free_pct") && !stderr.contains("delta_skipped"),
+            "cap refusal was reported as a floor skip (json={json}): {stderr}"
+        );
+    }
+}

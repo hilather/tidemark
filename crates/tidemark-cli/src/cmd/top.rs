@@ -63,9 +63,10 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 super::display_path(&context.config.general.state_dir)
             )
         })?;
-    // Plain top uses the ~24h snapshot only for Δ24h. A free-space refusal
-    // leaves that column blank, the way the TUI does. `--snapshot` and
-    // `--sort growth` still require the open to succeed.
+    // Plain top uses the ~24h snapshot only for Δ24h. Only a free-space floor
+    // refusal leaves that column blank. A state-size cap, and every other
+    // error, still fail the command. `--snapshot` and `--sort growth` require
+    // the open to succeed.
     let soft_delta = args.snapshot.is_none() && args.sort != Some(Sort::Growth);
     let (old, blank_delta) = match older_snapshot(
         &catalog,
@@ -76,6 +77,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         Ok(old) => (old, false),
         Err(OlderFailure {
             scan_id: Some(scan_id),
+            refusal: Some(SpaceRefusal::FreeSpaceFloor),
             ..
         }) if soft_delta => {
             warn_delta_skipped(&scan_id, context.config.retention.min_free_pct);
@@ -152,14 +154,31 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     )
 }
 /// One stderr line when plain `top` leaves Δ24h blank after a floor refusal.
+///
+/// `min_free_pct` is the configured retention value, not a fixed default.
 fn warn_delta_skipped(scan_id: &str, min_free_pct: f64) {
     eprintln!(
         "warning: Δ24h skipped: inflating {scan_id} would breach min_free_pct={min_free_pct}%"
     );
 }
+/// Which state-space rule refused inflating the Δ24h snapshot.
+enum SpaceRefusal {
+    FreeSpaceFloor,
+    MaxStateSize,
+}
 struct OlderFailure {
     scan_id: Option<String>,
+    refusal: Option<SpaceRefusal>,
     error: anyhow::Error,
+}
+fn space_refusal(reason: &str) -> Option<SpaceRefusal> {
+    if reason.contains("free-space floor") {
+        Some(SpaceRefusal::FreeSpaceFloor)
+    } else if reason.contains("maximum state size") {
+        Some(SpaceRefusal::MaxStateSize)
+    } else {
+        None
+    }
 }
 fn older_snapshot(
     catalog: &tidemark_store::catalog::Catalog,
@@ -173,6 +192,7 @@ fn older_snapshot(
         Err(error) => {
             return Err(OlderFailure {
                 scan_id: None,
+                refusal: None,
                 error: error.into(),
             })
         }
@@ -201,15 +221,19 @@ fn older_snapshot(
     };
     match tidemark_store::reader::Snapshot::open_with_retention(&path, policy) {
         Ok(snapshot) => Ok(Some(snapshot)),
-        Err(error @ tidemark_store::StoreError::Space(_)) => Err(OlderFailure {
-            scan_id: Some(entry.scan_id),
-            error: anyhow::Error::from(error).context(format!(
-                "open older snapshot: {}",
-                super::display_path(&path)
-            )),
-        }),
+        Err(tidemark_store::StoreError::Space(reason)) => {
+            let refusal = space_refusal(&reason);
+            Err(OlderFailure {
+                scan_id: refusal.as_ref().map(|_| entry.scan_id),
+                refusal,
+                error: anyhow::Error::from(tidemark_store::StoreError::Space(reason)).context(
+                    format!("open older snapshot: {}", super::display_path(&path)),
+                ),
+            })
+        }
         Err(error) => Err(OlderFailure {
             scan_id: None,
+            refusal: None,
             error: anyhow::Error::from(error).context(format!(
                 "open older snapshot: {}",
                 super::display_path(&path)
