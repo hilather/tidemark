@@ -34,6 +34,7 @@ assets = [
   { source = "target/man/tidemark-phantom.1", dest = "/usr/share/man/man1/tidemark-phantom.1", mode = "0644", user = "root", group = "root", doc = true },
   { source = "target/man/tidemark-probe.1", dest = "/usr/share/man/man1/tidemark-probe.1", mode = "0644", user = "root", group = "root", doc = true },
   { source = "target/man/tidemark-scan.1", dest = "/usr/share/man/man1/tidemark-scan.1", mode = "0644", user = "root", group = "root", doc = true },
+  { source = "target/man/tidemark-snapshots-export.1", dest = "/usr/share/man/man1/tidemark-snapshots-export.1", mode = "0644", user = "root", group = "root", doc = true },
   { source = "target/man/tidemark-snapshots-list.1", dest = "/usr/share/man/man1/tidemark-snapshots-list.1", mode = "0644", user = "root", group = "root", doc = true },
   { source = "target/man/tidemark-snapshots-prune.1", dest = "/usr/share/man/man1/tidemark-snapshots-prune.1", mode = "0644", user = "root", group = "root", doc = true },
   { source = "target/man/tidemark-snapshots-rebuild-catalog.1", dest = "/usr/share/man/man1/tidemark-snapshots-rebuild-catalog.1", mode = "0644", user = "root", group = "root", doc = true },
