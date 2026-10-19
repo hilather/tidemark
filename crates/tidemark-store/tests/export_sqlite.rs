@@ -1,4 +1,4 @@
-//! Owned by: SNAP-export-sqlite
+//! Owned by: WSNAP-export-sqlite
 //! Export of v1, v2 and cold snapshots as v1-schema SQLite databases.
 #![allow(clippy::unwrap_used)]
 use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path};
