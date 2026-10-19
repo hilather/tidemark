@@ -183,6 +183,11 @@ fn classify_with(error: StoreError, probe: impl FnOnce() -> Option<i32>) -> Stor
     if e.code == rusqlite::ErrorCode::DiskFull {
         return StoreError::Space("destination disk full".into());
     }
+    // Rule: an SQLite I/O error is a space failure (exit 5) only when the probe, run before
+    // cleanup, confirms ENOSPC/EDQUOT; otherwise it stays a runtime error (exit 1). There is
+    // no safe way to read the OS errno SQLite hides (`sqlite3_system_errno` is unsafe FFI,
+    // forbidden here), so a persistent quota or full disk is always caught, but a transient
+    // quota error that the probe does not reproduce is reported as an I/O error.
     if matches!(e.extended_code, IOERR_WRITE | IOERR_FSYNC | IOERR_TRUNCATE) {
         if let Some(n) = probe() {
             if n == rustix::io::Errno::NOSPC.raw_os_error()
