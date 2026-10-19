@@ -27,7 +27,7 @@ impl ScanRecorder for Recorder {
         Ok(())
     }
 }
-fn scan(cfg: &Config, root: &Path, now: i64) {
+fn run_fixture_scan(cfg: &Config, root: &Path, now: i64) -> Result<(), ScanError> {
     let req = ScanRequest {
         root: RawPath::from_path(root).unwrap(),
         mode: ModeRequest::Walk,
@@ -44,9 +44,12 @@ fn scan(cfg: &Config, root: &Path, now: i64) {
         &AtomicBool::new(false),
         &|_| {},
         &|| now,
-    )
-    .unwrap();
+    )?;
     assert!(out.file.unwrap().exists());
+    Ok(())
+}
+fn scan(cfg: &Config, root: &Path, now: i64) {
+    run_fixture_scan(cfg, root, now).unwrap();
 }
 
 #[path = "support/config.rs"]
@@ -430,6 +433,35 @@ fn length_between(state: &Path, pct: f64) -> Option<u64> {
     None
 }
 
+/// `pct` is no stricter than the mandatory 2 GiB floor, so no declared length
+/// can separate it from the default 5% floor.
+fn absolute_floor_hides_percentage(
+    totals: tidemark_store::space_guard::FsTotals,
+    pct: f64,
+) -> bool {
+    match (
+        first_floor_refusal(totals, pct),
+        first_floor_refusal(totals, 0.0),
+    ) {
+        (Some(configured), Some(absolute)) => configured >= absolute,
+        _ => false,
+    }
+}
+
+#[test]
+fn absolute_floor_hides_fifty_percent_only_on_a_small_filesystem() {
+    let small = tidemark_store::space_guard::FsTotals {
+        size: 1 << 30,
+        avail: 1 << 30,
+    };
+    assert!(absolute_floor_hides_percentage(small, 50.0));
+    let large = tidemark_store::space_guard::FsTotals {
+        size: 100 << 30,
+        avail: 80 << 30,
+    };
+    assert!(!absolute_floor_hides_percentage(large, 50.0));
+}
+
 #[test]
 fn cold_commands_enforce_configured_min_free_pct() {
     let root = test_support::private_tempdir().unwrap();
@@ -440,9 +472,23 @@ fn cold_commands_enforce_configured_min_free_pct() {
     let mut cfg = Config::default();
     cfg.general.state_dir = state.path().to_owned();
     cfg.retention.snapshots.cold_after_recent = false;
+    if absolute_floor_hides_percentage(filesystem_totals(state.path()), 50.0) {
+        eprintln!(
+            "skipped: filesystem is too small to host a declared inflate length that 50% refuses and 5% allows"
+        );
+        return;
+    }
     let now = tidemark_core::time::unix_now();
-    scan(&cfg, query, now - 86_400);
-    scan(&cfg, query, now);
+    for stamp in [now - 86_400, now] {
+        match run_fixture_scan(&cfg, query, stamp) {
+            Ok(()) => {}
+            Err(ScanError::NoSpace) => {
+                eprintln!("skipped: fixture scan was refused by the free-space floor");
+                return;
+            }
+            Err(error) => panic!("fixture scan failed: {error}"),
+        }
+    }
     let catalog = Catalog::open(state.path(), true).unwrap();
     let mut entries = catalog.list(None).unwrap();
     entries.sort_by_key(|entry| entry.started_at);
@@ -454,9 +500,15 @@ fn cold_commands_enforce_configured_min_free_pct() {
     catalog.point_to_cold(&older_id, &cold).unwrap();
     std::fs::remove_file(&hot).unwrap();
     drop(catalog);
-    let length = length_between(state.path(), 50.0).expect(
-        "the 2 GiB absolute floor hides 50% on this filesystem; 50% cannot be separated from 5%",
-    );
+    let Some(length) = length_between(state.path(), 50.0) else {
+        if absolute_floor_hides_percentage(filesystem_totals(state.path()), 50.0) {
+            eprintln!(
+                "skipped: filesystem is too small to host a declared inflate length that 50% refuses and 5% allows"
+            );
+            return;
+        }
+        panic!("could not separate a 50% free-space floor from the default 5%");
+    };
     let mut bytes = std::fs::read(&cold).unwrap();
     bytes[8..16].copy_from_slice(&length.to_le_bytes());
     std::fs::write(&cold, bytes).unwrap();
@@ -465,6 +517,7 @@ fn cold_commands_enforce_configured_min_free_pct() {
         "[retention]\nmin_free_pct = 50.0\nmax_state_size = \"1000TiB\"\n",
     );
     let floor = "state filesystem free-space floor would be crossed";
+    let cold_id = older_id.clone();
     for args in [
         vec![
             "diff".to_string(),
@@ -511,5 +564,53 @@ fn cold_commands_enforce_configured_min_free_pct() {
             !stderr.contains("maximum state size"),
             "cap masked the percentage for {args:?}: {stderr}"
         );
+        if args.first().is_some_and(|arg| arg == "diff") {
+            assert!(
+                stderr.contains(&cold_id),
+                "diff floor refusal did not name the snapshot: {stderr}"
+            );
+        }
     }
+    let plain = command(state.path(), false)
+        .args(["top", "--depth", "1", &query.display().to_string()])
+        .assert()
+        .success();
+    let plain = plain.get_output();
+    let stdout = String::from_utf8(plain.stdout.clone()).unwrap();
+    let stderr = String::from_utf8(plain.stderr.clone()).unwrap();
+    assert!(
+        stdout.contains("DELTA24h") || stdout.contains("Δ24h"),
+        "plain top omitted Δ24h when the predecessor exists: {stdout}"
+    );
+    assert!(
+        stdout.split_whitespace().any(|cell| cell == "-"),
+        "plain top did not show '-' for an unavailable Δ24h: {stdout}"
+    );
+    let warning =
+        format!("warning: Δ24h skipped: inflating {cold_id} would breach min_free_pct=50%");
+    assert_eq!(
+        stderr.lines().filter(|line| line == &warning).count(),
+        1,
+        "{stderr}"
+    );
+    let json = command(state.path(), true)
+        .args(["top", "--depth", "1", &query.display().to_string()])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let json_stderr = String::from_utf8(json.stderr.clone()).unwrap();
+    assert_eq!(
+        json_stderr.lines().filter(|line| line == &warning).count(),
+        1,
+        "{json_stderr}"
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let rows = doc["data"].as_array().expect("top json data");
+    assert!(!rows.is_empty(), "{doc}");
+    assert!(
+        rows.iter()
+            .all(|row| row["delta"].is_null() && row["delta_skipped"] == "free_space_floor"),
+        "plain top json did not mark the floor skip: {doc}"
+    );
 }

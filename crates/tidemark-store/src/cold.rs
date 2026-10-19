@@ -322,10 +322,14 @@ pub(crate) fn matches_hot(cold: &Path, hot: &Path) -> Result<()> {
     Ok(())
 }
 /// Inflate into an exclusively created private leaf, checking the exact payload length.
-/// Removes the destination on any decoding failure.
-pub fn inflate_to(path: &Path, dest: &Path) -> Result<()> {
+///
+/// `policy` is applied to the cold file's state directory before `dest` is created.
+/// A free-space refusal therefore leaves no leaf. Removes the destination on any
+/// decoding failure.
+pub fn inflate_to(path: &Path, dest: &Path, policy: &RetentionConfig) -> Result<()> {
     let mut source = open(path)?;
     let header = read_header(&mut source)?;
+    crate::space_guard::inflate_check(path, header.uncompressed_len, policy)?;
     let (dir, name) = parent(dest)?;
     let mut output = dir.create_leaf(name)?;
     let result = inflate(&mut source, &mut output, header.uncompressed_len);

@@ -63,12 +63,26 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 super::display_path(&context.config.general.state_dir)
             )
         })?;
-    let old = older_snapshot(
+    // Plain top uses the ~24h snapshot only for Δ24h. A free-space refusal
+    // leaves that column blank, the way the TUI does. `--snapshot` and
+    // `--sort growth` still require the open to succeed.
+    let soft_delta = args.snapshot.is_none() && args.sort != Some(Sort::Growth);
+    let (old, blank_delta) = match older_snapshot(
         &catalog,
         &snapshot,
         tidemark_core::time::unix_now(),
         &context.config.retention,
-    )?;
+    ) {
+        Ok(old) => (old, false),
+        Err(OlderFailure {
+            scan_id: Some(scan_id),
+            ..
+        }) if soft_delta => {
+            warn_delta_skipped(&scan_id, context.config.retention.min_free_pct);
+            (None, true)
+        }
+        Err(failure) => return Err(failure.error),
+    };
     if sort == Sort::Growth && old.is_none() {
         return Err(crate::CliError::Precondition(
             "growth sorting requires an older complete snapshot within 6h of now minus 24h".into(),
@@ -108,6 +122,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         hits.push(crate::render::tree::Directory {
             row,
             delta,
+            delta_skipped: blank_delta.then_some("free_space_floor"),
             live_disk,
         });
     }
@@ -132,17 +147,36 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         args.wide,
         crate::render::tree::ascii_locale(),
         context.json,
+        blank_delta,
         &mut out,
     )
+}
+/// One stderr line when plain `top` leaves Δ24h blank after a floor refusal.
+fn warn_delta_skipped(scan_id: &str, min_free_pct: f64) {
+    eprintln!(
+        "warning: Δ24h skipped: inflating {scan_id} would breach min_free_pct={min_free_pct}%"
+    );
+}
+struct OlderFailure {
+    scan_id: Option<String>,
+    error: anyhow::Error,
 }
 fn older_snapshot(
     catalog: &tidemark_store::catalog::Catalog,
     current: &tidemark_store::reader::Snapshot,
     now: i64,
     policy: &tidemark_core::config::RetentionConfig,
-) -> anyhow::Result<Option<tidemark_store::reader::Snapshot>> {
+) -> Result<Option<tidemark_store::reader::Snapshot>, OlderFailure> {
     let target = now.saturating_sub(86400);
-    let entries = catalog.list(Some(&current.meta().root))?;
+    let entries = match catalog.list(Some(&current.meta().root)) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Err(OlderFailure {
+                scan_id: None,
+                error: error.into(),
+            })
+        }
+    };
     let entry = entries
         .into_iter()
         .filter(|e| {
@@ -159,13 +193,29 @@ fn older_snapshot(
                 .then_with(|| b.started_at.cmp(&a.started_at))
                 .then_with(|| a.scan_id.cmp(&b.scan_id))
         });
-    entry
-        .and_then(|e| e.file)
-        .map(|p| {
-            tidemark_store::reader::Snapshot::open_with_retention(&p, policy)
-                .with_context(|| format!("open older snapshot: {}", super::display_path(&p)))
-        })
-        .transpose()
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    let Some(path) = entry.file else {
+        return Ok(None);
+    };
+    match tidemark_store::reader::Snapshot::open_with_retention(&path, policy) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(error @ tidemark_store::StoreError::Space(_)) => Err(OlderFailure {
+            scan_id: Some(entry.scan_id),
+            error: anyhow::Error::from(error).context(format!(
+                "open older snapshot: {}",
+                super::display_path(&path)
+            )),
+        }),
+        Err(error) => Err(OlderFailure {
+            scan_id: None,
+            error: anyhow::Error::from(error).context(format!(
+                "open older snapshot: {}",
+                super::display_path(&path)
+            )),
+        }),
+    }
 }
 /// CLI directory ordering, including the cross-snapshot growth metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

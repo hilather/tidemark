@@ -103,7 +103,7 @@ Open: `tidemark.lvm.v1` names both direct and reduced daemon shapes; scan.cancel
 H = contains hard links shared with directories outside this one (see `tidemark links`)
 ```
 
-The `Δ24h` column appears when a snapshot about 24 h older exists.
+The `Δ24h` column appears when a snapshot about 24 h older exists. Plain `top` (no `--snapshot`, and not `--sort growth`) still exits 0 when inflating that snapshot would breach `retention.min_free_pct`. The cells are `-`, and stderr carries one line: `warning: Δ24h skipped: inflating <id> would breach min_free_pct=<n>%`. In `tidemark.top.v1`, each row then has `delta: null` and `delta_skipped: "free_space_floor"`. When no older snapshot was selected, `delta` is null and `delta_skipped` is omitted. `--snapshot` and `--sort growth` still fail the command.
 
 ## 2. Daemon API
 

@@ -42,7 +42,7 @@ fn lookups(h: &History) -> u64 {
 #[test]
 fn unchanged_turns_do_not_post_generations_and_warm_paths_do_no_io() {
     let (_temp, key) = setup();
-    let mut h = History::default();
+    let mut h = History::new(tidemark_core::config::RetentionConfig::default());
     h.update(key.clone(), None, true, false, 10);
     let generation = h.generation;
     for _ in 0..100 {
@@ -73,7 +73,7 @@ fn identity_and_uuid_failures_are_unavailable_not_zero() {
             2 => bad.root = RawPath::new(b"/other".to_vec()).unwrap(),
             _ => bad.window[0].file = bad.window[0].file.with_extension("pruned"),
         }
-        let mut h = History::default();
+        let mut h = History::new(tidemark_core::config::RetentionConfig::default());
         h.update(bad, None, true, false, 1);
         h.settle(1);
         assert!(matches!(h.samples[0], Some(Sample::Unavailable(_))));
@@ -98,7 +98,7 @@ fn identity_and_uuid_failures_are_unavailable_not_zero() {
 #[test]
 fn missing_paths_are_negative_cached_and_failures_retry_after_five_seconds() {
     let (_temp, key) = setup();
-    let mut h = History::default();
+    let mut h = History::new(tidemark_core::config::RetentionConfig::default());
     let mut absent = key.clone();
     absent.path = RawPath::new(b"/fixture/renamed".to_vec()).unwrap();
     h.update(absent.clone(), None, true, false, 100);
@@ -152,7 +152,7 @@ fn window_retains_same_time_predecessors_and_excludes_open_siblings_and_future()
 #[test]
 fn cache_has_path_and_byte_bounds_and_oversized_paths_still_query() {
     let (_temp, key) = setup();
-    let mut h = History::default();
+    let mut h = History::new(tidemark_core::config::RetentionConfig::default());
     for i in 0..140 {
         let mut request = key.clone();
         request.path = RawPath::new(format!("/fixture/{i}").into_bytes()).unwrap();
@@ -201,7 +201,7 @@ fn entered(shared: &Shared) {
 #[test]
 fn delayed_reader_coalesces_requests_and_never_publishes_or_applies_stale_results() {
     let (_temp, key) = setup();
-    let mut h = History::default();
+    let mut h = History::new(tidemark_core::config::RetentionConfig::default());
     let shared = pause(&mut h);
     h.update(key.clone(), None, true, false, 1);
     entered(&shared);
@@ -232,7 +232,7 @@ fn delayed_reader_coalesces_requests_and_never_publishes_or_applies_stale_result
 #[test]
 fn hidden_chart_defers_io_and_drop_releases_a_blocked_open() {
     let (_temp, key) = setup();
-    let mut h = History::default();
+    let mut h = History::new(tidemark_core::config::RetentionConfig::default());
     h.update(key.clone(), None, false, false, 1);
     assert!(h.worker.is_none());
     let shared = pause(&mut h);
@@ -259,7 +259,7 @@ fn worker_rejects_known_uuid_mismatch_and_corrupt_files() {
         window: window(&[], &meta, &file),
         fs_uuid: "other-device".into(),
     };
-    let mut h = History::default();
+    let mut h = History::new(tidemark_core::config::RetentionConfig::default());
     h.update(key.clone(), None, true, false, 1);
     h.settle(1);
     assert_eq!(
@@ -273,7 +273,7 @@ fn worker_rejects_known_uuid_mismatch_and_corrupt_files() {
     assert_eq!(h.samples, vec![Some(Sample::Known(100))]);
     drop(h);
     std::fs::write(&file, b"corrupt database").unwrap();
-    let mut h = History::default();
+    let mut h = History::new(tidemark_core::config::RetentionConfig::default());
     h.update(key, None, true, false, 3);
     h.settle(3);
     assert_eq!(
@@ -307,7 +307,7 @@ fn deep_and_non_utf8_paths_are_exact_not_display_or_inode_keys() {
         window: window(&[], &meta, &file),
         fs_uuid: String::new(),
     };
-    let mut h = History::default();
+    let mut h = History::new(tidemark_core::config::RetentionConfig::default());
     h.update(key.clone(), None, true, false, 1);
     h.settle(1);
     assert_eq!(h.samples, vec![Some(Sample::Known(13))]);
@@ -344,7 +344,7 @@ fn seven_reader_bound_eviction_and_cold_warm_measurements() {
         window: entries[..7].to_vec(),
         fs_uuid: String::new(),
     };
-    let mut h = History::default();
+    let mut h = History::new(tidemark_core::config::RetentionConfig::default());
     let start = std::time::Instant::now();
     h.update(key.clone(), Some(25), true, false, 1);
     h.settle(1);

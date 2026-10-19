@@ -9,7 +9,18 @@ pub struct Directory {
     #[serde(flatten)]
     pub row: DirRow,
     /// Signed disk-byte change versus the older complete snapshot.
+    ///
+    /// Null when no older snapshot was selected, or when inflation was skipped.
     pub delta: Option<i128>,
+    /// Why `delta` is null even though an older snapshot was selected.
+    ///
+    /// Present only for a skipped inflation. `free_space_floor` means inflating
+    /// that snapshot would breach `retention.min_free_pct`. Omitted when `delta`
+    /// is known and when no older snapshot was selected, so a missing predecessor
+    /// stays `delta: null` with no `delta_skipped` field. `tidemark.top.v1` emits
+    /// this on each row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_skipped: Option<&'static str>,
     /// Live disk bytes from a gentle walk.
     pub live_disk: Option<u64>,
 }
@@ -55,17 +66,21 @@ pub fn snapshot_header(
     Ok(())
 }
 /// Render rows as an iterative tree, preserving the caller's sibling ordering.
+///
+/// `blank_delta` keeps the Δ24h column when an older snapshot exists but could
+/// not be inflated. Those cells are `-`.
 pub fn directories(
     rows: &[Directory],
     wide: bool,
     ascii: bool,
     json: bool,
+    blank_delta: bool,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
     if json {
         return super::json("tidemark.top.v1", rows, out);
     }
-    let delta = rows.iter().any(|r| r.delta.is_some());
+    let delta = blank_delta || rows.iter().any(|r| r.delta.is_some());
     let live = rows.iter().any(|r| r.live_disk.is_some());
     let mut header = vec![
         "PATH".into(),
@@ -131,11 +146,11 @@ pub fn directories(
             ]);
         }
         if delta {
-            cells.push(
-                r.delta
-                    .map(signed_bytes)
-                    .unwrap_or_else(|| "unknown".into()),
-            );
+            cells.push(match r.delta {
+                Some(n) => signed_bytes(n),
+                None if blank_delta => "-".into(),
+                None => "unknown".into(),
+            });
         }
         if live {
             cells.extend([

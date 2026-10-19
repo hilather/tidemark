@@ -1454,8 +1454,7 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         lang.as_deref(),
     );
     let start = dir.id.saturating_add(1);
-    let mut history = history::History::default();
-    history.set_retention(context.config.retention.clone());
+    let history = history::History::new(context.config.retention.clone());
     let mut browser = Browser {
         snapshot,
         snapshot_file,
