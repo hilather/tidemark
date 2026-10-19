@@ -480,7 +480,7 @@ fn own_files_columns_and_info() {
         .find(|l| l.contains("./ (files here)"))
         .unwrap();
     assert!(line.contains(&crate::render::size::bytes(4096)));
-    assert!(line.contains("12"));
+    assert!(line.split_whitespace().any(|token| token == "12"), "{line}");
     assert_eq!(line.matches('-').count(), 4);
     b.state.selected = b.own_position();
     b.pane(Pane::Info).unwrap();
@@ -579,11 +579,12 @@ size = 8192
     let screen = render(&b, 160, 48);
     let when = draw::fmt_when(newest, b.clock);
     // The header and depth title repeat the temp root. A path such as
-    // `/tmp/data/x` contains the substring `a/`, so match the listing row.
+    // `/tmp/data/x` contains the substring `a/`, so match the name cell.
     let row = screen
         .lines()
         .skip_while(|line| !line.contains("NEWEST"))
-        .find(|line| line.contains("a/"))
+        .skip(1)
+        .find(|line| line.split_whitespace().any(|token| token == "a/"))
         .unwrap();
     assert!(row.contains(&when), "{row}");
     assert_eq!(
@@ -594,7 +595,24 @@ size = 8192
         b.rows[0].1,
         Some(i128::from(b.rows[0].0.t_disk) - i128::from(baseline))
     );
-    assert!(render(&b, 160, 48).contains("live"));
+    // The depth title is the status cell that carries the live marker. The
+    // temp root is on that same line, so a path such as `/home/olive` contains
+    // the substring `live`. The footer also always shows the `R live` binding.
+    // The border is drawn against the title with no space, so the marker is the
+    // token `live` once those rules are stripped.
+    let title = screen
+        .lines()
+        .find(|line| {
+            line.split_whitespace()
+                .any(|token| token.trim_start_matches(['┌', '+']) == "depth")
+        })
+        .unwrap();
+    assert!(
+        title
+            .split_whitespace()
+            .any(|token| { token.trim_end_matches(['─', '-', '┐', '+']) == "live" }),
+        "{title}"
+    );
     config.throttle.min_ops_per_sec = 1;
     config.throttle.max_ops_per_sec = 1;
     b.start_refresh(&config);
