@@ -131,7 +131,7 @@ fn export_writes_a_queryable_v1_database_and_refuses_to_overwrite() {
         .arg(&target)
         .assert()
         .failure()
-        .code(1)
+        .code(5)
         .get_output()
         .stderr
         .clone();

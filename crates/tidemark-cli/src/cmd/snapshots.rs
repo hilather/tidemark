@@ -214,6 +214,14 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             // Resolve once: the published path is the one printed, with no second lookup.
             let target = &std::path::absolute(target)?;
             refuse_inside_state(target, state)?;
+            // The store refuses too; checking here gives the precondition exit code (5).
+            if std::fs::symlink_metadata(target).is_ok() {
+                return Err(crate::CliError::Precondition(format!(
+                    "output path already exists: {}",
+                    super::display_path(target)
+                ))
+                .into());
+            }
             // SIGINT/SIGTERM/SIGHUP only set a flag; the export stops between batches and
             // unwinds, so its staging copy and the cold-inflate leaf are removed.
             let interrupt = ExportInterrupt::new()?;
