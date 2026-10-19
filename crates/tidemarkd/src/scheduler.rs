@@ -580,16 +580,18 @@ impl Recorder {
             .file
             .as_ref()
             .ok_or_else(|| DaemonError::Scan("complete scan has no file".into()))?;
-        let snapshot = Snapshot::open(file).map_err(|e| DaemonError::Store(e.to_string()))?;
+        let snapshot = Snapshot::open_with_retention(file, &self.config.retention)
+            .map_err(|e| DaemonError::Store(e.to_string()))?;
         let previous = self.previous.lock();
         if let Some(old) = previous.as_ref().and_then(|e| e.file.as_ref()) {
-            let rows = tidemark_store::diff::diff(
+            let rows = tidemark_store::diff::diff_with_retention(
                 &snapshot,
                 old,
                 &entry.root,
                 tidemark_store::diff::DiffMetric::Disk,
                 cfg.series_depth,
                 GROWTH_CAP + 1,
+                &self.config.retention,
             )
             .map_err(|e| DaemonError::Store(e.to_string()))?;
             if rows.len() > GROWTH_CAP {
@@ -615,6 +617,7 @@ impl Recorder {
             }
         }
         if let Some(metrics) = self.state.view().snapshot_metrics_handle() {
+            metrics.set_retention(&self.config.retention);
             refresh(&metrics, &snapshot, self.config.metrics.dir_metrics_depth)?;
             self.state.publish_component(component(
                 "snapshot_metrics",
@@ -625,6 +628,7 @@ impl Recorder {
             // Keep construction compatible when W6-B replaces its unit stub.
             #[allow(clippy::default_constructed_unit_structs)]
             let metrics = crate::metrics::SnapshotMetrics::default();
+            metrics.set_retention(&self.config.retention);
             refresh(&metrics, &snapshot, self.config.metrics.dir_metrics_depth)?;
             self.state.publish(
                 Publication::SnapshotMetrics(metrics),

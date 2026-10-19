@@ -137,7 +137,11 @@ fn run_scan_with_environment(
     let catalog = tidemark_store::catalog::Catalog::open(&cfg.general.state_dir, true)?;
     let _lock = ScanLock::acquire(&cfg.general.state_dir)?;
     let preflight_now = clock();
-    tidemark_store::catalog::cleanup_abandoned_scans(&cfg.general.state_dir, preflight_now);
+    tidemark_store::catalog::cleanup_abandoned_scans_with_policy(
+        &cfg.general.state_dir,
+        preflight_now,
+        &cfg.retention,
+    );
     // The daemon can have a live sample writer: recovery belongs to startup,
     // or to the daemon-absent CLI preflight with all connections closed.
     let previous = catalog.latest(&req.root)?;

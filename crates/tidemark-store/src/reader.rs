@@ -7,6 +7,7 @@ use crate::{
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use std::{os::unix::ffi::OsStrExt, path::Path};
 use tidemark_core::{
+    config::RetentionConfig,
     path::{RawName, RawPath},
     snapshot::*,
 };
@@ -483,6 +484,9 @@ impl Snapshot {
 
     /// Open an immutable snapshot without acquiring SQLite locks.
     ///
+    /// Cold files inflate under [`RetentionConfig::default`]. Configured callers
+    /// use [`Self::open_with_retention`] so the operator floor is enforced.
+    ///
     /// ```no_run
     /// # fn main() -> Result<(), tidemark_store::StoreError> {
     /// let scan = tidemark_store::reader::Snapshot::open(std::path::Path::new("scan.db"))?;
@@ -491,8 +495,15 @@ impl Snapshot {
     /// # Ok(()) }
     /// ```
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_retention(path, &RetentionConfig::default())
+    }
+    /// Open an immutable snapshot, applying `policy` before a cold inflate.
+    ///
+    /// Hot snapshots do not inflate. A cold snapshot is refused when the decoded
+    /// length would cross `policy.min_free_pct` or `policy.max_state_size`.
+    pub fn open_with_retention(path: &Path, policy: &RetentionConfig) -> Result<Self> {
         Self::open_with_space_guard(path, |length| {
-            crate::space_guard::inflate_check(path, length)
+            crate::space_guard::inflate_check(path, length, policy)
         })
     }
     /// Open with an injected inflate space policy. The guard runs before creating a leaf.

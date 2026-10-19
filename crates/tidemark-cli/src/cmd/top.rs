@@ -63,7 +63,12 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 super::display_path(&context.config.general.state_dir)
             )
         })?;
-    let old = older_snapshot(&catalog, &snapshot, tidemark_core::time::unix_now())?;
+    let old = older_snapshot(
+        &catalog,
+        &snapshot,
+        tidemark_core::time::unix_now(),
+        &context.config.retention,
+    )?;
     if sort == Sort::Growth && old.is_none() {
         return Err(crate::CliError::Precondition(
             "growth sorting requires an older complete snapshot within 6h of now minus 24h".into(),
@@ -134,6 +139,7 @@ fn older_snapshot(
     catalog: &tidemark_store::catalog::Catalog,
     current: &tidemark_store::reader::Snapshot,
     now: i64,
+    policy: &tidemark_core::config::RetentionConfig,
 ) -> anyhow::Result<Option<tidemark_store::reader::Snapshot>> {
     let target = now.saturating_sub(86400);
     let entries = catalog.list(Some(&current.meta().root))?;
@@ -156,7 +162,7 @@ fn older_snapshot(
     entry
         .and_then(|e| e.file)
         .map(|p| {
-            tidemark_store::reader::Snapshot::open(&p)
+            tidemark_store::reader::Snapshot::open_with_retention(&p, policy)
                 .with_context(|| format!("open older snapshot: {}", super::display_path(&p)))
         })
         .transpose()

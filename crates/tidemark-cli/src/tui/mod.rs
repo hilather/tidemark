@@ -55,6 +55,7 @@ impl Drop for Refresh {
 struct Browser {
     snapshot: Snapshot,
     snapshot_file: std::path::PathBuf,
+    retention: tidemark_core::config::RetentionConfig,
     old: Option<Snapshot>,
     prev_open_failed_at: Option<i64>,
     dir: DirRow,
@@ -372,7 +373,7 @@ impl Browser {
                     .find(|r| r.path == path)
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("live root missing"))?;
-                let snapshot = Snapshot::open(&snapshot_file)?;
+                let snapshot = Snapshot::open_with_retention(&snapshot_file, &config.retention)?;
                 let mut children = Vec::new();
                 for row in rows.into_iter().filter(|r| r.parent_id == Some(root.id)) {
                     if worker_cancel.load(std::sync::atomic::Ordering::Acquire) {
@@ -394,7 +395,7 @@ impl Browser {
                 if children.len() <= 10_000 {
                     let previous = previous_file
                         .as_ref()
-                        .map(|file| Snapshot::open(file))
+                        .map(|file| Snapshot::open_with_retention(file, &config.retention))
                         .transpose()?;
                     for (row, _) in &children {
                         if worker_cancel.load(std::sync::atomic::Ordering::Acquire) {
@@ -908,7 +909,7 @@ impl Browser {
             return false;
         };
         let file = previous.1.clone();
-        match Snapshot::open(&file) {
+        match Snapshot::open_with_retention(&file, &self.retention) {
             Ok(snapshot) => {
                 self.old = Some(snapshot);
                 self.prev_open_failed_at = None;
@@ -1149,7 +1150,7 @@ impl Browser {
             Pane::Picker => {
                 if let Some((_, file, _, _)) = self.snapshots.get(self.state.selected) {
                     let file = file.clone();
-                    let snapshot = Snapshot::open(&file)?;
+                    let snapshot = Snapshot::open_with_retention(&file, &self.retention)?;
                     if let Some(dir) = snapshot.dir_by_path(&self.dir.path)? {
                         self.snapshot_file = file;
                         self.snapshot = snapshot;
@@ -1453,9 +1454,12 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         lang.as_deref(),
     );
     let start = dir.id.saturating_add(1);
+    let mut history = history::History::default();
+    history.set_retention(context.config.retention.clone());
     let mut browser = Browser {
         snapshot,
         snapshot_file,
+        retention: context.config.retention.clone(),
         old: None,
         prev_open_failed_at: None,
         dir,
@@ -1466,7 +1470,7 @@ pub(crate) fn run(args: &crate::cmd::tui::Args, context: &crate::Context) -> any
         snapshots,
         message: "Sort and filter apply to whole directory".into(),
         clock: tidemark_core::time::unix_now(),
-        history: history::History::default(),
+        history,
         history_refresh: false,
         data_revision: 0,
         info_subject: None,

@@ -193,9 +193,15 @@ pub fn space_check_with(
     SpaceVerdict::Ok
 }
 
-/// Check an inflate using the default state policy and the exact decoded size.
-/// Daemon policy wiring may call `space_check` with its configured policy instead.
-pub fn inflate_check(cold: &Path, length: u64) -> Result<(), crate::StoreError> {
+/// Check an inflate against `policy` and the exact decoded size.
+///
+/// `policy.min_free_pct` and `policy.max_state_size` are the caller's configured
+/// retention floor. The default policy is only for callers that have no config.
+pub fn inflate_check(
+    cold: &Path,
+    length: u64,
+    policy: &RetentionConfig,
+) -> Result<(), crate::StoreError> {
     let root = crate::state_dir::file_parent(cold)?;
     let state =
         if root.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("snapshots")) {
@@ -203,7 +209,7 @@ pub fn inflate_check(cold: &Path, length: u64) -> Result<(), crate::StoreError> 
         } else {
             &root
         };
-    match space_check(state, length, &RetentionConfig::default())? {
+    match space_check(state, length, policy)? {
         SpaceVerdict::Ok => Ok(()),
         SpaceVerdict::Refuse { reason } => Err(crate::StoreError::Space(reason)),
     }

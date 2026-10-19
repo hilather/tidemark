@@ -534,22 +534,11 @@ fn snapshot_directory(
         .subdir(std::ffi::OsStr::new("snapshots"), false)?
         .subdir(root, false)?)
 }
-fn open_snapshot(
+pub(crate) fn open_snapshot(
     context: &crate::Context,
     file: &std::path::Path,
 ) -> Result<tidemark_store::reader::Snapshot, tidemark_store::StoreError> {
-    tidemark_store::reader::Snapshot::open_with_space_guard(file, |length| {
-        match tidemark_store::space_guard::space_check(
-            &context.config.general.state_dir,
-            length,
-            &context.config.retention,
-        )? {
-            tidemark_store::space_guard::SpaceVerdict::Ok => Ok(()),
-            tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
-                Err(tidemark_store::StoreError::Space(reason))
-            }
-        }
-    })
+    tidemark_store::reader::Snapshot::open_with_retention(file, &context.config.retention)
 }
 /// Re-read a catalog row once when its file vanished (a cold publication may have replaced it).
 fn refreshed(

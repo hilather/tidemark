@@ -42,7 +42,7 @@ pub struct Args {
 pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     use tidemark_store::{
         catalog::Catalog,
-        diff::{diff, explain, DiffMetric},
+        diff::{diff_with_retention, explain_with_retention, DiffMetric},
     };
     if args.from.is_none() && args.since.is_none() {
         return Err(
@@ -132,22 +132,24 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         .file
         .as_ref()
         .ok_or_else(|| crate::CliError::Precondition("new snapshot has no file".into()))?;
-    let new = tidemark_store::Snapshot::open(new_file)
+    let policy = &context.config.retention;
+    let new = tidemark_store::Snapshot::open_with_retention(new_file, policy)
         .with_context(|| format!("open snapshot: {}", super::display_path(new_file)))?;
     let depth = u32::try_from(args.depth)
         .map_err(|_| crate::CliError::Configuration("depth exceeds u32".into()))?;
-    let rows = diff(
+    let rows = diff_with_retention(
         &new,
         old_file,
         &target,
         metric,
         depth,
         args.limit.unwrap_or(25),
+        policy,
     )?;
     let explanation = args
         .explain
         .then(|| {
-            explain(
+            explain_with_retention(
                 &new,
                 old_file,
                 &target,
@@ -155,6 +157,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 args.explain_ratio,
                 args.explain_min.0,
                 5,
+                policy,
             )
         })
         .transpose()?;

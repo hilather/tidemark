@@ -343,3 +343,173 @@ fn list_survives_missing_hot_file_and_corrupt_cold_header() {
         }
     }
 }
+
+fn unlimited(pct: f64) -> tidemark_core::config::RetentionConfig {
+    tidemark_core::config::RetentionConfig {
+        min_free_pct: pct,
+        max_state_size: tidemark_core::units::ByteSize(u64::MAX),
+        ..tidemark_core::config::RetentionConfig::default()
+    }
+}
+
+fn floor_reason(state: &Path, length: u64, pct: f64) -> Option<String> {
+    match tidemark_store::space_guard::space_check(state, length, &unlimited(pct)).unwrap() {
+        tidemark_store::space_guard::SpaceVerdict::Ok => None,
+        tidemark_store::space_guard::SpaceVerdict::Refuse { reason }
+            if reason.contains("free-space floor") =>
+        {
+            Some(reason)
+        }
+        tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
+            panic!("space check at {pct}% refused {length} bytes for another reason: {reason}")
+        }
+    }
+}
+
+fn filesystem_totals(state: &Path) -> tidemark_store::space_guard::FsTotals {
+    let file = std::fs::File::open(state).unwrap();
+    let stat = rustix::fs::fstatvfs(&file).unwrap();
+    tidemark_store::space_guard::FsTotals {
+        size: stat.f_blocks.saturating_mul(stat.f_frsize),
+        avail: stat.f_bavail.saturating_mul(stat.f_frsize),
+    }
+}
+
+fn refuses_frozen(totals: tidemark_store::space_guard::FsTotals, length: u64, pct: f64) -> bool {
+    match tidemark_store::space_guard::space_check_with(|| Ok(totals), 0, length, &unlimited(pct)) {
+        tidemark_store::space_guard::SpaceVerdict::Ok => false,
+        tidemark_store::space_guard::SpaceVerdict::Refuse { reason }
+            if reason.contains("free-space floor") =>
+        {
+            true
+        }
+        tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
+            panic!(
+                "frozen space check at {pct}% refused {length} bytes for another reason: {reason}"
+            )
+        }
+    }
+}
+
+fn first_floor_refusal(totals: tidemark_store::space_guard::FsTotals, pct: f64) -> Option<u64> {
+    let max = i64::MAX as u64 - 1;
+    if !refuses_frozen(totals, max, pct) {
+        return None;
+    }
+    let mut lo = 1u64;
+    let mut hi = max;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if refuses_frozen(totals, mid, pct) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    refuses_frozen(totals, lo, pct).then_some(lo)
+}
+
+/// A declared inflate that `pct` refuses and the 5% default still allows.
+///
+/// The boundary comes from one filesystem snapshot. Searching the live free
+/// space lets a parallel test move the floor and collapse the two policies.
+fn length_between(state: &Path, pct: f64) -> Option<u64> {
+    for _ in 0..4 {
+        let totals = filesystem_totals(state);
+        let strict = first_floor_refusal(totals, pct)?;
+        let loose = first_floor_refusal(totals, 5.0)?;
+        if strict >= loose {
+            return None;
+        }
+        let length = strict + (loose - strict) / 2;
+        if floor_reason(state, length, pct).is_some() && floor_reason(state, length, 5.0).is_none()
+        {
+            return Some(length);
+        }
+    }
+    None
+}
+
+#[test]
+fn cold_commands_enforce_configured_min_free_pct() {
+    let root = test_support::private_tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("child")).unwrap();
+    let state = test_support::private_tempdir().unwrap();
+    let canon = tidemark_fs::canon::canonicalize(root.path()).unwrap();
+    let query = canon.as_path();
+    let mut cfg = Config::default();
+    cfg.general.state_dir = state.path().to_owned();
+    cfg.retention.snapshots.cold_after_recent = false;
+    let now = tidemark_core::time::unix_now();
+    scan(&cfg, query, now - 86_400);
+    scan(&cfg, query, now);
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    let mut entries = catalog.list(None).unwrap();
+    entries.sort_by_key(|entry| entry.started_at);
+    assert_eq!(entries.len(), 2);
+    let older_id = entries[0].scan_id.clone();
+    let newer_id = entries[1].scan_id.clone();
+    let hot = entries[0].file.clone().unwrap();
+    let cold = tidemark_store::cold::compress_snapshot(&hot, 1, &|| false).unwrap();
+    catalog.point_to_cold(&older_id, &cold).unwrap();
+    std::fs::remove_file(&hot).unwrap();
+    drop(catalog);
+    let length = length_between(state.path(), 50.0).expect(
+        "the 2 GiB absolute floor hides 50% on this filesystem; 50% cannot be separated from 5%",
+    );
+    let mut bytes = std::fs::read(&cold).unwrap();
+    bytes[8..16].copy_from_slice(&length.to_le_bytes());
+    std::fs::write(&cold, bytes).unwrap();
+    config_support::direct_config(
+        state.path(),
+        "[retention]\nmin_free_pct = 50.0\nmax_state_size = \"1000TiB\"\n",
+    );
+    let floor = "state filesystem free-space floor would be crossed";
+    for args in [
+        vec![
+            "diff".to_string(),
+            "--from".into(),
+            older_id.clone(),
+            "--to".into(),
+            newer_id,
+            "--depth".into(),
+            "1".into(),
+            query.display().to_string(),
+        ],
+        vec![
+            "top".into(),
+            "--snapshot".into(),
+            older_id,
+            "--depth".into(),
+            "1".into(),
+            query.display().to_string(),
+        ],
+        vec![
+            "top".into(),
+            "--sort".into(),
+            "growth".into(),
+            "--depth".into(),
+            "1".into(),
+            query.display().to_string(),
+        ],
+    ] {
+        let stderr = String::from_utf8(
+            command(state.path(), false)
+                .args(&args)
+                .assert()
+                .code(1)
+                .get_output()
+                .stderr
+                .clone(),
+        )
+        .unwrap();
+        assert!(
+            stderr.contains(floor),
+            "configured 50% was not enforced for {args:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("maximum state size"),
+            "cap masked the percentage for {args:?}: {stderr}"
+        );
+    }
+}
