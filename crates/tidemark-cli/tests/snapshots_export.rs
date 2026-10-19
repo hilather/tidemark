@@ -1,4 +1,4 @@
-//! Owned by: SNAP-export-sqlite
+//! Owned by: WSNAP-export-sqlite
 //! End-to-end `snapshots export --sqlite` from hot and cold snapshots.
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used)]

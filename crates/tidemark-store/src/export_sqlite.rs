@@ -1,4 +1,4 @@
-//! Owned by: SNAP-export-sqlite
+//! Owned by: WSNAP-export-sqlite
 //! Materialise any snapshot (v1, v2 or inflated cold) as a v1-schema SQLite database.
 
 use crate::{
