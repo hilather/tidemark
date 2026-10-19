@@ -64,6 +64,21 @@ fn directory(
         value => Ok(value?),
     }
 }
+#[cfg(test)]
+type ChildOpenHook = Box<dyn FnMut(&[u8])>;
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CHILD_OPEN: std::cell::RefCell<Option<ChildOpenHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn before_child_open(name: &[u8]) {
+    BEFORE_CHILD_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(name);
+        }
+    });
+}
 fn state_usage(path: &Path) -> io::Result<u64> {
     use rustix::fs::{self, Dir, FileType, Mode, OFlags};
     // Iterative DFS has at most 4096 retained directory fds and one entry fd.
@@ -90,12 +105,20 @@ fn state_usage(path: &Path) -> io::Result<u64> {
             continue;
         }
         // O_PATH never reads contents; NOFOLLOW binds this fd to the entry itself.
-        let child = fs::openat(
+        // The API socket and its lock are unlinked while a scan is still measuring
+        // state. A name returned by getdents can be gone before open; that leaf is
+        // not allocated space.
+        #[cfg(test)]
+        before_child_open(name.to_bytes());
+        let child = match fs::openat(
             iter.fd()?,
             name,
             OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
-        )?;
+        ) {
+            Err(rustix::io::Errno::NOENT) => continue,
+            other => other?,
+        };
         if mount_id(&child)? != root_mount {
             continue;
         }
@@ -238,5 +261,31 @@ mod tests {
         let root_link = own.path().join("root-link");
         std::os::unix::fs::symlink(&child, &root_link).unwrap();
         assert!(state_usage(&root_link).is_err());
+    }
+    #[test]
+    fn vanished_leaf_between_getdents_and_open_is_not_usage() {
+        let own = ::test_support::private_tempdir().unwrap();
+        let socket = own.path().join("api.sock");
+        std::fs::write(&socket, vec![1; 8192]).unwrap();
+        let with_socket = state_usage(own.path()).unwrap();
+        let root = own.path().to_owned();
+        BEFORE_CHILD_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |name| {
+                if name == b"api.sock" {
+                    let _ = std::fs::remove_file(root.join("api.sock"));
+                }
+            }));
+        });
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                BEFORE_CHILD_OPEN.with(|hook| *hook.borrow_mut() = None);
+            }
+        }
+        let _clear = Clear;
+        let raced = state_usage(own.path()).unwrap();
+        let gone = state_usage(own.path()).unwrap();
+        assert!(with_socket > gone);
+        assert_eq!(raced, gone);
     }
 }
