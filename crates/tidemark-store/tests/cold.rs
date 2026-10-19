@@ -267,12 +267,18 @@ fn roundtrip_all_reader_methods_and_drop() {
         0
     );
     let dest = tmp.path().join("restored.db");
-    inflate_to(&cold, &dest, &RetentionConfig::default()).unwrap();
+    let Some(policy) = permissive_inflate(tmp.path(), &hot) else {
+        return;
+    };
+    inflate_to(&cold, &dest, &policy).unwrap();
     assert_eq!(fs::read(dest).unwrap(), fs::read(hot).unwrap());
 }
 #[test]
 fn corrupt_headers_frames_lengths_and_destination_collisions() {
     let (tmp, hot) = write_fixture(3);
+    let Some(policy) = permissive_inflate(tmp.path(), &hot) else {
+        return;
+    };
     let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
     let original = fs::read(&cold).unwrap();
     let dest = tmp.path().join("out.db");
@@ -296,14 +302,14 @@ fn corrupt_headers_frames_lengths_and_destination_collisions() {
         }
         fs::write(&cold, bytes).unwrap();
         assert!(
-            inflate_to(&cold, &dest, &RetentionConfig::default()).is_err(),
+            inflate_to(&cold, &dest, &policy).is_err(),
             "mutation {mutation}"
         );
         assert!(!dest.exists());
     }
     fs::write(&cold, original).unwrap();
-    inflate_to(&cold, &dest, &RetentionConfig::default()).unwrap();
-    assert!(inflate_to(&cold, &dest, &RetentionConfig::default()).is_err());
+    inflate_to(&cold, &dest, &policy).unwrap();
+    assert!(inflate_to(&cold, &dest, &policy).is_err());
     assert!(compress_snapshot(&hot, 1, &|| false).is_err());
 }
 #[test]
@@ -914,6 +920,21 @@ fn unlimited(pct: f64) -> RetentionConfig {
         max_state_size: tidemark_core::units::ByteSize(u64::MAX),
         ..RetentionConfig::default()
     }
+}
+
+/// Policy for tests that are not about the free-space floor: 0% and no cap.
+///
+/// That policy still leaves the mandatory 2 GiB floor. Returns `None` when the
+/// floor refuses `hot`'s payload, so the caller skips instead of failing.
+fn permissive_inflate(dir: &Path, hot: &Path) -> Option<RetentionConfig> {
+    let estimate = fs::metadata(hot).unwrap().len();
+    if refuses_frozen(filesystem_totals(dir), estimate, 0.0) {
+        eprintln!(
+            "skipped: mandatory free-space floor refuses inflate_to even at min_free_pct 0 with no cap"
+        );
+        return None;
+    }
+    Some(unlimited(0.0))
 }
 
 fn floor_reason(state: &Path, length: u64, pct: f64) -> Option<String> {

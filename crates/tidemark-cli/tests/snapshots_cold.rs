@@ -27,7 +27,7 @@ impl ScanRecorder for Recorder {
         Ok(())
     }
 }
-fn scan(cfg: &Config, root: &Path, now: i64) {
+fn run_fixture_scan(cfg: &Config, root: &Path, now: i64) -> Result<(), ScanError> {
     let req = ScanRequest {
         root: RawPath::from_path(root).unwrap(),
         mode: ModeRequest::Walk,
@@ -44,9 +44,12 @@ fn scan(cfg: &Config, root: &Path, now: i64) {
         &AtomicBool::new(false),
         &|_| {},
         &|| now,
-    )
-    .unwrap();
+    )?;
     assert!(out.file.unwrap().exists());
+    Ok(())
+}
+fn scan(cfg: &Config, root: &Path, now: i64) {
+    run_fixture_scan(cfg, root, now).unwrap();
 }
 
 #[path = "support/config.rs"]
@@ -469,9 +472,23 @@ fn cold_commands_enforce_configured_min_free_pct() {
     let mut cfg = Config::default();
     cfg.general.state_dir = state.path().to_owned();
     cfg.retention.snapshots.cold_after_recent = false;
+    if absolute_floor_hides_percentage(filesystem_totals(state.path()), 50.0) {
+        eprintln!(
+            "skipped: filesystem is too small to host a declared inflate length that 50% refuses and 5% allows"
+        );
+        return;
+    }
     let now = tidemark_core::time::unix_now();
-    scan(&cfg, query, now - 86_400);
-    scan(&cfg, query, now);
+    for stamp in [now - 86_400, now] {
+        match run_fixture_scan(&cfg, query, stamp) {
+            Ok(()) => {}
+            Err(ScanError::NoSpace) => {
+                eprintln!("skipped: fixture scan was refused by the free-space floor");
+                return;
+            }
+            Err(error) => panic!("fixture scan failed: {error}"),
+        }
+    }
     let catalog = Catalog::open(state.path(), true).unwrap();
     let mut entries = catalog.list(None).unwrap();
     entries.sort_by_key(|entry| entry.started_at);
