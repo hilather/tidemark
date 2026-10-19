@@ -572,8 +572,15 @@ size = 8192
         "live rows retain Unix seconds from stat, through aggregation and refresh"
     );
     let screen = render(&b, 160, 48);
-    let row = screen.lines().find(|line| line.contains("a/")).unwrap();
-    assert!(row.contains(&draw::fmt_when(newest, b.clock)), "{row}");
+    let when = draw::fmt_when(newest, b.clock);
+    // The header and depth title repeat the temp root. A path such as
+    // `/tmp/data/x` contains the substring `a/`, so match the listing row.
+    let row = screen
+        .lines()
+        .skip_while(|line| !line.contains("NEWEST"))
+        .find(|line| line.contains("a/"))
+        .unwrap();
+    assert!(row.contains(&when), "{row}");
     assert_eq!(
         b.rows[0].0.t_disk,
         test_support::oracle::du_disk(fixture.root.join("a"))
