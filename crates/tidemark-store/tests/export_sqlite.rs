@@ -634,7 +634,7 @@ fn quota_probe(dir: &Path) -> Option<i32> {
 }
 
 #[test]
-fn fix3_s1_write_failure_is_classified_before_cleanup_frees_space() {
+fn fix3_s1_persistent_quota_is_space_and_unconfirmed_io_error_is_runtime() {
     let a = test_support::private_tempdir().unwrap();
     let hot = write_v1(a.path());
     let snap = Snapshot::open(&hot).unwrap();
@@ -649,7 +649,9 @@ fn fix3_s1_write_failure_is_classified_before_cleanup_frees_space() {
         );
         assert_eq!(leftovers, 0, "{stage}");
     }
-    // An unrelated write error (probe finds the directory healthy) keeps its class.
+    // Control: SQLite I/O error not confirmed as space → exit 1 (by design). The probe finds
+    // the directory healthy, so the error stays a runtime error even if the cause was a
+    // transient quota hit.
     let (result, _) = export_with_fault(&snap, "finish", || sqlite_failure(778), |_| None);
     assert!(matches!(result, Err(StoreError::Sql(_))), "{result:?}");
 }
