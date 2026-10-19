@@ -1,0 +1,24 @@
+VERDICT: READY
+BLOCKER 0 / SHOULD-FIX 0 / NOTE 0
+
+Reviewed exact candidate `a9be5d55a37e05de131d1b8bd19cc2390b3cd133` against base `21846e540ba7aca2b9deb5a3f35e36fe3e0fc5e4`: the two `SNAP-staging-nospace:` commits, `f1d6643` and `a9be5d5`. The supplied checkout is integration commit `cd83d7951e1ed15a77a08500a9f71aadcf8d89d5`; its later SQLite-export changes are outside this review. Builds used an unchanged archive of the exact candidate. Read review21, the task handoff and the relevant orchestrator, storage, interface and snapshot-v2 contracts. No concrete defect was found in the scoped change.
+
+**Review21's staging-row SHOULD-FIX is fixed.** At the 100,000-input-row checkpoint, `writer_v2.rs:206` returns `StoreError::Space`. All seven `WriterSink` row methods propagate storage errors as `SinkError::Store` (`orchestrator.rs:1042–1101`), and `PreparedAggregation::write` wraps them in `AggError::Sink` (`agg/mod.rs:575–601`). The `written?` at `orchestrator.rs:570` now invokes the manual conversion at lines 1460–1468, which routes the storage error through the existing `From<StoreError>` at lines 1447–1458 and produces `ScanError::NoSpace`.
+
+The new `staging_nospace.rs` regression exercises that real checkpoint: it completes a first scan, sets a 16 MiB state cap, writes a private 32 MiB leaf after the second scan's preflight, and supplies 100,000 root annotations. On the candidate it passes the NoSpace assertion and verifies the prior snapshot still exists, exactly one failed catalog entry has no file, and no `.tmp` leaves remain. The exact, unmodified test source compiled against unchanged base libraries fails at its NoSpace assertion (`staging_nospace.rs:88`, exit 101). This demonstrates a regression that detects the fix, rather than merely exercising the already-working preflight or conversion refusal.
+
+Existing direct CLI dispatch maps `NoSpace` to `CliError::Precondition` and exit 5 (`tidemark-cli/src/cmd/scan.rs:262–276,291–304`; `src/lib.rs:58–65`). The daemon's matching branch publishes `StateSpaceRefused(true)` and degraded state-space health (`tidemarkd/src/scheduler.rs:895–901`). These downstream conclusions are from source inspection, not a live CLI/daemon fault injection. The staging checkpoint occurs after `scan_started` acknowledges the scan; this does not establish a synchronous `scan.start` API refusal.
+
+**Other typed wrappers change, but no changed caller behavior was found.** The new match unwraps every `Agg(Sink(Store(e)))`, so non-space failures such as `StoreError::Sql` or `StoreError::Integer` now become `ScanError::Store(e)` instead of `ScanError::Agg(...)`. Their transparent messages are unchanged; both wrappers still take the CLI Runtime/exit-1 branch and the same daemon failure/retry path. Other aggregation errors, including `SinkError::Other`, remain `ScanError::Agg`. This broader wrapper normalization is stated in the handoff and is not a demonstrated defect.
+
+No remaining policy-space refusal bypass was found in the scan publication boundary. Preflight still returns `NoSpace` (`orchestrator.rs:1275`); conversion callback and conversion-headroom refusals (`writer_v2.rs:459,477`) still use `finish_snapshot` and the existing storage conversion (`orchestrator.rs:1475–1483`). Cancellation precedence before `written?`, finish-time cancellation/publication-collision handling, failed-catalog recording (`orchestrator.rs:1291–1308`), and temporary-file removal on writer drop (`writer_v2.rs:720–728`) are unchanged. The existing conversion, cancellation, collision and cleanup tests pass alongside the new staging regression.
+
+Validation used Rust 1.98.0, with no production or repository test edits:
+
+- `cargo test --offline --manifest-path target/review23/candidate/Cargo.toml -p tidemark-scan --lib --tests`: exit 0; 91 passed, 4 ignored.
+- Base `conversion_nospace` test target built with `--offline --no-run` to provide its unchanged libraries; the exact candidate staging test was then compiled with `rustc --test` against those libraries. Compilation passed; the expected assertion failure returned exit 101.
+- `cargo clean --offline`: exit 0; removed both builds and the temporary archives under the checkout's ignored `target/` directory.
+
+Supporting artifacts are in this attempt's worker-output `library/`: `candidate.diff`, the unchanged `staging_nospace.rs`, `validation-context.json`, `test-summary.json`, and build/test/cleanup logs. Candidate test log SHA-256: `cd6939cc18c2575f74f7a1bf2b64ba322dbc8eeaffee1179c0ec97759eb92337`. Base regression log SHA-256: `ec8c8c12096cad87ad4d2f3af3234fe392b882a3fb71c0109fed6945eb636a77`.
+
+No privileged commands, VM tests, physical ENOSPC experiment or ignored scale tests were run. Full-workspace CI, clippy and privileged-feature compilation were not repeated. This report is review evidence, not release or integration approval.

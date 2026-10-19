@@ -668,7 +668,7 @@ pub enum ScanError {
     Store(tidemark_store::StoreError),
     /// Aggregation failed.
     #[error(transparent)]
-    Agg(#[from] crate::agg::AggError),
+    Agg(crate::agg::AggError),
     /// Walk failed.
     #[error(transparent)]
     Walk(#[from] tidemark_fs::walk::WalkError),
@@ -1453,6 +1453,16 @@ impl From<tidemark_store::StoreError> for ScanError {
                 ScanError::NoSpace
             }
             other => ScanError::Store(other),
+        }
+    }
+}
+
+impl From<crate::agg::AggError> for ScanError {
+    /// Staging-row space refusals keep the `NoSpace` category.
+    fn from(e: crate::agg::AggError) -> Self {
+        match e {
+            crate::agg::AggError::Sink(crate::agg::SinkError::Store(se)) => se.into(),
+            other => ScanError::Agg(other),
         }
     }
 }

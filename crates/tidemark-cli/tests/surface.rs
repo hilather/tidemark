@@ -107,7 +107,7 @@ fn complete_command_and_flag_tree() {
     for (parent, children) in [
         (
             "snapshots",
-            vec!["list", "show", "prune", "rebuild-catalog"],
+            vec!["list", "show", "export", "prune", "rebuild-catalog"],
         ),
         ("export", vec!["ncdu"]),
         ("deploy", vec!["stage", "verify", "unstage"]),
@@ -133,6 +133,7 @@ fn nested_flags_and_short_options() {
     for (parent, child, flags) in [
         ("snapshots", "list", vec!["root"]),
         ("snapshots", "show", vec!["id", "root"]),
+        ("snapshots", "export", vec!["sqlite", "id", "out", "root"]),
         ("snapshots", "prune", vec!["root", "dry_run"]),
         ("snapshots", "rebuild-catalog", vec!["root"]),
         (
