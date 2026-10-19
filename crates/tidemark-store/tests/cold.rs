@@ -904,3 +904,210 @@ fn quarantine_collision_does_not_stop_later_cold_pointer_repair() {
         "later cold-only entry must be repaired in the same cleanup"
     );
 }
+
+fn unlimited(pct: f64) -> RetentionConfig {
+    RetentionConfig {
+        min_free_pct: pct,
+        max_state_size: tidemark_core::units::ByteSize(u64::MAX),
+        ..RetentionConfig::default()
+    }
+}
+
+fn floor_reason(state: &Path, length: u64, pct: f64) -> Option<String> {
+    match tidemark_store::space_guard::space_check(state, length, &unlimited(pct)).unwrap() {
+        tidemark_store::space_guard::SpaceVerdict::Ok => None,
+        tidemark_store::space_guard::SpaceVerdict::Refuse { reason }
+            if reason.contains("free-space floor") =>
+        {
+            Some(reason)
+        }
+        tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
+            panic!("space check at {pct}% refused {length} bytes for another reason: {reason}")
+        }
+    }
+}
+
+fn filesystem_totals(state: &Path) -> tidemark_store::space_guard::FsTotals {
+    let file = fs::File::open(state).unwrap();
+    let stat = rustix::fs::fstatvfs(&file).unwrap();
+    tidemark_store::space_guard::FsTotals {
+        size: stat.f_blocks.saturating_mul(stat.f_frsize),
+        avail: stat.f_bavail.saturating_mul(stat.f_frsize),
+    }
+}
+
+fn refuses_frozen(totals: tidemark_store::space_guard::FsTotals, length: u64, pct: f64) -> bool {
+    match tidemark_store::space_guard::space_check_with(|| Ok(totals), 0, length, &unlimited(pct)) {
+        tidemark_store::space_guard::SpaceVerdict::Ok => false,
+        tidemark_store::space_guard::SpaceVerdict::Refuse { reason }
+            if reason.contains("free-space floor") =>
+        {
+            true
+        }
+        tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
+            panic!(
+                "frozen space check at {pct}% refused {length} bytes for another reason: {reason}"
+            )
+        }
+    }
+}
+
+fn first_floor_refusal(totals: tidemark_store::space_guard::FsTotals, pct: f64) -> Option<u64> {
+    let max = i64::MAX as u64 - 1;
+    if !refuses_frozen(totals, max, pct) {
+        return None;
+    }
+    let mut lo = 1u64;
+    let mut hi = max;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if refuses_frozen(totals, mid, pct) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    refuses_frozen(totals, lo, pct).then_some(lo)
+}
+
+/// A declared inflate that `pct` refuses and the 5% default still allows.
+///
+/// The boundary comes from one filesystem snapshot. Searching the live free
+/// space lets a parallel test move the floor and collapse the two policies.
+fn length_between(state: &Path, pct: f64) -> Option<u64> {
+    for _ in 0..4 {
+        let totals = filesystem_totals(state);
+        let strict = first_floor_refusal(totals, pct)?;
+        let loose = first_floor_refusal(totals, 5.0)?;
+        if strict >= loose {
+            return None;
+        }
+        let length = strict + (loose - strict) / 2;
+        if floor_reason(state, length, pct).is_some() && floor_reason(state, length, 5.0).is_none()
+        {
+            return Some(length);
+        }
+    }
+    None
+}
+
+fn declare_length(cold: &Path, length: u64) {
+    let mut bytes = fs::read(cold).unwrap();
+    bytes[8..16].copy_from_slice(&length.to_le_bytes());
+    fs::write(cold, bytes).unwrap();
+}
+
+fn must_err<T>(result: Result<T, StoreError>) -> StoreError {
+    match result {
+        Ok(_) => panic!("expected the cold inflate to fail"),
+        Err(error) => error,
+    }
+}
+
+#[test]
+fn snapshot_open_cold_path_enforces_configured_min_free_pct() {
+    use tidemark_store::diff::{diff_with_retention, explain_with_retention, DiffMetric};
+    use tidemark_store::space_guard::{space_check_with, FsTotals, SpaceVerdict};
+    let size = 100 << 30;
+    let avail = 40 << 30;
+    assert!(matches!(
+        space_check_with(
+            || Ok(FsTotals { size, avail }),
+            0,
+            1,
+            &unlimited(50.0)
+        ),
+        SpaceVerdict::Refuse { reason } if reason.contains("free-space floor")
+    ));
+    assert!(matches!(
+        space_check_with(|| Ok(FsTotals { size, avail }), 0, 1, &unlimited(5.0)),
+        SpaceVerdict::Ok
+    ));
+
+    let (state, hot) = catalog_fixture();
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    let length = length_between(state.path(), 50.0).expect(
+        "the 2 GiB absolute floor hides 50% on this filesystem; 50% cannot be separated from 5%",
+    );
+    declare_length(&cold, length);
+    let inflate = cold.parent().unwrap().join(".inflate");
+    let strict = unlimited(50.0);
+    let loose = unlimited(5.0);
+    let expected = floor_reason(state.path(), length, 50.0).unwrap();
+    assert!(floor_reason(state.path(), length, 5.0).is_none());
+
+    match tidemark_store::space_guard::inflate_check(&cold, length, &strict) {
+        Err(StoreError::Space(reason)) => assert_eq!(reason, expected),
+        other => panic!("inflate_check ignored 50%: {other:?}"),
+    }
+    assert!(tidemark_store::space_guard::inflate_check(&cold, length, &loose).is_ok());
+
+    match must_err(Snapshot::open_with_retention(&cold, &strict)) {
+        StoreError::Space(reason) => assert_eq!(reason, expected),
+        other => panic!("Snapshot::open cold path ignored 50%: {other}"),
+    }
+    assert!(
+        !inflate.exists(),
+        "refusing the free-space floor must not create an inflate leaf"
+    );
+    match must_err(Snapshot::open_with_retention(&cold, &loose)) {
+        StoreError::Invalid(reason) => assert!(reason.contains("length"), "{reason}"),
+        other => panic!("5% should pass the guard and reject the declared length: {other}"),
+    }
+
+    let new = Snapshot::open(&hot).unwrap();
+    let root = meta().root;
+    match must_err(diff_with_retention(
+        &new,
+        &cold,
+        &root,
+        DiffMetric::Disk,
+        1,
+        10,
+        &strict,
+    )) {
+        StoreError::Space(reason) => assert_eq!(reason, expected),
+        other => panic!("diff inflate ignored 50%: {other}"),
+    }
+    match must_err(explain_with_retention(
+        &new,
+        &cold,
+        &root,
+        DiffMetric::Disk,
+        0.5,
+        1,
+        5,
+        &strict,
+    )) {
+        StoreError::Space(reason) => assert_eq!(reason, expected),
+        other => panic!("explain inflate ignored 50%: {other}"),
+    }
+}
+
+#[test]
+fn cleanup_inflate_enforces_configured_min_free_pct() {
+    let (state, hot) = catalog_fixture();
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    catalog.rebuild_from_files().unwrap();
+    let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
+    let length = length_between(state.path(), 50.0).expect(
+        "the 2 GiB absolute floor hides 50% on this filesystem; 50% cannot be separated from 5%",
+    );
+    declare_length(&cold, length);
+    drop(catalog);
+    tidemark_store::catalog::cleanup_abandoned_scans_with_policy(
+        state.path(),
+        123,
+        &unlimited(50.0),
+    );
+    assert!(hot.exists() && cold.exists());
+    assert!(!cold.with_extension("zst.bad").exists());
+    tidemark_store::catalog::cleanup_abandoned_scans_with_policy(
+        state.path(),
+        123,
+        &unlimited(5.0),
+    );
+    assert!(hot.exists());
+    assert!(!cold.exists());
+    assert!(cold.with_extension("zst.bad").exists());
+}

@@ -7,7 +7,7 @@ use std::{
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf},
 };
-use tidemark_core::{path::RawPath, scan::ScanMode};
+use tidemark_core::{config::RetentionConfig, path::RawPath, scan::ScanMode};
 /// Encode root bytes injectively for the snapshot directory name.
 pub fn root_slug(root: &RawPath) -> String {
     let mut out = String::new();
@@ -677,10 +677,18 @@ fn recover_catalog_owned(
 /// recording its own running scan. `now` is the repair timestamp in UTC seconds.
 /// Errors are logged independently so file failures do not prevent row repair.
 pub fn cleanup_abandoned_scans(state_dir: &Path, now: i64) {
+    cleanup_abandoned_scans_with_policy(state_dir, now, &RetentionConfig::default())
+}
+/// Repair abandoned scans, inflating cold pairs under `policy`.
+///
+/// The caller MUST hold the exclusive host scan lock and must call this before
+/// recording its own running scan. `now` is the repair timestamp in UTC seconds.
+/// Errors are logged independently so file failures do not prevent row repair.
+pub fn cleanup_abandoned_scans_with_policy(state_dir: &Path, now: i64, policy: &RetentionConfig) {
     if let Err(error) = cleanup_temporaries(state_dir) {
         tracing::warn!(%error, "snapshot temporary cleanup failed");
     }
-    if let Err(error) = cleanup_cold(state_dir) {
+    if let Err(error) = cleanup_cold(state_dir, policy) {
         tracing::warn!(%error, "cold snapshot cleanup failed");
     }
     if let Err(error) = repair_running(state_dir, now) {
@@ -829,7 +837,7 @@ fn pair_validity(result: Result<(), StoreError>) -> Option<bool> {
 
 // Readers retain a flock on each inflated leaf. An unlocked inode is stale regardless
 // of PID reuse; cleanup does not guess process liveness or consult the wall clock.
-fn cleanup_cold(state: &Path) -> Result<(), StoreError> {
+fn cleanup_cold(state: &Path, policy: &RetentionConfig) -> Result<(), StoreError> {
     use std::ffi::OsStr;
     let verified = crate::state_dir::StateDir::open(state, false)?;
     let snapshots = match verified.subdir(OsStr::new("snapshots"), false) {
@@ -901,7 +909,7 @@ fn cleanup_cold(state: &Path) -> Result<(), StoreError> {
                         continue;
                     }
                     let hot_valid = pair_validity(crate::cold::valid_hot(&hot_path).map(|_| ()));
-                    let cold_valid = pair_validity(crate::cold::valid_cold(&path));
+                    let cold_valid = pair_validity(crate::cold::valid_cold(&path, policy));
                     let (keep, bad) = match (hot_valid, cold_valid) {
                         (Some(true), Some(false)) => (&hot_path, &path),
                         (Some(false), Some(true)) => (&path, &hot_path),
@@ -950,7 +958,7 @@ fn cleanup_cold(state: &Path) -> Result<(), StoreError> {
                     rustix::fs::fsync(dir.fd()).map_err(std::io::Error::from)?;
                     tracing::warn!(hot=%hot_path.display(), cold=%path.display(),
                         "quarantined invalid snapshot pair member");
-                } else if crate::cold::valid_cold(&path).is_ok() {
+                } else if crate::cold::valid_cold(&path, policy).is_ok() {
                     Catalog::open(state, true)?.point_to_cold(scan, &path)?;
                 }
             }

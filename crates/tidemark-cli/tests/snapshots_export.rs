@@ -225,9 +225,9 @@ fn export_refuses_stdout_dash() {
         .stderr
         .clone();
     let refused = String::from_utf8(refused).unwrap();
-    assert!(
-        refused.contains("output path '-' is not supported"),
-        "{refused}"
+    assert_eq!(
+        refused,
+        "output path '-' is not supported; pass a file path\n"
     );
     assert!(!out.path().join("-").exists());
     assert_no_staging(out.path());

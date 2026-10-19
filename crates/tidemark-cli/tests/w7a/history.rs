@@ -180,7 +180,9 @@ fn cache_has_path_and_byte_bounds_and_oversized_paths_still_query() {
 }
 
 fn pause(h: &mut History) -> Arc<Shared> {
-    let worker = h.worker.get_or_insert_with(Worker::new);
+    let worker = h
+        .worker
+        .get_or_insert_with(|| Worker::new(tidemark_core::config::RetentionConfig::default()));
     worker.shared.lock().paused = true;
     worker.shared.clone()
 }

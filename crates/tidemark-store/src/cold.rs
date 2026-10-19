@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tidemark_core::{
+    config::RetentionConfig,
     path::RawPath,
     snapshot::{DirRow, SnapshotMeta},
 };
@@ -145,8 +146,8 @@ fn snapshot_header(snapshot: &Snapshot, length: u64) -> Result<ColdHeader> {
         uncompressed_len: length,
     })
 }
-fn checked_snapshot(path: &Path, scan: &str) -> Result<Snapshot> {
-    let snapshot = Snapshot::open(path)?;
+fn checked_snapshot(path: &Path, scan: &str, policy: &RetentionConfig) -> Result<Snapshot> {
+    let snapshot = Snapshot::open_with_retention(path, policy)?;
     let check: String = snapshot
         .conn()
         .pragma_query_value(None, "quick_check", |r| r.get(0))?;
@@ -164,7 +165,7 @@ pub(crate) fn valid_hot(path: &Path) -> Result<Snapshot> {
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| StoreError::Invalid("invalid hot filename".into()))?;
-    checked_snapshot(path, scan)
+    checked_snapshot(path, scan, &RetentionConfig::default())
 }
 fn header_matches_snapshot(header: &ColdHeader, snapshot: &Snapshot) -> Result<()> {
     let actual = snapshot_header(snapshot, header.uncompressed_len)?;
@@ -178,8 +179,8 @@ fn header_matches_snapshot(header: &ColdHeader, snapshot: &Snapshot) -> Result<(
     }
     Ok(())
 }
-/// Fully validate a cold member using a guarded, bounded-memory inflate leaf.
-pub(crate) fn valid_cold(path: &Path) -> Result<()> {
+/// Fully validate a cold member, inflating under `policy`'s free-space floor.
+pub(crate) fn valid_cold(path: &Path, policy: &RetentionConfig) -> Result<()> {
     let header = read_cold_header(path)?;
     let scan = header.metadata()?.scan_id.to_string();
     if path.file_name() != Some(OsStr::new(&format!("{scan}.db.zst"))) {
@@ -187,7 +188,7 @@ pub(crate) fn valid_cold(path: &Path) -> Result<()> {
             "cold filename identity mismatch".into(),
         ));
     }
-    let snapshot = checked_snapshot(path, &scan)?;
+    let snapshot = checked_snapshot(path, &scan, policy)?;
     header_matches_snapshot(&header, &snapshot)
 }
 /// Stream a complete snapshot to an exclusive temporary, sync, rename without replacement,

@@ -74,6 +74,11 @@ fn command_error(error: anyhow::Error) -> CliError {
         CliError::Precondition(message) if message.starts_with("output path already exists:") => {
             Some(message.clone())
         }
+        CliError::Configuration(message)
+            if message.starts_with("output path '-' is not supported") =>
+        {
+            Some(message.clone())
+        }
         _ => None,
     });
     let message = match unprefixed {
@@ -325,6 +330,20 @@ mod tests {
         let error = command_error(error);
         assert_eq!(error.exit_code(), 5);
         assert_eq!(error.to_string(), "output path already exists: /tmp/out");
+    }
+
+    #[test]
+    fn dash_output_errors_omit_the_command_subject() {
+        let error = anyhow::Error::new(CliError::Configuration(
+            "output path '-' is not supported; pass a file path".into(),
+        ))
+        .context("snapshots: /var/lib/tidemark");
+        let error = command_error(error);
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(
+            error.to_string(),
+            "output path '-' is not supported; pass a file path"
+        );
     }
 }
 

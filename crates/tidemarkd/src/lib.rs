@@ -1109,7 +1109,12 @@ pub fn run_controlled(
     // Both storage opens perform header preflight before SQLite. Recovery is corruption-only.
     let storage = state.storage_path();
     let catalog = retry_start("catalog", &state, &shutdown, || {
-        startup_catalog(&storage, options.now, Duration::from_secs(30))
+        startup_catalog_with(
+            &storage,
+            options.now,
+            Duration::from_secs(30),
+            &config.retention,
+        )
     })?;
     // Read catalog history before treating any configured root as measured never-scanned.
     for root in &config.roots {
@@ -1468,10 +1473,24 @@ fn join_until(
     }
     result
 }
+#[cfg(test)]
 fn startup_catalog(
     storage: &std::path::Path,
     now: i64,
     wait: Duration,
+) -> Result<tidemark_store::catalog::Catalog, DaemonError> {
+    startup_catalog_with(
+        storage,
+        now,
+        wait,
+        &tidemark_core::config::RetentionConfig::default(),
+    )
+}
+fn startup_catalog_with(
+    storage: &std::path::Path,
+    now: i64,
+    wait: Duration,
+    policy: &tidemark_core::config::RetentionConfig,
 ) -> Result<tidemark_store::catalog::Catalog, DaemonError> {
     // Probe without migrations or writes before deciding whether to wait.
     let needs_recovery = match tidemark_store::catalog::Catalog::open(storage, false) {
@@ -1540,7 +1559,9 @@ fn startup_catalog(
             .map_err(startup_store_error)?;
         // Cleanup requires scan exclusion after normal writer ownership is retained.
         match tidemark_scan::orchestrator::ScanLock::acquire(storage) {
-            Ok(_lock) => tidemark_store::catalog::cleanup_abandoned_scans(storage, now),
+            Ok(_lock) => {
+                tidemark_store::catalog::cleanup_abandoned_scans_with_policy(storage, now, policy)
+            }
             Err(tidemark_scan::orchestrator::ScanError::Busy) => {
                 tracing::info!("startup scan cleanup skipped: host scan lock is held");
             }
@@ -1552,7 +1573,7 @@ fn startup_catalog(
     let catalog = match &lock {
         Some(lock) => {
             let catalog = lock.open_catalog(storage).map_err(startup_scan_error)?;
-            tidemark_store::catalog::cleanup_abandoned_scans(storage, now);
+            tidemark_store::catalog::cleanup_abandoned_scans_with_policy(storage, now, policy);
             catalog
         }
         None => {

@@ -7,7 +7,7 @@ use crate::{
     StoreError,
 };
 use std::{cmp::Ordering, collections::BinaryHeap, path::Path};
-use tidemark_core::{path::RawPath, snapshot::DirRow};
+use tidemark_core::{config::RetentionConfig, path::RawPath, snapshot::DirRow};
 /// Snapshot counter selected for comparison.
 #[derive(Debug, Clone, Copy)]
 pub enum DiffMetric {
@@ -61,8 +61,28 @@ pub fn diff(
     max_depth_rel: u32,
     limit: usize,
 ) -> Result<Vec<DiffRow>, StoreError> {
+    diff_with_retention(
+        new,
+        old,
+        target,
+        metric,
+        max_depth_rel,
+        limit,
+        &RetentionConfig::default(),
+    )
+}
+/// Compare snapshots, applying `policy` when `old` is a cold inflate.
+pub fn diff_with_retention(
+    new: &Snapshot,
+    old: &Path,
+    target: &RawPath,
+    metric: DiffMetric,
+    max_depth_rel: u32,
+    limit: usize,
+    policy: &RetentionConfig,
+) -> Result<Vec<DiffRow>, StoreError> {
     check_limit(limit)?;
-    let old = Snapshot::open(old)?;
+    let old = Snapshot::open_with_retention(old, policy)?;
     check_roots(new, &old)?;
     let n = new.dir_by_path(target)?;
     let o = old.dir_by_path(target)?;
@@ -117,11 +137,34 @@ pub fn explain(
     min_bytes: u64,
     top: usize,
 ) -> Result<Explanation, StoreError> {
+    explain_with_retention(
+        new,
+        old,
+        target,
+        metric,
+        ratio,
+        min_bytes,
+        top,
+        &RetentionConfig::default(),
+    )
+}
+/// Follow the dominant child, applying `policy` when `old` is a cold inflate.
+#[allow(clippy::too_many_arguments)]
+pub fn explain_with_retention(
+    new: &Snapshot,
+    old: &Path,
+    target: &RawPath,
+    metric: DiffMetric,
+    ratio: f64,
+    min_bytes: u64,
+    top: usize,
+    policy: &RetentionConfig,
+) -> Result<Explanation, StoreError> {
     check_limit(top)?;
     if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
         return Err(StoreError::Invalid("explain ratio must be in (0,1]".into()));
     }
-    let old = Snapshot::open(old)?;
+    let old = Snapshot::open_with_retention(old, policy)?;
     check_roots(new, &old)?;
     let mut path = target.clone();
     let mut n = new.dir_by_path(&path)?;

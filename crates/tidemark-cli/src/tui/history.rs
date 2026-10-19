@@ -11,7 +11,9 @@ use std::{
     },
     thread::JoinHandle,
 };
-use tidemark_core::{path::RawPath, scan::SnapshotStatus, snapshot::SnapshotMeta};
+use tidemark_core::{
+    config::RetentionConfig, path::RawPath, scan::SnapshotStatus, snapshot::SnapshotMeta,
+};
 use tidemark_store::reader::Snapshot;
 
 pub(super) const SAMPLES: usize = 7;
@@ -118,6 +120,7 @@ struct Shared {
     discarded: AtomicU64,
     #[cfg(test)]
     readers: AtomicU64,
+    retention: RetentionConfig,
 }
 
 impl Shared {
@@ -147,7 +150,7 @@ impl Shared {
                     .unwrap_or_else(|error| error.into_inner());
             }
         }
-        Snapshot::open(file)
+        Snapshot::open_with_retention(file, &self.retention)
     }
 }
 
@@ -157,8 +160,11 @@ struct Worker {
 }
 
 impl Worker {
-    fn new() -> Self {
-        let shared = Arc::new(Shared::default());
+    fn new(policy: RetentionConfig) -> Self {
+        let shared = Arc::new(Shared {
+            retention: policy,
+            ..Shared::default()
+        });
         let worker = shared.clone();
         let thread = std::thread::spawn(move || {
             let mut readers: Vec<(Entry, Snapshot)> = Vec::new();
@@ -327,9 +333,17 @@ pub(super) struct History {
     cache: VecDeque<Cached>,
     bytes: usize,
     worker: Option<Worker>,
+    retention: RetentionConfig,
 }
 
 impl History {
+    /// Retention floor used when the worker opens a cold snapshot.
+    ///
+    /// Must be set before the first [`Self::update`] that starts the worker.
+    pub(super) fn set_retention(&mut self, policy: RetentionConfig) {
+        self.retention = policy;
+    }
+
     pub fn prepare_window(&mut self, meta: &SnapshotMeta, file: &Path, catalog: &[CatalogRow]) {
         if self
             .opened
@@ -392,7 +406,8 @@ impl History {
                 && (self.samples.iter().any(Option::is_none)
                     || (window_changed && self.worker.is_some()))
             {
-                let worker = self.worker.get_or_insert_with(Worker::new);
+                let policy = self.retention.clone();
+                let worker = self.worker.get_or_insert_with(|| Worker::new(policy));
                 let mut mailbox = worker.shared.lock();
                 worker
                     .shared

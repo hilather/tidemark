@@ -9,7 +9,9 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
-use tidemark_core::{api::*, config::MetricsConfig, scan::SnapshotStatus, snapshot::DirRow};
+use tidemark_core::{
+    api::*, config::MetricsConfig, config::RetentionConfig, scan::SnapshotStatus, snapshot::DirRow,
+};
 use tidemark_live::alerts::AlertSource;
 
 /// Default candidate capacity per family; reconciled to the configured series cap.
@@ -27,16 +29,22 @@ struct CachedRoot {
 pub struct SnapshotMetrics {
     roots: RwLock<BTreeMap<Vec<u8>, CachedRoot>>,
     capacity: std::sync::atomic::AtomicUsize,
+    retention: RwLock<RetentionConfig>,
 }
 impl Default for SnapshotMetrics {
     fn default() -> Self {
         Self {
             roots: RwLock::new(BTreeMap::new()),
             capacity: std::sync::atomic::AtomicUsize::new(DEFAULT_CANDIDATES),
+            retention: RwLock::new(RetentionConfig::default()),
         }
     }
 }
 impl SnapshotMetrics {
+    /// Floor applied when a refresh reopens another root's cold snapshot.
+    pub fn set_retention(&self, policy: &RetentionConfig) {
+        *self.retention.write() = policy.clone();
+    }
     /// Refresh bounded directory aggregates from an immutable complete snapshot.
     pub fn refresh(
         &self,
@@ -49,6 +57,7 @@ impl SnapshotMetrics {
             ));
         }
         let key = snapshot.meta().root.as_bytes().to_vec();
+        let policy = self.retention.read().clone();
         let mut roots = self.roots.write();
         let capacity = self.capacity.load(Ordering::Acquire);
         if !roots.contains_key(&key) && roots.len() >= MAX_ROOTS {
@@ -73,7 +82,8 @@ impl SnapshotMetrics {
                 let Some((file, depth)) = roots[root].source.as_ref() else {
                     continue;
                 };
-                opened = tidemark_store::reader::Snapshot::open(file).map_err(store)?;
+                opened = tidemark_store::reader::Snapshot::open_with_retention(file, &policy)
+                    .map_err(store)?;
                 (&opened, *depth)
             };
             if reader.meta().status != SnapshotStatus::Complete
@@ -168,6 +178,7 @@ fn reconcile(
         }
     }
     let fresh = SnapshotMetrics::default();
+    fresh.set_retention(&config.retention);
     fresh
         .capacity
         .store(config.metrics.max_series_per_metric, Ordering::Release);
@@ -183,7 +194,9 @@ fn reconcile(
                 },
             );
         }
-        let snapshot = tidemark_store::reader::Snapshot::open(&file).map_err(store)?;
+        let snapshot =
+            tidemark_store::reader::Snapshot::open_with_retention(&file, &config.retention)
+                .map_err(store)?;
         if snapshot.meta().root != root {
             return Err(crate::DaemonError::Store(
                 "metrics snapshot root disagrees with catalog".into(),
@@ -192,6 +205,7 @@ fn reconcile(
         fresh.refresh(&snapshot, config.metrics.dir_metrics_depth)?;
     }
     if let Some(cache) = cache {
+        cache.set_retention(&config.retention);
         let mut roots = cache.roots.write();
         *roots = fresh.roots.into_inner();
         cache
