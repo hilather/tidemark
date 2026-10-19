@@ -209,14 +209,16 @@ fn probe_write_errno(dir: &Path) -> Option<i32> {
     result.err().and_then(|e| e.raw_os_error())
 }
 
+type ProbeFn = std::sync::Arc<dyn Fn(&Path) -> Option<i32> + Send + Sync>;
+type StageFaultFn = std::sync::Arc<dyn Fn(&str) -> Option<StoreError> + Send + Sync>;
 /// Test-only fault injection for the export lifecycle.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct ExportFaults {
     /// Replaces the staging-directory write probe; called while the temporary database exists.
-    pub probe: Option<std::sync::Arc<dyn Fn(&Path) -> Option<i32> + Send + Sync>>,
+    pub probe: Option<ProbeFn>,
     /// Fails the named stage (`create`, `copy`, `finish`) with the returned error.
-    pub fault: Option<std::sync::Arc<dyn Fn(&str) -> Option<StoreError> + Send + Sync>>,
+    pub fault: Option<StageFaultFn>,
 }
 
 /// Write `snapshot` to `out` as a v1-schema database (with `dirs.path`/`path_hash` and the v1 indexes).

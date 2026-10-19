@@ -24,13 +24,15 @@ pub struct SnapshotWriter {
     failed: bool,
     hooks: WriterHooks,
 }
+type ClassifyFn = Box<dyn Fn(StoreError) -> StoreError + Send>;
+type FaultFn = Box<dyn Fn(&str) -> Option<StoreError> + Send>;
 /// Callbacks that run while the writer and its temporary file still exist.
 #[derive(Default)]
 pub(crate) struct WriterHooks {
     /// Reclassifies a failure of `create`/`finish_with` before cleanup frees any space.
-    pub(crate) classify: Option<Box<dyn Fn(StoreError) -> StoreError + Send>>,
+    pub(crate) classify: Option<ClassifyFn>,
     /// Test fault injection: `Some(error)` fails the named stage (`create`, `finish`).
-    pub(crate) fault: Option<Box<dyn Fn(&str) -> Option<StoreError> + Send>>,
+    pub(crate) fault: Option<FaultFn>,
 }
 impl WriterHooks {
     fn fail(&self, stage: &str) -> Result<(), StoreError> {
