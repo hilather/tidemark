@@ -1,0 +1,1 @@
+SNAP-export-rpmfixture: added the `tidemark-snapshots-export.1` manual asset entry to `tests/install/rpm-upgrade.toml` at the same position as in `packaging/rpm/rpm.toml` (line 37), so the fixture again matches the packaging spec except for the config source line. No other changes.
