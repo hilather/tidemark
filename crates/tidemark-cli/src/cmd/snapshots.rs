@@ -198,6 +198,13 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         Command::Export {
             id, out: target, ..
         } => {
+            // `-` is a filename today; refuse it as usage before any export work.
+            if target.as_os_str() == "-" {
+                return Err(crate::CliError::Configuration(
+                    "output path '-' is not supported; pass a file path".into(),
+                )
+                .into());
+            }
             let e = catalog
                 .get(id)?
                 .ok_or_else(|| crate::CliError::Precondition(format!("snapshot {id} not found")))?;
@@ -214,7 +221,8 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             // Resolve once: the published path is the one printed, with no second lookup.
             let target = &std::path::absolute(target)?;
             refuse_inside_state(target, state)?;
-            // The store refuses too; checking here gives the precondition exit code (5).
+            // Fast refusal before open, inflate and copy. A path that appears
+            // later is `StoreError::OutputExists` and still exits 5.
             if std::fs::symlink_metadata(target).is_ok() {
                 return Err(crate::CliError::Precondition(format!(
                     "output path already exists: {}",
@@ -396,7 +404,7 @@ fn refuse_inside_state(target: &std::path::Path, state: &std::path::Path) -> any
     }
     Ok(())
 }
-/// Space exhaustion exits 5; everything else keeps its runtime classification.
+/// Space exhaustion and an existing output path exit 5; other errors keep their classification.
 fn export_error(error: tidemark_store::StoreError) -> anyhow::Error {
     use tidemark_store::StoreError;
     match error {
@@ -414,6 +422,10 @@ fn export_error(error: tidemark_store::StoreError) -> anyhow::Error {
         }
         StoreError::Io(io) if io.kind() == std::io::ErrorKind::Interrupted => {
             crate::CliError::Partial("export interrupted".into()).into()
+        }
+        // Output collisions only. Other `AlreadyExists` I/O stays a runtime error.
+        StoreError::OutputExists(path) => {
+            crate::CliError::Precondition(format!("output path already exists: {path}")).into()
         }
         other => other.into(),
     }
@@ -750,4 +762,26 @@ pub(crate) fn missing_path(
         }
     }
     crate::CliError::Precondition(detail)
+}
+
+#[cfg(test)]
+mod export_error_tests {
+    use super::export_error;
+    use tidemark_store::StoreError;
+
+    #[test]
+    fn output_exists_is_precondition_and_io_already_exists_is_not() {
+        let err = export_error(StoreError::OutputExists("/tmp/out".into()));
+        let cli = err.downcast_ref::<crate::CliError>();
+        assert!(
+            matches!(cli, Some(crate::CliError::Precondition(message)) if message == "output path already exists: /tmp/out")
+        );
+        assert_eq!(cli.map(crate::CliError::exit_code), Some(5));
+
+        let err = export_error(StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a unique staging directory",
+        )));
+        assert!(err.downcast_ref::<crate::CliError>().is_none(), "{err}");
+    }
 }

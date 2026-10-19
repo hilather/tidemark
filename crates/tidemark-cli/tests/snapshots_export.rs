@@ -136,9 +136,111 @@ fn export_writes_a_queryable_v1_database_and_refuses_to_overwrite() {
         .stderr
         .clone();
     let refused = String::from_utf8(refused).unwrap();
-    assert!(refused.contains("already exists"), "{refused}");
+    assert_eq!(
+        refused,
+        format!("output path already exists: {}\n", target.display())
+    );
     assert_eq!(std::fs::read(&target).unwrap(), before);
     assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn export_refuses_directory_and_dangling_symlink_without_staging() {
+    use std::os::unix::fs::MetadataExt;
+    let (_root, state, out, id) = fixture();
+    let dir = out.path().join("existing-dir");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("keep"), b"untouched").unwrap();
+    let dir_meta = std::fs::symlink_metadata(&dir).unwrap();
+    let refused = command(state.path(), false)
+        .args(["snapshots", "export", "--sqlite", &id])
+        .arg(&dir)
+        .assert()
+        .failure()
+        .code(5)
+        .stdout("")
+        .get_output()
+        .stderr
+        .clone();
+    assert_eq!(
+        String::from_utf8(refused).unwrap(),
+        format!("output path already exists: {}\n", dir.display())
+    );
+    let after = std::fs::symlink_metadata(&dir).unwrap();
+    assert!(after.is_dir());
+    assert_eq!(after.ino(), dir_meta.ino());
+    assert_eq!(after.mtime(), dir_meta.mtime());
+    assert_eq!(std::fs::read(dir.join("keep")).unwrap(), b"untouched");
+    let mut children: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    children.sort();
+    assert_eq!(children, [std::ffi::OsString::from("keep")]);
+    assert_no_staging(out.path());
+
+    let link = out.path().join("dangling");
+    std::os::unix::fs::symlink("missing-target", &link).unwrap();
+    let link_meta = std::fs::symlink_metadata(&link).unwrap();
+    let refused = command(state.path(), false)
+        .args(["snapshots", "export", "--sqlite", &id])
+        .arg(&link)
+        .assert()
+        .failure()
+        .code(5)
+        .stdout("")
+        .get_output()
+        .stderr
+        .clone();
+    assert_eq!(
+        String::from_utf8(refused).unwrap(),
+        format!("output path already exists: {}\n", link.display())
+    );
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        std::path::Path::new("missing-target")
+    );
+    assert_eq!(
+        std::fs::metadata(&link).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let after = std::fs::symlink_metadata(&link).unwrap();
+    assert!(after.file_type().is_symlink());
+    assert_eq!(after.ino(), link_meta.ino());
+    assert_eq!(after.mtime(), link_meta.mtime());
+    assert_no_staging(out.path());
+}
+
+#[test]
+fn export_refuses_stdout_dash() {
+    let (_root, state, out, id) = fixture();
+    let refused = command(state.path(), false)
+        .current_dir(out.path())
+        .args(["snapshots", "export", "--sqlite", &id, "-"])
+        .assert()
+        .failure()
+        .code(2)
+        .stdout("")
+        .get_output()
+        .stderr
+        .clone();
+    let refused = String::from_utf8(refused).unwrap();
+    assert!(
+        refused.contains("output path '-' is not supported"),
+        "{refused}"
+    );
+    assert!(!out.path().join("-").exists());
+    assert_no_staging(out.path());
+}
+
+fn assert_no_staging(dir: &Path) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let name = entry.unwrap().file_name();
+        assert!(
+            !name.to_string_lossy().starts_with(".tidemark-export-"),
+            "staging leftover {name:?}"
+        );
+    }
 }
 
 #[test]

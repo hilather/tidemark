@@ -67,8 +67,19 @@ impl CliError {
     }
 }
 fn command_error(error: anyhow::Error) -> CliError {
-    let message = format!("{error:#}");
     let code = error.downcast_ref::<CliError>().map(CliError::exit_code);
+    // The command subject (`snapshots: <state_dir>`) names the catalog, which
+    // does not help when the failure is the output path itself.
+    let unprefixed = error.downcast_ref::<CliError>().and_then(|cli| match cli {
+        CliError::Precondition(message) if message.starts_with("output path already exists:") => {
+            Some(message.clone())
+        }
+        _ => None,
+    });
+    let message = match unprefixed {
+        Some(message) => message,
+        None => format!("{error:#}"),
+    };
     match code {
         Some(2) => CliError::Configuration(message),
         Some(3) => CliError::Partial(message),
@@ -302,6 +313,18 @@ mod tests {
             };
             assert_eq!(command_error(error).exit_code(), 1);
         }
+    }
+
+    #[test]
+    fn output_path_errors_omit_the_command_subject() {
+        let error = anyhow::Error::new(CliError::Precondition(
+            "output path already exists: /tmp/out".into(),
+        ))
+        .context("export snapshot: /tmp/out")
+        .context("snapshots: /var/lib/tidemark");
+        let error = command_error(error);
+        assert_eq!(error.exit_code(), 5);
+        assert_eq!(error.to_string(), "output path already exists: /tmp/out");
     }
 }
 
