@@ -65,19 +65,19 @@ fn directory(
     }
 }
 #[cfg(test)]
-type ChildOpenHook = Box<dyn FnMut(&[u8])>;
+type ChildOpenHook = Box<dyn FnMut(&[u8]) -> Option<rustix::io::Errno>>;
 #[cfg(test)]
 thread_local! {
     static BEFORE_CHILD_OPEN: std::cell::RefCell<Option<ChildOpenHook>> =
         const { std::cell::RefCell::new(None) };
 }
+/// Runs after a directory entry is yielded and before `openat`.
+///
+/// `Some` replaces the `openat` result so a test can force an errno. `None`
+/// performs the real open.
 #[cfg(test)]
-fn before_child_open(name: &[u8]) {
-    BEFORE_CHILD_OPEN.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().as_mut() {
-            hook(name);
-        }
-    });
+fn before_child_open(name: &[u8]) -> Option<rustix::io::Errno> {
+    BEFORE_CHILD_OPEN.with(|hook| hook.borrow_mut().as_mut().and_then(|hook| hook(name)))
 }
 fn state_usage(path: &Path) -> io::Result<u64> {
     use rustix::fs::{self, Dir, FileType, Mode, OFlags};
@@ -106,16 +106,23 @@ fn state_usage(path: &Path) -> io::Result<u64> {
         }
         // O_PATH never reads contents; NOFOLLOW binds this fd to the entry itself.
         // The API socket and its lock are unlinked while a scan is still measuring
-        // state. A name returned by getdents can be gone before open; that leaf is
-        // not allocated space.
+        // state. A name already returned by getdents can be gone before open; that
+        // leaf is not allocated space. Every other errno, including EACCES, still
+        // fails the measurement.
         #[cfg(test)]
-        before_child_open(name.to_bytes());
-        let child = match fs::openat(
-            iter.fd()?,
-            name,
-            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
+        let injected = before_child_open(name.to_bytes());
+        #[cfg(not(test))]
+        let injected: Option<rustix::io::Errno> = None;
+        let opened = match injected {
+            Some(errno) => Err(errno),
+            None => fs::openat(
+                iter.fd()?,
+                name,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ),
+        };
+        let child = match opened {
             Err(rustix::io::Errno::NOENT) => continue,
             other => other?,
         };
@@ -262,30 +269,95 @@ mod tests {
         std::os::unix::fs::symlink(&child, &root_link).unwrap();
         assert!(state_usage(&root_link).is_err());
     }
+    struct ClearChildOpenHook;
+    impl Drop for ClearChildOpenHook {
+        fn drop(&mut self) {
+            BEFORE_CHILD_OPEN.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    fn install_child_open_hook(hook: ChildOpenHook) -> ClearChildOpenHook {
+        BEFORE_CHILD_OPEN.with(|slot| *slot.borrow_mut() = Some(hook));
+        ClearChildOpenHook
+    }
+
+    /// The scan maps every `space_check` I/O error to a refusal and reports
+    /// `ScanError::NoSpace`. A missing name is not that error.
     #[test]
-    fn vanished_leaf_between_getdents_and_open_is_not_usage() {
+    fn vanished_leaf_between_readdir_and_openat_is_skipped_not_nospace() {
         let own = ::test_support::private_tempdir().unwrap();
         let socket = own.path().join("api.sock");
         std::fs::write(&socket, vec![1; 8192]).unwrap();
         let with_socket = state_usage(own.path()).unwrap();
         let root = own.path().to_owned();
-        BEFORE_CHILD_OPEN.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move |name| {
-                if name == b"api.sock" {
-                    let _ = std::fs::remove_file(root.join("api.sock"));
-                }
-            }));
-        });
-        struct Clear;
-        impl Drop for Clear {
-            fn drop(&mut self) {
-                BEFORE_CHILD_OPEN.with(|hook| *hook.borrow_mut() = None);
+        let _clear = install_child_open_hook(Box::new(move |name| {
+            if name == b"api.sock" {
+                std::fs::remove_file(root.join("api.sock")).unwrap();
             }
-        }
-        let _clear = Clear;
+            None
+        }));
+
         let raced = state_usage(own.path()).unwrap();
         let gone = state_usage(own.path()).unwrap();
         assert!(with_socket > gone);
         assert_eq!(raced, gone);
+
+        std::fs::write(&socket, vec![1; 8192]).unwrap();
+        let measured =
+            space_check(own.path(), 0, &RetentionConfig::default()).unwrap_or_else(|error| {
+                panic!("leaf removed between readdir and openat reported as NoSpace: {error}")
+            });
+        assert!(
+            !matches!(
+                &measured,
+                SpaceVerdict::Refuse { reason }
+                    if reason.contains("No such file or directory") || reason.contains("os error 2")
+            ),
+            "vanished leaf reported as NoSpace: {measured:?}"
+        );
+        assert!(!socket.exists(), "openat ran before the leaf was removed");
+        assert_eq!(
+            space_check_with(
+                || {
+                    Ok(FsTotals {
+                        size: 64 << 30,
+                        avail: 32 << 30,
+                    })
+                },
+                raced,
+                0,
+                &RetentionConfig::default(),
+            ),
+            SpaceVerdict::Ok,
+            "skipped leaf must not be reported as NoSpace"
+        );
+    }
+
+    #[test]
+    fn child_open_eacces_propagates() {
+        let own = ::test_support::private_tempdir().unwrap();
+        let socket = own.path().join("api.sock");
+        std::fs::write(&socket, vec![1; 8192]).unwrap();
+        let _clear = install_child_open_hook(Box::new(|name| {
+            if name == b"api.sock" {
+                Some(rustix::io::Errno::ACCESS)
+            } else {
+                None
+            }
+        }));
+
+        let usage = state_usage(own.path()).unwrap_err();
+        assert_eq!(
+            usage.raw_os_error(),
+            Some(rustix::io::Errno::ACCESS.raw_os_error())
+        );
+        let checked = space_check(own.path(), 0, &RetentionConfig::default()).unwrap_err();
+        assert_eq!(
+            checked.raw_os_error(),
+            Some(rustix::io::Errno::ACCESS.raw_os_error())
+        );
+        assert!(
+            socket.exists(),
+            "EACCES must not be treated as a vanished leaf"
+        );
     }
 }
