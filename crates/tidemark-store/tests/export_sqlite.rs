@@ -591,3 +591,79 @@ fn s1_cancel_during_finalization_before_publication() {
         });
     }
 }
+
+fn sqlite_failure(extended: i32) -> StoreError {
+    StoreError::Sql(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(extended),
+        None,
+    ))
+}
+
+/// Export `snap` with `fault` failing `stage`; `probe` is the staging-directory write probe.
+fn export_with_fault(
+    snap: &Snapshot,
+    stage: &'static str,
+    error: fn() -> StoreError,
+    probe: fn(&Path) -> Option<i32>,
+) -> (
+    Result<tidemark_store::export_sqlite::SqliteExportStats, StoreError>,
+    usize,
+) {
+    let out = test_support::private_tempdir().unwrap();
+    let faults = tidemark_store::export_sqlite::ExportFaults {
+        probe: Some(std::sync::Arc::new(probe)),
+        fault: Some(std::sync::Arc::new(move |s| (s == stage).then(error))),
+    };
+    let result = tidemark_store::export_sqlite::export_sqlite_with_faults(
+        snap,
+        &out.path().join("never.db"),
+        &|| false,
+        &faults,
+    );
+    (result, fs::read_dir(out.path()).unwrap().count())
+}
+
+/// A quota that stops the database but would admit a small probe once the failed
+/// database's space is released: the probe must run while the temporary file exists.
+fn quota_probe(dir: &Path) -> Option<i32> {
+    let tmp_exists = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().ends_with(".db.tmp"));
+    tmp_exists.then(|| rustix::io::Errno::DQUOT.raw_os_error())
+}
+
+#[test]
+fn fix3_s1_write_failure_is_classified_before_cleanup_frees_space() {
+    let a = test_support::private_tempdir().unwrap();
+    let hot = write_v1(a.path());
+    let snap = Snapshot::open(&hot).unwrap();
+    // `copy` fails while the writer is live; `finish` fails inside `finish_with`, which
+    // consumes the writer (its drop unlinks the database).
+    for stage in ["copy", "finish"] {
+        let (result, leftovers) =
+            export_with_fault(&snap, stage, || sqlite_failure(778), quota_probe);
+        assert!(
+            matches!(result, Err(StoreError::Space(_))),
+            "{stage}: {result:?}"
+        );
+        assert_eq!(leftovers, 0, "{stage}");
+    }
+    // An unrelated write error (probe finds the directory healthy) keeps its class.
+    let (result, _) = export_with_fault(&snap, "finish", || sqlite_failure(778), |_| None);
+    assert!(matches!(result, Err(StoreError::Sql(_))), "{result:?}");
+}
+
+#[test]
+fn fix3_s2_space_failure_during_writer_creation_is_space() {
+    let a = test_support::private_tempdir().unwrap();
+    let hot = write_v1(a.path());
+    let snap = Snapshot::open(&hot).unwrap();
+    let (result, leftovers) = export_with_fault(&snap, "create", || sqlite_failure(13), |_| None);
+    assert!(matches!(result, Err(StoreError::Space(_))), "{result:?}");
+    assert_eq!(leftovers, 0);
+    let (result, leftovers) =
+        export_with_fault(&snap, "create", || sqlite_failure(778), quota_probe);
+    assert!(matches!(result, Err(StoreError::Space(_))), "{result:?}");
+    assert_eq!(leftovers, 0);
+}

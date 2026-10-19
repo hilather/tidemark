@@ -3,7 +3,7 @@
 
 use crate::{
     reader::{dir_row, file_row, link_row, plain_row_error, Snapshot},
-    writer::SnapshotWriter,
+    writer::{SnapshotWriter, WriterHooks},
     StoreError,
 };
 use rusqlite::params;
@@ -35,10 +35,60 @@ pub struct SqliteExportStats {
 /// Rows buffered between writer calls; memory is bounded by this, not by tree size.
 const BATCH: usize = 10_000;
 
-/// One page of v1 link instances in `(ino, rowid)` order, served by the `li_ino` index
-/// (columns 0-2 are the row; 3 and 4 are the keyset position).
-pub(crate) const V1_INSTANCE_PAGE: &str = "SELECT ino,dir_id,name,ino,rowid FROM link_instances \
-     WHERE (ino,rowid)>(?1,?2) ORDER BY ino,rowid LIMIT ?3";
+/// Rest of the current inode's v1 link instances in rowid order (`li_ino` seeks on both
+/// `ino` and `rowid`, so earlier rows of the inode are never revisited). Columns 0-2 are
+/// the row; 3 is the keyset rowid.
+pub(crate) const V1_INSTANCE_SAME_INO: &str = "SELECT ino,dir_id,name,rowid FROM link_instances \
+     WHERE ino=?1 AND rowid>?2 ORDER BY rowid LIMIT ?3";
+/// Instances of later inodes in `(ino, rowid)` order, used once an inode is exhausted.
+pub(crate) const V1_INSTANCE_NEXT_INO: &str = "SELECT ino,dir_id,name,rowid FROM link_instances \
+     WHERE ino>?1 ORDER BY ino,rowid LIMIT ?2";
+
+/// Stream every v1 link instance in `(ino, rowid)` order in pages of at most `page` rows.
+///
+/// `on_page` receives each non-empty page; `vm_steps` accumulates SQLite VM steps (a work
+/// counter for tests).
+pub(crate) fn v1_instance_pages(
+    conn: &rusqlite::Connection,
+    page: usize,
+    vm_steps: &mut u64,
+    on_page: &mut dyn FnMut(Vec<LinkInstanceRow>) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    use rusqlite::StatementStatus;
+    let (mut ino, mut rowid) = (i64::MIN, i64::MIN);
+    loop {
+        let mut batch: Vec<LinkInstanceRow> = Vec::with_capacity(page);
+        // Continue the current inode first; only an exhausted inode advances to the next.
+        let mut stmt = conn.prepare_cached(V1_INSTANCE_SAME_INO)?;
+        stmt.reset_status(StatementStatus::VmStep);
+        {
+            let mut rows = stmt.query(params![ino, rowid, page as i64])?;
+            while let Some(r) = rows.next()? {
+                rowid = r.get(3)?;
+                batch.push(crate::reader::instance_row(r)?);
+            }
+        }
+        *vm_steps += u64::try_from(stmt.get_status(StatementStatus::VmStep)).unwrap_or(0);
+        drop(stmt);
+        if batch.len() < page {
+            let mut stmt = conn.prepare_cached(V1_INSTANCE_NEXT_INO)?;
+            stmt.reset_status(StatementStatus::VmStep);
+            {
+                let mut rows = stmt.query(params![ino, (page - batch.len()) as i64])?;
+                while let Some(r) = rows.next()? {
+                    ino = r.get(0)?;
+                    rowid = r.get(3)?;
+                    batch.push(crate::reader::instance_row(r)?);
+                }
+            }
+            *vm_steps += u64::try_from(stmt.get_status(StatementStatus::VmStep)).unwrap_or(0);
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        on_page(batch)?;
+    }
+}
 
 /// A private staging directory this export created (and only this one).
 ///
@@ -145,6 +195,9 @@ fn classify_with(error: StoreError, probe: impl FnOnce() -> Option<i32>) -> Stor
     error
 }
 /// Write 1 MiB and sync it in `dir`; the errno of the first failure, if any.
+///
+/// Only run while the failed writer's temporary file still exists, so a quota that stopped
+/// the database also stops the probe.
 fn probe_write_errno(dir: &Path) -> Option<i32> {
     use std::io::Write;
     let path = dir.join("space-probe");
@@ -154,6 +207,16 @@ fn probe_write_errno(dir: &Path) -> Option<i32> {
     });
     let _ = std::fs::remove_file(&path);
     result.err().and_then(|e| e.raw_os_error())
+}
+
+/// Test-only fault injection for the export lifecycle.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ExportFaults {
+    /// Replaces the staging-directory write probe; called while the temporary database exists.
+    pub probe: Option<std::sync::Arc<dyn Fn(&Path) -> Option<i32> + Send + Sync>>,
+    /// Fails the named stage (`create`, `copy`, `finish`) with the returned error.
+    pub fault: Option<std::sync::Arc<dyn Fn(&str) -> Option<StoreError> + Send + Sync>>,
 }
 
 /// Write `snapshot` to `out` as a v1-schema database (with `dirs.path`/`path_hash` and the v1 indexes).
@@ -179,7 +242,18 @@ pub fn export_sqlite_cancellable(
     out: &Path,
     cancel: &dyn Fn() -> bool,
 ) -> Result<SqliteExportStats, StoreError> {
-    export_inner(snapshot, out, cancel).map_err(|e| match e {
+    export_sqlite_with_faults(snapshot, out, cancel, &ExportFaults::default())
+}
+
+/// [`export_sqlite_cancellable`] with test fault injection.
+#[doc(hidden)]
+pub fn export_sqlite_with_faults(
+    snapshot: &Snapshot,
+    out: &Path,
+    cancel: &dyn Fn() -> bool,
+    faults: &ExportFaults,
+) -> Result<SqliteExportStats, StoreError> {
+    export_inner(snapshot, out, cancel, faults).map_err(|e| match e {
         StoreError::Cancelled => interrupted(),
         other => other,
     })
@@ -189,6 +263,7 @@ fn export_inner(
     snapshot: &Snapshot,
     out: &Path,
     cancel: &dyn Fn() -> bool,
+    faults: &ExportFaults,
 ) -> Result<SqliteExportStats, StoreError> {
     if std::fs::symlink_metadata(out).is_ok() {
         return Err(std::io::Error::new(
@@ -211,16 +286,44 @@ fn export_inner(
     let staging = Staging::create(&parent)?;
     let mut meta = snapshot.meta().clone();
     meta.schema_version = 1;
-    let mut writer = SnapshotWriter::create(&staging.path, &meta)?;
+    // Space failures are classified where they happen, while the writer's temporary file
+    // still exists (its cleanup frees the space the failing operation could not get).
+    let classify = |e: StoreError| match e {
+        StoreError::Cancelled => interrupted(),
+        other => classify_with(other, || match &faults.probe {
+            Some(p) => p(&staging.path),
+            None => probe_write_errno(&staging.path),
+        }),
+    };
+    let hooks = WriterHooks {
+        classify: Some(Box::new({
+            let dir = staging.path.clone();
+            let probe = faults.probe.clone();
+            move |e| match e {
+                StoreError::Cancelled => e,
+                other => classify_with(other, || match &probe {
+                    Some(p) => p(&dir),
+                    None => probe_write_errno(&dir),
+                }),
+            }
+        })),
+        fault: faults.fault.clone().map(|f| {
+            Box::new(move |stage: &str| f(stage)) as Box<dyn Fn(&str) -> Option<StoreError> + Send>
+        }),
+    };
+    let mut writer = SnapshotWriter::create_with(&staging.path, &meta, hooks)?;
     let mut stats = SqliteExportStats::default();
     let built = (|| {
-        copy_all(snapshot, &mut writer, &mut stats, cancel)?;
+        if let Some(e) = faults.fault.as_ref().and_then(|f| f("copy")) {
+            return Err(classify(e));
+        }
+        copy_all(snapshot, &mut writer, &mut stats, cancel).map_err(&classify)?;
         check(cancel)?;
         writer.finish_with(&meta, cancel)
     })()
     .map_err(|e| match e {
         StoreError::Cancelled => interrupted(),
-        other => classify_with(other, || probe_write_errno(&staging.path)),
+        other => other,
     })?;
     // Last chance to cancel: after the rename below the export is published and succeeds.
     check(cancel)?;
@@ -367,27 +470,13 @@ fn copy_all(
             Ok(())
         })?;
     } else {
-        // Keyset pages on (ino, rowid): `li_ino` is (ino, rowid), so no sorter is needed.
-        let (mut ino, mut rowid) = (i64::MIN, i64::MIN);
-        loop {
-            let mut stmt = snap.conn().prepare_cached(V1_INSTANCE_PAGE)?;
-            let mut rows = stmt.query(params![ino, rowid, BATCH as i64])?;
-            let mut n = 0usize;
-            while let Some(r) = rows.next()? {
-                ino = r.get(3)?;
-                rowid = r.get(4)?;
-                batch.push(crate::reader::instance_row(r)?);
-                n += 1;
-            }
-            drop(rows);
-            if n == 0 {
-                break;
-            }
+        // Pages within the current inode seek on (ino, rowid); no sorter, no rescans.
+        let mut steps = 0u64;
+        v1_instance_pages(snap.conn(), BATCH, &mut steps, &mut |page| {
             check(cancel)?;
-            stats.link_instances += batch.len() as u64;
-            writer.put_link_instances(&batch)?;
-            batch.clear();
-        }
+            stats.link_instances += page.len() as u64;
+            writer.put_link_instances(&page)
+        })?;
     }
     stats.link_instances += batch.len() as u64;
     writer.put_link_instances(&batch)?;
@@ -512,30 +601,87 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
-    /// S2: the v1 instance page is served by `li_ino` without a sorter.
-    #[test]
-    fn s2_v1_instance_page_needs_no_temp_btree() {
-        let dir = test_support::private_tempdir().unwrap();
-        let db = dir.path().join("v1.db");
-        let conn = rusqlite::Connection::open(&db).unwrap();
+    fn li_conn(rows: &[(i64, i64)]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE link_instances (ino INTEGER NOT NULL, dir_id INTEGER NOT NULL, name BLOB);
              CREATE INDEX li_ino ON link_instances(ino);
              CREATE INDEX li_dir ON link_instances(dir_id);",
         )
         .unwrap();
-        let mut stmt = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {V1_INSTANCE_PAGE}"))
+        let tx = conn.unchecked_transaction().unwrap();
+        for (i, (ino, dir)) in rows.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO link_instances VALUES (?,?,?)",
+                params![ino, dir, format!("n{i}").into_bytes()],
+            )
             .unwrap();
-        let plan: Vec<String> = stmt
-            .query_map(params![0i64, 0i64, 10i64], |r| r.get::<_, String>(3))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert!(!plan.is_empty());
-        for line in &plan {
-            assert!(!line.contains("TEMP B-TREE"), "sorter in plan: {plan:?}");
         }
-        assert!(plan.iter().any(|l| l.contains("li_ino")), "{plan:?}");
+        tx.commit().unwrap();
+        conn.execute_batch("ANALYZE").unwrap();
+        conn
+    }
+
+    /// S3: neither page query needs a sorter; the same-inode page seeks on both columns.
+    #[test]
+    fn s3_v1_instance_pages_seek_without_temp_btree() {
+        let conn = li_conn(&[(1, 1)]);
+        for (sql, n, must) in [
+            (V1_INSTANCE_SAME_INO, 3, "ino=? AND rowid>?"),
+            (V1_INSTANCE_NEXT_INO, 2, "ino>?"),
+        ] {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let args: Vec<i64> = vec![0; n];
+            let plan: Vec<String> = stmt
+                .query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(plan.iter().all(|l| !l.contains("TEMP B-TREE")), "{plan:?}");
+            assert!(
+                plan.iter()
+                    .any(|l| l.contains("li_ino") && l.contains(must)),
+                "{plan:?}"
+            );
+        }
+    }
+
+    /// S3: a single-inode set is read in O(N) VM work, not O(N * pages).
+    #[test]
+    fn s3_single_inode_paging_is_linear() {
+        let steps_for = |n: usize, page: usize| {
+            let conn = li_conn(&vec![(7, 1); n]);
+            let (mut steps, mut seen) = (0u64, 0usize);
+            v1_instance_pages(&conn, page, &mut steps, &mut |p| {
+                seen += p.len();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, n);
+            steps
+        };
+        let n = 30_001;
+        let few = steps_for(n, 10_000);
+        let many = steps_for(n, 500);
+        // ~6 VM steps per row; a prefix rescan would add ~N*pages/2 more per page count.
+        assert!(few <= 10 * n as u64, "{few}");
+        assert!(many <= 10 * n as u64 + 100 * (n / 500 + 2) as u64, "{many}");
+    }
+
+    /// S3: order and content across inodes, with pages that split inodes.
+    #[test]
+    fn s3_pages_keep_ino_rowid_order() {
+        let rows: Vec<(i64, i64)> = (0..50).map(|i| ([5, 2, 9][i % 3], i as i64)).collect();
+        let conn = li_conn(&rows);
+        let mut got = Vec::new();
+        v1_instance_pages(&conn, 7, &mut 0, &mut |p| {
+            assert!(p.len() <= 7);
+            got.extend(p.iter().map(|r| (r.ino, r.dir_id)));
+            Ok(())
+        })
+        .unwrap();
+        let mut want: Vec<(u64, u32)> = rows.iter().map(|&(i, d)| (i as u64, d as u32)).collect();
+        want.sort_by_key(|&(i, _)| i); // stable: rowid order within an inode
+        assert_eq!(got, want);
     }
 }

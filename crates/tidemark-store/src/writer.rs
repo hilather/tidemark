@@ -22,10 +22,42 @@ pub struct SnapshotWriter {
     check_interval: u64,
     check: Option<Box<dyn FnMut() -> SpaceVerdict + Send>>,
     failed: bool,
+    hooks: WriterHooks,
+}
+/// Callbacks that run while the writer and its temporary file still exist.
+#[derive(Default)]
+pub(crate) struct WriterHooks {
+    /// Reclassifies a failure of `create`/`finish_with` before cleanup frees any space.
+    pub(crate) classify: Option<Box<dyn Fn(StoreError) -> StoreError + Send>>,
+    /// Test fault injection: `Some(error)` fails the named stage (`create`, `finish`).
+    pub(crate) fault: Option<Box<dyn Fn(&str) -> Option<StoreError> + Send>>,
+}
+impl WriterHooks {
+    fn fail(&self, stage: &str) -> Result<(), StoreError> {
+        match self.fault.as_ref().and_then(|f| f(stage)) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+    fn map(&self, e: StoreError) -> StoreError {
+        match &self.classify {
+            Some(c) => c(e),
+            None => e,
+        }
+    }
 }
 impl SnapshotWriter {
     /// Create a private temporary file, refusing an existing scan id.
     pub fn create(dir: &Path, meta: &SnapshotMeta) -> Result<Self, StoreError> {
+        Self::create_with(dir, meta, WriterHooks::default())
+    }
+    /// [`create`](Self::create) with hooks; a failure after the temporary file exists is
+    /// passed through `hooks.classify` before the file is removed.
+    pub(crate) fn create_with(
+        dir: &Path,
+        meta: &SnapshotMeta,
+        hooks: WriterHooks,
+    ) -> Result<Self, StoreError> {
         if meta.schema_version != 1 {
             return Err(StoreError::Invalid("snapshot schema must be 1".into()));
         }
@@ -67,7 +99,21 @@ impl SnapshotWriter {
             check_interval: 100_000,
             check: None,
             failed: false,
+            hooks,
         };
+        let init = (|| {
+            writer.hooks.fail("create")?;
+            writer.init_db(file, &directory)
+        })();
+        init.map_err(|e| writer.hooks.map(e))?;
+        Ok(writer)
+    }
+    fn init_db(
+        &mut self,
+        file: File,
+        directory: &crate::state_dir::StateDir,
+    ) -> Result<(), StoreError> {
+        let writer = self;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         drop(file);
         directory.check_leaf(
@@ -85,7 +131,7 @@ impl SnapshotWriter {
                 .ok_or_else(|| StoreError::Invalid("missing schema".into()))?,
         )?;
         writer.conn = Some(conn);
-        Ok(writer)
+        Ok(())
     }
     fn connection(&self) -> Result<&Connection, StoreError> {
         if self.failed {
@@ -322,6 +368,16 @@ impl SnapshotWriter {
         final_meta: &SnapshotMeta,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<PathBuf, StoreError> {
+        // Classify while `self` (and its temporary file) still exists.
+        let result = self.finish_steps(final_meta, cancelled);
+        result.map_err(|e| self.hooks.map(e))
+    }
+    fn finish_steps(
+        &mut self,
+        final_meta: &SnapshotMeta,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<PathBuf, StoreError> {
+        self.hooks.fail("finish")?;
         if final_meta.scan_id != self.meta.scan_id
             || final_meta.root != self.meta.root
             || final_meta.schema_version != 1
