@@ -124,8 +124,9 @@ impl Staging {
                 }
             };
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
+        // Name attempts ran out. This is not an output collision
+        // (`StoreError::OutputExists`); keep it an ordinary I/O error.
+        Err(std::io::Error::other(
             "could not create a unique staging directory",
         ))
     }
@@ -156,6 +157,12 @@ fn random_token(salt: u32) -> u64 {
 
 fn interrupted() -> StoreError {
     std::io::Error::new(std::io::ErrorKind::Interrupted, "export interrupted").into()
+}
+fn output_exists(path: &Path) -> StoreError {
+    use std::os::unix::ffi::OsStrExt;
+    StoreError::OutputExists(tidemark_core::path::display_lossy_bytes(
+        path.as_os_str().as_bytes(),
+    ))
 }
 fn check(cancel: &dyn Fn() -> bool) -> Result<(), StoreError> {
     if cancel() {
@@ -222,7 +229,10 @@ type StageFaultFn = std::sync::Arc<dyn Fn(&str) -> Option<StoreError> + Send + S
 pub struct ExportFaults {
     /// Replaces the staging-directory write probe; called while the temporary database exists.
     pub probe: Option<ProbeFn>,
-    /// Fails the named stage (`create`, `copy`, `finish`) with the returned error.
+    /// Fails the named stage (`create`, `copy`, `finish`, `publish`) with the returned error.
+    ///
+    /// `publish` runs after the database is durable and before `RENAME_NOREPLACE`.
+    /// Returning `None` continues the publish, so a test can create the destination first.
     pub fault: Option<StageFaultFn>,
 }
 
@@ -273,11 +283,7 @@ fn export_inner(
     faults: &ExportFaults,
 ) -> Result<SqliteExportStats, StoreError> {
     if std::fs::symlink_metadata(out).is_ok() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("output path already exists: {}", out.display()),
-        )
-        .into());
+        return Err(output_exists(out));
     }
     let name = out
         .file_name()
@@ -334,14 +340,23 @@ fn export_inner(
     })?;
     // Last chance to cancel: after the rename below the export is published and succeeds.
     check(cancel)?;
-    rustix::fs::renameat_with(
+    if let Some(e) = faults.fault.as_ref().and_then(|f| f("publish")) {
+        return Err(e);
+    }
+    if let Err(errno) = rustix::fs::renameat_with(
         rustix::fs::CWD,
         &built,
         rustix::fs::CWD,
         &final_path,
         rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(std::io::Error::from)?;
+    ) {
+        let io = std::io::Error::from(errno);
+        // Only the destination collision is a precondition. Other rename failures stay I/O.
+        if io.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(output_exists(&final_path));
+        }
+        return Err(io.into());
+    }
     std::fs::File::open(&parent)?.sync_all()?;
     drop(staging);
     Ok(stats)

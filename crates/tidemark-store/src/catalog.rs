@@ -802,6 +802,7 @@ fn cleanup_temporaries(state_dir: &Path) -> std::io::Result<()> {
 
 // Resource and access failures do not prove corruption. Keep both members when
 // validation cannot finish (notably a space-guard refusal or descriptor exhaustion).
+// An export output collision is not a catalog-pair result either.
 fn pair_validity(result: Result<(), StoreError>) -> Option<bool> {
     match result {
         Ok(()) => Some(true),
@@ -816,7 +817,12 @@ fn pair_validity(result: Result<(), StoreError>) -> Option<bool> {
                 | rusqlite::ErrorCode::Unknown
         )
         .then_some(false),
-        Err(StoreError::Space(_) | StoreError::Cancelled | StoreError::NotYetImplemented) => None,
+        Err(
+            StoreError::Space(_)
+            | StoreError::Cancelled
+            | StoreError::NotYetImplemented
+            | StoreError::OutputExists(_),
+        ) => None,
         Err(_) => Some(false),
     }
 }

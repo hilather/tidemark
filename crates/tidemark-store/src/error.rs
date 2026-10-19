@@ -31,6 +31,12 @@ pub enum StoreError {
     /// State space policy refused additional rows.
     #[error("state space exhausted: {0}")]
     Space(String),
+    /// An export destination already exists and was left unchanged.
+    ///
+    /// Only this variant is an output-path precondition. Other `AlreadyExists`
+    /// I/O errors are not.
+    #[error("output path already exists: {0}")]
+    OutputExists(String),
 }
 pub(crate) fn sql_u64(n: u64) -> Result<i64, StoreError> {
     i64::try_from(n).map_err(|_| StoreError::Integer(n.to_string()))

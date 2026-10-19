@@ -322,16 +322,50 @@ fn existing_output_is_refused_and_untouched() {
     let target = out.path().join("exists.db");
     fs::write(&target, b"precious").unwrap();
     match export_sqlite(&snap, &target) {
-        Err(StoreError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists),
-        other => panic!("expected AlreadyExists, got {other:?}"),
+        Err(StoreError::OutputExists(path)) => assert!(path.contains("exists.db"), "{path}"),
+        other => panic!("expected OutputExists, got {other:?}"),
     }
     assert_eq!(fs::read(&target).unwrap(), b"precious");
     // A dangling symlink also counts as existing and is not followed.
     let link = out.path().join("link.db");
     std::os::unix::fs::symlink(out.path().join("nowhere"), &link).unwrap();
-    assert!(export_sqlite(&snap, &link).is_err());
+    match export_sqlite(&snap, &link) {
+        Err(StoreError::OutputExists(_)) => {}
+        other => panic!("expected OutputExists, got {other:?}"),
+    }
     assert!(!out.path().join("nowhere").exists());
     assert_eq!(fs::read_dir(out.path()).unwrap().count(), 2);
+}
+
+#[test]
+fn publish_race_reports_output_exists_and_leaves_the_occupant() {
+    let a = test_support::private_tempdir().unwrap();
+    let out = test_support::private_tempdir().unwrap();
+    let snap = Snapshot::open(&write_v2(a.path())).unwrap();
+    // Match the path `export_sqlite` renames onto (it canonicalizes the parent).
+    let target = fs::canonicalize(out.path()).unwrap().join("race.db");
+    let planted = target.clone();
+    let faults = export_sqlite::ExportFaults {
+        probe: None,
+        fault: Some(std::sync::Arc::new(move |stage| {
+            if stage == "publish" {
+                fs::write(&planted, b"occupant").unwrap();
+            }
+            None
+        })),
+    };
+    let result = export_sqlite::export_sqlite_with_faults(&snap, &target, &|| false, &faults);
+    match result {
+        Err(StoreError::OutputExists(path)) => assert!(path.contains("race.db"), "{path}"),
+        other => panic!("expected OutputExists, got {other:?}"),
+    }
+    assert_eq!(fs::read(&target).unwrap(), b"occupant");
+    let mut names: Vec<_> = fs::read_dir(out.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, [std::ffi::OsString::from("race.db")]);
 }
 
 #[test]
