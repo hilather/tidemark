@@ -428,6 +428,8 @@ By default, retention compresses retained complete snapshots outside each root's
 
 Cold snapshots open transparently for queries. Opening one temporarily inflates its uncompressed size into a private `.inflate/` directory beside the snapshots. The space guard can refuse this temporary allocation. Closing the snapshot removes the inflated file; startup cleanup removes abandoned inflation files and `.db.zst.tmp` compression temporaries.
 
+Plain `top` uses the snapshot from about 24 h earlier only for Δ24h. If inflating it would breach `retention.min_free_pct`, the column is `-`, the command exits 0, and stderr prints one warning naming that snapshot id and the percentage. `--json` (`tidemark.top.v1`) then sets every row's `delta` to null and adds `delta_skipped` with the value `free_space_floor`. A missing older snapshot also has `delta: null`, and omits `delta_skipped`. `top --snapshot` and `top --sort growth` still fail when the inflate is refused.
+
 Files ending in `.db.bad` or `.db.zst.bad` are quarantined recovery evidence. Cleanup preserves an existing quarantine file and warns on a naming collision. Deleting a scan through retention or `snapshots prune` also removes its quarantine siblings. Do not use quarantine leaves as snapshots.
 
 To disable future compression, set:

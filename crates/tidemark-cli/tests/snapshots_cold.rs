@@ -586,22 +586,31 @@ fn cold_commands_enforce_configured_min_free_pct() {
         stdout.split_whitespace().any(|cell| cell == "-"),
         "plain top did not show '-' for an unavailable Δ24h: {stdout}"
     );
-    assert!(
-        !stderr.contains(floor),
-        "plain top reported the floor refusal: {stderr}"
+    let warning =
+        format!("warning: Δ24h skipped: inflating {cold_id} would breach min_free_pct=50%");
+    assert_eq!(
+        stderr.lines().filter(|line| line == &warning).count(),
+        1,
+        "{stderr}"
     );
     let json = command(state.path(), true)
         .args(["top", "--depth", "1", &query.display().to_string()])
         .assert()
         .success()
         .get_output()
-        .stdout
         .clone();
-    let doc: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let json_stderr = String::from_utf8(json.stderr.clone()).unwrap();
+    assert_eq!(
+        json_stderr.lines().filter(|line| line == &warning).count(),
+        1,
+        "{json_stderr}"
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     let rows = doc["data"].as_array().expect("top json data");
     assert!(!rows.is_empty(), "{doc}");
     assert!(
-        rows.iter().all(|row| row["delta"].is_null()),
-        "plain top json kept a delta without the predecessor: {doc}"
+        rows.iter()
+            .all(|row| row["delta"].is_null() && row["delta_skipped"] == "free_space_floor"),
+        "plain top json did not mark the floor skip: {doc}"
     );
 }

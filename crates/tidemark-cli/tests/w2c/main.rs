@@ -94,16 +94,19 @@ fn tree_unicode_ascii_and_raw_paths() {
         Directory {
             row: row(0, None, b"/fixture", 4096),
             delta: Some(1024),
+            delta_skipped: None,
             live_disk: Some(5120),
         },
         Directory {
             row: row(1, Some(0), b"/fixture/a\xff", 2048),
             delta: Some(-1024),
+            delta_skipped: None,
             live_disk: Some(1024),
         },
         Directory {
             row: row(2, Some(0), b"/fixture/z", 1024),
             delta: Some(0),
+            delta_skipped: None,
             live_disk: None,
         },
     ];
@@ -167,6 +170,7 @@ fn top_json_schema_and_paths() {
     let rows = vec![Directory {
         row: row(0, None, b"/a\xff", 4096),
         delta: Some(-4),
+        delta_skipped: None,
         live_disk: None,
     }];
     let mut buf = Vec::new();

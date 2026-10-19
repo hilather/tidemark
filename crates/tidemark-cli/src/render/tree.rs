@@ -9,7 +9,18 @@ pub struct Directory {
     #[serde(flatten)]
     pub row: DirRow,
     /// Signed disk-byte change versus the older complete snapshot.
+    ///
+    /// Null when no older snapshot was selected, or when inflation was skipped.
     pub delta: Option<i128>,
+    /// Why `delta` is null even though an older snapshot was selected.
+    ///
+    /// Present only for a skipped inflation. `free_space_floor` means inflating
+    /// that snapshot would breach `retention.min_free_pct`. Omitted when `delta`
+    /// is known and when no older snapshot was selected, so a missing predecessor
+    /// stays `delta: null` with no `delta_skipped` field. `tidemark.top.v1` emits
+    /// this on each row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_skipped: Option<&'static str>,
     /// Live disk bytes from a gentle walk.
     pub live_disk: Option<u64>,
 }
