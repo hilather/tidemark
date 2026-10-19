@@ -961,7 +961,9 @@ fn filesystem_totals(state: &Path) -> tidemark_store::space_guard::FsTotals {
 }
 
 fn refuses_frozen(totals: tidemark_store::space_guard::FsTotals, length: u64, pct: f64) -> bool {
-    match tidemark_store::space_guard::space_check_with(|| Ok(totals), 0, length, &unlimited(pct)) {
+    match tidemark_store::space_guard::space_check_with(|| Ok(totals), 0, length, &unlimited(pct))
+        .unwrap()
+    {
         tidemark_store::space_guard::SpaceVerdict::Ok => false,
         tidemark_store::space_guard::SpaceVerdict::Refuse { reason }
             if reason.contains("free-space floor") =>
@@ -1070,11 +1072,12 @@ fn snapshot_open_cold_path_enforces_configured_min_free_pct() {
             0,
             1,
             &unlimited(50.0)
-        ),
+        )
+        .unwrap(),
         SpaceVerdict::Refuse { reason } if reason.contains("free-space floor")
     ));
     assert!(matches!(
-        space_check_with(|| Ok(FsTotals { size, avail }), 0, 1, &unlimited(5.0)),
+        space_check_with(|| Ok(FsTotals { size, avail }), 0, 1, &unlimited(5.0)).unwrap(),
         SpaceVerdict::Ok
     ));
 
