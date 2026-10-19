@@ -35,6 +35,11 @@ pub struct SqliteExportStats {
 /// Rows buffered between writer calls; memory is bounded by this, not by tree size.
 const BATCH: usize = 10_000;
 
+/// One page of v1 link instances in `(ino, rowid)` order, served by the `li_ino` index
+/// (columns 0-2 are the row; 3 and 4 are the keyset position).
+pub(crate) const V1_INSTANCE_PAGE: &str = "SELECT ino,dir_id,name,ino,rowid FROM link_instances \
+     WHERE (ino,rowid)>(?1,?2) ORDER BY ino,rowid LIMIT ?3";
+
 /// A private staging directory this export created (and only this one).
 ///
 /// The directory is created exclusively (`mkdir` fails on any existing entry, which is
@@ -109,16 +114,46 @@ fn check(cancel: &dyn Fn() -> bool) -> Result<(), StoreError> {
         Ok(())
     }
 }
+/// SQLite extended result codes for a failed write, fsync or truncate.
+const IOERR_WRITE: i32 = 778;
+const IOERR_FSYNC: i32 = 1034;
+const IOERR_TRUNCATE: i32 = 1546;
+
 /// Disk-full from the destination database is a space failure.
-fn classify(error: StoreError) -> StoreError {
-    match error {
-        StoreError::Sql(rusqlite::Error::SqliteFailure(e, _))
-            if e.code == rusqlite::ErrorCode::DiskFull =>
-        {
-            StoreError::Space("destination disk full".into())
-        }
-        other => other,
+///
+/// SQLite reports a failed `pwrite`/`fsync`/`ftruncate` as `SQLITE_IOERR_*` without the OS
+/// error, and this crate cannot call `sqlite3_system_errno` (`unsafe` is confined to
+/// `tidemark-sys`). For those three codes, `probe` re-tries a write in the staging directory
+/// and returns its errno; only `ENOSPC`/`EDQUOT` make it a space failure, so unrelated
+/// I/O errors keep their classification.
+fn classify_with(error: StoreError, probe: impl FnOnce() -> Option<i32>) -> StoreError {
+    let StoreError::Sql(rusqlite::Error::SqliteFailure(e, _)) = &error else {
+        return error;
+    };
+    if e.code == rusqlite::ErrorCode::DiskFull {
+        return StoreError::Space("destination disk full".into());
     }
+    if matches!(e.extended_code, IOERR_WRITE | IOERR_FSYNC | IOERR_TRUNCATE) {
+        if let Some(n) = probe() {
+            if n == rustix::io::Errno::NOSPC.raw_os_error()
+                || n == rustix::io::Errno::DQUOT.raw_os_error()
+            {
+                return StoreError::Space("destination disk full or quota exceeded".into());
+            }
+        }
+    }
+    error
+}
+/// Write 1 MiB and sync it in `dir`; the errno of the first failure, if any.
+fn probe_write_errno(dir: &Path) -> Option<i32> {
+    use std::io::Write;
+    let path = dir.join("space-probe");
+    let result = std::fs::File::create(&path).and_then(|mut f| {
+        f.write_all(&vec![0u8; 1 << 20])?;
+        f.sync_all()
+    });
+    let _ = std::fs::remove_file(&path);
+    result.err().and_then(|e| e.raw_os_error())
 }
 
 /// Write `snapshot` to `out` as a v1-schema database (with `dirs.path`/`path_hash` and the v1 indexes).
@@ -144,7 +179,10 @@ pub fn export_sqlite_cancellable(
     out: &Path,
     cancel: &dyn Fn() -> bool,
 ) -> Result<SqliteExportStats, StoreError> {
-    export_inner(snapshot, out, cancel).map_err(classify)
+    export_inner(snapshot, out, cancel).map_err(|e| match e {
+        StoreError::Cancelled => interrupted(),
+        other => other,
+    })
 }
 
 fn export_inner(
@@ -175,9 +213,17 @@ fn export_inner(
     meta.schema_version = 1;
     let mut writer = SnapshotWriter::create(&staging.path, &meta)?;
     let mut stats = SqliteExportStats::default();
-    copy_all(snapshot, &mut writer, &mut stats, cancel)?;
+    let built = (|| {
+        copy_all(snapshot, &mut writer, &mut stats, cancel)?;
+        check(cancel)?;
+        writer.finish_with(&meta, cancel)
+    })()
+    .map_err(|e| match e {
+        StoreError::Cancelled => interrupted(),
+        other => classify_with(other, || probe_write_errno(&staging.path)),
+    })?;
+    // Last chance to cancel: after the rename below the export is published and succeeds.
     check(cancel)?;
-    let built = writer.finish(&meta)?;
     rustix::fs::renameat_with(
         rustix::fs::CWD,
         &built,
@@ -306,7 +352,7 @@ fn copy_all(
         writer.put_link_sets(&sets)?;
         check(cancel)?;
     }
-    // Every stored instance, streamed in (ino, dir_id, name) order and uncapped, including
+    // Every stored instance, streamed uncapped (v1 in `(ino, rowid)` order, v2 in `(ino, dir_id, name)` order), including
     // instances of inodes without a `link_sets` row (unresolved partial scans hold them).
     let mut batch: Vec<LinkInstanceRow> = Vec::with_capacity(BATCH);
     if snap.is_v2() {
@@ -321,18 +367,26 @@ fn copy_all(
             Ok(())
         })?;
     } else {
-        let mut stmt = snap
-            .conn()
-            .prepare("SELECT ino,dir_id,name FROM link_instances ORDER BY ino,dir_id,name,rowid")?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            batch.push(crate::reader::instance_row(r)?);
-            if batch.len() >= BATCH {
-                check(cancel)?;
-                stats.link_instances += batch.len() as u64;
-                writer.put_link_instances(&batch)?;
-                batch.clear();
+        // Keyset pages on (ino, rowid): `li_ino` is (ino, rowid), so no sorter is needed.
+        let (mut ino, mut rowid) = (i64::MIN, i64::MIN);
+        loop {
+            let mut stmt = snap.conn().prepare_cached(V1_INSTANCE_PAGE)?;
+            let mut rows = stmt.query(params![ino, rowid, BATCH as i64])?;
+            let mut n = 0usize;
+            while let Some(r) = rows.next()? {
+                ino = r.get(3)?;
+                rowid = r.get(4)?;
+                batch.push(crate::reader::instance_row(r)?);
+                n += 1;
             }
+            drop(rows);
+            if n == 0 {
+                break;
+            }
+            check(cancel)?;
+            stats.link_instances += batch.len() as u64;
+            writer.put_link_instances(&batch)?;
+            batch.clear();
         }
     }
     stats.link_instances += batch.len() as u64;
@@ -406,4 +460,82 @@ fn error_row_at(r: &rusqlite::Row<'_>) -> rusqlite::Result<tidemark_core::snapsh
 }
 fn conv<E: std::error::Error + Send + Sync + 'static>(e: E) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite_failure(extended: i32) -> StoreError {
+        StoreError::Sql(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(extended),
+            None,
+        ))
+    }
+
+    #[test]
+    fn s3_quota_and_enospc_io_errors_are_space() {
+        for ext in [IOERR_WRITE, IOERR_FSYNC, IOERR_TRUNCATE] {
+            for errno in [rustix::io::Errno::DQUOT, rustix::io::Errno::NOSPC] {
+                let out = classify_with(sqlite_failure(ext), || Some(errno.raw_os_error()));
+                assert!(
+                    matches!(out, StoreError::Space(_)),
+                    "{ext} {errno:?}: {out:?}"
+                );
+            }
+        }
+        let full = classify_with(sqlite_failure(13), || None);
+        assert!(
+            matches!(full, StoreError::Space(_)),
+            "SQLITE_FULL: {full:?}"
+        );
+    }
+
+    #[test]
+    fn s3_unrelated_io_errors_are_not_space() {
+        let eio = rustix::io::Errno::IO.raw_os_error();
+        for probe in [Some(eio), None] {
+            let out = classify_with(sqlite_failure(IOERR_WRITE), || probe);
+            assert!(matches!(out, StoreError::Sql(_)), "{out:?}");
+        }
+        // Other I/O codes (read) never consult the probe.
+        let out = classify_with(sqlite_failure(266), || {
+            Some(rustix::io::Errno::DQUOT.raw_os_error())
+        });
+        assert!(matches!(out, StoreError::Sql(_)), "{out:?}");
+    }
+
+    #[test]
+    fn s3_probe_reports_no_errno_on_a_healthy_directory() {
+        let dir = test_support::private_tempdir().unwrap();
+        assert_eq!(probe_write_errno(dir.path()), None);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// S2: the v1 instance page is served by `li_ino` without a sorter.
+    #[test]
+    fn s2_v1_instance_page_needs_no_temp_btree() {
+        let dir = test_support::private_tempdir().unwrap();
+        let db = dir.path().join("v1.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE link_instances (ino INTEGER NOT NULL, dir_id INTEGER NOT NULL, name BLOB);
+             CREATE INDEX li_ino ON link_instances(ino);
+             CREATE INDEX li_dir ON link_instances(dir_id);",
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {V1_INSTANCE_PAGE}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params![0i64, 0i64, 10i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(!plan.is_empty());
+        for line in &plan {
+            assert!(!line.contains("TEMP B-TREE"), "sorter in plan: {plan:?}");
+        }
+        assert!(plan.iter().any(|l| l.contains("li_ino")), "{plan:?}");
+    }
 }

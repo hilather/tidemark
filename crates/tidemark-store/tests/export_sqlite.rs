@@ -519,3 +519,75 @@ fn s7_writer_rejects_non_increasing_directory_ids() {
     rows.push(rows[0].clone());
     assert!(matches!(w.put_dirs(&rows), Err(StoreError::Invalid(_))));
 }
+
+/// Files in the staging directory, for driving cancellation at a precise export stage.
+fn staged(out: &Path) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for e in fs::read_dir(out).unwrap().flatten() {
+        if e.file_name()
+            .to_string_lossy()
+            .starts_with(".tidemark-export-")
+        {
+            for f in fs::read_dir(e.path()).unwrap().flatten() {
+                paths.push(f.path());
+            }
+        }
+    }
+    paths
+}
+
+/// Run an export whose cancel callback trips once `stage(staged files)` holds.
+fn export_cancelled_at(snap: &Snapshot, stage: &dyn Fn(&[std::path::PathBuf]) -> bool) {
+    let out = test_support::private_tempdir().unwrap();
+    let target = out.path().join("never.db");
+    let result = tidemark_store::export_sqlite::export_sqlite_cancellable(snap, &target, &|| {
+        stage(&staged(out.path()))
+    });
+    match result {
+        Err(StoreError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::Interrupted),
+        other => panic!("expected Interrupted, got {other:?}"),
+    }
+    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 0, "leftovers");
+}
+
+#[test]
+fn s1_cancel_during_finalization_before_publication() {
+    let a = test_support::private_tempdir().unwrap();
+    let hot1 = write_v1(a.path());
+    let b = test_support::private_tempdir().unwrap();
+    let hot2 = write_v2(b.path());
+    let cold = compress_snapshot(&hot2, 3, &|| false).unwrap();
+    let sources = [
+        Snapshot::open(&hot1).unwrap(),
+        Snapshot::open(&hot2).unwrap(),
+        Snapshot::open_with_space_guard(&cold, |_| Ok(())).unwrap(),
+    ];
+    for snap in &sources {
+        // The last index exists: only `finish_with`'s own checkpoints can stop the export.
+        export_cancelled_at(snap, &|files| {
+            files.iter().any(|p| {
+                p.to_string_lossy().ends_with(".db.tmp")
+                    && rusqlite::Connection::open_with_flags(
+                        p,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .and_then(|c| {
+                        c.busy_timeout(std::time::Duration::ZERO)?;
+                        c.query_row(
+                            "SELECT count(*) FROM sqlite_master WHERE name='li_dir'",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )
+                    })
+                    .is_ok_and(|n| n == 1)
+            })
+        });
+        // The writer has already renamed its database into the staging directory: only
+        // the check right before the outer publication rename can stop the export.
+        export_cancelled_at(snap, &|files| {
+            files
+                .iter()
+                .any(|p| p.extension().is_some_and(|e| e == "db"))
+        });
+    }
+}
