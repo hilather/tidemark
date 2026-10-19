@@ -319,9 +319,9 @@ fn injected_space_refusal_precedes_leaf_creation() {
     let length = fs::metadata(hot).unwrap().len();
     let result = Snapshot::open_with_space_guard(&cold, |n| {
         assert_eq!(n, length);
-        Err(StoreError::Space("injected".into()))
+        Err(StoreError::space(None, "injected"))
     });
-    assert!(matches!(result, Err(StoreError::Space(_))));
+    assert!(matches!(result, Err(StoreError::Space { .. })));
     assert!(!tmp.path().join(".inflate").exists());
 }
 fn catalog_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -865,7 +865,10 @@ fn space_refusal_is_inconclusive_for_pair_cleanup() {
     // Valid signed-domain length that cannot fit on the fixture filesystem.
     bytes[8..16].copy_from_slice(&(i64::MAX as u64 - 1).to_le_bytes());
     fs::write(&cold, &bytes).unwrap();
-    assert!(matches!(Snapshot::open(&cold), Err(StoreError::Space(_))));
+    assert!(matches!(
+        Snapshot::open(&cold),
+        Err(StoreError::Space { .. })
+    ));
     cleanup_abandoned_scans(state.path(), 123);
     assert!(hot.exists());
     assert_eq!(fs::read(&cold).unwrap(), bytes);
@@ -940,13 +943,12 @@ fn permissive_inflate(dir: &Path, hot: &Path) -> Option<RetentionConfig> {
 fn floor_reason(state: &Path, length: u64, pct: f64) -> Option<String> {
     match tidemark_store::space_guard::space_check(state, length, &unlimited(pct)).unwrap() {
         tidemark_store::space_guard::SpaceVerdict::Ok => None,
-        tidemark_store::space_guard::SpaceVerdict::Refuse { reason }
-            if reason.contains("free-space floor") =>
-        {
-            Some(reason)
-        }
-        tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
-            panic!("space check at {pct}% refused {length} bytes for another reason: {reason}")
+        tidemark_store::space_guard::SpaceVerdict::Refuse {
+            kind: Some(tidemark_store::space_guard::SpaceRefusal::Floor { .. }),
+            reason,
+        } => Some(reason),
+        tidemark_store::space_guard::SpaceVerdict::Refuse { kind, reason } => {
+            panic!("space check at {pct}% refused {length} bytes as {kind:?}: {reason}")
         }
     }
 }
@@ -965,15 +967,12 @@ fn refuses_frozen(totals: tidemark_store::space_guard::FsTotals, length: u64, pc
         .unwrap()
     {
         tidemark_store::space_guard::SpaceVerdict::Ok => false,
-        tidemark_store::space_guard::SpaceVerdict::Refuse { reason }
-            if reason.contains("free-space floor") =>
-        {
-            true
-        }
-        tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
-            panic!(
-                "frozen space check at {pct}% refused {length} bytes for another reason: {reason}"
-            )
+        tidemark_store::space_guard::SpaceVerdict::Refuse {
+            kind: Some(tidemark_store::space_guard::SpaceRefusal::Floor { .. }),
+            reason: _,
+        } => true,
+        tidemark_store::space_guard::SpaceVerdict::Refuse { kind, reason } => {
+            panic!("frozen space check at {pct}% refused {length} bytes as {kind:?}: {reason}")
         }
     }
 }
@@ -1067,14 +1066,11 @@ fn snapshot_open_cold_path_enforces_configured_min_free_pct() {
     let size = 100 << 30;
     let avail = 40 << 30;
     assert!(matches!(
-        space_check_with(
-            || Ok(FsTotals { size, avail }),
-            0,
-            1,
-            &unlimited(50.0)
-        )
-        .unwrap(),
-        SpaceVerdict::Refuse { reason } if reason.contains("free-space floor")
+        space_check_with(|| Ok(FsTotals { size, avail }), 0, 1, &unlimited(50.0)).unwrap(),
+        SpaceVerdict::Refuse {
+            kind: Some(tidemark_store::space_guard::SpaceRefusal::Floor { .. }),
+            ..
+        }
     ));
     assert!(matches!(
         space_check_with(|| Ok(FsTotals { size, avail }), 0, 1, &unlimited(5.0)).unwrap(),
@@ -1094,13 +1090,13 @@ fn snapshot_open_cold_path_enforces_configured_min_free_pct() {
     assert!(floor_reason(state.path(), length, 5.0).is_none());
 
     match tidemark_store::space_guard::inflate_check(&cold, length, &strict) {
-        Err(StoreError::Space(reason)) => assert_eq!(reason, expected),
+        Err(StoreError::Space { reason, .. }) => assert_eq!(reason, expected),
         other => panic!("inflate_check ignored 50%: {other:?}"),
     }
     assert!(tidemark_store::space_guard::inflate_check(&cold, length, &loose).is_ok());
     let restored = state.path().join("restored.db");
     match inflate_to(&cold, &restored, &strict) {
-        Err(StoreError::Space(reason)) => assert_eq!(reason, expected),
+        Err(StoreError::Space { reason, .. }) => assert_eq!(reason, expected),
         other => panic!("inflate_to ignored 50%: {other:?}"),
     }
     assert!(
@@ -1109,7 +1105,7 @@ fn snapshot_open_cold_path_enforces_configured_min_free_pct() {
     );
 
     match must_err(Snapshot::open_with_retention(&cold, &strict)) {
-        StoreError::Space(reason) => assert_eq!(reason, expected),
+        StoreError::Space { reason, .. } => assert_eq!(reason, expected),
         other => panic!("Snapshot::open cold path ignored 50%: {other}"),
     }
     assert!(
@@ -1132,7 +1128,7 @@ fn snapshot_open_cold_path_enforces_configured_min_free_pct() {
         10,
         &strict,
     )) {
-        StoreError::Space(reason) => assert_eq!(reason, expected),
+        StoreError::Space { reason, .. } => assert_eq!(reason, expected),
         other => panic!("diff inflate ignored 50%: {other}"),
     }
     match must_err(explain_with_retention(
@@ -1145,7 +1141,7 @@ fn snapshot_open_cold_path_enforces_configured_min_free_pct() {
         5,
         &strict,
     )) {
-        StoreError::Space(reason) => assert_eq!(reason, expected),
+        StoreError::Space { reason, .. } => assert_eq!(reason, expected),
         other => panic!("explain inflate ignored 50%: {other}"),
     }
 }

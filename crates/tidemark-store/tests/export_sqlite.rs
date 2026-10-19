@@ -678,7 +678,7 @@ fn fix3_s1_persistent_quota_is_space_and_unconfirmed_io_error_is_runtime() {
         let (result, leftovers) =
             export_with_fault(&snap, stage, || sqlite_failure(778), quota_probe);
         assert!(
-            matches!(result, Err(StoreError::Space(_))),
+            matches!(result, Err(StoreError::Space { .. })),
             "{stage}: {result:?}"
         );
         assert_eq!(leftovers, 0, "{stage}");
@@ -696,10 +696,16 @@ fn fix3_s2_space_failure_during_writer_creation_is_space() {
     let hot = write_v1(a.path());
     let snap = Snapshot::open(&hot).unwrap();
     let (result, leftovers) = export_with_fault(&snap, "create", || sqlite_failure(13), |_| None);
-    assert!(matches!(result, Err(StoreError::Space(_))), "{result:?}");
+    assert!(
+        matches!(result, Err(StoreError::Space { .. })),
+        "{result:?}"
+    );
     assert_eq!(leftovers, 0);
     let (result, leftovers) =
         export_with_fault(&snap, "create", || sqlite_failure(778), quota_probe);
-    assert!(matches!(result, Err(StoreError::Space(_))), "{result:?}");
+    assert!(
+        matches!(result, Err(StoreError::Space { .. })),
+        "{result:?}"
+    );
     assert_eq!(leftovers, 0);
 }

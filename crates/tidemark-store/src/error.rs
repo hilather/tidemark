@@ -29,14 +29,35 @@ pub enum StoreError {
     #[error("invalid storage data: {0}")]
     Invalid(String),
     /// State space policy refused additional rows.
-    #[error("state space exhausted: {0}")]
-    Space(String),
+    ///
+    /// `reason` is the operator text. `kind` is the guard classification.
+    #[error("state space exhausted: {reason}")]
+    Space {
+        /// Which rule refused the write. `None` means the refusal did not come
+        /// from the space guard. Measuring the filesystem is [`StoreError::Io`],
+        /// not a space refusal.
+        kind: Option<crate::space_guard::SpaceRefusal>,
+        /// Operator-facing explanation. Unchanged from the historical string.
+        reason: String,
+    },
     /// An export destination already exists and was left unchanged.
     ///
     /// Only this variant is an output-path precondition. Other `AlreadyExists`
     /// I/O errors are not.
     #[error("output path already exists: {0}")]
     OutputExists(String),
+}
+impl StoreError {
+    /// A space refusal with an explicit classification.
+    pub fn space(
+        kind: Option<crate::space_guard::SpaceRefusal>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::Space {
+            kind,
+            reason: reason.into(),
+        }
+    }
 }
 pub(crate) fn sql_u64(n: u64) -> Result<i64, StoreError> {
     i64::try_from(n).map_err(|_| StoreError::Integer(n.to_string()))

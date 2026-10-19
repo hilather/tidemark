@@ -153,9 +153,9 @@ impl SnapshotWriter {
         if self.rows_since_check >= self.check_interval {
             self.rows_since_check = 0;
             if let Some(check) = self.check.as_mut() {
-                if let SpaceVerdict::Refuse { reason } = check() {
+                if let SpaceVerdict::Refuse { kind, reason } = check() {
                     self.failed = true;
-                    return Err(StoreError::Space(reason));
+                    return Err(StoreError::space(kind, reason));
                 }
             }
         }

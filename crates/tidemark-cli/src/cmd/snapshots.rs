@@ -308,13 +308,14 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                     if !dry_run {
                         let result = (|| -> anyhow::Result<()> {
                             let estimate = std::fs::metadata(hot)?.len() / 2;
-                            if let tidemark_store::space_guard::SpaceVerdict::Refuse { reason } =
-                                tidemark_store::space_guard::space_check(
-                                    state,
-                                    estimate,
-                                    &context.config.retention,
-                                )?
-                            {
+                            if let tidemark_store::space_guard::SpaceVerdict::Refuse {
+                                reason,
+                                ..
+                            } = tidemark_store::space_guard::space_check(
+                                state,
+                                estimate,
+                                &context.config.retention,
+                            )? {
                                 anyhow::bail!("{reason}");
                             }
                             let cold = tidemark_store::cold::compress_snapshot(
@@ -408,7 +409,7 @@ fn refuse_inside_state(target: &std::path::Path, state: &std::path::Path) -> any
 fn export_error(error: tidemark_store::StoreError) -> anyhow::Error {
     use tidemark_store::StoreError;
     match error {
-        StoreError::Space(reason) => {
+        StoreError::Space { reason, .. } => {
             crate::CliError::Precondition(format!("no space for export: {reason}")).into()
         }
         StoreError::Io(io)

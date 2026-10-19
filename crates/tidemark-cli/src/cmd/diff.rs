@@ -189,7 +189,7 @@ fn named_inflate(
     file: &std::path::Path,
 ) -> anyhow::Error {
     match error {
-        tidemark_store::StoreError::Space(_) => anyhow::Error::from(error).context(format!(
+        tidemark_store::StoreError::Space { .. } => anyhow::Error::from(error).context(format!(
             "inflate snapshot {id}: {}",
             super::display_path(file)
         )),
@@ -203,7 +203,7 @@ fn named_open(
     file: &std::path::Path,
 ) -> anyhow::Error {
     match error {
-        tidemark_store::StoreError::Space(_) => named_inflate(error, id, file),
+        tidemark_store::StoreError::Space { .. } => named_inflate(error, id, file),
         other => anyhow::Error::from(other)
             .context(format!("open snapshot: {}", super::display_path(file))),
     }

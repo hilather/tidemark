@@ -826,7 +826,7 @@ fn pair_validity(result: Result<(), StoreError>) -> Option<bool> {
         )
         .then_some(false),
         Err(
-            StoreError::Space(_)
+            StoreError::Space { .. }
             | StoreError::Cancelled
             | StoreError::NotYetImplemented
             | StoreError::OutputExists(_),

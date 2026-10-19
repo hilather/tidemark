@@ -2,6 +2,27 @@
 //! Conservative filesystem-space checks for Tidemark's own state.
 use std::{io, path::Path};
 use tidemark_core::config::RetentionConfig;
+/// Why a state-space check refused a write.
+///
+/// Plain `top` soft-skips only [`SpaceRefusal::Floor`]. A failure to read
+/// filesystem totals or measure state usage is [`std::io::Error`], not a variant
+/// here, and becomes [`crate::StoreError::Io`] for callers of [`inflate_check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpaceRefusal {
+    /// Free space would fall below the effective floor in `bytes`.
+    Floor {
+        /// Effective floor: `max(min_free_pct of filesystem size, 2 GiB)`.
+        bytes: u64,
+        /// The 2 GiB constant determined `bytes` (the percentage was not higher).
+        minimum_applied: bool,
+    },
+    /// `used + estimate` would exceed `max_state_size`.
+    MaxStateSize,
+    /// The percentage floor could not be computed in range.
+    Overflow,
+    /// `min_free_pct` is not a finite value in `0..=100`.
+    InvalidPolicy,
+}
 /// Space-policy decision, without performing pruning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpaceVerdict {
@@ -9,9 +30,29 @@ pub enum SpaceVerdict {
     Ok,
     /// Writing would violate the policy.
     Refuse {
+        /// Which rule refused the write.
+        ///
+        /// `None` is a caller-supplied refusal, not a classification from
+        /// [`space_check_with`].
+        kind: Option<SpaceRefusal>,
         /// Explanation for operators and the state_space alert.
         reason: String,
     },
+}
+impl SpaceVerdict {
+    /// A refusal that did not come from [`space_check_with`].
+    pub fn other(reason: impl Into<String>) -> Self {
+        Self::Refuse {
+            kind: None,
+            reason: reason.into(),
+        }
+    }
+}
+fn refuse(kind: SpaceRefusal, reason: &str) -> io::Result<SpaceVerdict> {
+    Ok(SpaceVerdict::Refuse {
+        kind: Some(kind),
+        reason: reason.to_owned(),
+    })
 }
 /// Byte totals measured on the filesystem containing the state directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +282,47 @@ pub fn space_check(
     let used = state_usage(state_dir)?;
     space_check_with(|| Ok(fs), used, estimate, policy)
 }
+/// Mandatory free bytes. `2 << 30` is 2 GiB.
+const MANDATORY_FREE_BYTES: u64 = 2 << 30;
+const OVERFLOW_REASON: &str = "free-space floor overflow";
+
+/// `size * mantissa`, or [`SpaceRefusal::Overflow`] when the product does not fit.
+fn scaled_numerator(size: u128, mantissa: u128) -> Result<u128, SpaceRefusal> {
+    size.checked_mul(mantissa).ok_or(SpaceRefusal::Overflow)
+}
+/// `2^shift * 100`, or [`SpaceRefusal::Overflow`] when the product does not fit.
+///
+/// Valid percentages take the `shift >= 121` shortcut in [`percentage_bytes`]
+/// before this multiply. The failure kind stays [`SpaceRefusal::Overflow`].
+fn percent_denominator(shift: u32) -> Result<u128, SpaceRefusal> {
+    (1u128 << shift)
+        .checked_mul(100)
+        .ok_or(SpaceRefusal::Overflow)
+}
+/// Ceil of `size * min_free_pct / 100` as an exact binary rational.
+fn percentage_bytes(size: u64, min_free_pct: f64) -> Result<u128, SpaceRefusal> {
+    // Decode the nonnegative finite f64 as an exact binary rational.
+    let bits = min_free_pct.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as u32;
+    let mantissa = (bits & ((1u64 << 52) - 1)) | if exponent == 0 { 0 } else { 1u64 << 52 };
+    let shift = if exponent == 0 { 1074 } else { 1075 - exponent };
+    // u64 * 53-bit mantissa fits u128; checked operations retain conservative failure.
+    let numerator = scaled_numerator(u128::from(size), u128::from(mantissa))?;
+    if numerator == 0 {
+        return Ok(0);
+    }
+    if shift >= 121 {
+        return Ok(u128::from(numerator != 0));
+    }
+    let denominator = percent_denominator(shift)?;
+    Ok(numerator / denominator + u128::from(numerator % denominator != 0))
+}
+/// `max(percentage, 2 GiB)`, and whether the 2 GiB constant set that value.
+fn apply_mandatory(percentage: u128) -> Result<(u64, bool), SpaceRefusal> {
+    let mandatory = u128::from(MANDATORY_FREE_BYTES);
+    let bytes = u64::try_from(percentage.max(mandatory)).map_err(|_| SpaceRefusal::Overflow)?;
+    Ok((bytes, percentage <= mandatory))
+}
 /// Apply the state cap and max(percent floor, 2 GiB) free-space floor.
 ///
 /// A failure to read filesystem totals is returned as an error. Policy
@@ -251,44 +333,42 @@ pub fn space_check_with(
     estimate: u64,
     policy: &RetentionConfig,
 ) -> io::Result<SpaceVerdict> {
-    let refuse = |reason: &str| {
-        Ok(SpaceVerdict::Refuse {
-            reason: reason.into(),
-        })
-    };
     if !policy.min_free_pct.is_finite() || !(0.0..=100.0).contains(&policy.min_free_pct) {
-        return refuse("invalid minimum free percentage");
+        return refuse(
+            SpaceRefusal::InvalidPolicy,
+            "invalid minimum free percentage",
+        );
     }
     let stat = statvfs()?;
     if used_by_state
         .checked_add(estimate)
         .is_none_or(|n| n > policy.max_state_size.0)
     {
-        return refuse("maximum state size would be exceeded");
+        return refuse(
+            SpaceRefusal::MaxStateSize,
+            "maximum state size would be exceeded",
+        );
     }
-    // Decode the nonnegative finite f64 as an exact binary rational.
-    let bits = policy.min_free_pct.to_bits();
-    let exponent = ((bits >> 52) & 0x7ff) as u32;
-    let mantissa = (bits & ((1u64 << 52) - 1)) | if exponent == 0 { 0 } else { 1u64 << 52 };
-    let shift = if exponent == 0 { 1074 } else { 1075 - exponent };
-    // u64 * 53-bit mantissa fits u128; checked operations retain conservative failure.
-    let numerator = u128::from(stat.size).checked_mul(u128::from(mantissa));
-    let percentage = match numerator {
-        Some(0) => 0,
-        Some(n) if shift >= 121 => u128::from(n != 0),
-        Some(n) => {
-            let Some(denominator) = (1u128 << shift).checked_mul(100) else {
-                return refuse("free-space floor overflow");
-            };
-            n / denominator + u128::from(n % denominator != 0)
-        }
-        None => return refuse("free-space floor overflow"),
+    // The next three failures are the historical "free-space floor overflow"
+    // sites (numerator, denominator, and floor width). They are Overflow on
+    // purpose, so a caller can hard-fail them instead of treating the text
+    // as a free-space floor skip.
+    let percentage = match percentage_bytes(stat.size, policy.min_free_pct) {
+        Ok(percentage) => percentage,
+        Err(_) => return refuse(SpaceRefusal::Overflow, OVERFLOW_REASON),
     };
-    let Ok(floor) = u64::try_from(percentage.max(2 << 30)) else {
-        return refuse("free-space floor overflow");
+    let (floor, minimum_applied) = match apply_mandatory(percentage) {
+        Ok(floor) => floor,
+        Err(_) => return refuse(SpaceRefusal::Overflow, OVERFLOW_REASON),
     };
     if stat.avail.checked_sub(estimate).is_none_or(|n| n < floor) {
-        return refuse("state filesystem free-space floor would be crossed");
+        return Ok(SpaceVerdict::Refuse {
+            kind: Some(SpaceRefusal::Floor {
+                bytes: floor,
+                minimum_applied,
+            }),
+            reason: "state filesystem free-space floor would be crossed".to_owned(),
+        });
     }
     Ok(SpaceVerdict::Ok)
 }
@@ -311,7 +391,7 @@ pub fn inflate_check(
         };
     match space_check(state, length, policy)? {
         SpaceVerdict::Ok => Ok(()),
-        SpaceVerdict::Refuse { reason } => Err(crate::StoreError::Space(reason)),
+        SpaceVerdict::Refuse { kind, reason } => Err(crate::StoreError::space(kind, reason)),
     }
 }
 
@@ -404,7 +484,7 @@ mod tests {
         assert!(
             !matches!(
                 &measured,
-                SpaceVerdict::Refuse { reason }
+                SpaceVerdict::Refuse { reason, .. }
                     if reason.contains("No such file or directory") || reason.contains("os error 2")
             ),
             "vanished leaf reported as NoSpace: {measured:?}"
@@ -531,6 +611,169 @@ mod tests {
         assert!(
             socket.exists(),
             "EACCES must not be treated as a vanished leaf"
+        );
+    }
+
+    fn policy(pct: f64, cap: u64) -> RetentionConfig {
+        RetentionConfig {
+            min_free_pct: pct,
+            max_state_size: tidemark_core::units::ByteSize(cap),
+            ..RetentionConfig::default()
+        }
+    }
+    fn check(
+        totals: Option<FsTotals>,
+        used: u64,
+        estimate: u64,
+        pct: f64,
+        cap: u64,
+    ) -> SpaceVerdict {
+        space_check_with(
+            move || totals.ok_or_else(|| io::Error::other("stat failed")),
+            used,
+            estimate,
+            &policy(pct, cap),
+        )
+        .unwrap()
+    }
+    fn assert_refusal(verdict: SpaceVerdict, kind: SpaceRefusal, reason: &str) {
+        match verdict {
+            SpaceVerdict::Refuse {
+                kind: Some(got),
+                reason: text,
+            } => {
+                assert_eq!(got, kind, "{text}");
+                assert_eq!(text, reason);
+            }
+            SpaceVerdict::Refuse {
+                kind: None,
+                reason: text,
+            } => {
+                panic!("expected {kind:?} ({reason}), got an unclassified refusal: {text}")
+            }
+            SpaceVerdict::Ok => panic!("expected {kind:?} ({reason})"),
+        }
+    }
+
+    #[test]
+    fn every_space_guard_refusal_site_names_its_kind() {
+        let huge = FsTotals {
+            size: 100 << 30,
+            avail: 80 << 30,
+        };
+        assert_refusal(
+            check(Some(huge), 0, 0, f64::NAN, u64::MAX),
+            SpaceRefusal::InvalidPolicy,
+            "invalid minimum free percentage",
+        );
+        assert_refusal(
+            check(Some(huge), 0, 0, f64::INFINITY, u64::MAX),
+            SpaceRefusal::InvalidPolicy,
+            "invalid minimum free percentage",
+        );
+        assert_refusal(
+            check(Some(huge), 0, 0, -0.1, u64::MAX),
+            SpaceRefusal::InvalidPolicy,
+            "invalid minimum free percentage",
+        );
+        assert_refusal(
+            check(Some(huge), 0, 0, 100.1, u64::MAX),
+            SpaceRefusal::InvalidPolicy,
+            "invalid minimum free percentage",
+        );
+        let unreadable = space_check_with(
+            || Err(io::Error::other("stat failed")),
+            0,
+            0,
+            &policy(5.0, u64::MAX),
+        )
+        .expect_err("unreadable totals are an I/O error");
+        assert_eq!(unreadable.to_string(), "stat failed");
+        assert!(matches!(
+            crate::StoreError::from(unreadable),
+            crate::StoreError::Io(_)
+        ));
+        assert_refusal(
+            check(Some(huge), 80, 30, 5.0, 100),
+            SpaceRefusal::MaxStateSize,
+            "maximum state size would be exceeded",
+        );
+        assert_refusal(
+            check(Some(huge), u64::MAX, 1, 5.0, u64::MAX),
+            SpaceRefusal::MaxStateSize,
+            "maximum state size would be exceeded",
+        );
+        assert_refusal(
+            check(
+                Some(FsTotals {
+                    size: 4 << 30,
+                    avail: 1 << 30,
+                }),
+                0,
+                0,
+                0.0,
+                u64::MAX,
+            ),
+            SpaceRefusal::Floor {
+                bytes: MANDATORY_FREE_BYTES,
+                minimum_applied: true,
+            },
+            "state filesystem free-space floor would be crossed",
+        );
+        assert_refusal(
+            check(
+                Some(FsTotals {
+                    size: 100 << 30,
+                    avail: 10 << 30,
+                }),
+                0,
+                0,
+                50.0,
+                u64::MAX,
+            ),
+            SpaceRefusal::Floor {
+                bytes: 50 << 30,
+                minimum_applied: false,
+            },
+            "state filesystem free-space floor would be crossed",
+        );
+        assert!(matches!(
+            check(Some(huge), 0, 0, 5.0, u64::MAX),
+            SpaceVerdict::Ok
+        ));
+        // Both limits at once: the cap is checked first and wins.
+        let tight = FsTotals {
+            size: 100 << 30,
+            avail: 1 << 30,
+        };
+        assert_refusal(
+            check(Some(tight), 0, 128 << 10, 50.0, 64 << 10),
+            SpaceRefusal::MaxStateSize,
+            "maximum state size would be exceeded",
+        );
+        assert_refusal(
+            check(Some(tight), 0, 128 << 10, 50.0, u64::MAX),
+            SpaceRefusal::Floor {
+                bytes: 50 << 30,
+                minimum_applied: false,
+            },
+            "state filesystem free-space floor would be crossed",
+        );
+
+        // Numerator overflow: size * mantissa does not fit in u128.
+        assert_eq!(scaled_numerator(u128::MAX, 2), Err(SpaceRefusal::Overflow));
+        // Denominator overflow: 2^shift * 100 does not fit. Valid percentages
+        // never reach this multiply (shift >= 121 returns early).
+        assert_eq!(percent_denominator(122), Err(SpaceRefusal::Overflow));
+        // Width overflow: max(percentage, 2 GiB) does not fit in u64.
+        assert_eq!(
+            apply_mandatory(u128::from(u64::MAX) + 1),
+            Err(SpaceRefusal::Overflow)
+        );
+        assert_eq!(OVERFLOW_REASON, "free-space floor overflow");
+        assert_eq!(
+            percentage_bytes(u64::MAX, 100.0).map(|p| apply_mandatory(p).map(|_| ())),
+            Ok(Ok(()))
         );
     }
 }

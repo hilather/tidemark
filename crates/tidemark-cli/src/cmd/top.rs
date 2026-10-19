@@ -76,11 +76,14 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
     ) {
         Ok(old) => (old, false),
         Err(OlderFailure {
-            scan_id: Some(scan_id),
-            refusal: Some(SpaceRefusal::FreeSpaceFloor),
-            ..
+            floor: Some(skip), ..
         }) if soft_delta => {
-            warn_delta_skipped(&scan_id, context.config.retention.min_free_pct);
+            warn_delta_skipped(
+                &skip.scan_id,
+                context.config.retention.min_free_pct,
+                skip.bytes,
+                skip.minimum_applied,
+            );
             (None, true)
         }
         Err(failure) => return Err(failure.error),
@@ -155,29 +158,47 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
 }
 /// One stderr line when plain `top` leaves Δ24h blank after a floor refusal.
 ///
-/// `min_free_pct` is the configured retention value, not a fixed default.
-fn warn_delta_skipped(scan_id: &str, min_free_pct: f64) {
-    eprintln!(
-        "warning: Δ24h skipped: inflating {scan_id} would breach min_free_pct={min_free_pct}%"
-    );
+/// When the mandatory 2 GiB minimum set the floor, the line names that minimum
+/// and its byte count. It does not name `min_free_pct`. When the percentage is
+/// higher, the line names the effective floor in bytes and the configured percentage.
+fn warn_delta_skipped(scan_id: &str, min_free_pct: f64, floor_bytes: u64, minimum_applied: bool) {
+    if minimum_applied {
+        eprintln!(
+            "warning: Δ24h skipped: inflating {scan_id} would breach the 2 GiB minimum (floor={floor_bytes} bytes)"
+        );
+    } else {
+        eprintln!(
+            "warning: Δ24h skipped: inflating {scan_id} would breach floor={floor_bytes} bytes (min_free_pct={min_free_pct}%, 2 GiB minimum not applied)"
+        );
+    }
 }
-/// Which state-space rule refused inflating the Δ24h snapshot.
-enum SpaceRefusal {
-    FreeSpaceFloor,
-    MaxStateSize,
+/// Floor details that plain `top` may turn into a blank Δ24h column.
+struct FloorSkip {
+    scan_id: String,
+    bytes: u64,
+    minimum_applied: bool,
 }
 struct OlderFailure {
-    scan_id: Option<String>,
-    refusal: Option<SpaceRefusal>,
+    floor: Option<FloorSkip>,
     error: anyhow::Error,
 }
-fn space_refusal(reason: &str) -> Option<SpaceRefusal> {
-    if reason.contains("free-space floor") {
-        Some(SpaceRefusal::FreeSpaceFloor)
-    } else if reason.contains("maximum state size") {
-        Some(SpaceRefusal::MaxStateSize)
-    } else {
-        None
+/// Only a free-space floor is a Δ24h skip. Every other kind fails the command.
+fn floor_skip(
+    kind: &tidemark_store::space_guard::SpaceRefusal,
+    scan_id: &str,
+) -> Option<FloorSkip> {
+    match kind {
+        tidemark_store::space_guard::SpaceRefusal::Floor {
+            bytes,
+            minimum_applied,
+        } => Some(FloorSkip {
+            scan_id: scan_id.to_owned(),
+            bytes: *bytes,
+            minimum_applied: *minimum_applied,
+        }),
+        tidemark_store::space_guard::SpaceRefusal::MaxStateSize
+        | tidemark_store::space_guard::SpaceRefusal::Overflow
+        | tidemark_store::space_guard::SpaceRefusal::InvalidPolicy => None,
     }
 }
 fn older_snapshot(
@@ -191,8 +212,7 @@ fn older_snapshot(
         Ok(entries) => entries,
         Err(error) => {
             return Err(OlderFailure {
-                scan_id: None,
-                refusal: None,
+                floor: None,
                 error: error.into(),
             })
         }
@@ -221,19 +241,16 @@ fn older_snapshot(
     };
     match tidemark_store::reader::Snapshot::open_with_retention(&path, policy) {
         Ok(snapshot) => Ok(Some(snapshot)),
-        Err(tidemark_store::StoreError::Space(reason)) => {
-            let refusal = space_refusal(&reason);
-            Err(OlderFailure {
-                scan_id: refusal.as_ref().map(|_| entry.scan_id),
-                refusal,
-                error: anyhow::Error::from(tidemark_store::StoreError::Space(reason)).context(
-                    format!("open older snapshot: {}", super::display_path(&path)),
-                ),
-            })
-        }
+        Err(tidemark_store::StoreError::Space { kind, reason }) => Err(OlderFailure {
+            floor: kind
+                .as_ref()
+                .and_then(|kind| floor_skip(kind, &entry.scan_id)),
+            error: anyhow::Error::from(tidemark_store::StoreError::space(kind, reason)).context(
+                format!("open older snapshot: {}", super::display_path(&path)),
+            ),
+        }),
         Err(error) => Err(OlderFailure {
-            scan_id: None,
-            refusal: None,
+            floor: None,
             error: anyhow::Error::from(error).context(format!(
                 "open older snapshot: {}",
                 super::display_path(&path)
@@ -262,4 +279,32 @@ pub enum Sort {
     Name,
     /// Signed disk-byte growth compared with the older complete snapshot.
     Growth,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::floor_skip;
+    use tidemark_store::space_guard::SpaceRefusal;
+
+    #[test]
+    fn only_a_floor_refusal_can_skip_delta() {
+        assert!(floor_skip(
+            &SpaceRefusal::Floor {
+                bytes: 2 << 30,
+                minimum_applied: true,
+            },
+            "id",
+        )
+        .is_some_and(|skip| skip.minimum_applied && skip.bytes == 2 << 30 && skip.scan_id == "id"));
+        for kind in [
+            SpaceRefusal::MaxStateSize,
+            SpaceRefusal::Overflow,
+            SpaceRefusal::InvalidPolicy,
+        ] {
+            assert!(
+                floor_skip(&kind, "id").is_none(),
+                "non-floor refusal must hard-fail"
+            );
+        }
+    }
 }
