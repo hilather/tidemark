@@ -267,7 +267,7 @@ fn roundtrip_all_reader_methods_and_drop() {
         0
     );
     let dest = tmp.path().join("restored.db");
-    inflate_to(&cold, &dest).unwrap();
+    inflate_to(&cold, &dest, &RetentionConfig::default()).unwrap();
     assert_eq!(fs::read(dest).unwrap(), fs::read(hot).unwrap());
 }
 #[test]
@@ -295,12 +295,15 @@ fn corrupt_headers_frames_lengths_and_destination_collisions() {
             }
         }
         fs::write(&cold, bytes).unwrap();
-        assert!(inflate_to(&cold, &dest).is_err(), "mutation {mutation}");
+        assert!(
+            inflate_to(&cold, &dest, &RetentionConfig::default()).is_err(),
+            "mutation {mutation}"
+        );
         assert!(!dest.exists());
     }
     fs::write(&cold, original).unwrap();
-    inflate_to(&cold, &dest).unwrap();
-    assert!(inflate_to(&cold, &dest).is_err());
+    inflate_to(&cold, &dest, &RetentionConfig::default()).unwrap();
+    assert!(inflate_to(&cold, &dest, &RetentionConfig::default()).is_err());
     assert!(compress_snapshot(&hot, 1, &|| false).is_err());
 }
 #[test]
@@ -991,6 +994,36 @@ fn length_between(state: &Path, pct: f64) -> Option<u64> {
     None
 }
 
+/// `pct` is no stricter than the mandatory 2 GiB floor, so no declared length
+/// can separate it from the default 5% floor.
+fn absolute_floor_hides_percentage(
+    totals: tidemark_store::space_guard::FsTotals,
+    pct: f64,
+) -> bool {
+    match (
+        first_floor_refusal(totals, pct),
+        first_floor_refusal(totals, 0.0),
+    ) {
+        (Some(configured), Some(absolute)) => configured >= absolute,
+        _ => false,
+    }
+}
+
+/// A length that 50% refuses and 5% allows, or `None` when this filesystem is
+/// too small to host one.
+fn length_or_skip(state: &Path) -> Option<u64> {
+    if let Some(length) = length_between(state, 50.0) {
+        return Some(length);
+    }
+    if absolute_floor_hides_percentage(filesystem_totals(state), 50.0) {
+        eprintln!(
+            "skipped: filesystem is too small to host a declared inflate length that 50% refuses and 5% allows"
+        );
+        return None;
+    }
+    panic!("could not separate a 50% free-space floor from the default 5%");
+}
+
 fn declare_length(cold: &Path, length: u64) {
     let mut bytes = fs::read(cold).unwrap();
     bytes[8..16].copy_from_slice(&length.to_le_bytes());
@@ -1026,9 +1059,9 @@ fn snapshot_open_cold_path_enforces_configured_min_free_pct() {
 
     let (state, hot) = catalog_fixture();
     let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
-    let length = length_between(state.path(), 50.0).expect(
-        "the 2 GiB absolute floor hides 50% on this filesystem; 50% cannot be separated from 5%",
-    );
+    let Some(length) = length_or_skip(state.path()) else {
+        return;
+    };
     declare_length(&cold, length);
     let inflate = cold.parent().unwrap().join(".inflate");
     let strict = unlimited(50.0);
@@ -1041,6 +1074,15 @@ fn snapshot_open_cold_path_enforces_configured_min_free_pct() {
         other => panic!("inflate_check ignored 50%: {other:?}"),
     }
     assert!(tidemark_store::space_guard::inflate_check(&cold, length, &loose).is_ok());
+    let restored = state.path().join("restored.db");
+    match inflate_to(&cold, &restored, &strict) {
+        Err(StoreError::Space(reason)) => assert_eq!(reason, expected),
+        other => panic!("inflate_to ignored 50%: {other:?}"),
+    }
+    assert!(
+        !restored.exists(),
+        "refusing the free-space floor must not create an inflate destination"
+    );
 
     match must_err(Snapshot::open_with_retention(&cold, &strict)) {
         StoreError::Space(reason) => assert_eq!(reason, expected),
@@ -1090,9 +1132,9 @@ fn cleanup_inflate_enforces_configured_min_free_pct() {
     let catalog = Catalog::open(state.path(), true).unwrap();
     catalog.rebuild_from_files().unwrap();
     let cold = compress_snapshot(&hot, 1, &|| false).unwrap();
-    let length = length_between(state.path(), 50.0).expect(
-        "the 2 GiB absolute floor hides 50% on this filesystem; 50% cannot be separated from 5%",
-    );
+    let Some(length) = length_or_skip(state.path()) else {
+        return;
+    };
     declare_length(&cold, length);
     drop(catalog);
     tidemark_store::catalog::cleanup_abandoned_scans_with_policy(

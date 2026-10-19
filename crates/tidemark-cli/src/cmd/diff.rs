@@ -134,7 +134,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         .ok_or_else(|| crate::CliError::Precondition("new snapshot has no file".into()))?;
     let policy = &context.config.retention;
     let new = tidemark_store::Snapshot::open_with_retention(new_file, policy)
-        .with_context(|| format!("open snapshot: {}", super::display_path(new_file)))?;
+        .map_err(|error| named_open(error, &entry.scan_id, new_file))?;
     let depth = u32::try_from(args.depth)
         .map_err(|_| crate::CliError::Configuration("depth exceeds u32".into()))?;
     let rows = diff_with_retention(
@@ -145,7 +145,8 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         depth,
         args.limit.unwrap_or(25),
         policy,
-    )?;
+    )
+    .map_err(|error| named_inflate(error, &old.scan_id, old_file))?;
     let explanation = args
         .explain
         .then(|| {
@@ -159,6 +160,7 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 5,
                 policy,
             )
+            .map_err(|error| named_inflate(error, &old.scan_id, old_file))
         })
         .transpose()?;
     let warning = crate::render::diff::coverage_notice(&old, &entry);
@@ -179,6 +181,32 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         context.json,
         &mut out,
     )
+}
+/// A free-space refusal names the snapshot. Other failures are unchanged.
+fn named_inflate(
+    error: tidemark_store::StoreError,
+    id: &str,
+    file: &std::path::Path,
+) -> anyhow::Error {
+    match error {
+        tidemark_store::StoreError::Space(_) => anyhow::Error::from(error).context(format!(
+            "inflate snapshot {id}: {}",
+            super::display_path(file)
+        )),
+        other => other.into(),
+    }
+}
+/// Open one snapshot. A free-space refusal names it; other failures keep the path.
+fn named_open(
+    error: tidemark_store::StoreError,
+    id: &str,
+    file: &std::path::Path,
+) -> anyhow::Error {
+    match error {
+        tidemark_store::StoreError::Space(_) => named_inflate(error, id, file),
+        other => anyhow::Error::from(other)
+            .context(format!("open snapshot: {}", super::display_path(file))),
+    }
 }
 fn query_path(path: &std::path::Path) -> anyhow::Result<tidemark_core::path::RawPath> {
     use std::os::unix::ffi::OsStrExt;

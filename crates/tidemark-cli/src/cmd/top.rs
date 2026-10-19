@@ -63,12 +63,20 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
                 super::display_path(&context.config.general.state_dir)
             )
         })?;
-    let old = older_snapshot(
+    // Plain top uses the ~24h snapshot only for Δ24h. A free-space refusal
+    // leaves that column blank, the way the TUI does. `--snapshot` and
+    // `--sort growth` still require the open to succeed.
+    let soft_delta = args.snapshot.is_none() && args.sort != Some(Sort::Growth);
+    let (old, blank_delta) = match older_snapshot(
         &catalog,
         &snapshot,
         tidemark_core::time::unix_now(),
         &context.config.retention,
-    )?;
+    ) {
+        Ok(old) => (old, false),
+        Err(error) if soft_delta && is_space_refusal(&error) => (None, true),
+        Err(error) => return Err(error),
+    };
     if sort == Sort::Growth && old.is_none() {
         return Err(crate::CliError::Precondition(
             "growth sorting requires an older complete snapshot within 6h of now minus 24h".into(),
@@ -132,8 +140,17 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         args.wide,
         crate::render::tree::ascii_locale(),
         context.json,
+        blank_delta,
         &mut out,
     )
+}
+fn is_space_refusal(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<tidemark_store::StoreError>(),
+            Some(tidemark_store::StoreError::Space(_))
+        )
+    })
 }
 fn older_snapshot(
     catalog: &tidemark_store::catalog::Catalog,

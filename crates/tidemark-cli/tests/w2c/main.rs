@@ -109,7 +109,7 @@ fn tree_unicode_ascii_and_raw_paths() {
     ];
     for ascii in [false, true] {
         let mut buf = Vec::new();
-        tree::directories(&rows, true, ascii, false, &mut buf).unwrap();
+        tree::directories(&rows, true, ascii, false, false, &mut buf).unwrap();
         insta::with_settings!({snapshot_path =>"snapshots"}, {
             insta::assert_snapshot!(if ascii { "tree_ascii" } else { "tree_unicode" },String::from_utf8(buf).unwrap());
         });
@@ -170,7 +170,7 @@ fn top_json_schema_and_paths() {
         live_disk: None,
     }];
     let mut buf = Vec::new();
-    tree::directories(&rows, false, true, true, &mut buf).unwrap();
+    tree::directories(&rows, false, true, true, false, &mut buf).unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
     insta::with_settings!({snapshot_path => "snapshots"}, {insta::assert_json_snapshot!("top_json",doc);});
     assert_eq!(doc["schema"], "tidemark.top.v1");

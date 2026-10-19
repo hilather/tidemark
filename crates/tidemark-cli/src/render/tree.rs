@@ -55,17 +55,21 @@ pub fn snapshot_header(
     Ok(())
 }
 /// Render rows as an iterative tree, preserving the caller's sibling ordering.
+///
+/// `blank_delta` keeps the Δ24h column when an older snapshot exists but could
+/// not be inflated. Those cells are `-`.
 pub fn directories(
     rows: &[Directory],
     wide: bool,
     ascii: bool,
     json: bool,
+    blank_delta: bool,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
     if json {
         return super::json("tidemark.top.v1", rows, out);
     }
-    let delta = rows.iter().any(|r| r.delta.is_some());
+    let delta = blank_delta || rows.iter().any(|r| r.delta.is_some());
     let live = rows.iter().any(|r| r.live_disk.is_some());
     let mut header = vec![
         "PATH".into(),
@@ -131,11 +135,11 @@ pub fn directories(
             ]);
         }
         if delta {
-            cells.push(
-                r.delta
-                    .map(signed_bytes)
-                    .unwrap_or_else(|| "unknown".into()),
-            );
+            cells.push(match r.delta {
+                Some(n) => signed_bytes(n),
+                None if blank_delta => "-".into(),
+                None => "unknown".into(),
+            });
         }
         if live {
             cells.extend([

@@ -320,7 +320,6 @@ impl Cached {
 }
 
 /// UI-owned result cache and scheduling state; the worker alone owns historical readers.
-#[derive(Default)]
 pub(super) struct History {
     pub window: Vec<Entry>,
     pub samples: Vec<Option<Sample>>,
@@ -337,11 +336,22 @@ pub(super) struct History {
 }
 
 impl History {
-    /// Retention floor used when the worker opens a cold snapshot.
-    ///
-    /// Must be set before the first [`Self::update`] that starts the worker.
-    pub(super) fn set_retention(&mut self, policy: RetentionConfig) {
-        self.retention = policy;
+    /// Cold opens use `retention` for the life of the worker.
+    pub(super) fn new(retention: RetentionConfig) -> Self {
+        Self {
+            window: Vec::new(),
+            samples: Vec::new(),
+            key: None,
+            generation: 0,
+            opened: None,
+            visible: false,
+            active: false,
+            failed_at: None,
+            cache: VecDeque::new(),
+            bytes: 0,
+            worker: None,
+            retention,
+        }
     }
 
     pub fn prepare_window(&mut self, meta: &SnapshotMeta, file: &Path, catalog: &[CatalogRow]) {
