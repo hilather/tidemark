@@ -64,9 +64,10 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
             )
         })?;
     // Plain top uses the ~24h snapshot only for Δ24h. Only a free-space floor
-    // refusal leaves that column blank. A state-size cap, and every other
-    // error, still fail the command. `--snapshot` and `--sort growth` require
-    // the open to succeed.
+    // refusal leaves that column blank and exits 0. A state-size cap, overflow,
+    // invalid policy, and every other error still fail the command (a space
+    // refusal exits 5 via `command_error`). `--snapshot` and `--sort growth`
+    // require the open to succeed, so a floor refusal is hard there too.
     let soft_delta = args.snapshot.is_none() && args.sort != Some(Sort::Growth);
     let (old, blank_delta) = match older_snapshot(
         &catalog,
@@ -182,7 +183,8 @@ struct OlderFailure {
     floor: Option<FloorSkip>,
     error: anyhow::Error,
 }
-/// Only a free-space floor is a Δ24h skip. Every other kind fails the command.
+/// Only a free-space floor is a Δ24h skip. Every other kind fails the command
+/// (exit 5 once `command_error` sees the `StoreError::Space`).
 fn floor_skip(
     kind: &tidemark_store::space_guard::SpaceRefusal,
     scan_id: &str,

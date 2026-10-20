@@ -17,7 +17,7 @@ pub struct Directory {
     /// Present only for a skipped inflation. `free_space_floor` means inflating
     /// that snapshot would breach the free-space floor (`retention.min_free_pct`
     /// or the mandatory 2 GiB floor). A `max_state_size` refusal, a floor
-    /// overflow, and an invalid `min_free_pct` are not skips: the command fails
+    /// overflow, and an invalid `min_free_pct` are not skips: the command exits 5
     /// and this field is absent. Omitted when `delta` is known and when no older
     /// snapshot was selected, so a missing predecessor stays `delta: null` with
     /// no `delta_skipped` field. `tidemark.top.v1` emits this on each row.

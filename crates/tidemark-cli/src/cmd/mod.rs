@@ -115,6 +115,9 @@ pub(crate) fn error_context(
 }
 
 #[cfg(test)]
+mod space_refusal_tests;
+
+#[cfg(test)]
 mod context_tests {
     use clap::Parser;
     #[test]
