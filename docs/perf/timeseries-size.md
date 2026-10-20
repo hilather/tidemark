@@ -64,7 +64,7 @@ Section `retention` then calls `TimeSeries::compact`. `now` is `start_ts + durat
 
 Dev profile. SQLite page layout does not depend on Rust optimization level. Bundled SQLite is rusqlite 0.38.0 / libsqlite3-sys 0.36.0 (`SELECT sqlite_version()` = 3.51.1). A rusqlite bump needs a new baseline.
 
-Measured on this change's dev `xtask`, Linux 6.12.94+ x86_64, 4 CPUs, 16 GiB RAM. This is not an isolated benchmark host. Wall time was a few seconds and is not a result.
+Measured from dev-profile `xtask` at `10d25778347879eda0a8577fdaa8a7d10e6b362a`, Linux 6.12.94+ x86_64, 4 CPUs, 16 GiB RAM. This is not an isolated benchmark host. Wall time was a few seconds and is not a result.
 
 ```sh
 cargo run --locked -p xtask -- ts-size --profile v1 --out /tmp/tidemark-ts-size-v1
