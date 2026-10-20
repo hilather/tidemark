@@ -28,12 +28,25 @@ const MAX_FILES_PER_PROCESS: u32 = 1_024;
 const MAX_SLOTS: u32 = 100_000;
 const MAX_PASSES: i64 = 20_000;
 /// Worst-case phantom plus writer rows, including the reuse day.
-const MAX_SAMPLE_ROWS: u64 = 2_000_000;
+/// 16×8 open files over 7 days plus the reuse day is 2,949,120.
+const MAX_SAMPLE_ROWS: u64 = 4_000_000;
 const MIN_PATH_BYTES: usize = 32;
 const MAX_PATH_BYTES: usize = 512;
 const DAY_SECS: i64 = 86_400;
 #[cfg(test)]
-const CI_BYTE_CEILING: i64 = 8 * 1024 * 1024;
+const CI_PAGE_COUNT: i64 = 17;
+#[cfg(test)]
+const CI_WRITER_SAMPLES_BYTES: i64 = 12_288;
+#[cfg(test)]
+const CI_WRITER_TS_BYTES: i64 = 4_096;
+#[cfg(test)]
+const CI_PHANTOM_SAMPLES_BYTES: i64 = 4_096;
+#[cfg(test)]
+const CI_PHANTOM_TS_BYTES: i64 = 4_096;
+#[cfg(test)]
+const CI_AFTER_DELETE_PAGES: i64 = 17;
+#[cfg(test)]
+const CI_AFTER_REUSE_PAGES: i64 = 18;
 
 /// Insert order matches `tidemarkd` procscan: one pass, phantom batches, then writer batches.
 const INSERT_ORDER: &str = "per_pass_phantom_then_writers";
@@ -103,19 +116,10 @@ struct Parameters {
     writer_synchronous: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ObjectBytes {
-    name: String,
-    bytes: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct TableCount {
-    name: String,
-    rows: i64,
-}
-
 /// Main-file size after a truncate checkpoint. `shm_bytes` is recorded and not compared.
+///
+/// `objects` and `rows` are keyed by dbstat / table name. Serde emits those keys in
+/// sorted order, so a diff does not depend on array position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct Measurement {
     sqlite_version: String,
@@ -130,8 +134,8 @@ struct Measurement {
     checkpoint_busy: i64,
     checkpoint_log: i64,
     checkpoint_frames: i64,
-    objects: Vec<ObjectBytes>,
-    rows: Vec<TableCount>,
+    objects: BTreeMap<String, i64>,
+    rows: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -408,8 +412,8 @@ struct RawStats {
     page_size: i64,
     page_count: i64,
     freelist_count: i64,
-    objects: Vec<ObjectBytes>,
-    rows: Vec<TableCount>,
+    objects: BTreeMap<String, i64>,
+    rows: BTreeMap<String, i64>,
 }
 
 fn open_measure(db: &Path) -> Result<Connection> {
@@ -443,20 +447,15 @@ fn read_stats(conn: &Connection) -> Result<RawStats> {
     let mut object_stmt =
         conn.prepare("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY name")?;
     let objects = object_stmt
-        .query_map([], |row| {
-            Ok(ObjectBytes {
-                name: row.get(0)?,
-                bytes: row.get(1)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<BTreeMap<String, i64>>>()?;
     let mut table_stmt = conn.prepare(
         "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )?;
     let names = table_stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut rows = Vec::with_capacity(names.len());
+    let mut rows = BTreeMap::new();
     for name in names {
         if !name
             .bytes()
@@ -468,7 +467,7 @@ fn read_stats(conn: &Connection) -> Result<RawStats> {
             conn.query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |row| {
                 row.get(0)
             })?;
-        rows.push(TableCount { name, rows: count });
+        rows.insert(name, count);
     }
     Ok(RawStats {
         sqlite_version,
@@ -516,7 +515,7 @@ fn check_measurement(measurement: &Measurement) -> Result<()> {
             measurement.main_file_len
         );
     }
-    let summed: i64 = measurement.objects.iter().map(|object| object.bytes).sum();
+    let summed: i64 = measurement.objects.values().sum();
     let accounted = summed
         .checked_add(
             measurement
@@ -635,17 +634,13 @@ fn render_measurement(label: &str, measurement: &Measurement) {
         measurement.wal_bytes,
         measurement.sqlite_version
     );
-    for object in &measurement.objects {
+    for (name, bytes) in &measurement.objects {
         let rows = measurement
             .rows
-            .iter()
-            .find(|table| table.name == object.name)
-            .map(|table| table.rows.to_string())
+            .get(name)
+            .map(ToString::to_string)
             .unwrap_or_else(|| "-".into());
-        eprintln!(
-            "  {:<24} {:>12} bytes  rows {rows}",
-            object.name, object.bytes
-        );
+        eprintln!("  {name:<24} {bytes:>12} bytes  rows {rows}");
     }
 }
 
@@ -683,15 +678,18 @@ fn parameters(profile: &Profile, profile_name: &str, passes: i64) -> Result<Para
 
 impl Profile {
     fn v1() -> Self {
-        // 16*5 = 80 open files per pass, and every path-length class is used.
+        // 16*8 = 128 open files per pass. One 64-byte path class: that is the
+        // unique core for the longest comm at the reuse-day generation, and it
+        // is the row width that brings writer_ts / writer_samples near the
+        // production 12% index ratio. See docs/perf/timeseries-size.md.
         Self {
             processes: 16,
-            files_per_process: 5,
+            files_per_process: 8,
             interval_secs: 60,
             duration_secs: 604_800,
             seed: 42,
-            churn_permille: 200,
-            path_bytes: vec![96, 128, 160, 192, 256],
+            churn_permille: 150,
+            path_bytes: vec![64],
             mount: "/data".into(),
             start_ts: 1_780_000_000,
         }
@@ -705,7 +703,7 @@ impl Profile {
             duration_secs: 300,
             seed: 42,
             churn_permille: 250,
-            path_bytes: vec![96, 128, 160, 192, 256],
+            path_bytes: vec![64],
             mount: "/data".into(),
             start_ts: 1_780_000_000,
         }
@@ -1139,22 +1137,12 @@ fn parse_path_bytes(text: &str) -> Result<Vec<usize>> {
 
 #[cfg(test)]
 fn rows_of(measurement: &Measurement, name: &str) -> i64 {
-    measurement
-        .rows
-        .iter()
-        .find(|table| table.name == name)
-        .map(|table| table.rows)
-        .unwrap_or(0)
+    measurement.rows.get(name).copied().unwrap_or(0)
 }
 
 #[cfg(test)]
 fn bytes_of(measurement: &Measurement, name: &str) -> i64 {
-    measurement
-        .objects
-        .iter()
-        .find(|object| object.name == name)
-        .map(|object| object.bytes)
-        .unwrap_or(0)
+    measurement.objects.get(name).copied().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1211,7 +1199,10 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen, profile.path_bytes);
-        assert_eq!(rows.writers.len(), 80);
+        assert_eq!(
+            rows.writers.len(),
+            (profile.processes * profile.files_per_process) as usize
+        );
     }
 
     #[test]
@@ -1252,7 +1243,7 @@ mod tests {
         assert_eq!(first.writers[0].disk, 4096);
         assert_eq!(first.writers[0].size, 4096);
         assert_eq!(first.writers[0].ino, pack_ino(1000, 0, 1).unwrap());
-        assert_eq!(first.writers[0].path.len(), 96);
+        assert_eq!(first.writers[0].path.len(), profile.path_bytes[0]);
         let second = state.emit(1, &profile).unwrap();
         assert_eq!(second.phantom[0].bytes, 4096);
         assert_eq!(second.phantom[0].ino, pack_ino(1000, 0, 1).unwrap());
@@ -1343,16 +1334,25 @@ mod tests {
         assert_eq!(left.wal_bytes, 0);
         assert_eq!(left.journal_mode, "wal");
         assert_eq!(left.auto_vacuum, 0);
-        assert!(left.page_count * left.page_size < CI_BYTE_CEILING);
+        assert_eq!(left.page_count, CI_PAGE_COUNT);
         assert_eq!(rows_of(&left, "writer_samples"), 60);
         assert_eq!(rows_of(&left, "phantom_samples"), 14);
-        assert!(bytes_of(&left, "writer_samples") >= 2 * left.page_size);
-        assert!(bytes_of(&left, "writer_ts") >= left.page_size);
-        assert!(bytes_of(&left, "phantom_samples") >= left.page_size);
-        assert!(bytes_of(&left, "phantom_ts") >= left.page_size);
-        for table in &left.rows {
-            if table.name != "writer_samples" && table.name != "phantom_samples" {
-                assert_eq!(table.rows, 0, "{}", table.name);
+        assert_eq!(bytes_of(&left, "writer_samples"), CI_WRITER_SAMPLES_BYTES);
+        assert_eq!(bytes_of(&left, "writer_ts"), CI_WRITER_TS_BYTES);
+        assert_eq!(bytes_of(&left, "phantom_samples"), CI_PHANTOM_SAMPLES_BYTES);
+        assert_eq!(bytes_of(&left, "phantom_ts"), CI_PHANTOM_TS_BYTES);
+        for (name, bytes) in &left.objects {
+            if matches!(
+                name.as_str(),
+                "writer_samples" | "writer_ts" | "phantom_samples" | "phantom_ts"
+            ) {
+                continue;
+            }
+            assert_eq!(*bytes, left.page_size, "{name}");
+        }
+        for (name, rows) in &left.rows {
+            if name != "writer_samples" && name != "phantom_samples" {
+                assert_eq!(*rows, 0, "{name}");
             }
         }
     }
@@ -1368,9 +1368,29 @@ mod tests {
             rows_of(&report.retention.after_reuse, "writer_samples")
                 > rows_of(&report.retention.after_delete, "writer_samples")
         );
-        assert!(
-            report.retention.after_reuse.page_count * report.retention.after_reuse.page_size
-                < CI_BYTE_CEILING
+        assert_eq!(
+            report.retention.after_delete.page_count,
+            CI_AFTER_DELETE_PAGES
+        );
+        assert_eq!(
+            report.retention.after_reuse.page_count,
+            CI_AFTER_REUSE_PAGES
+        );
+        assert_eq!(
+            bytes_of(&report.retention.after_reuse, "writer_samples"),
+            16_384
+        );
+        assert_eq!(
+            bytes_of(&report.retention.after_reuse, "writer_ts"),
+            CI_WRITER_TS_BYTES
+        );
+        assert_eq!(
+            bytes_of(&report.retention.after_reuse, "phantom_samples"),
+            CI_PHANTOM_SAMPLES_BYTES
+        );
+        assert_eq!(
+            bytes_of(&report.retention.after_reuse, "phantom_ts"),
+            CI_PHANTOM_TS_BYTES
         );
         assert_eq!(report.retention.after_delete.wal_bytes, 0);
         assert_eq!(report.retention.after_reuse.wal_bytes, 0);
