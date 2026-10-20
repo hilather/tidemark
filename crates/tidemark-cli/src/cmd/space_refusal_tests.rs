@@ -1,4 +1,4 @@
-//! Owned by: issue-12
+//! Owned by: WSPACE-exit
 //! Each command returns `StoreError::Space` for a guard refusal, and
 //! `command_error` is the exit-5 mapping. Plain `top`'s floor skip stays Ok.
 
