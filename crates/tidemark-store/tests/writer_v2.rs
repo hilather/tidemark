@@ -624,8 +624,10 @@ fn cleanup_errors_drop_abort_and_space_refusal() {
             2 => {
                 w.space_check_every(
                     0,
-                    Box::new(|| SpaceVerdict::Refuse {
-                        reason: "test".into(),
+                    Box::new(|| {
+                        Ok(SpaceVerdict::Refuse {
+                            reason: "test".into(),
+                        })
                     }),
                 );
                 assert!(matches!(w.put_dirs(&[dir(0)]), Err(StoreError::Space(_))));
@@ -817,7 +819,7 @@ fn finish_rechecks_space_after_input_and_each_conversion_checkpoint() {
         u64::MAX,
         Box::new(move || {
             count.fetch_add(1, Ordering::SeqCst);
-            SpaceVerdict::Ok
+            Ok(SpaceVerdict::Ok)
         }),
     );
     w.finish(&m).unwrap();
@@ -833,11 +835,11 @@ fn finish_rechecks_space_after_input_and_each_conversion_checkpoint() {
                 let refuse = n == stop;
                 n += 1;
                 if refuse {
-                    SpaceVerdict::Refuse {
+                    Ok(SpaceVerdict::Refuse {
                         reason: "NoSpace test".into(),
-                    }
+                    })
                 } else {
-                    SpaceVerdict::Ok
+                    Ok(SpaceVerdict::Ok)
                 }
             }),
         );
@@ -1011,11 +1013,11 @@ fn space_guard_turns_to_refusal_after_last_input_row() {
         0,
         Box::new(move || {
             if flag.load(Ordering::SeqCst) {
-                SpaceVerdict::Refuse {
+                Ok(SpaceVerdict::Refuse {
                     reason: "NoSpace after input".into(),
-                }
+                })
             } else {
-                SpaceVerdict::Ok
+                Ok(SpaceVerdict::Ok)
             }
         }),
     );

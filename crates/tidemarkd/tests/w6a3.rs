@@ -625,3 +625,101 @@ fn space_refusal_reply_and_status_are_published_before_acknowledgement() {
     assert_eq!(component.state, "degraded");
     assert_eq!(component.detail, "scan: NoSpace");
 }
+
+#[test]
+fn mid_scan_space_io_error_is_not_nospace() {
+    use std::time::Instant;
+    use tidemark_core::{
+        config::{RootConfig, RootMode},
+        path::RawPath,
+    };
+    use tidemark_scan::orchestrator::{clear_mid_scan_space_check, fail_mid_scan_space_check};
+    use tidemarkd::{scheduler, services::tswriter};
+    let root = ::test_support::private_tempdir().unwrap();
+    std::fs::write(root.path().join("file"), b"bytes").unwrap();
+    let storage = ::test_support::private_tempdir().unwrap();
+    struct ClearFault(std::path::PathBuf);
+    impl Drop for ClearFault {
+        fn drop(&mut self) {
+            clear_mid_scan_space_check(&self.0);
+        }
+    }
+    let _clear = ClearFault(storage.path().to_owned());
+    // EIO. The pre-scan guard does not consult this fault.
+    fail_mid_scan_space_check(storage.path(), 5).unwrap();
+    let mut c = Config::default();
+    c.general.state_dir = storage.path().to_owned();
+    c.roots = vec![RootConfig {
+        path: root.path().to_owned(),
+        schedule: "off".into(),
+        mode: RootMode::Walk,
+        ..RootConfig::default()
+    }];
+    let state = LiveState::new(&c, 10);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::new(AtomicBool::new(false));
+    let (writer, wh) =
+        tswriter::start(Arc::new(c.clone()), state.clone(), writer_stop.clone()).unwrap();
+    let (control, sh) = scheduler::start(Arc::new(c), state.clone(), writer, stop.clone()).unwrap();
+    let ctx = Context {
+        state: state.clone(),
+        scans: control,
+        reload: Arc::new(|| unreachable!("reload unused")),
+    };
+    let response = api::dispatch(
+        &Request {
+            v: 1,
+            id: "io".into(),
+            method: "scan.start".into(),
+            params: serde_json::to_value(ScanStartParams {
+                root: RawPath::from_path(root.path()).unwrap(),
+                mode: Some(RootMode::Walk),
+                throttle: None,
+            })
+            .unwrap(),
+        },
+        0,
+        &ctx,
+        20,
+    )
+    .unwrap();
+    assert!(
+        response
+            .error
+            .as_ref()
+            .is_none_or(|error| error.message != "scan: NoSpace"),
+        "mid-scan I/O error was reported as NoSpace: {:?}",
+        response.error
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let scheduler_detail = loop {
+        let status = state.view().status(0).unwrap();
+        let scheduler = status
+            .components
+            .iter()
+            .find(|component| component.name == "scheduler");
+        if scheduler.is_some_and(|component| component.detail.contains("os error 5")) {
+            break scheduler.unwrap().detail.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scan did not surface the I/O error: {scheduler:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!scheduler_detail.contains("NoSpace"), "{scheduler_detail}");
+    assert_ne!(state.view().state_space_refused(), Some(true));
+    let status = state.view().status(0).unwrap();
+    let space = status
+        .components
+        .iter()
+        .find(|component| component.name == "state_space");
+    assert!(
+        space.is_none_or(|component| component.detail != "scan: NoSpace"),
+        "NoSpace alert fired: {space:?}"
+    );
+    stop.store(true, Ordering::Release);
+    sh.join().unwrap().unwrap();
+    writer_stop.store(true, Ordering::Release);
+    wh.join().unwrap().unwrap();
+}

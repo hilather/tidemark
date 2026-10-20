@@ -10,6 +10,20 @@ use std::{
 };
 use tidemark_core::snapshot::*;
 
+type SpaceCheckFn = Box<dyn FnMut() -> std::io::Result<SpaceVerdict> + Send>;
+fn apply_space_check(
+    check: &mut dyn FnMut() -> std::io::Result<SpaceVerdict>,
+) -> Result<(), StoreError> {
+    match check() {
+        Ok(SpaceVerdict::Ok) => Ok(()),
+        Ok(SpaceVerdict::Refuse { reason }) => Err(StoreError::Space(reason)),
+        Err(error) => {
+            tracing::warn!(%error, "state space measurement failed");
+            Err(StoreError::Io(error))
+        }
+    }
+}
+
 pub(crate) const SCHEMA: &str = include_str!("../migrations/snapshot-v1.sql");
 /// Snapshot v2 layout and compression settings. Chunk buffers never exceed 8192 rows.
 #[derive(Clone, Debug)]
@@ -63,7 +77,7 @@ pub struct SnapshotWriterV2 {
     last_dir: Option<u32>,
     rows_since_check: u64,
     check_interval: u64,
-    check: Option<Box<dyn FnMut() -> SpaceVerdict + Send>>,
+    check: Option<SpaceCheckFn>,
     failed: bool,
     file_sequence: i64,
     instance_sequence: i64,
@@ -201,9 +215,9 @@ impl SnapshotWriterV2 {
         if self.rows_since_check >= self.check_interval {
             self.rows_since_check = 0;
             if let Some(check) = self.check.as_mut() {
-                if let SpaceVerdict::Refuse { reason } = check() {
+                if let Err(error) = apply_space_check(check) {
                     self.failed = true;
-                    return Err(StoreError::Space(reason));
+                    return Err(error);
                 }
             }
         }
@@ -413,7 +427,7 @@ impl SnapshotWriterV2 {
     }
     /// Configure periodic space checks; zero means check before every input row.
     /// Finish also checks at conversion boundaries, every chunk, and every 8192 plain rows.
-    pub fn space_check_every(&mut self, rows: u64, check: Box<dyn FnMut() -> SpaceVerdict + Send>) {
+    pub fn space_check_every(&mut self, rows: u64, check: SpaceCheckFn) {
         self.check_interval = rows.max(1);
         self.rows_since_check = 0;
         self.check = Some(check);
@@ -455,9 +469,7 @@ impl SnapshotWriterV2 {
         let conversion_checkpoint = || {
             check_cancel()?;
             if let Some(check) = check.borrow_mut().as_mut() {
-                if let SpaceVerdict::Refuse { reason } = check() {
-                    return Err(StoreError::Space(reason));
-                }
+                apply_space_check(check)?;
             }
             let stage = self.connection()?;
             let pages: u32 = stage.query_row("PRAGMA page_count", [], |r| r.get(0))?;

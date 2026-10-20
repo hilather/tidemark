@@ -64,6 +64,52 @@ fn directory(
         value => Ok(value?),
     }
 }
+#[cfg(test)]
+type ErrnoHook = Box<dyn FnMut(&[u8]) -> Option<rustix::io::Errno>>;
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CHILD_OPEN: std::cell::RefCell<Option<ErrnoHook>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_DIR_LIST: std::cell::RefCell<Option<ErrnoHook>> =
+        const { std::cell::RefCell::new(None) };
+    static ON_READDIR: std::cell::RefCell<Option<ErrnoHook>> =
+        const { std::cell::RefCell::new(None) };
+    static DIR_STACK: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+/// Runs after a directory entry is yielded and before `openat`.
+///
+/// `Some` replaces the `openat` result so a test can force an errno. `None`
+/// performs the real open.
+#[cfg(test)]
+fn before_child_open(name: &[u8]) -> Option<rustix::io::Errno> {
+    BEFORE_CHILD_OPEN.with(|hook| hook.borrow_mut().as_mut().and_then(|hook| hook(name)))
+}
+/// Runs after a directory's `O_PATH` open and before it is opened for listing.
+#[cfg(test)]
+fn before_directory_list(name: &[u8]) -> Option<rustix::io::Errno> {
+    BEFORE_DIR_LIST.with(|hook| hook.borrow_mut().as_mut().and_then(|hook| hook(name)))
+}
+/// Replaces the next `getdents` result while `name` is the directory being listed.
+#[cfg(test)]
+fn readdir_fault() -> Option<rustix::io::Errno> {
+    let name = DIR_STACK
+        .with(|stack| stack.borrow().last().cloned())
+        .unwrap_or_default();
+    ON_READDIR.with(|hook| hook.borrow_mut().as_mut().and_then(|hook| hook(&name)))
+}
+#[cfg(test)]
+fn enter_dir(name: &[u8]) {
+    DIR_STACK.with(|stack| stack.borrow_mut().push(name.to_vec()));
+}
+#[cfg(test)]
+fn leave_dir() {
+    DIR_STACK.with(|stack| {
+        stack.borrow_mut().pop();
+    });
+}
+fn is_noent(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(rustix::io::Errno::NOENT.raw_os_error())
+}
 fn state_usage(path: &Path) -> io::Result<u64> {
     use rustix::fs::{self, Dir, FileType, Mode, OFlags};
     // Iterative DFS has at most 4096 retained directory fds and one entry fd.
@@ -76,26 +122,65 @@ fn state_usage(path: &Path) -> io::Result<u64> {
         .ok()
         .and_then(|n| n.checked_mul(512))
         .ok_or_else(|| io::Error::other("state allocation overflow"))?;
+    #[cfg(test)]
+    {
+        DIR_STACK.with(|stack| stack.borrow_mut().clear());
+        enter_dir(b"");
+    }
     let mut stack = vec![Dir::new(root)?];
     while let Some(iter) = stack.last_mut() {
-        let entry = match iter.next() {
+        // ENOENT while listing means this directory was removed. Drop the
+        // subtree. Every other errno still fails the measurement.
+        #[cfg(test)]
+        let injected_read = readdir_fault();
+        #[cfg(not(test))]
+        let injected_read: Option<rustix::io::Errno> = None;
+        let read = match injected_read {
+            Some(errno) => Some(Err(errno)),
+            None => iter.next(),
+        };
+        let entry = match read {
             None => {
                 stack.pop();
+                #[cfg(test)]
+                leave_dir();
                 continue;
             }
-            Some(entry) => entry?,
+            Some(Ok(entry)) => entry,
+            Some(Err(rustix::io::Errno::NOENT)) => {
+                stack.pop();
+                #[cfg(test)]
+                leave_dir();
+                continue;
+            }
+            Some(Err(errno)) => return Err(errno.into()),
         };
         let name = entry.file_name();
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
         // O_PATH never reads contents; NOFOLLOW binds this fd to the entry itself.
-        let child = fs::openat(
-            iter.fd()?,
-            name,
-            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
+        // The API socket and its lock are unlinked while a scan is still measuring
+        // state. A name already returned by getdents can be gone before open; that
+        // leaf is not allocated space. Every other errno, including EACCES, still
+        // fails the measurement.
+        #[cfg(test)]
+        let injected = before_child_open(name.to_bytes());
+        #[cfg(not(test))]
+        let injected: Option<rustix::io::Errno> = None;
+        let opened = match injected {
+            Some(errno) => Err(errno),
+            None => fs::openat(
+                iter.fd()?,
+                name,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ),
+        };
+        let child = match opened {
+            Err(rustix::io::Errno::NOENT) => continue,
+            other => other?,
+        };
         if mount_id(&child)? != root_mount {
             continue;
         }
@@ -122,7 +207,24 @@ fn state_usage(path: &Path) -> io::Result<u64> {
                 return Err(io::Error::other("state directory depth exceeds 4096"));
             }
             // Open through the already bound entry fd, so a replacement race is harmless.
-            stack.push(Dir::new(directory(&child, ".")?)?);
+            // The directory can be removed after the O_PATH open and before this
+            // listing open. ENOENT means the subtree is gone.
+            #[cfg(test)]
+            let list_fault = before_directory_list(name.to_bytes());
+            #[cfg(not(test))]
+            let list_fault: Option<rustix::io::Errno> = None;
+            match list_fault {
+                Some(rustix::io::Errno::NOENT) => continue,
+                Some(errno) => return Err(errno.into()),
+                None => {}
+            }
+            let listed = match directory(&child, ".") {
+                Err(error) if is_noent(&error) => continue,
+                other => other?,
+            };
+            #[cfg(test)]
+            enter_dir(name.to_bytes());
+            stack.push(Dir::new(listed)?);
         }
     }
     Ok(used)
@@ -137,29 +239,27 @@ pub fn space_check(
 ) -> io::Result<SpaceVerdict> {
     let fs = totals(state_dir)?;
     let used = state_usage(state_dir)?;
-    Ok(space_check_with(|| Ok(fs), used, estimate, policy))
+    space_check_with(|| Ok(fs), used, estimate, policy)
 }
 /// Apply the state cap and max(percent floor, 2 GiB) free-space floor.
+///
+/// A failure to read filesystem totals is returned as an error. Policy
+/// violations are [`SpaceVerdict::Refuse`].
 pub fn space_check_with(
     statvfs: impl Fn() -> io::Result<FsTotals>,
     used_by_state: u64,
     estimate: u64,
     policy: &RetentionConfig,
-) -> SpaceVerdict {
-    let refuse = |reason: &str| SpaceVerdict::Refuse {
-        reason: reason.into(),
+) -> io::Result<SpaceVerdict> {
+    let refuse = |reason: &str| {
+        Ok(SpaceVerdict::Refuse {
+            reason: reason.into(),
+        })
     };
     if !policy.min_free_pct.is_finite() || !(0.0..=100.0).contains(&policy.min_free_pct) {
         return refuse("invalid minimum free percentage");
     }
-    let stat = match statvfs() {
-        Ok(s) => s,
-        Err(e) => {
-            return SpaceVerdict::Refuse {
-                reason: format!("cannot measure state filesystem: {e}"),
-            }
-        }
-    };
+    let stat = statvfs()?;
     if used_by_state
         .checked_add(estimate)
         .is_none_or(|n| n > policy.max_state_size.0)
@@ -190,7 +290,7 @@ pub fn space_check_with(
     if stat.avail.checked_sub(estimate).is_none_or(|n| n < floor) {
         return refuse("state filesystem free-space floor would be crossed");
     }
-    SpaceVerdict::Ok
+    Ok(SpaceVerdict::Ok)
 }
 
 /// Check an inflate against `policy` and the exact decoded size.
@@ -238,5 +338,199 @@ mod tests {
         let root_link = own.path().join("root-link");
         std::os::unix::fs::symlink(&child, &root_link).unwrap();
         assert!(state_usage(&root_link).is_err());
+    }
+    struct ClearHooks;
+    impl Drop for ClearHooks {
+        fn drop(&mut self) {
+            BEFORE_CHILD_OPEN.with(|hook| *hook.borrow_mut() = None);
+            BEFORE_DIR_LIST.with(|hook| *hook.borrow_mut() = None);
+            ON_READDIR.with(|hook| *hook.borrow_mut() = None);
+            DIR_STACK.with(|stack| stack.borrow_mut().clear());
+        }
+    }
+    fn install_child_open_hook(hook: ErrnoHook) -> ClearHooks {
+        BEFORE_CHILD_OPEN.with(|slot| *slot.borrow_mut() = Some(hook));
+        ClearHooks
+    }
+    fn install_dir_list_hook(hook: ErrnoHook) -> ClearHooks {
+        BEFORE_DIR_LIST.with(|slot| *slot.borrow_mut() = Some(hook));
+        ClearHooks
+    }
+    fn install_readdir_hook(hook: ErrnoHook) -> ClearHooks {
+        ON_READDIR.with(|slot| *slot.borrow_mut() = Some(hook));
+        ClearHooks
+    }
+    fn accepted(usage: u64) -> SpaceVerdict {
+        space_check_with(
+            || {
+                Ok(FsTotals {
+                    size: 64 << 30,
+                    avail: 32 << 30,
+                })
+            },
+            usage,
+            0,
+            &RetentionConfig::default(),
+        )
+        .unwrap()
+    }
+
+    /// A missing name is skipped. Only a space refusal becomes `ScanError::NoSpace`;
+    /// an I/O error from this measurement stays an I/O error.
+    #[test]
+    fn vanished_leaf_between_readdir_and_openat_is_skipped_not_nospace() {
+        let own = ::test_support::private_tempdir().unwrap();
+        let socket = own.path().join("api.sock");
+        std::fs::write(&socket, vec![1; 8192]).unwrap();
+        let with_socket = state_usage(own.path()).unwrap();
+        let root = own.path().to_owned();
+        let _clear = install_child_open_hook(Box::new(move |name| {
+            if name == b"api.sock" {
+                std::fs::remove_file(root.join("api.sock")).unwrap();
+            }
+            None
+        }));
+
+        let raced = state_usage(own.path()).unwrap();
+        let gone = state_usage(own.path()).unwrap();
+        assert!(with_socket > gone);
+        assert_eq!(raced, gone);
+
+        std::fs::write(&socket, vec![1; 8192]).unwrap();
+        let measured =
+            space_check(own.path(), 0, &RetentionConfig::default()).unwrap_or_else(|error| {
+                panic!("leaf removed between readdir and openat reported as NoSpace: {error}")
+            });
+        assert!(
+            !matches!(
+                &measured,
+                SpaceVerdict::Refuse { reason }
+                    if reason.contains("No such file or directory") || reason.contains("os error 2")
+            ),
+            "vanished leaf reported as NoSpace: {measured:?}"
+        );
+        assert!(!socket.exists(), "openat ran before the leaf was removed");
+        assert_eq!(
+            accepted(raced),
+            SpaceVerdict::Ok,
+            "skipped leaf must not be reported as NoSpace"
+        );
+    }
+
+    #[test]
+    fn subdirectory_removed_before_listing_is_skipped() {
+        let own = ::test_support::private_tempdir().unwrap();
+        let sub = own.path().join("sub");
+        ::test_support::private_dir(&sub).unwrap();
+        let leaf = sub.join("leaf");
+        std::fs::write(&leaf, vec![1; 8192]).unwrap();
+        let with_leaf = state_usage(own.path()).unwrap();
+        let root = own.path().to_owned();
+        let _clear = install_dir_list_hook(Box::new(move |name| {
+            if name == b"sub" {
+                std::fs::remove_file(root.join("sub/leaf")).unwrap();
+                std::fs::remove_dir(root.join("sub")).unwrap();
+            }
+            None
+        }));
+        let raced = state_usage(own.path()).unwrap();
+        assert!(with_leaf > raced);
+        assert!(
+            !sub.exists(),
+            "listing open ran before the directory was removed"
+        );
+        ::test_support::private_dir(&sub).unwrap();
+        std::fs::write(&leaf, vec![1; 8192]).unwrap();
+        space_check(own.path(), 0, &RetentionConfig::default()).unwrap_or_else(|error| {
+            panic!("directory removed before listing reported as NoSpace: {error}")
+        });
+        assert_eq!(accepted(raced), SpaceVerdict::Ok);
+    }
+
+    #[test]
+    fn directory_removed_during_listing_is_skipped() {
+        let own = ::test_support::private_tempdir().unwrap();
+        let sub = own.path().join("sub");
+        ::test_support::private_dir(&sub).unwrap();
+        std::fs::write(sub.join("a"), vec![1; 8192]).unwrap();
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = reads.clone();
+        let _clear = install_readdir_hook(Box::new(move |name| {
+            if name == b"sub" {
+                let seen = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if seen >= 1 {
+                    return Some(rustix::io::Errno::NOENT);
+                }
+            }
+            None
+        }));
+        let raced = state_usage(own.path()).unwrap();
+        assert!(
+            reads.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "listing did not continue after the first entry"
+        );
+        space_check(own.path(), 0, &RetentionConfig::default()).unwrap_or_else(|error| {
+            panic!("directory removed during listing reported as NoSpace: {error}")
+        });
+        assert_eq!(accepted(raced), SpaceVerdict::Ok);
+    }
+
+    #[test]
+    fn directory_list_eacces_propagates() {
+        let own = ::test_support::private_tempdir().unwrap();
+        let sub = own.path().join("sub");
+        ::test_support::private_dir(&sub).unwrap();
+        let _clear = install_dir_list_hook(Box::new(|name| {
+            (name == b"sub").then_some(rustix::io::Errno::ACCESS)
+        }));
+        let error = state_usage(own.path()).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::ACCESS.raw_os_error())
+        );
+    }
+
+    #[test]
+    fn readdir_eio_propagates() {
+        let own = ::test_support::private_tempdir().unwrap();
+        let sub = own.path().join("sub");
+        ::test_support::private_dir(&sub).unwrap();
+        let _clear = install_readdir_hook(Box::new(|name| {
+            (name == b"sub").then_some(rustix::io::Errno::IO)
+        }));
+        let error = state_usage(own.path()).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::IO.raw_os_error())
+        );
+    }
+
+    #[test]
+    fn child_open_eacces_propagates() {
+        let own = ::test_support::private_tempdir().unwrap();
+        let socket = own.path().join("api.sock");
+        std::fs::write(&socket, vec![1; 8192]).unwrap();
+        let _clear = install_child_open_hook(Box::new(|name| {
+            if name == b"api.sock" {
+                Some(rustix::io::Errno::ACCESS)
+            } else {
+                None
+            }
+        }));
+
+        let usage = state_usage(own.path()).unwrap_err();
+        assert_eq!(
+            usage.raw_os_error(),
+            Some(rustix::io::Errno::ACCESS.raw_os_error())
+        );
+        let checked = space_check(own.path(), 0, &RetentionConfig::default()).unwrap_err();
+        assert_eq!(
+            checked.raw_os_error(),
+            Some(rustix::io::Errno::ACCESS.raw_os_error())
+        );
+        assert!(
+            socket.exists(),
+            "EACCES must not be treated as a vanished leaf"
+        );
     }
 }

@@ -553,10 +553,12 @@ fn run_scan_with_environment(
                 writer.space_check_every(
                     100_000,
                     Box::new(move || {
+                        // Measurement failures stay I/O errors. The scheduler logs
+                        // them and retries with retry_due. Only a space refusal is NoSpace.
+                        if let Some(code) = mid_scan_space_errno(&state_dir) {
+                            return Err(std::io::Error::from_raw_os_error(code));
+                        }
                         tidemark_store::space_guard::space_check(&state_dir, 0, &policy)
-                            .unwrap_or_else(|e| tidemark_store::space_guard::SpaceVerdict::Refuse {
-                                reason: e.to_string(),
-                            })
                     }),
                 );
                 let mut sink = WriterSink {
@@ -1446,6 +1448,67 @@ fn record_walk_phase(phases: &mut std::collections::BTreeMap<String, u64>, elaps
     phases
         .entry("walk".into())
         .or_insert_with(|| milliseconds(elapsed));
+}
+
+struct MidScanSpaceFault {
+    state_dir: std::path::PathBuf,
+    raw_os_error: i32,
+}
+static MID_SCAN_SPACE_FAULTS: std::sync::Mutex<Vec<MidScanSpaceFault>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Fail later mid-scan state-space measurements of `state_dir` with `raw_os_error`.
+///
+/// The pre-scan guard is unchanged. Production scans leave this empty, so the
+/// check is one uncontended lock. Tests clear it with [`clear_mid_scan_space_check`].
+#[doc(hidden)]
+pub fn fail_mid_scan_space_check(
+    state_dir: &std::path::Path,
+    raw_os_error: i32,
+) -> std::io::Result<()> {
+    let state_dir = std::fs::canonicalize(state_dir)?;
+    let mut faults = MID_SCAN_SPACE_FAULTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    faults.retain(|fault| fault.state_dir != state_dir);
+    faults.push(MidScanSpaceFault {
+        state_dir,
+        raw_os_error,
+    });
+    Ok(())
+}
+
+/// Remove a fault installed by [`fail_mid_scan_space_check`].
+#[doc(hidden)]
+pub fn clear_mid_scan_space_check(state_dir: &std::path::Path) {
+    let Ok(state_dir) = std::fs::canonicalize(state_dir) else {
+        return;
+    };
+    let mut faults = MID_SCAN_SPACE_FAULTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    faults.retain(|fault| fault.state_dir != state_dir);
+}
+
+fn mid_scan_space_errno(state_dir: &std::path::Path) -> Option<i32> {
+    let faults = MID_SCAN_SPACE_FAULTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if faults.is_empty() {
+        return None;
+    }
+    let installed: Vec<_> = faults
+        .iter()
+        .map(|fault| (fault.state_dir.clone(), fault.raw_os_error))
+        .collect();
+    drop(faults);
+    let Ok(state_dir) = std::fs::canonicalize(state_dir) else {
+        return None;
+    };
+    installed
+        .into_iter()
+        .find(|(dir, _)| dir == &state_dir)
+        .map(|(_, code)| code)
 }
 
 impl From<tidemark_store::StoreError> for ScanError {

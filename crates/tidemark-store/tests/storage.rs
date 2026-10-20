@@ -525,16 +525,14 @@ fn space_guard_decision_table_and_live_state_measurement() {
     for (size, avail, used, estimate, ok) in cases {
         assert_eq!(
             matches!(
-                space_check_with(|| Ok(FsTotals { size, avail }), used, estimate, &policy),
+                space_check_with(|| Ok(FsTotals { size, avail }), used, estimate, &policy).unwrap(),
                 SpaceVerdict::Ok
             ),
             ok
         );
     }
-    assert!(matches!(
-        space_check_with(|| Err(std::io::Error::other("test")), 0, 0, &policy),
-        SpaceVerdict::Refuse { .. }
-    ));
+    let measured = space_check_with(|| Err(std::io::Error::other("test")), 0, 0, &policy);
+    assert!(measured.unwrap_err().to_string().contains("test"));
     assert!(matches!(
         space_check_with(
             || Ok(FsTotals {
@@ -544,12 +542,13 @@ fn space_guard_decision_table_and_live_state_measurement() {
             u64::MAX,
             1,
             &policy
-        ),
+        )
+        .unwrap(),
         SpaceVerdict::Refuse { .. }
     ));
     policy.min_free_pct = f64::NAN;
     assert!(matches!(
-        space_check_with(|| Ok(FsTotals { size: 0, avail: 0 }), 0, 0, &policy),
+        space_check_with(|| Ok(FsTotals { size: 0, avail: 0 }), 0, 0, &policy).unwrap(),
         SpaceVerdict::Refuse { .. }
     ));
     let temp = ::test_support::private_tempdir().unwrap();
@@ -1149,7 +1148,8 @@ fn space_floor_does_not_round_down_large_sizes() {
             0,
             0,
             &policy
-        ),
+        )
+        .unwrap(),
         SpaceVerdict::Refuse { .. }
     ));
     policy.min_free_pct = 12.5;
@@ -1162,7 +1162,8 @@ fn space_floor_does_not_round_down_large_sizes() {
             0,
             0,
             &policy
-        ),
+        )
+        .unwrap(),
         SpaceVerdict::Refuse { .. }
     ));
 }
