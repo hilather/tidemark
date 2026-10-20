@@ -1151,7 +1151,7 @@ fn compress_retained(
                 &cfg.retention,
             )? {
                 tidemark_store::space_guard::SpaceVerdict::Ok => {}
-                tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
+                tidemark_store::space_guard::SpaceVerdict::Refuse { reason, .. } => {
                     return Err(ScanError::Precondition(reason))
                 }
             }
@@ -1515,7 +1515,7 @@ impl From<tidemark_store::StoreError> for ScanError {
     /// Space refusals from the store keep the `NoSpace` category.
     fn from(e: tidemark_store::StoreError) -> Self {
         match e {
-            tidemark_store::StoreError::Space(msg) => {
+            tidemark_store::StoreError::Space { reason: msg, .. } => {
                 tracing::warn!(%msg, "state space refused");
                 ScanError::NoSpace
             }
@@ -1917,9 +1917,7 @@ mod tests {
             catalog.record_start(&e).unwrap();
             guard_and_prune(state.path(), &catalog, 4, 86501, || {
                 Ok(if file.exists() {
-                    SpaceVerdict::Refuse {
-                        reason: "injected".into(),
-                    }
+                    SpaceVerdict::other("injected")
                 } else {
                     SpaceVerdict::Ok
                 })
@@ -2021,9 +2019,7 @@ mod tests {
         let state = ::test_support::private_tempdir().unwrap();
         let catalog = Catalog::open(state.path(), true).unwrap();
         let result = guard_and_prune(state.path(), &catalog, 4, 100000, || {
-            Ok(SpaceVerdict::Refuse {
-                reason: "injected".into(),
-            })
+            Ok(SpaceVerdict::other("injected"))
         });
         assert!(matches!(result, Err(ScanError::NoSpace)));
         assert!(!state.path().join("snapshots").exists());
@@ -2046,9 +2042,7 @@ mod tests {
         }
         guard_and_prune(state.path(), &catalog, 2, 100000, || {
             Ok(if dir.join("id0.db").exists() {
-                SpaceVerdict::Refuse {
-                    reason: "injected".into(),
-                }
+                SpaceVerdict::other("injected")
             } else {
                 SpaceVerdict::Ok
             })

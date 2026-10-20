@@ -622,15 +622,11 @@ fn cleanup_errors_drop_abort_and_space_refusal() {
             0 => drop(w),
             1 => w.abort(),
             2 => {
-                w.space_check_every(
-                    0,
-                    Box::new(|| {
-                        Ok(SpaceVerdict::Refuse {
-                            reason: "test".into(),
-                        })
-                    }),
-                );
-                assert!(matches!(w.put_dirs(&[dir(0)]), Err(StoreError::Space(_))));
+                w.space_check_every(0, Box::new(|| Ok(SpaceVerdict::other("test"))));
+                assert!(matches!(
+                    w.put_dirs(&[dir(0)]),
+                    Err(StoreError::Space { .. })
+                ));
                 assert!(w.finish(&m).is_err());
             }
             3 => {
@@ -835,16 +831,14 @@ fn finish_rechecks_space_after_input_and_each_conversion_checkpoint() {
                 let refuse = n == stop;
                 n += 1;
                 if refuse {
-                    Ok(SpaceVerdict::Refuse {
-                        reason: "NoSpace test".into(),
-                    })
+                    Ok(SpaceVerdict::other("NoSpace test"))
                 } else {
                     Ok(SpaceVerdict::Ok)
                 }
             }),
         );
         assert!(
-            matches!(w.finish(&m), Err(StoreError::Space(_))),
+            matches!(w.finish(&m), Err(StoreError::Space { .. })),
             "checkpoint {stop}"
         );
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
@@ -1013,9 +1007,7 @@ fn space_guard_turns_to_refusal_after_last_input_row() {
         0,
         Box::new(move || {
             if flag.load(Ordering::SeqCst) {
-                Ok(SpaceVerdict::Refuse {
-                    reason: "NoSpace after input".into(),
-                })
+                Ok(SpaceVerdict::other("NoSpace after input"))
             } else {
                 Ok(SpaceVerdict::Ok)
             }
@@ -1023,6 +1015,6 @@ fn space_guard_turns_to_refusal_after_last_input_row() {
     );
     populate(&mut w, &(0..6).map(dir).collect::<Vec<_>>());
     refuse.store(true, Ordering::SeqCst);
-    assert!(matches!(w.finish(&m), Err(StoreError::Space(_))));
+    assert!(matches!(w.finish(&m), Err(StoreError::Space { .. })));
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }

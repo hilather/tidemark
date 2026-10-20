@@ -358,13 +358,12 @@ fn unlimited(pct: f64) -> tidemark_core::config::RetentionConfig {
 fn floor_reason(state: &Path, length: u64, pct: f64) -> Option<String> {
     match tidemark_store::space_guard::space_check(state, length, &unlimited(pct)).unwrap() {
         tidemark_store::space_guard::SpaceVerdict::Ok => None,
-        tidemark_store::space_guard::SpaceVerdict::Refuse { reason }
-            if reason.contains("free-space floor") =>
-        {
-            Some(reason)
-        }
-        tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
-            panic!("space check at {pct}% refused {length} bytes for another reason: {reason}")
+        tidemark_store::space_guard::SpaceVerdict::Refuse {
+            kind: Some(tidemark_store::space_guard::SpaceRefusal::Floor { .. }),
+            reason,
+        } => Some(reason),
+        tidemark_store::space_guard::SpaceVerdict::Refuse { kind, reason } => {
+            panic!("space check at {pct}% refused {length} bytes as {kind:?}: {reason}")
         }
     }
 }
@@ -383,15 +382,12 @@ fn refuses_frozen(totals: tidemark_store::space_guard::FsTotals, length: u64, pc
         .unwrap()
     {
         tidemark_store::space_guard::SpaceVerdict::Ok => false,
-        tidemark_store::space_guard::SpaceVerdict::Refuse { reason }
-            if reason.contains("free-space floor") =>
-        {
-            true
-        }
-        tidemark_store::space_guard::SpaceVerdict::Refuse { reason } => {
-            panic!(
-                "frozen space check at {pct}% refused {length} bytes for another reason: {reason}"
-            )
+        tidemark_store::space_guard::SpaceVerdict::Refuse {
+            kind: Some(tidemark_store::space_guard::SpaceRefusal::Floor { .. }),
+            reason: _,
+        } => true,
+        tidemark_store::space_guard::SpaceVerdict::Refuse { kind, reason } => {
+            panic!("frozen space check at {pct}% refused {length} bytes as {kind:?}: {reason}")
         }
     }
 }
@@ -588,8 +584,27 @@ fn cold_commands_enforce_configured_min_free_pct() {
         stdout.split_whitespace().any(|cell| cell == "-"),
         "plain top did not show '-' for an unavailable Δ24h: {stdout}"
     );
-    let warning =
-        format!("warning: Δ24h skipped: inflating {cold_id} would breach min_free_pct=50%");
+    let (floor_bytes, minimum_applied) =
+        match tidemark_store::space_guard::space_check(state.path(), length, &unlimited(50.0))
+            .unwrap()
+        {
+            tidemark_store::space_guard::SpaceVerdict::Refuse {
+                kind:
+                    Some(tidemark_store::space_guard::SpaceRefusal::Floor {
+                        bytes,
+                        minimum_applied,
+                    }),
+                ..
+            } => (bytes, minimum_applied),
+            other => panic!("declared length was not a floor refusal: {other:?}"),
+        };
+    assert!(
+        !minimum_applied,
+        "50% should be the binding floor once the 2 GiB minimum no longer hides it"
+    );
+    let warning = format!(
+        "warning: Δ24h skipped: inflating {cold_id} would breach floor={floor_bytes} bytes (min_free_pct=50%, 2 GiB minimum not applied)"
+    );
     assert_eq!(
         stderr.lines().filter(|line| line == &warning).count(),
         1,
@@ -615,4 +630,225 @@ fn cold_commands_enforce_configured_min_free_pct() {
             .all(|row| row["delta"].is_null() && row["delta_skipped"] == "free_space_floor"),
         "plain top json did not mark the floor skip: {doc}"
     );
+}
+
+#[test]
+fn plain_top_max_state_size_refusal_exits_1() {
+    let root = test_support::private_tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("child")).unwrap();
+    let state = test_support::private_tempdir().unwrap();
+    let canon = tidemark_fs::canon::canonicalize(root.path()).unwrap();
+    let query = canon.as_path();
+    let mut cfg = Config::default();
+    cfg.general.state_dir = state.path().to_owned();
+    cfg.retention.snapshots.cold_after_recent = false;
+    let now = tidemark_core::time::unix_now();
+    for stamp in [now - 86_400, now] {
+        match run_fixture_scan(&cfg, query, stamp) {
+            Ok(()) => {}
+            Err(ScanError::NoSpace) => {
+                eprintln!("skipped: fixture scan was refused by the free-space floor");
+                return;
+            }
+            Err(error) => panic!("fixture scan failed: {error}"),
+        }
+    }
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    let mut entries = catalog.list(None).unwrap();
+    entries.sort_by_key(|entry| entry.started_at);
+    assert_eq!(entries.len(), 2);
+    let older_id = entries[0].scan_id.clone();
+    let hot = entries[0].file.clone().unwrap();
+    let cold = tidemark_store::cold::compress_snapshot(&hot, 1, &|| false).unwrap();
+    catalog.point_to_cold(&older_id, &cold).unwrap();
+    std::fs::remove_file(&hot).unwrap();
+    drop(catalog);
+    // Larger than the 64 KiB cap, and far below the free-space floor, so the
+    // cap is the rule that refuses inflation.
+    let mut bytes = std::fs::read(&cold).unwrap();
+    bytes[8..16].copy_from_slice(&(128u64 << 10).to_le_bytes());
+    std::fs::write(&cold, bytes).unwrap();
+    config_support::direct_config(
+        state.path(),
+        "[retention]\nmin_free_pct = 5.0\nmax_state_size = \"64KiB\"\n",
+    );
+    let cap = "maximum state size would be exceeded";
+    for json in [false, true] {
+        let output = command(state.path(), json)
+            .args(["top", "--depth", "1", &query.display().to_string()])
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        assert!(
+            stdout.is_empty(),
+            "cap refusal wrote stdout (json={json}): {stdout}"
+        );
+        assert!(
+            stderr.contains(cap),
+            "cap refusal did not report the state cap (json={json}): {stderr}"
+        );
+        assert!(
+            !stderr.contains("min_free_pct") && !stderr.contains("delta_skipped"),
+            "cap refusal was reported as a floor skip (json={json}): {stderr}"
+        );
+    }
+}
+
+#[test]
+fn plain_top_mandatory_floor_names_bytes_not_percentage() {
+    let Some((_root, state, query, cold_id, cold)) = cold_predecessor() else {
+        return;
+    };
+    // Larger than any filesystem here, and below the 8 EiB cap, so the refusal
+    // stays the mandatory 2 GiB floor even if free space moves during the test.
+    let length = 1u64 << 62;
+    match tidemark_store::space_guard::space_check(state.path(), length, &unlimited(0.0)).unwrap() {
+        tidemark_store::space_guard::SpaceVerdict::Refuse {
+            kind:
+                Some(tidemark_store::space_guard::SpaceRefusal::Floor {
+                    bytes,
+                    minimum_applied: true,
+                }),
+            ..
+        } => assert_eq!(bytes, 2 << 30),
+        other => panic!("0% should refuse via the 2 GiB minimum: {other:?}"),
+    }
+    let mut bytes = std::fs::read(&cold).unwrap();
+    bytes[8..16].copy_from_slice(&length.to_le_bytes());
+    std::fs::write(&cold, bytes).unwrap();
+    config_support::direct_config(
+        state.path(),
+        "[retention]\nmin_free_pct = 0.0\nmax_state_size = \"8EiB\"\n",
+    );
+    let warning = format!(
+        "warning: Δ24h skipped: inflating {cold_id} would breach the 2 GiB minimum (floor={} bytes)",
+        2u64 << 30
+    );
+    for json in [false, true] {
+        let output = command(state.path(), json)
+            .args(["top", "--depth", "1", &query.display().to_string()])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        assert_eq!(
+            stderr.lines().filter(|line| line == &warning).count(),
+            1,
+            "json={json}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("min_free_pct"),
+            "2 GiB refusal named the percentage (json={json}): {stderr}"
+        );
+    }
+    let doc: serde_json::Value = serde_json::from_slice(
+        &command(state.path(), true)
+            .args(["top", "--depth", "1", &query.display().to_string()])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .unwrap();
+    let rows = doc["data"].as_array().expect("top json data");
+    assert!(
+        rows.iter()
+            .all(|row| row["delta"].is_null() && row["delta_skipped"] == "free_space_floor"),
+        "{doc}"
+    );
+}
+
+#[test]
+fn plain_top_cap_wins_when_floor_would_also_refuse() {
+    let Some((_root, state, query, _cold_id, cold)) = cold_predecessor() else {
+        return;
+    };
+    // Above the 64 KiB cap, and larger than free space, so the floor would also refuse.
+    let length = 1u64 << 62;
+    match tidemark_store::space_guard::space_check(state.path(), length, &unlimited(50.0)).unwrap()
+    {
+        tidemark_store::space_guard::SpaceVerdict::Refuse {
+            kind: Some(tidemark_store::space_guard::SpaceRefusal::Floor { .. }),
+            ..
+        } => {}
+        other => panic!("floor should refuse {length} bytes when the cap is absent: {other:?}"),
+    }
+    let mut bytes = std::fs::read(&cold).unwrap();
+    bytes[8..16].copy_from_slice(&length.to_le_bytes());
+    std::fs::write(&cold, bytes).unwrap();
+    config_support::direct_config(
+        state.path(),
+        "[retention]\nmin_free_pct = 50.0\nmax_state_size = \"64KiB\"\n",
+    );
+    let cap = "maximum state size would be exceeded";
+    for json in [false, true] {
+        let output = command(state.path(), json)
+            .args(["top", "--depth", "1", &query.display().to_string()])
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        assert!(
+            stdout.is_empty(),
+            "both limits wrote stdout (json={json}): {stdout}"
+        );
+        assert!(
+            stderr.contains(cap),
+            "cap did not win when both limits refuse (json={json}): {stderr}"
+        );
+        assert!(
+            !stderr.contains("min_free_pct")
+                && !stderr.contains("delta_skipped")
+                && !stderr.contains("2 GiB"),
+            "both limits were reported as a floor skip (json={json}): {stderr}"
+        );
+    }
+}
+
+/// Two scans about 24h apart, with the older one cold. `None` when the scan has no space.
+///
+/// The first directory is the scanned tree. `query` points into it, so the caller keeps both.
+fn cold_predecessor() -> Option<(
+    tempfile::TempDir,
+    tempfile::TempDir,
+    PathBuf,
+    String,
+    PathBuf,
+)> {
+    let root = test_support::private_tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("child")).unwrap();
+    let state = test_support::private_tempdir().unwrap();
+    let canon = tidemark_fs::canon::canonicalize(root.path()).unwrap();
+    let query = canon.as_path().to_path_buf();
+    let mut cfg = Config::default();
+    cfg.general.state_dir = state.path().to_owned();
+    cfg.retention.snapshots.cold_after_recent = false;
+    let now = tidemark_core::time::unix_now();
+    for stamp in [now - 86_400, now] {
+        match run_fixture_scan(&cfg, &query, stamp) {
+            Ok(()) => {}
+            Err(ScanError::NoSpace) => {
+                eprintln!("skipped: fixture scan was refused by the free-space floor");
+                return None;
+            }
+            Err(error) => panic!("fixture scan failed: {error}"),
+        }
+    }
+    let catalog = Catalog::open(state.path(), true).unwrap();
+    let mut entries = catalog.list(None).unwrap();
+    entries.sort_by_key(|entry| entry.started_at);
+    assert_eq!(entries.len(), 2);
+    let older_id = entries[0].scan_id.clone();
+    let hot = entries[0].file.clone().unwrap();
+    let cold = tidemark_store::cold::compress_snapshot(&hot, 1, &|| false).unwrap();
+    catalog.point_to_cold(&older_id, &cold).unwrap();
+    std::fs::remove_file(&hot).unwrap();
+    drop(catalog);
+    Some((root, state, query, older_id, cold))
 }

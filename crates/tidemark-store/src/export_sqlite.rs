@@ -188,7 +188,7 @@ fn classify_with(error: StoreError, probe: impl FnOnce() -> Option<i32>) -> Stor
         return error;
     };
     if e.code == rusqlite::ErrorCode::DiskFull {
-        return StoreError::Space("destination disk full".into());
+        return StoreError::space(None, "destination disk full");
     }
     // Rule: an SQLite I/O error is a space failure (exit 5) only when the probe, run before
     // cleanup, confirms ENOSPC/EDQUOT; otherwise it stays a runtime error (exit 1). There is
@@ -200,7 +200,7 @@ fn classify_with(error: StoreError, probe: impl FnOnce() -> Option<i32>) -> Stor
             if n == rustix::io::Errno::NOSPC.raw_os_error()
                 || n == rustix::io::Errno::DQUOT.raw_os_error()
             {
-                return StoreError::Space("destination disk full or quota exceeded".into());
+                return StoreError::space(None, "destination disk full or quota exceeded");
             }
         }
     }
@@ -590,14 +590,14 @@ mod tests {
             for errno in [rustix::io::Errno::DQUOT, rustix::io::Errno::NOSPC] {
                 let out = classify_with(sqlite_failure(ext), || Some(errno.raw_os_error()));
                 assert!(
-                    matches!(out, StoreError::Space(_)),
+                    matches!(out, StoreError::Space { .. }),
                     "{ext} {errno:?}: {out:?}"
                 );
             }
         }
         let full = classify_with(sqlite_failure(13), || None);
         assert!(
-            matches!(full, StoreError::Space(_)),
+            matches!(full, StoreError::Space { .. }),
             "SQLITE_FULL: {full:?}"
         );
     }

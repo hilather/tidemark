@@ -16,7 +16,7 @@ fn apply_space_check(
 ) -> Result<(), StoreError> {
     match check() {
         Ok(SpaceVerdict::Ok) => Ok(()),
-        Ok(SpaceVerdict::Refuse { reason }) => Err(StoreError::Space(reason)),
+        Ok(SpaceVerdict::Refuse { kind, reason }) => Err(StoreError::space(kind, reason)),
         Err(error) => {
             tracing::warn!(%error, "state space measurement failed");
             Err(StoreError::Io(error))
@@ -486,7 +486,7 @@ impl SnapshotWriterV2 {
             let stat =
                 rustix::fs::fstatvfs(File::open(&self.tmp)?).map_err(std::io::Error::from)?;
             if stat.f_bavail.saturating_mul(stat.f_frsize) < estimate {
-                return Err(StoreError::Space("insufficient conversion headroom".into()));
+                return Err(StoreError::space(None, "insufficient conversion headroom"));
             }
             Ok(())
         };

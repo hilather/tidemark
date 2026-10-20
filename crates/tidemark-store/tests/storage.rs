@@ -272,12 +272,7 @@ fn drop_abort_collision_and_failed_write_never_publish() {
     assert!(w.finish(&m).is_err());
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     let mut w = SnapshotWriter::create(tmp.path(), &m).unwrap();
-    w.space_check_every(
-        1,
-        Box::new(|| SpaceVerdict::Refuse {
-            reason: "test".into(),
-        }),
-    );
+    w.space_check_every(1, Box::new(|| SpaceVerdict::other("test")));
     assert!(w.put_dirs(&[dir(0)]).is_err());
     w.abort();
     let w = SnapshotWriter::create(tmp.path(), &m).unwrap();
@@ -531,8 +526,12 @@ fn space_guard_decision_table_and_live_state_measurement() {
             ok
         );
     }
-    let measured = space_check_with(|| Err(std::io::Error::other("test")), 0, 0, &policy);
-    assert!(measured.unwrap_err().to_string().contains("test"));
+    let unreadable = space_check_with(|| Err(std::io::Error::other("test")), 0, 0, &policy)
+        .expect_err("unreadable totals");
+    assert!(matches!(
+        tidemark_store::StoreError::from(unreadable),
+        tidemark_store::StoreError::Io(_)
+    ));
     assert!(matches!(
         space_check_with(
             || Ok(FsTotals {
@@ -995,7 +994,7 @@ fn state_usage_skips_same_device_bind_mount() {
     // The small loop filesystem necessarily violates the mandatory 2-GiB floor;
     // ensure it did not instead violate the state-allocation cap.
     assert!(
-        matches!(result.unwrap(),SpaceVerdict::Refuse{reason} if reason.contains("free-space floor"))
+        matches!(result.unwrap(), SpaceVerdict::Refuse { kind: Some(tidemark_store::space_guard::SpaceRefusal::Floor { .. }), reason } if reason == "state filesystem free-space floor would be crossed")
     );
 }
 
