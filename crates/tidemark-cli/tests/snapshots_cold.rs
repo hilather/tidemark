@@ -548,7 +548,7 @@ fn cold_commands_enforce_configured_min_free_pct() {
             command(state.path(), false)
                 .args(&args)
                 .assert()
-                .code(1)
+                .code(5)
                 .get_output()
                 .stderr
                 .clone(),
@@ -633,7 +633,7 @@ fn cold_commands_enforce_configured_min_free_pct() {
 }
 
 #[test]
-fn plain_top_max_state_size_refusal_exits_1() {
+fn plain_top_max_state_size_refusal_exits_5() {
     let root = test_support::private_tempdir().unwrap();
     std::fs::create_dir_all(root.path().join("child")).unwrap();
     let state = test_support::private_tempdir().unwrap();
@@ -677,7 +677,7 @@ fn plain_top_max_state_size_refusal_exits_1() {
         let output = command(state.path(), json)
             .args(["top", "--depth", "1", &query.display().to_string()])
             .assert()
-            .code(1)
+            .code(5)
             .get_output()
             .clone();
         let stdout = String::from_utf8(output.stdout.clone()).unwrap();
@@ -789,7 +789,7 @@ fn plain_top_cap_wins_when_floor_would_also_refuse() {
         let output = command(state.path(), json)
             .args(["top", "--depth", "1", &query.display().to_string()])
             .assert()
-            .code(1)
+            .code(5)
             .get_output()
             .clone();
         let stdout = String::from_utf8(output.stdout.clone()).unwrap();

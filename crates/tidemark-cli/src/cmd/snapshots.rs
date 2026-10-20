@@ -405,13 +405,12 @@ fn refuse_inside_state(target: &std::path::Path, state: &std::path::Path) -> any
     }
     Ok(())
 }
-/// Space exhaustion and an existing output path exit 5; other errors keep their classification.
+/// Confirmed out-of-space I/O, an interrupted export, and an existing output
+/// path keep their exit codes. `StoreError::Space` is not rewritten here:
+/// `command_error` maps every refusal kind to exit 5.
 fn export_error(error: tidemark_store::StoreError) -> anyhow::Error {
     use tidemark_store::StoreError;
     match error {
-        StoreError::Space { reason, .. } => {
-            crate::CliError::Precondition(format!("no space for export: {reason}")).into()
-        }
         StoreError::Io(io)
             if matches!(
                 io.raw_os_error(),
@@ -773,5 +772,69 @@ mod export_error_tests {
             "could not create a unique staging directory",
         )));
         assert!(err.downcast_ref::<crate::CliError>().is_none(), "{err}");
+        assert_eq!(crate::command_error(err).exit_code(), 1);
+    }
+
+    #[test]
+    fn space_refusals_stay_store_errors_and_io_codes_are_unchanged() {
+        use tidemark_store::space_guard::SpaceRefusal;
+        for (kind, reason) in [
+            (
+                Some(SpaceRefusal::Floor {
+                    bytes: 2 << 30,
+                    minimum_applied: false,
+                }),
+                "state filesystem free-space floor would be crossed",
+            ),
+            (
+                Some(SpaceRefusal::MaxStateSize),
+                "maximum state size would be exceeded",
+            ),
+            (Some(SpaceRefusal::Overflow), "free-space floor overflow"),
+            (
+                Some(SpaceRefusal::InvalidPolicy),
+                "invalid minimum free percentage",
+            ),
+            (None, "destination disk full"),
+        ] {
+            let err = export_error(StoreError::space(kind, reason));
+            assert!(
+                matches!(
+                    err.downcast_ref::<StoreError>(),
+                    Some(StoreError::Space { .. })
+                ),
+                "{err}"
+            );
+            let mapped = crate::command_error(err.context("export snapshot: /tmp/out"));
+            assert_eq!(mapped.exit_code(), 5, "{reason}");
+            assert!(mapped.to_string().contains(reason), "{mapped}");
+        }
+        let full = export_error(StoreError::Io(std::io::Error::from_raw_os_error(
+            rustix::io::Errno::NOSPC.raw_os_error(),
+        )));
+        assert_eq!(
+            full.downcast_ref::<crate::CliError>()
+                .map(crate::CliError::exit_code),
+            Some(5)
+        );
+        let quota = export_error(StoreError::Io(std::io::Error::from_raw_os_error(
+            rustix::io::Errno::DQUOT.raw_os_error(),
+        )));
+        assert_eq!(
+            quota
+                .downcast_ref::<crate::CliError>()
+                .map(crate::CliError::exit_code),
+            Some(5)
+        );
+        let interrupted = export_error(StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "export interrupted",
+        )));
+        assert_eq!(
+            interrupted
+                .downcast_ref::<crate::CliError>()
+                .map(crate::CliError::exit_code),
+            Some(3)
+        );
     }
 }

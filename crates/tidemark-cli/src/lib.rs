@@ -66,8 +66,24 @@ impl CliError {
         }
     }
 }
+/// Every returned [`tidemark_store::StoreError::Space`] is a precondition.
+///
+/// Callers leave the store error in the chain. Plain `top` does not return a
+/// free-space floor refusal of the Δ24h snapshot; that soft skip stays exit 0.
+/// `MaxStateSize`, `Overflow`, `InvalidPolicy`, an unclassified refusal, and
+/// `Floor` on every path that cannot continue all exit 5. I/O stays a store
+/// error and keeps its current code (normally runtime exit 1; `snapshots export`
+/// still maps a confirmed `ENOSPC`/`EDQUOT` I/O error itself).
+fn is_space_refusal(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        matches!(
+            source.downcast_ref::<tidemark_store::StoreError>(),
+            Some(tidemark_store::StoreError::Space { .. })
+        )
+    })
+}
 fn command_error(error: anyhow::Error) -> CliError {
-    let code = error.downcast_ref::<CliError>().map(CliError::exit_code);
+    let mut code = error.downcast_ref::<CliError>().map(CliError::exit_code);
     // The command subject (`snapshots: <state_dir>`) names the catalog, which
     // does not help when the failure is the output path itself.
     let unprefixed = error.downcast_ref::<CliError>().and_then(|cli| match cli {
@@ -85,6 +101,12 @@ fn command_error(error: anyhow::Error) -> CliError {
         Some(message) => message,
         None => format!("{error:#}"),
     };
+    // One mapping for every command that propagates `StoreError::Space`.
+    // An explicit `CliError` (export's out-of-space I/O, output collisions)
+    // already chose a code and is left alone.
+    if code.is_none() && is_space_refusal(&error) {
+        code = Some(5);
+    }
     match code {
         Some(2) => CliError::Configuration(message),
         Some(3) => CliError::Partial(message),
@@ -318,6 +340,68 @@ mod tests {
             };
             assert_eq!(command_error(error).exit_code(), 1);
         }
+    }
+
+    #[test]
+    fn space_refusals_exit_5_and_io_keeps_runtime() {
+        use tidemark_store::space_guard::SpaceRefusal;
+        use tidemark_store::StoreError;
+        let kinds = [
+            Some(SpaceRefusal::Floor {
+                bytes: 2 << 30,
+                minimum_applied: true,
+            }),
+            Some(SpaceRefusal::MaxStateSize),
+            Some(SpaceRefusal::Overflow),
+            Some(SpaceRefusal::InvalidPolicy),
+            None,
+        ];
+        let reasons = [
+            "state filesystem free-space floor would be crossed",
+            "maximum state size would be exceeded",
+            "free-space floor overflow",
+            "invalid minimum free percentage",
+            "destination disk full",
+        ];
+        // `Overflow` is not produced by a real filesystem-sized `space_check`
+        // (the u64 arithmetic cannot overflow). Every command leaves
+        // `StoreError::Space` in the error chain, and this mapping does not
+        // branch on the kind or on which command added context.
+        for context in [
+            "diff: /data",
+            "top: /data",
+            "snapshots: /var/lib/tidemark",
+            "files: /data",
+            "wide: /data",
+            "links: /data",
+            "export: /var/lib/tidemark",
+            "tui: /data",
+        ] {
+            for (kind, reason) in kinds.iter().copied().zip(reasons) {
+                let error = anyhow::Error::from(StoreError::space(kind, reason)).context(format!(
+                    "open snapshot: {}",
+                    cmd::display_path(std::path::Path::new("/var/lib/tidemark/snap.db.zst"))
+                ));
+                let error = command_error(error.context(context));
+                assert_eq!(error.exit_code(), 5, "{context} {reason}");
+                let text = error.to_string();
+                assert!(
+                    text.contains(reason) && text.contains("state space exhausted"),
+                    "{context}: {text}"
+                );
+                assert!(!text.contains("delta_skipped"), "{text}");
+            }
+        }
+        let io = anyhow::Error::from(StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing snapshot",
+        )))
+        .context("open snapshot: /var/lib/tidemark/snap.db.zst");
+        let io = command_error(io.context("snapshots show: /var/lib/tidemark"));
+        assert_eq!(io.exit_code(), 1);
+        assert!(io.to_string().contains("missing snapshot"), "{io}");
+        let sql = anyhow::Error::from(StoreError::Invalid("not a snapshot".into()));
+        assert_eq!(command_error(sql).exit_code(), 1);
     }
 
     #[test]

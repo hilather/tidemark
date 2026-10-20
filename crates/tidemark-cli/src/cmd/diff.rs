@@ -182,7 +182,8 @@ pub fn run(args: &Args, context: &crate::Context) -> anyhow::Result<()> {
         &mut out,
     )
 }
-/// A free-space refusal names the snapshot. Other failures are unchanged.
+/// A free-space refusal names the snapshot. The `StoreError::Space` stays in
+/// the chain so `command_error` exits 5. Other failures are unchanged.
 fn named_inflate(
     error: tidemark_store::StoreError,
     id: &str,
