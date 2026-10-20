@@ -11,7 +11,10 @@ privileged = ["test-support/privileged"]
 [dependencies]
 clap.workspace = true
 clap_mangen.workspace = true
+rusqlite.workspace = true
 tidemark-cli = { path = "../crates/tidemark-cli" }
+tidemark-core = { path = "../crates/tidemark-core" }
+tidemark-store = { path = "../crates/tidemark-store" }
 tidemarkd = { path = "../crates/tidemarkd" }
 toml.workspace = true
 serde_json.workspace = true
