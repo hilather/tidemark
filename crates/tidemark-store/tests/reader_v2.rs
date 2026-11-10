@@ -884,6 +884,22 @@ fn s3_wrong_typed_v2_meta_is_invalid_naming_key() {
     }
 }
 
+#[test]
+fn s3_invalid_utf8_v2_meta_is_invalid_naming_key() {
+    for key in ["plain_depth", "hash_width"] {
+        for value in ["CAST(x'ff' AS TEXT)", "CAST(x'80' AS TEXT)"] {
+            let (_dir, file) =
+                v2_file(&format!("UPDATE meta SET value={value} WHERE key='{key}';"));
+            match Snapshot::open(&file) {
+                Err(StoreError::Invalid(m)) => {
+                    assert!(m.contains(&format!("meta key {key} is not text")), "{m}");
+                }
+                other => panic!("{key}/{value}: {:?}", other.map(|_| ())),
+            }
+        }
+    }
+}
+
 // ---- SNAP-reader2-queries: files, links, errors and ncdu parity ----
 
 struct Rng(u64);
@@ -2452,6 +2468,63 @@ fn s2_malformed_plain_rows_are_invalid_in_v2() {
         let snap = tamper_in_place(&_two, sql);
         let r = query(&snap);
         assert!(matches!(r, Err(StoreError::Invalid(_))), "{sql}: {r:?}");
+    }
+}
+
+#[test]
+fn s2_invalid_utf8_plain_rows_are_invalid_in_v2() {
+    let d = data(tree(6, 4), 11);
+    let note = d.notes[0].dir_id;
+    type Query = Box<dyn Fn(&Snapshot) -> Result<(), StoreError>>;
+    let cases: [(&str, &str, Query); 4] = [
+        (
+            "skipped",
+            "reason",
+            Box::new(|s| s.skipped_under(0).map(|_| ())),
+        ),
+        (
+            "errors",
+            "op",
+            Box::new(|s| s.errors_under(0, 100).map(|_| ())),
+        ),
+        (
+            "annotations",
+            "key",
+            Box::new(move |s| s.annotations(note).map(|_| ())),
+        ),
+        (
+            "annotations",
+            "value",
+            Box::new(move |s| s.annotations(note).map(|_| ())),
+        ),
+    ];
+    for (table, column, query) in cases {
+        for value in ["CAST(x'ff' AS TEXT)", "CAST(x'80' AS TEXT)"] {
+            let p = pair_data(
+                &d,
+                Shape {
+                    plain: 2,
+                    hash: 64,
+                    dirs: 3,
+                    files: 3,
+                    li: 3,
+                },
+            );
+            let Pair { _one, _two, .. } = p;
+            let sql = format!("UPDATE {table} SET {column}={value};");
+            let v2 = tamper_in_place(&_two, &sql);
+            let result = query(&v2);
+            assert!(
+                matches!(&result, Err(StoreError::Invalid(m)) if m.contains("undecodable row")),
+                "{sql}: {result:?}"
+            );
+            let v1 = tamper_in_place(&_one, &sql);
+            let result = query(&v1);
+            assert!(
+                matches!(result, Err(StoreError::Sql(_))),
+                "{sql}: {result:?}"
+            );
+        }
     }
 }
 

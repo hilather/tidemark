@@ -417,6 +417,7 @@ impl Backend {
                 .optional()
                 .map_err(|e| match e {
                     rusqlite::Error::InvalidColumnType(..)
+                    | rusqlite::Error::Utf8Error(..)
                     | rusqlite::Error::FromSqlConversionFailure(..) => {
                         bad(&format!("meta key {key} is not text"))
                     }

@@ -31,7 +31,7 @@ test-support = { path = "crates/test-support" }
 rustix = { version = "1", features = ["fs", "process", "system", "event", "net", "termios"] }
 libc = "0.2"
 signal-hook = "0.3"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 crossbeam-deque = "0.8"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
