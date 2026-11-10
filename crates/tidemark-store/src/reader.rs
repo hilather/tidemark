@@ -112,6 +112,7 @@ pub(crate) fn plain_row_error(error: rusqlite::Error) -> StoreError {
     match error {
         rusqlite::Error::FromSqlConversionFailure(..)
         | rusqlite::Error::InvalidColumnType(..)
+        | rusqlite::Error::Utf8Error(..)
         | rusqlite::Error::IntegralValueOutOfRange(..) => {
             StoreError::Invalid(format!("invalid v2 snapshot: undecodable row ({error})"))
         }
