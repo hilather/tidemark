@@ -11,9 +11,16 @@ pub enum ParseError {
     #[error("invalid mountinfo: {0}")]
     Invalid(&'static str),
 }
-use std::io;
+use std::{
+    io,
+    os::fd::BorrowedFd,
+    sync::atomic::{AtomicBool, Ordering},
+};
 pub(crate) use tidemark_core::path::display_lossy_bytes as display_field;
-use tidemark_core::{path::RawPath, scan::DevId};
+use tidemark_core::{
+    path::RawPath,
+    scan::{DevId, Gate},
+};
 /// Filesystem path or kernel object used as a mount root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountRoot {
@@ -224,6 +231,101 @@ pub fn other_mounts_of_dev<'a>(
         .collect();
     mounts.sort_by(|a, b| a.mount_point.cmp(&b.mount_point).then(a.id.cmp(&b.id)));
     mounts
+}
+/// Whether an opened scan root is still on the mountinfo record chosen for it.
+///
+/// The descriptor's mount ID (statx `STATX_MNT_ID`, else `/proc/self/fdinfo`)
+/// must equal the record's ID when known. The device must also match, except on
+/// btrfs, where `stat` reports a per-subvolume device that mountinfo does not
+/// show; there a known mount ID and a btrfs descriptor are required instead.
+/// Without a mount ID only the device comparison is available. Each metadata
+/// or proc read is gated, and cancellation is checked before issuing it.
+pub fn descriptor_on_mount(
+    fd: BorrowedFd<'_>,
+    st_dev: DevId,
+    mount: &MountInfo,
+    gate: &dyn Gate,
+    cancel: &AtomicBool,
+) -> io::Result<bool> {
+    let mount_id = mount_id_with(gate, cancel, || statx_mount_id(fd), || fdinfo_mount_id(fd))?;
+    identity_matches(mount, st_dev, mount_id, || {
+        charge(gate, cancel)?;
+        Ok(is_btrfs(fd))
+    })
+}
+// Mirrors walk::getdents::charge: acquire, then refuse I/O once cancelled.
+fn charge(gate: &dyn Gate, cancel: &AtomicBool) -> io::Result<()> {
+    gate.acquire(1);
+    if cancel.load(Ordering::Acquire) {
+        Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"))
+    } else {
+        Ok(())
+    }
+}
+fn mount_id_with(
+    gate: &dyn Gate,
+    cancel: &AtomicBool,
+    statx: impl FnOnce() -> Option<u64>,
+    fdinfo: impl FnOnce() -> Option<u64>,
+) -> io::Result<Option<u64>> {
+    charge(gate, cancel)?;
+    if let Some(id) = statx() {
+        return Ok(Some(id));
+    }
+    charge(gate, cancel)?;
+    Ok(fdinfo())
+}
+fn identity_matches(
+    mount: &MountInfo,
+    st_dev: DevId,
+    mount_id: Option<u64>,
+    descriptor_btrfs: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<bool> {
+    if st_dev == mount.dev {
+        return Ok(mount_id.is_none_or(|id| id == u64::from(mount.id)));
+    }
+    // btrfs subvolumes have their own anonymous st_dev; mountinfo shows the
+    // filesystem's. Accept only a known matching mount ID on a btrfs descriptor.
+    if mount.fs_type != "btrfs" || mount_id != Some(u64::from(mount.id)) {
+        return Ok(false);
+    }
+    descriptor_btrfs()
+}
+fn statx_mount_id(fd: BorrowedFd<'_>) -> Option<u64> {
+    use rustix::fs::{statx, AtFlags, StatxFlags};
+    let stat = statx(
+        fd,
+        "",
+        AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::MNT_ID,
+    )
+    .ok()?;
+    (stat.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stat.stx_mnt_id)
+}
+// EL8 statx supplies no mount ID; fdinfo has carried it since Linux 3.15.
+fn fdinfo_mount_id(fd: BorrowedFd<'_>) -> Option<u64> {
+    use rustix::fs::{Mode, OFlags};
+    use std::{io::Read, os::fd::AsRawFd};
+    let info = std::fs::File::from(
+        rustix::fs::open(
+            format!("/proc/self/fdinfo/{}", fd.as_raw_fd()),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?,
+    );
+    let mut text = String::new();
+    info.take(4096).read_to_string(&mut text).ok()?;
+    parse_fdinfo_mount_id(&text)
+}
+fn parse_fdinfo_mount_id(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .and_then(|id| id.trim().parse().ok())
+}
+const BTRFS_SUPER_MAGIC: u64 = 0x9123_683E;
+fn is_btrfs(fd: BorrowedFd<'_>) -> bool {
+    rustix::fs::fstatfs(fd).is_ok_and(|s| s.f_type as u64 == BTRFS_SUPER_MAGIC)
 }
 #[cfg(test)]
 #[path = "../tests/w1a/mount.rs"]

@@ -104,3 +104,39 @@ fn scan_publishes_v2_equal_to_v1_reading() {
     assert_eq!(kids.len(), 2);
     assert!(kids[0].t_apparent >= kids[1].t_apparent || kids[0].t_disk >= kids[1].t_disk);
 }
+
+#[test]
+fn walk_scan_of_a_tree_on_the_build_filesystem_passes_mount_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    // The build tree is often on btrfs, where each subvolume's st_dev differs
+    // from mountinfo's device; the root guard must accept it (issue #21).
+    let state = test_support::private_tempdir().unwrap();
+    let root = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    std::fs::create_dir_all(root.path().join("a")).unwrap();
+    test_support::private_write(root.path().join("a/f"), [1u8; 100]).unwrap();
+    let mut cfg = Config::default();
+    cfg.general.state_dir = state.path().to_owned();
+    let req = ScanRequest {
+        root: RawPath::from_path(root.path()).unwrap(),
+        mode: ModeRequest::Walk,
+        throttle: Some("max".into()),
+        threads: Some(1),
+        exclude_extra: vec![],
+        keep_partial: false,
+        annotations: vec![],
+    };
+    let out = run_scan_with_clock(
+        &cfg,
+        &req,
+        &Recorder(state.path().to_owned()),
+        &AtomicBool::new(false),
+        &|_| {},
+        &|| 1_800_000_000,
+    )
+    .unwrap();
+    let dirs = all_dirs(&Snapshot::open(&out.file.unwrap()).unwrap());
+    assert_eq!(dirs.len(), 2);
+}
