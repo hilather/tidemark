@@ -79,3 +79,135 @@ fn nsfs_object_root_keeps_table_and_boundaries() {
     let object = parse_mountinfo(b"1 0 0:5 net:[a\\377] /net rw - nsfs nsfs rw").unwrap();
     assert_eq!(object[0].root, MountRoot::Object(b"net:[a\xff]".to_vec()));
 }
+// Recorded from a btrfs host: mountinfo shows the filesystem's anonymous
+// device (0:29); stat on the /@home subvolume reports 0:51.
+const BTRFS_HOME: &[u8] = b"56 32 0:29 /@home /home rw,relatime shared:152 - btrfs /dev/mapper/root rw,subvolid=257,subvol=/@home\n";
+const XFS_DATA: &[u8] = b"99 1 253:2 / /data rw,relatime - xfs /dev/mapper/rl-data rw\n";
+fn must_not_probe() -> io::Result<bool> {
+    panic!("descriptor filesystem probed outside the btrfs branch")
+}
+#[test]
+fn root_identity_keeps_device_check_off_btrfs() {
+    for (sample, other_dev) in [
+        (XFS_DATA, libc::makedev(253, 3)),
+        (
+            b"264 32 0:57 / /tmp rw - tmpfs tmpfs rw\n".as_slice(),
+            libc::makedev(0, 58),
+        ),
+    ] {
+        let mounts = parse_mountinfo(sample).unwrap();
+        let m = &mounts[0];
+        let id = u64::from(m.id);
+        assert!(identity_matches(m, m.dev, Some(id), must_not_probe).unwrap());
+        assert!(identity_matches(m, m.dev, None, must_not_probe).unwrap());
+        assert!(!identity_matches(m, m.dev, Some(id + 1), must_not_probe).unwrap());
+        assert!(!identity_matches(m, other_dev, Some(id), must_not_probe).unwrap());
+        assert!(!identity_matches(m, other_dev, None, must_not_probe).unwrap());
+    }
+}
+#[test]
+fn root_identity_on_btrfs_subvolume_needs_mount_id_and_btrfs_descriptor() {
+    let mounts = parse_mountinfo(BTRFS_HOME).unwrap();
+    let m = &mounts[0];
+    let subvolume = libc::makedev(0, 51);
+    assert!(identity_matches(m, subvolume, Some(56), || Ok(true)).unwrap());
+    assert!(!identity_matches(m, subvolume, Some(56), || Ok(false)).unwrap());
+    assert!(!identity_matches(m, subvolume, Some(57), || Ok(true)).unwrap());
+    // Without a mount ID, fail closed exactly like the device-only check.
+    assert!(!identity_matches(m, subvolume, None, || Ok(true)).unwrap());
+    assert!(identity_matches(m, m.dev, None, must_not_probe).unwrap());
+    let cancelled = identity_matches(m, subvolume, Some(56), || {
+        Err(io::Error::new(io::ErrorKind::Interrupted, "scan cancelled"))
+    });
+    assert_eq!(cancelled.unwrap_err().kind(), io::ErrorKind::Interrupted);
+}
+struct CountGate {
+    units: std::sync::atomic::AtomicU32,
+    cancel_at: u32,
+    cancel: AtomicBool,
+}
+impl CountGate {
+    fn new(cancel_at: u32) -> Self {
+        Self {
+            units: 0.into(),
+            cancel_at,
+            cancel: AtomicBool::new(false),
+        }
+    }
+    fn units(&self) -> u32 {
+        self.units.load(Ordering::Relaxed)
+    }
+}
+impl Gate for CountGate {
+    fn acquire(&self, cost: u32) {
+        let total = self.units.fetch_add(cost, Ordering::Relaxed) + cost;
+        if total == self.cancel_at {
+            self.cancel.store(true, Ordering::Release);
+        }
+    }
+    fn current_rate(&self) -> f64 {
+        0.0
+    }
+}
+#[test]
+fn mount_id_sources_are_gated_in_order() {
+    let gate = CountGate::new(0);
+    let id = mount_id_with(&gate, &gate.cancel, || Some(7), || panic!("fdinfo read")).unwrap();
+    assert_eq!((id, gate.units()), (Some(7), 1));
+    let gate = CountGate::new(0);
+    let id = mount_id_with(&gate, &gate.cancel, || None, || Some(8)).unwrap();
+    assert_eq!((id, gate.units()), (Some(8), 2));
+    let gate = CountGate::new(0);
+    let id = mount_id_with(&gate, &gate.cancel, || None, || None).unwrap();
+    assert_eq!((id, gate.units()), (None, 2));
+}
+#[test]
+fn mount_id_sources_stop_once_cancelled() {
+    let gate = CountGate::new(1);
+    let err = mount_id_with(&gate, &gate.cancel, || panic!("statx"), || panic!("fdinfo"));
+    assert_eq!(err.unwrap_err().kind(), io::ErrorKind::Interrupted);
+    let gate = CountGate::new(2);
+    let err = mount_id_with(&gate, &gate.cancel, || None, || panic!("fdinfo"));
+    assert_eq!(err.unwrap_err().kind(), io::ErrorKind::Interrupted);
+}
+#[test]
+fn fdinfo_mount_id_parser() {
+    assert_eq!(
+        parse_fdinfo_mount_id("pos:\t0\nflags:\t02200000\nmnt_id:\t56\nino:\t256\n"),
+        Some(56)
+    );
+    assert_eq!(parse_fdinfo_mount_id("mnt_id: 42\nmnt_id: 99"), Some(42));
+    for text in [
+        "",
+        "pos:\t0\n",
+        "mnt_id:",
+        "mnt_id: x",
+        "mnt_id: -1",
+        "mnt_id: 18446744073709551616",
+    ] {
+        assert_eq!(parse_fdinfo_mount_id(text), None, "{text:?}");
+    }
+}
+#[test]
+fn open_root_is_on_its_mountinfo_record() {
+    use std::os::fd::AsFd;
+    let dir = test_support::private_tempdir().unwrap();
+    let file = std::fs::File::open(dir.path()).unwrap();
+    let fd = file.as_fd();
+    let mounts = read_mountinfo().unwrap();
+    let path = RawPath::from_path(dir.path()).unwrap();
+    let m = mount_for_path(&mounts, &path).unwrap();
+    // fdinfo is the EL8 production source; statx must agree when it has an ID.
+    assert_eq!(fdinfo_mount_id(fd), Some(u64::from(m.id)));
+    if let Some(id) = statx_mount_id(fd) {
+        assert_eq!(id, u64::from(m.id));
+    }
+    let st_dev = rustix::fs::fstat(fd).unwrap().st_dev;
+    let gate = CountGate::new(0);
+    assert!(descriptor_on_mount(fd, st_dev, m, &gate, &gate.cancel).unwrap());
+    if st_dev != m.dev {
+        // A btrfs subvolume: the case the device-only check refused.
+        assert_eq!(m.fs_type, "btrfs");
+        assert!(is_btrfs(fd));
+    }
+}

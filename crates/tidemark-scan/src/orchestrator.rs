@@ -164,7 +164,15 @@ fn run_scan_with_environment(
         gate.acquire(1);
         check_cancel(cancel)?;
         let root_stat = rustix::fs::fstat(&root_fd)?;
-        if root_stat.st_dev != mount.dev {
+        let on_mount = mount::descriptor_on_mount(
+            root_fd.as_fd(),
+            root_stat.st_dev,
+            mount,
+            gate.as_ref(),
+            cancel,
+        );
+        check_cancel(cancel)?;
+        if !on_mount? {
             return Err(ScanError::Precondition(
                 "root mount changed during setup".into(),
             ));
