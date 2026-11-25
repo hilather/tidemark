@@ -1,4 +1,8 @@
 [advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0542", reason = "2026-11-25: informational unmaintained notice for humantime, not a vulnerability; no patched version is available. Replacement is planned." },
+    { id = "RUSTSEC-2026-0543", reason = "2026-11-25: informational unmaintained notice for chrono, not a vulnerability; no patched version is available. Replacement is planned." },
+]
 
 [licenses]
 # xxhash-rust requires the Boost Software License (BSL-1.0).
